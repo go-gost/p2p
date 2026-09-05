@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Standalone host process for the GOST [p2p plugin](https://github.com/go-gost/plugin) control protocol (`github.com/go-gost/plugin/p2p/proto`). GOST calls `OpenTunnel(peer)` over gRPC; this process returns a locally dialable TCP endpoint that bridges to the peer. The GOST side (`x/p2p/`) consumes the returned endpoint as the base connection of any whitelisted chain-node dialer.
 
-Current implementation is the **stub milestone**: it proves the plugin seam end to end. No NAT traversal, rendezvous, DERP relay, hole punching, or encryption — those belong to future milestones of this repo.
+Current implementation is the **stub milestone + mux/token**: it proves the plugin seam end to end, supports inner dialers `tcp/tls/ws/mtcp/mtls/mws` (mux inners reuse one tunnel as a session), and has optional control-plane token auth. No NAT traversal, rendezvous, DERP relay, hole punching, or data-plane encryption — those belong to future milestones of this repo.
 
 ## Build & Run
 
@@ -22,6 +22,7 @@ GOWORK=off go build ./...  # standalone build must also pass
 |---|---|---|
 | `--addr` | `127.0.0.1:8003` | gRPC control-plane listen address |
 | `--bind` | `127.0.0.1` | data-plane listen IP; each tunnel gets an ephemeral port on it |
+| `--token` | *(empty)* | control-plane auth token; empty disables checking (loopback default) |
 | `--debug` | off | slog debug level (tunnel open/close events) |
 
 ## Architecture (two planes)
@@ -34,17 +35,18 @@ GOWORK=off go build ./...  # standalone build must also pass
 
 **Data plane** — per tunnel ([server.go](server.go) `bridge`): every accepted connection is dialed to `target` (the peer) and copied in both directions. Half-close semantics: when one direction EOFs, the peer side gets `CloseWrite()` so the other side can drain; full close only after both directions finish.
 
-**Lifecycle**: one tunnel per GOST dial (stub form). `tunnelConn.Close()` on the GOST side triggers `CloseTunnel`, which tears down listener + connections — verified zero-residue in e2e.
+**Lifecycle**: non-mux inner (tcp/tls/ws): one tunnel per GOST dial; `tunnelConn.Close()` triggers `CloseTunnel` (listener + connections), verified zero-residue in e2e. Mux inner (mtcp/mtls/mws): one tunnel per mux session, kept alive until the session dies or the process exits (gost's own mux semantics); N streams multiplex over it.
 
 ## Trust boundary (do not weaken)
 
-The control channel is **unauthenticated**: anyone who can reach `--addr` can make this process dial arbitrary `host:port` (active-dial SSRF surface — unlike other plugin hosts, this one dials *out*). The **loopback default is the security boundary**; do not expose `--addr` beyond loopback without adding authentication first. The peer string is forwarded to `net.DialTimeout` verbatim — keep the `SplitHostPort` validation in `OpenTunnel`.
+By default the control channel is **unauthenticated**: anyone who can reach `--addr` can make this process dial arbitrary `host:port` (active-dial SSRF surface — unlike other plugin hosts, this one dials *out*). The **loopback default is the security boundary**. `--token <secret>` enables checking on every RPC via the gRPC `token` metadata key sent by the GOST client (constant-time compare); the token travels over a plaintext channel today, so cross-machine deployment requires `--token` **plus** control TLS. The peer string is forwarded to `net.DialTimeout` verbatim — keep the `SplitHostPort` validation in `OpenTunnel`.
 
 ## Future milestones (in rough order)
 
-1. Muxed tunnels (one tunnel = one port, many streams) — removes the per-dial ephemeral-port churn.
-2. DERP-subset rendezvous/relay as an in-GOST service; this host grows the traversal engine.
-3. UDP/hole-punched tunnels — **outside the current endpoint contract** (TCP-semantic byte pipe); needs a reliable-stream layer (QUIC/kcp class) and likely a new RPC family in the proto.
+1. DERP-subset rendezvous/relay as an in-GOST service; this host grows the traversal engine.
+2. UDP/hole-punched tunnels — **outside the current endpoint contract** (TCP-semantic byte pipe); needs a reliable-stream layer (QUIC/kcp class) and likely a new RPC family in the proto.
+
+(Muxed tunnels — one tunnel = one port, many streams — shipped in the mux milestone.)
 
 ## Verification
 

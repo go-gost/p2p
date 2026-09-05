@@ -2,7 +2,7 @@
 
 Tunnel host process for [GOST](https://github.com/go-gost/gost)'s [p2p plugin](https://github.com/go-gost/plugin) protocol. It lets GOST establish the network path to a chain node through a tunnel opened by this process — the traversal strategy (rendezvous, relay, hole punching) is entirely up to the plugin, and GOST only ever sees a plain local endpoint to dial.
 
-**Status: stub.** This build proves the plugin seam end to end: it bridges each tunnel to the peer with a local TCP forward. No NAT traversal, rendezvous, or encryption yet — see the roadmap below.
+**Status: stub + mux.** This build proves the plugin seam end to end: it bridges each tunnel to the peer with a local TCP forward. Inner dialers `tcp/tls/ws/mtcp/mtls/mws` are supported — the mux family reuses one tunnel as a multiplexed session (one tunnel, many streams). Control-plane token auth is available (`--token`). No NAT traversal, rendezvous, or encryption yet — see the roadmap below.
 
 ## How it works
 
@@ -27,6 +27,7 @@ go build -o p2p .
 |---|---|---|
 | `--addr` | `127.0.0.1:8003` | gRPC control-plane listen address |
 | `--bind` | `127.0.0.1` | data-plane listen IP (one ephemeral port per tunnel) |
+| `--token` | *(empty)* | control-plane auth token; empty disables checking |
 | `--debug` | off | debug logging |
 
 Point a GOST chain node at it:
@@ -37,6 +38,7 @@ p2ps:
     plugin:
       type: grpc
       addr: 127.0.0.1:8003
+      token: gost                       # matches the host's --token
 
 chains:
   - name: chain-0
@@ -55,13 +57,12 @@ chains:
 
 ## Security
 
-The control channel is **unauthenticated**. Any process that can reach `--addr` can make this host dial arbitrary addresses. Keep `--addr` on loopback (the default) unless you add authentication first.
+The control channel is unauthenticated by default: any process that can reach `--addr` can make this host dial arbitrary addresses. Keep `--addr` on loopback (the default). For cross-machine deployment set `--token` (the GOST client sends it as gRPC metadata) **and** control TLS — the token alone travels over a plaintext gRPC channel today.
 
 ## Roadmap
 
-1. Muxed tunnels — one tunnel/port carrying many streams.
-2. DERP-subset rendezvous + relay; the traversal engine grows here.
-3. UDP / hole-punched tunnels (requires a reliable-stream layer over the current TCP-semantic endpoint contract).
+1. DERP-subset rendezvous + relay; the traversal engine grows here.
+2. UDP / hole-punched tunnels (requires a reliable-stream layer over the current TCP-semantic endpoint contract).
 
 ## License
 
