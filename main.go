@@ -8,27 +8,62 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/go-gost/plugin/p2p/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"p2p/internal/derpclient"
 )
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8003", "gRPC listen address (control plane)")
 	bind := flag.String("bind", "127.0.0.1", "data plane listen IP; each tunnel gets an ephemeral port on it")
 	token := flag.String("token", "", "control-plane auth token; empty disables checking (loopback default)")
+	derpURL := flag.String("derp", "", "DERP relay server URL (wss://host/derp); enables DERP engine mode")
+	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
+	target := flag.String("target", "", "local bridge target for inbound tunnels in DERP mode (host:port)")
 	debug := flag.Bool("debug", false, "debug logging")
 	flag.Parse()
 
 	if *debug {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
+
+	var engine *Engine
+	if *derpURL != "" {
+		priv, pub, err := loadOrCreateKey(*keyFile)
+		if err != nil {
+			slog.Error("load key", "file", *keyFile, "error", err)
+			os.Exit(1)
+		}
+		if *target != "" {
+			if _, _, err := net.SplitHostPort(*target); err != nil {
+				slog.Error("invalid --target", "value", *target, "error", err)
+				os.Exit(1)
+			}
+		}
+		engine = newEngine(*derpURL, *target, priv, slog.Default())
+		slog.Info("p2p derp engine", "url", *derpURL,
+			"pubkey", base64.RawURLEncoding.EncodeToString(pub[:]),
+			"target", *target)
+		if err := engine.Connect(); err != nil {
+			// Keep serving gRPC: the reconnect ticker retries in the
+			// background, but inbound tunnels stay unreachable until the
+			// first successful connection.
+			slog.Warn("derp connect", "error", err)
+		}
 	}
 
 	ln, err := net.Listen("tcp", *addr)
@@ -43,12 +78,51 @@ func main() {
 	// remains the only boundary, so keep --addr off-loopback unless both
 	// --token and control TLS are in place.
 	s := grpc.NewServer(grpc.UnaryInterceptor(authInterceptor(*token)))
-	proto.RegisterP2PServer(s, newServer(*bind))
-	slog.Info("p2p stub listening", "addr", *addr, "bind", *bind, "auth", *token != "")
+	proto.RegisterP2PServer(s, newServer(*bind, engine))
+	slog.Info("p2p stub listening", "addr", *addr, "bind", *bind, "auth", *token != "", "derp", *derpURL != "")
 	if err := s.Serve(ln); err != nil {
 		slog.Error("serve", "error", err)
 		os.Exit(1)
 	}
+}
+
+// defaultKeyPath is where the DERP key lives unless --key overrides it.
+func defaultKeyPath() string {
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "p2p", "key-v1")
+	}
+	return "p2p-key-v1"
+}
+
+// loadOrCreateKey loads a hex-encoded curve25519 private key from path,
+// generating and storing a new one (0600) if the file is missing.
+func loadOrCreateKey(path string) (derpclient.PrivateKey, derpclient.PublicKey, error) {
+	if path == "" {
+		path = defaultKeyPath()
+	}
+	if b, err := os.ReadFile(path); err == nil {
+		raw, err := hex.DecodeString(strings.TrimSpace(string(b)))
+		if err != nil {
+			return derpclient.PrivateKey{}, derpclient.PublicKey{}, fmt.Errorf("bad key file: %w", err)
+		}
+		var priv derpclient.PrivateKey
+		if len(raw) != len(priv) {
+			return priv, derpclient.PublicKey{}, fmt.Errorf("bad key file: want %d hex bytes, got %d", len(priv), len(raw))
+		}
+		copy(priv[:], raw)
+		return priv, priv.Public(), nil
+	}
+	priv, pub, err := derpclient.Generate()
+	if err != nil {
+		return priv, pub, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return priv, pub, err
+	}
+	if err := os.WriteFile(path, []byte(hex.EncodeToString(priv[:])+"\n"), 0o600); err != nil {
+		return priv, pub, err
+	}
+	return priv, pub, nil
 }
 
 // authInterceptor returns a unary interceptor comparing the client's token

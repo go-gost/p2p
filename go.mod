@@ -3,7 +3,10 @@ module p2p
 go 1.26.4
 
 require (
-	github.com/go-gost/plugin v0.6.0
+	github.com/coder/websocket v1.8.14
+	github.com/go-gost/plugin v0.6.1
+	github.com/xtaci/smux v1.5.57
+	golang.org/x/crypto v0.55.0
 	google.golang.org/grpc v1.83.2
 )
 
