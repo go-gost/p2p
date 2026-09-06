@@ -16,7 +16,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/go-gost/plugin/p2p/proto"
@@ -35,8 +34,6 @@ func main() {
 	derpURL := flag.String("derp", "", "DERP relay server URL (wss://host/derp); enables DERP engine mode")
 	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
 	target := flag.String("target", "", "local bridge target for inbound tunnels in DERP mode (host:port)")
-	var services stringList
-	flag.Var(&services, "service", "service name to announce (repeatable); enables name-based discovery for this host")
 	debug := flag.Bool("debug", false, "debug logging")
 	flag.Parse()
 
@@ -57,13 +54,10 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		engine = newEngine(*derpURL, *target, priv, services, slog.Default())
+		engine = newEngine(*derpURL, *target, priv, slog.Default())
 		slog.Info("p2p derp engine", "url", *derpURL,
 			"pubkey", base64.RawURLEncoding.EncodeToString(pub[:]),
-			"target", *target, "services", services.String())
-		for _, name := range services {
-			slog.Info("announcing", "name", name)
-		}
+			"target", *target)
 		if err := engine.Connect(); err != nil {
 			// Keep serving gRPC: the reconnect ticker retries in the
 			// background, but inbound tunnels stay unreachable until the
@@ -90,24 +84,6 @@ func main() {
 		slog.Error("serve", "error", err)
 		os.Exit(1)
 	}
-}
-
-// nameRe constrains service names: lowercase alphanumeric + hyphen, ≤64
-// bytes. The cap is a protocol sanity bound, not a collision safeguard —
-// key/name precedence in OpenTunnel makes parsing unambiguous (see the
-// discovery plan's boundary notes).
-var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
-
-// stringList collects repeated --service values.
-type stringList []string
-
-func (s *stringList) String() string { return strings.Join(*s, ",") }
-func (s *stringList) Set(v string) error {
-	if !nameRe.MatchString(v) {
-		return fmt.Errorf("invalid service name %q (want [a-z0-9][a-z0-9-]{0,63})", v)
-	}
-	*s = append(*s, v)
-	return nil
 }
 
 // defaultKeyPath is where the DERP key lives unless --key overrides it.

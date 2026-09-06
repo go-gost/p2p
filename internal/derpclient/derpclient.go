@@ -62,11 +62,6 @@ const (
 	nonceLen       = 24
 	maxInfoLen     = 1 << 20
 	maxFrameLen    = keyLen + MaxPacketSize + nonceLen + 8 // generous bound for any frame we accept
-
-	// presenceChanSize bounds the buffered presence-event queue; on overflow
-	// events are dropped. Existence is re-learned from the periodic name
-	// announcements, so a dropped blip only delays discovery.
-	presenceChanSize = 64
 )
 
 // Frame types from derp.go@v1.102.3.
@@ -151,14 +146,6 @@ type serverInfo struct {
 	TokenBucketBytesBurst     int `json:",omitempty"`
 }
 
-// PresenceEvent reports a peer's presence on this connection: Present when
-// the server announced the peer (one event per announced key), false when it
-// left (PeerGone).
-type PresenceEvent struct {
-	Key     PublicKey
-	Present bool
-}
-
 // Client is a WebSocket-DERP connection. All methods are safe for concurrent
 // use; Recv is intended to be called from a single reader goroutine.
 type Client struct {
@@ -172,9 +159,6 @@ type Client struct {
 	serverKey PublicKey
 
 	wmu sync.Mutex // serializes all frame writes (including pong replies from Recv)
-
-	presenceMu sync.Mutex
-	presenceCh chan PresenceEvent // nil until Presence() is first called
 }
 
 // Dial connects to the DERP server at rawURL ("wss://host/derp", or ws://
@@ -225,33 +209,6 @@ func (c *Client) PublicKey() PublicKey { return c.pub }
 
 // ServerPublicKey returns the server's public key learned from the greeting.
 func (c *Client) ServerPublicKey() PublicKey { return c.serverKey }
-
-// Presence returns the channel of PeerPresent/PeerGone events for this
-// connection, created lazily on first call. Each connected client owns its
-// own channel; it is closed when the connection closes, so a consumer can
-// range until the session is gone.
-func (c *Client) Presence() <-chan PresenceEvent {
-	c.presenceMu.Lock()
-	defer c.presenceMu.Unlock()
-	if c.presenceCh == nil {
-		c.presenceCh = make(chan PresenceEvent, presenceChanSize)
-	}
-	return c.presenceCh
-}
-
-// enqueuePresence adds a presence event without blocking Recv's packet
-// path; a full channel drops the event.
-func (c *Client) enqueuePresence(ev PresenceEvent) {
-	c.presenceMu.Lock()
-	defer c.presenceMu.Unlock()
-	if c.presenceCh == nil {
-		return // no consumer
-	}
-	select {
-	case c.presenceCh <- ev:
-	default: // full: drop; existence converges via announcements
-	}
-}
 
 // handshake mirrors the reference client: read FrameServerKey, send
 // FrameClientInfo (boxed to the server key), read FrameServerInfo.
@@ -322,9 +279,8 @@ func (c *Client) pong(payload []byte) error {
 }
 
 // Recv blocks until a packet arrives and returns its source key and bytes.
-// KeepAlive, unknown frame types, and Pong replies are consumed internally;
-// FramePing is answered with FramePong. PeerGone/PeerPresent are surfaced on
-// the Presence() channel instead of returned.
+// KeepAlive, PeerGone/PeerPresent, unknown frame types, and Pong replies are
+// consumed internally; FramePing is answered with FramePong.
 func (c *Client) Recv() (src PublicKey, pkt []byte, err error) {
 	for {
 		t, body, err := c.readFrame()
@@ -342,21 +298,7 @@ func (c *Client) Recv() (src PublicKey, pkt []byte, err error) {
 			if len(body) > 0 {
 				c.pong(body)
 			}
-		case framePeerPresent:
-			// Body is one or more 32-byte keys of connected peers.
-			for off := 0; off+keyLen <= len(body); off += keyLen {
-				var k PublicKey
-				copy(k[:], body[off:off+keyLen])
-				c.enqueuePresence(PresenceEvent{Key: k, Present: true})
-			}
-		case framePeerGone:
-			// Body is the 32-byte key plus 1 informational reason byte.
-			if len(body) >= keyLen {
-				var k PublicKey
-				copy(k[:], body[:keyLen])
-				c.enqueuePresence(PresenceEvent{Key: k, Present: false})
-			}
-		case frameKeepAlive, framePong, frameServerKey, frameServerInfo:
+		case frameKeepAlive, framePeerGone, framePeerPresent, framePong, frameServerKey, frameServerInfo:
 			// no-op for us
 		default:
 			// Unknown frame type: skip (forward compatibility).
@@ -396,15 +338,8 @@ func (c *Client) writeFrame(t byte, body []byte) error {
 	return c.bw.Flush()
 }
 
-// Close closes the connection and the Presence channel (a consumer ranging
-// on Presence() unblocks here).
+// Close closes the connection.
 func (c *Client) Close() error {
-	c.presenceMu.Lock()
-	if c.presenceCh != nil {
-		close(c.presenceCh)
-		c.presenceCh = nil
-	}
-	c.presenceMu.Unlock()
 	c.cancel()
 	c.ws.Close(websocket.StatusNormalClosure, "")
 	return c.conn.Close()
