@@ -36,10 +36,29 @@ type Engine struct {
 	pub    derpclient.PublicKey
 	log    *slog.Logger
 
+	// services are the names this host announces to connected peers; empty
+	// means a pure dialing host that never announces.
+	services []string
+	// announcePeriod is the name-announcement interval (shortened in tests).
+	announcePeriod time.Duration
+
 	mu     sync.Mutex
 	client *derpclient.Client
 	peers  map[derpclient.PublicKey]*peerConn
-	stop   chan struct{}
+	// online tracks peers present on the current DERP connection; it is the
+	// announcement target set and is repopulated on every reconnect.
+	online map[derpclient.PublicKey]time.Time
+	// svc caches service-name -> announcing key (newest wins per name), with
+	// a TTL backstop for peers that vanish without a PeerGone.
+	svc  map[string]svcEnt
+	stop chan struct{}
+}
+
+// svcEnt is one cached service name: the announcing peer's key and when the
+// last announcement refreshed it.
+type svcEnt struct {
+	key      derpclient.PublicKey
+	lastSeen time.Time
 }
 
 // peerConn is the per-peer packet adapter: smux sees it as a net.Conn, whose
@@ -72,17 +91,45 @@ const (
 	// keepAlivePeriod pings the DERP server well below typical proxy idle
 	// timeouts (e.g. Cloudflare's ~100s).
 	keepAlivePeriod = 30 * time.Second
+	// defaultAnnouncePeriod is the interval between name announcements to
+	// every online peer; per-peer instantaneous announcements fire on new
+	// presence, so this is only the backstop cadence.
+	defaultAnnouncePeriod = 15 * time.Second
+	// svcEntryTTL evicts cached names that stop being announced (silent peer
+	// disappearance or a partition where PeerGone never arrives).
+	svcEntryTTL = 60 * time.Second
+	// maxNameLen bounds a service name in an announce frame. It is a protocol
+	// sanity bound, NOT a collision safeguard: key/name precedence in
+	// OpenTunnel's peer string already makes parsing unambiguous (see the
+	// discovery plan's boundary notes).
+	maxNameLen = 64
 )
 
-func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger) *Engine {
+// Application-layer framing above DERP: every relayed packet starts with a
+// type byte the receiving pump dispatches on before session routing. Session
+// data is the smux byte stream under type 0x01; type 0x00 carries engine
+// control frames (name announcements), which never enter the mux session.
+const (
+	frameTypeControl = 0x00
+	frameTypeData    = 0x01
+
+	kindAnnounce = 0x01 // name-announce: [0x00][kind][name bytes]
+	// kind 0x02 reserved for M2 address candidates — not implemented.
+)
+
+func newEngine(url, target string, priv derpclient.PrivateKey, services []string, log *slog.Logger) *Engine {
 	e := &Engine{
-		url:    url,
-		target: target,
-		priv:   priv,
-		pub:    priv.Public(),
-		peers:  make(map[derpclient.PublicKey]*peerConn),
-		log:    log,
-		stop:   make(chan struct{}),
+		url:            url,
+		target:         target,
+		priv:           priv,
+		pub:            priv.Public(),
+		services:       services,
+		peers:          make(map[derpclient.PublicKey]*peerConn),
+		online:         make(map[derpclient.PublicKey]time.Time),
+		svc:            make(map[string]svcEnt),
+		log:            log,
+		stop:           make(chan struct{}),
+		announcePeriod: defaultAnnouncePeriod,
 	}
 	// The host is a rendezvous node: it must be connected to the relay for
 	// peers to reach it, and it must recover after the connection drops.
@@ -184,8 +231,11 @@ func (e *Engine) peerConn(peer derpclient.PublicKey) *peerConn {
 	return pc
 }
 
-// ensureClientLocked dials the DERP server and starts the pump + keepalive
-// goroutines. Caller must hold e.mu.
+// ensureClientLocked dials the DERP server and starts the pump, keepalive,
+// presence, and announce goroutines. Caller must hold e.mu. Each connect
+// gets its own presence/announcer bound to this client: when the connection
+// dies, its presence channel closes (ending the goroutine) and the announcer
+// notices on the next tick.
 func (e *Engine) ensureClientLocked() {
 	if e.client != nil {
 		return
@@ -201,10 +251,15 @@ func (e *Engine) ensureClientLocked() {
 	e.log.Debug("derp connected", "url", e.url, "server", c.ServerPublicKey())
 	go e.pump(c)
 	go e.keepalive(c)
+	go e.runPresence(c)
+	go e.runAnnouncer(c)
 }
 
-// pump routes inbound packets to the owning peer adapter; a transport error
-// tears down the connection and all sessions (the next OpenStream redials).
+// pump routes inbound packets: control frames are dispatched by our
+// application-layer type byte (never entering a session), while session data
+// gets its type byte stripped once and routed to the owning peer adapter; a
+// transport error tears down the connection and all sessions (the next
+// OpenStream redials).
 func (e *Engine) pump(c *derpclient.Client) {
 	for {
 		src, pkt, err := c.Recv()
@@ -213,13 +268,30 @@ func (e *Engine) pump(c *derpclient.Client) {
 			return
 		}
 		e.mu.Lock()
-		pc, stale := e.peers[src], e.client != c
+		stale := e.client != c
 		e.mu.Unlock()
 		if stale {
 			// A teardown replaced this connection while Recv was holding a
 			// packet; routing it into the new session would corrupt it.
 			return
 		}
+		if len(pkt) == 0 {
+			continue
+		}
+		switch pkt[0] {
+		case frameTypeControl:
+			e.handleControl(src, pkt[1:])
+			continue
+		case frameTypeData:
+			pkt = pkt[1:] // strip once; peerConn.Read never re-strips
+		default:
+			// Unknown application frame type: drop (forward compatibility).
+			continue
+		}
+
+		e.mu.Lock()
+		pc := e.peers[src]
+		e.mu.Unlock()
 		if pc == nil {
 			// Packets from unknown peers: create the adapter so an inbound
 			// tunnel (the other side opening a stream) can be served.
@@ -256,6 +328,124 @@ func (e *Engine) keepalive(c *derpclient.Client) {
 	}
 }
 
+// runPresence folds PeerPresent/PeerGone events into the online set and the
+// service cache, and announces this host's services to a newly-present peer
+// for low-latency discovery. It lives for one DERP connection: the client's
+// Presence channel is closed on disconnect, ending this range.
+func (e *Engine) runPresence(c *derpclient.Client) {
+	for ev := range c.Presence() {
+		e.mu.Lock()
+		if ev.Present {
+			e.online[ev.Key] = time.Now()
+		} else {
+			delete(e.online, ev.Key)
+			for name, ent := range e.svc {
+				if ent.key == ev.Key {
+					delete(e.svc, name)
+				}
+			}
+		}
+		e.mu.Unlock()
+		if ev.Present {
+			e.announceOn(c, []derpclient.PublicKey{ev.Key})
+		}
+	}
+}
+
+// runAnnouncer re-announces this host's services to every online peer each
+// tick. It is per-connection; once the connection is replaced or closed the
+// stale check on the next tick ends it.
+func (e *Engine) runAnnouncer(c *derpclient.Client) {
+	t := time.NewTicker(e.announcePeriod)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.stop:
+			return
+		case <-t.C:
+			e.mu.Lock()
+			if e.client != c {
+				e.mu.Unlock()
+				return
+			}
+			keys := make([]derpclient.PublicKey, 0, len(e.online))
+			for k := range e.online {
+				keys = append(keys, k)
+			}
+			e.mu.Unlock()
+			e.announceOn(c, keys)
+		}
+	}
+}
+
+// announceOn sends this host's current service set to each key via c. The
+// key list and service snapshot are taken under e.mu; SendPacket runs
+// outside the lock. Announcements carry no auth: any peer can announce any
+// name on an open relay — the inner dialer is the real gate.
+func (e *Engine) announceOn(c *derpclient.Client, keys []derpclient.PublicKey) {
+	if c == nil || len(keys) == 0 {
+		return
+	}
+	e.mu.Lock()
+	if e.client != c {
+		e.mu.Unlock()
+		return // connection already replaced; this goroutine is stale
+	}
+	services := append([]string(nil), e.services...)
+	e.mu.Unlock()
+	if len(services) == 0 {
+		return
+	}
+	for _, k := range keys {
+		for _, name := range services {
+			if err := c.SendPacket(k, announcePacket(name)); err != nil {
+				e.log.Debug("announce",
+					"peer", base64.RawURLEncoding.EncodeToString(k[:]),
+					"name", name, "error", err)
+			}
+		}
+	}
+}
+
+// announcePacket frames a name-announce control packet for a peer.
+func announcePacket(name string) []byte {
+	return append([]byte{frameTypeControl, kindAnnounce}, name...)
+}
+
+// handleControl processes an engine control frame from src. Only the
+// announce kind is defined; reserved kinds (M2 address candidates) and empty
+// or oversized names are ignored.
+func (e *Engine) handleControl(src derpclient.PublicKey, body []byte) {
+	if len(body) < 2 || body[0] != kindAnnounce {
+		return
+	}
+	name := body[1:]
+	if len(name) == 0 || len(name) > maxNameLen {
+		return
+	}
+	e.mu.Lock()
+	e.svc[string(name)] = svcEnt{key: src, lastSeen: time.Now()}
+	e.mu.Unlock()
+}
+
+// Lookup resolves a service name to the announcing peer's public key if a
+// recent announcement is on record. Entries older than svcEntryTTL (≈4
+// announce ticks) expire even without a PeerGone to bound staleness after
+// partition or derper restart.
+func (e *Engine) Lookup(name string) (derpclient.PublicKey, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ent, ok := e.svc[name]
+	if !ok {
+		return derpclient.PublicKey{}, false
+	}
+	if time.Since(ent.lastSeen) > svcEntryTTL {
+		delete(e.svc, name)
+		return derpclient.PublicKey{}, false
+	}
+	return ent.key, true
+}
+
 // teardown drops the transport and every session built on it.
 func (e *Engine) teardown(c *derpclient.Client, cause error) {
 	e.mu.Lock()
@@ -269,6 +459,10 @@ func (e *Engine) teardown(c *derpclient.Client, cause error) {
 		peers = append(peers, pc)
 	}
 	e.peers = make(map[derpclient.PublicKey]*peerConn)
+	// The connection is gone: every online peer and cached name on it is
+	// stale; they are re-learned after the redial.
+	e.online = make(map[derpclient.PublicKey]time.Time)
+	e.svc = make(map[string]svcEnt)
 	e.mu.Unlock()
 	e.log.Error("derp connection lost", "error", cause)
 	c.Close()
@@ -292,6 +486,8 @@ func (e *Engine) Close() {
 		peers = append(peers, pc)
 	}
 	e.peers = make(map[derpclient.PublicKey]*peerConn)
+	e.online = make(map[derpclient.PublicKey]time.Time)
+	e.svc = make(map[string]svcEnt)
 	e.mu.Unlock()
 	for _, pc := range peers {
 		pc.kill(errors.New("engine closed"))
@@ -400,7 +596,9 @@ func (pc *peerConn) Read(p []byte) (int, error) {
 	}
 }
 
-// Write implements net.Conn: each write is one DERP SendPacket.
+// Write implements net.Conn: each write is one DERP SendPacket carrying the
+// session-data type byte so the receiving pump can route it past control
+// frames.
 func (pc *peerConn) Write(p []byte) (int, error) {
 	pc.mu.Lock()
 	closed := pc.closed
@@ -415,7 +613,10 @@ func (pc *peerConn) Write(p []byte) (int, error) {
 	if c == nil {
 		return 0, errors.New("derp engine: no connection")
 	}
-	if err := c.SendPacket(pc.peer, p); err != nil {
+	pkt := make([]byte, 0, len(p)+1)
+	pkt = append(pkt, frameTypeData)
+	pkt = append(pkt, p...)
+	if err := c.SendPacket(pc.peer, pkt); err != nil {
 		return 0, err
 	}
 	return len(p), nil

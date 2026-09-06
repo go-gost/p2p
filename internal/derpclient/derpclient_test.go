@@ -66,7 +66,7 @@ func readFrame(fr *frameReader) (byte, []byte, error) {
 // RecvPacket — enough to prove framing, handshake crypto, and routing shape.
 // Full relay behavior is verified against a real derper in the e2e.
 type miniServer struct {
-	srv *httptest.Server
+	srv  *httptest.Server
 	priv PrivateKey
 	pub  PublicKey
 }
@@ -313,7 +313,7 @@ func TestBadServerInfoBoxRejected(t *testing.T) {
 		conn := websocket.NetConn(r.Context(), ws, websocket.MessageBinary)
 		br := newFrameReader(conn)
 		bw := newFrameWriter(conn)
-		other, _, _ := Generate()   // seals ServerInfo with this key...
+		other, _, _ := Generate()            // seals ServerInfo with this key...
 		greetPriv, greetPub, _ := Generate() // ...but greets with another
 		greeting := append(append([]byte{}, Magic...), greetPub[:]...)
 		writeFrame(bw, frameServerKey, greeting)

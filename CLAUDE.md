@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Standalone host process for the GOST [p2p plugin](https://github.com/go-gost/plugin) control protocol (`github.com/go-gost/plugin/p2p/proto`). GOST calls `OpenTunnel(peer)` over gRPC; this process returns a locally dialable TCP endpoint that bridges to the peer. The GOST side (`x/p2p/`) consumes the returned endpoint as the base connection of any whitelisted chain-node dialer.
 
-Current implementation: **stub + mux + token + DERP relay**. It proves the plugin seam end to end, supports inner dialers `tcp/tls/ws/mtcp/mtls/mws` (mux inners reuse one tunnel as a session), has optional control-plane token auth, and — with `--derp` — relays tunnels cross-machine through a DERP server. Data-plane encryption is end-to-end (the inner protocol's job); STUN/UDP hole punching is a future milestone.
+Current implementation: **stub + mux + token + DERP relay + name discovery**. It proves the plugin seam end to end, supports inner dialers `tcp/tls/ws/mtcp/mtls/mws` (mux inners reuse one tunnel as a session), has optional control-plane token auth, and — with `--derp` — relays tunnels cross-machine through a DERP server where hosts can announce service names so peers dial by name. Data-plane encryption is end-to-end (the inner protocol's job); STUN/UDP hole punching is a future milestone.
 
 ## Build & Run
 
@@ -29,6 +29,7 @@ GOWORK=off go build ./...  # standalone build must also pass
 | `--derp` | *(empty)* | DERP relay URL (`wss://host/derp`); enables engine mode |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
 | `--target` | *(empty)* | local bridge target for inbound tunnels in DERP mode |
+| `--service` | *(none)* | service name to announce (repeatable); peer dials by name instead of base64 key |
 | `--debug` | off | slog debug level (tunnel open/close events) |
 
 ## Architecture (two planes)
@@ -43,6 +44,8 @@ GOWORK=off go build ./...  # standalone build must also pass
 
 **DERP engine** ([engine.go](engine.go)): one long-lived WebSocket-DERP connection per host (client package `internal/derpclient`, a minimal DERP subset over the standard WS path — see its package doc for the wire reference @v1.102.3). A packet pump routes inbound packets to per-peer adapters; each peer pair has exactly one `smux` session (role chosen by public-key ordering) over which each tunnel is one stream. Both sides run an accept loop bridging inbound streams to `--target`. The host connects eagerly at startup (it is a rendezvous node) and redials every 5s on disconnect; `--key` is generated on first run and its public key printed — that base64 string is what peers put in their GOST node `addr`.
 
+**Name discovery** ([engine.go](engine.go) `Lookup`/`announceOn`, [server.go](server.go) at `OpenTunnel`): above the DERP packet stream the engine puts a 1-byte application-frame type — `0x01` session data (the smux bytes, tagged on write and stripped once by the pump), `0x00` control frames whose `kind 0x01` is a name announcement carrying the announcing peer's key from the DERP packet source (host identity is never repeated in the frame). `derpclient` surfaces `PeerPresent`/`PeerGone` on a per-connection `Presence()` channel; the engine tracks the `online` set, announces its `--service` names to a newly-present peer immediately and every 15s thereafter, and caches `name → key` (newest wins, evicted on `PeerGone`, 60s TTL backstop). `OpenTunnel` in DERP mode tries the base64-key parse first (keys win by protocol precedence — a name can never be ambiguous with a key for the addresser) and falls back to name resolution, returning `NotFound` for unknown names. `-F p2p://<key>` keeps working unchanged.
+
 **Lifecycle**: non-mux inner (tcp/tls/ws): one tunnel per GOST dial; `tunnelConn.Close()` triggers `CloseTunnel` (listener + connections), verified zero-residue in e2e. Mux inner (mtcp/mtls/mws): one tunnel per mux session, kept alive until the session dies or the process exits (gost's own mux semantics); N streams multiplex over it. In DERP mode the engine's smux session has the same shape one level down.
 
 ## Trust boundary (do not weaken)
@@ -54,7 +57,7 @@ A DERP relay with `-verify-clients=false` is an **open relay**: it can observe a
 ## Future milestones (in rough order)
 
 1. STUN + UDP hole-punched tunnels — needs a reliable-stream layer over UDP; the DERP engine stays as the fallback relay.
-2. Rendezvous presence/address discovery (DERP `PeerPresent` frames are received but not yet surfaced).
+2. ✅ Name discovery over DERP presence (`PeerPresent` surfaced; shipped in the discovery milestone).
 
 (Muxed tunnels shipped in the mux milestone; DERP relay shipped in the derp milestone.)
 

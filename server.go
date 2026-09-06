@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log/slog"
@@ -61,10 +62,17 @@ type tunnel struct {
 func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (*proto.OpenTunnelReply, error) {
 	peer := req.Peer
 	if s.engine != nil {
-		// DERP mode: the peer is a public key; validate its shape now and
-		// fail fast with a clear error.
-		if _, err := parsePeerKey(peer); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "invalid peer %q: %v", peer, err)
+		// DERP mode: the peer is either a base64 public key or a service
+		// name. Keys win (parsePeerKey); a non-key string resolves through
+		// the engine's name cache — an unknown name is NotFound. The tunnel
+		// pins the resolved key: a later re-registration of the name to a new
+		// peer does not re-route an existing tunnel.
+		if _, kerr := parsePeerKey(peer); kerr != nil {
+			key, ok := s.engine.Lookup(peer)
+			if !ok {
+				return nil, status.Errorf(codes.NotFound, "unknown peer %q (not a base64 key or a known service name)", peer)
+			}
+			peer = base64.RawURLEncoding.EncodeToString(key[:])
 		}
 	} else {
 		host, port, err := net.SplitHostPort(req.Peer)
