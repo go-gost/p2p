@@ -307,6 +307,7 @@ func (dc *directConn) punch() {
 // SYN out and confirms the path is usable before routing tunnels onto it.
 func primeKCP(c net.Conn, timeout time.Duration) error {
 	c.SetDeadline(time.Now().Add(timeout))
+	defer c.SetDeadline(time.Time{}) // clear: the session must outlive priming
 	if _, err := c.Write([]byte{0}); err != nil {
 		return err
 	}
@@ -337,6 +338,7 @@ func (dc *directConn) kcpAccept(socket *net.UDPConn, peer *net.UDPAddr) (net.Con
 		return nil, err
 	}
 	sess.SetDeadline(time.Now().Add(punchTimeout))
+	defer sess.SetDeadline(time.Time{}) // clear: the session must outlive the echo
 	var b [1]byte
 	if _, err := io.ReadFull(sess, b[:]); err != nil {
 		sess.Close()

@@ -161,6 +161,53 @@ func TestDirectPunchRoundTrip(t *testing.T) {
 	roundTrip(t, s2, "ping!")
 }
 
+// TestDirectSurvivesPunchTimeout proves the direct session outlives the
+// priming deadline. The deadline set during the KCP priming round-trip must be
+// cleared, or the first smux read after it expires kills the session (a
+// ~10s-flap in production). Traffic must still flow over the direct path after
+// sleeping past the (test-shortened) punchTimeout.
+func TestDirectSurvivesPunchTimeout(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+
+	waitFor(t, 5*time.Second, func() bool {
+		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
+	})
+
+	// Sleep past punchTimeout (2s in tests). With the deadline left set, the
+	// session dies here; with it cleared, smux keepalive holds it up.
+	time.Sleep(3 * time.Second)
+
+	// Cut relay data; only a still-alive direct path can carry this.
+	rs.setDropData(true)
+	s2, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatalf("open after punchTimeout: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "still alive")
+}
+
 // TestDirectFallbackToRelay proves that after the direct session is torn down,
 // new streams fall back to the relay path.
 func TestDirectFallbackToRelay(t *testing.T) {
