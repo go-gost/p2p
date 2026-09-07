@@ -8,6 +8,18 @@ Standalone host process for the GOST [p2p plugin](https://github.com/go-gost/plu
 
 Current implementation: **stub + mux + token + DERP relay + STUN/UDP hole punching**. It proves the plugin seam end to end, supports inner dialers `tcp/tls/ws/mtcp/mtls/mws` (mux inners reuse one tunnel as a session), has optional control-plane token auth, and — with `--derp` — relays tunnels cross-machine through a DERP server. After a relay session is up, both peers punch a UDP hole (STUN + KCP + smux) and prefer the direct path; the relay stays as fallback. Data-plane encryption is end-to-end (the inner protocol's job).
 
+### Positioning / contract boundary
+
+`p2p` is a **P2P connectivity layer, not a turnkey secure tunnel**. The contract is deliberately narrow: *give a peer public key, get a TCP tunnel; NAT traversal best-effort (STUN + hole punch, relay fallback); reachability is ours, security is the caller's.* This mirrors IP/TCP — reachability, not policy.
+
+This is a scoping decision, not a gap — do not add these as core features without explicit sign-off:
+
+- **Encryption** (of the relay/hole-punched data path) is out of scope by design; confidentiality lives one layer up (the inner dialer's `tls`/`mtls`/`wss`). The transports are intentionally plaintext.
+- **Peer discovery** (name→key) is an enhancement, not required — addressing is by base64 curve25519 public key, a complete scheme. See Roadmap for why it was abandoned.
+- **A relay is inherent** to cross-NAT reachability; `derper` is a deployment choice (see `deploy/`), and symmetric-NAT peers stay on relay permanently.
+
+An integrator supplies: a relay, peer public keys, and (if needed) its own encryption above the tunnel.
+
 ## Build & Run
 
 ```bash
