@@ -1,0 +1,45 @@
+# Self-hosted DERP relay + STUN server for go-gost p2p (docker compose),
+# plain-HTTP mode — no TLS, no certs to manage.
+#
+# Derper serves raw HTTP/WebSocket on 8443 (a non-443 listen addr disables its
+# built-in TLS). Connect with ws://, not wss://.
+#
+# Before up:
+#   1. Replace derp.example.com with your real hostname or IP.
+#   2. docker compose up -d
+#   3. Open the firewall for 8443/tcp and 3478/udp.
+#
+# p2p hosts connect with:
+#     ./p2p --derp ws://derp.example.com:8443/derp --key peer.key ...
+#
+# SECURITY / TRUST: a plain ws:// relay means the hop from host to relay is
+# unencrypted and observable in transit. That matches the p2p trust model —
+# the relay can already observe the bytes it forwards, so confidentiality MUST
+# come from the inner dialer (tls/mtls/wss), never from this relay link. Do
+# not use an unencrypted relay link over an untrusted path alongside a
+# cleartext inner dialer.
+#
+# -verify-clients=false (open relay) is required by p2p's public-key auth.
+#
+# TLS in front instead? Chain this same image behind any WebSocket-capable L7
+# proxy (Traefik/Caddy/nginx) — nothing here changes.
+services:
+  derper:
+    image: gogost/derper:1.102.3
+    container_name: derper
+    restart: unless-stopped
+    command:
+      # Explicit IPv4 bind — a wildcard -a would leave STUN on [::]:3478,
+      # unreachable from IPv4 punch probes. Container is non-root, ports stay
+      # >1024.
+      - -a=0.0.0.0:8443
+      - -stun=true
+      - -stun-port=3478
+      - -verify-clients=false
+    ports:
+      - "8443:8443/tcp"   # ws://derp.example.com:8443/derp
+      - "3478:3478/udp"   # STUN, for NAT hole punching
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

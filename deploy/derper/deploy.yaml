@@ -9,10 +9,14 @@
 #   1. Image is gogost/derper (built by the derper repo's GitHub Actions);
 #      pin the tag to the derper version you want.
 #   2. Replace every derp.example.com with your real public hostname.
-#   3. Create the TLS secret that Traefik serves (kubernetes.io/tls):
-#        kubectl -n derp create secret tls derper-tls \
-#          --cert=fullchain.pem --key=privkey.pem
-#      (or let cert-manager issue it).
+#
+# No cert secret is managed here: the Ingress tls block carries no
+# secretName, so Traefik serves its bundled default certificate — a
+# self-signed one that does not match the public hostname. p2p hosts must
+# skip verification against it:
+#     ./p2p --derp wss://derp.example.com/derp --tls.secure=false ...
+# (or --tls.caFile <traefik-default-cert> when that cert's SAN matches the
+# hostname — otherwise hostname verification still fails).
 #
 # p2p hosts then connect with:  --derp wss://derp.example.com/derp
 #
@@ -26,23 +30,6 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: derp
----
-# TLS cert for Traefik (standard kubernetes.io/tls; Traefik terminates here).
-apiVersion: v1
-kind: Secret
-metadata:
-  name: derper-tls
-  namespace: derp
-type: kubernetes.io/tls
-stringData:
-  tls.crt: |
-    -----BEGIN CERTIFICATE-----
-    # paste full chain here
-    -----END CERTIFICATE-----
-  tls.key: |
-    -----BEGIN PRIVATE KEY-----
-    # paste private key here
-    -----END PRIVATE KEY-----
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -140,8 +127,7 @@ spec:
   ingressClassName: traefik
   tls:
     - hosts:
-        - derp.example.com
-      secretName: derper-tls
+        - derp.example.com # no secretName → Traefik's default self-signed cert
   rules:
     - host: derp.example.com
       http:
