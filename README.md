@@ -20,7 +20,7 @@ GOST client ──dial endpoint─────▶ p2p host ──bridge──▶
 
 ```bash
 go build -o p2p .
-./p2p --addr 127.0.0.1:8003 --bind 127.0.0.1 --debug
+./p2p --addr 127.0.0.1:8003 --bind 127.0.0.1
 ```
 
 | Flag | Default | Meaning |
@@ -32,7 +32,9 @@ go build -o p2p .
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
 | `--target` | *(empty)* | local bridge target for inbound tunnels in DERP mode |
 | `--stun` | `--derp` host `:3478` | STUN server (host:port) for NAT hole punching |
-| `--debug` | off | debug logging |
+| `--log.level` | `info` | log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal` |
+| `--log.format` | `json` | log format: `json` or `text` |
+| `--log.output` | `stderr` | log output: `stderr`, `stdout`, `none`, or a file path (size-rotates at 100 MB) |
 
 Point a GOST chain node at it:
 

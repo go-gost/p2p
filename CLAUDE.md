@@ -15,7 +15,7 @@ go build -o p2p .          # or: go run . (go.work resolves deps too)
 GOWORK=off go build ./...  # standalone build must also pass
 
 # Run the stub (loopback bridge)
-./p2p --addr 127.0.0.1:8003 --bind 127.0.0.1 --debug
+./p2p --addr 127.0.0.1:8003 --bind 127.0.0.1
 
 # Run in DERP engine mode
 ./p2p --derp wss://derp.example.com/derp --key peer.key --target 127.0.0.1:18080
@@ -30,7 +30,9 @@ GOWORK=off go build ./...  # standalone build must also pass
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
 | `--target` | *(empty)* | local bridge target for inbound tunnels in DERP mode |
 | `--stun` | `--derp` host `:3478` | STUN server (host:port) for NAT hole punching |
-| `--debug` | off | slog debug level (tunnel open/close events) |
+| `--log.level` | `info` | log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal` |
+| `--log.format` | `json` | log format: `json` or `text` |
+| `--log.output` | `stderr` | log output: `stderr`, `stdout`, `none`, or a file path (size-rotates at 100 MB) |
 
 ## Architecture (two planes)
 

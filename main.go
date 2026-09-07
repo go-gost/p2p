@@ -12,18 +12,21 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/go-gost/plugin/p2p/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"gopkg.in/natefinch/lumberjack.v2"
 
 	"p2p/internal/derpclient"
 )
@@ -36,11 +39,14 @@ func main() {
 	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
 	target := flag.String("target", "", "local bridge target for inbound tunnels in DERP mode (host:port)")
 	stunAddr := flag.String("stun", "", "STUN server address (host:port); defaults to the --derp host on :3478")
-	debug := flag.Bool("debug", false, "debug logging")
+	logLevel := flag.String("log.level", "info", "log level: trace, debug, info, warn, error, or fatal")
+	logFormat := flag.String("log.format", "json", "log format: json or text")
+	logOutput := flag.String("log.output", "stderr", "log output: stderr, stdout, none, or a file path")
 	flag.Parse()
 
-	if *debug {
-		slog.SetLogLoggerLevel(slog.LevelDebug)
+	if err := setupLogger(*logOutput, *logFormat, *logLevel); err != nil {
+		slog.Error("setup logger", "error", err)
+		os.Exit(1)
 	}
 
 	var engine *Engine
@@ -89,6 +95,124 @@ func main() {
 	if err := s.Serve(ln); err != nil {
 		slog.Error("serve", "error", err)
 		os.Exit(1)
+	}
+}
+
+// Custom slog levels to cover gost's logrus-compatible range (slog built-in:
+// Debug=-4, Info=0, Warn=4, Error=8).
+const (
+	levelTrace = slog.Level(-8)
+	levelFatal = slog.Level(12)
+)
+
+// setupLogger configures the default slog logger mirroring gost's logger
+// config: output (stderr/stdout/none/file), level (trace…fatal), and format
+// (json/text, JSON by default). File output is rotation-backed via lumberjack,
+// the same writer gost uses.
+func setupLogger(output, format, level string) error {
+	lvl, err := parseLogLevel(level)
+	if err != nil {
+		return err
+	}
+
+	w, err := logOutput(output)
+	if err != nil {
+		return err
+	}
+
+	ho := &slog.HandlerOptions{
+		Level:       lvl,
+		ReplaceAttr: replaceAttr,
+	}
+	var h slog.Handler
+	switch format {
+	case "", "json":
+		h = slog.NewJSONHandler(w, ho)
+	case "text":
+		h = slog.NewTextHandler(w, ho)
+	default:
+		return fmt.Errorf("unknown log format %q (want json or text)", format)
+	}
+	slog.SetDefault(slog.New(h))
+	return nil
+}
+
+// parseLogLevel maps a gost-style level name to a slog.Level.
+func parseLogLevel(s string) (slog.Level, error) {
+	switch s {
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "trace":
+		return levelTrace, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	case "fatal":
+		return levelFatal, nil
+	default:
+		return 0, fmt.Errorf("unknown log level %q (want trace, debug, info, warn, error, or fatal)", s)
+	}
+}
+
+// logOutput resolves an output destination to a writer. A file path returns a
+// lumberjack writer for size-based rotation.
+func logOutput(output string) (io.Writer, error) {
+	switch output {
+	case "", "stderr":
+		return os.Stderr, nil
+	case "stdout":
+		return os.Stdout, nil
+	case "none", "null":
+		return io.Discard, nil
+	default:
+		if dir := filepath.Dir(output); dir != "." {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return nil, err
+			}
+		}
+		// ponytail: rotation knobs (maxSize/maxBackups/maxAge/compress) are not
+		// exposed as flags; lumberjack defaults (100MB, keep all) are fine.
+		return &lumberjack.Logger{Filename: output, MaxSize: 100}, nil
+	}
+}
+
+// replaceAttr normalises slog output to gost's logrus-style form: lowercase
+// level names and RFC 3339 timestamps with millisecond precision.
+func replaceAttr(groups []string, a slog.Attr) slog.Attr {
+	if len(groups) > 0 {
+		return a
+	}
+	switch a.Key {
+	case slog.TimeKey:
+		if t, ok := a.Value.Any().(time.Time); ok {
+			a.Value = slog.StringValue(t.Format("2006-01-02T15:04:05.000Z07:00"))
+		}
+	case slog.LevelKey:
+		if lvl, ok := a.Value.Any().(slog.Level); ok {
+			a.Value = slog.StringValue(levelString(lvl))
+		}
+	}
+	return a
+}
+
+// levelString returns a gost-style lowercase level name for a slog.Level.
+func levelString(lvl slog.Level) string {
+	switch {
+	case lvl <= levelTrace:
+		return "trace"
+	case lvl <= slog.LevelDebug:
+		return "debug"
+	case lvl <= slog.LevelInfo:
+		return "info"
+	case lvl <= slog.LevelWarn:
+		return "warn"
+	case lvl <= slog.LevelError:
+		return "error"
+	default:
+		return "fatal"
 	}
 }
 
