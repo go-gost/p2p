@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -31,8 +32,9 @@ import (
 // regardless of who dials first. smux allows either side to open streams.
 type Engine struct {
 	url      string
-	target   string // local bridge target for inbound streams ("" = refuse inbound)
-	stunAddr string // STUN server (host:port); "" disables hole punching
+	target   string      // local bridge target for inbound streams ("" = refuse inbound)
+	stunAddr string      // STUN server (host:port); "" disables hole punching
+	tlsCfg   *tls.Config // relay TLS options; nil = default verification
 	priv     derpclient.PrivateKey
 	pub      derpclient.PublicKey
 	log      *slog.Logger
@@ -213,7 +215,7 @@ func (e *Engine) ensureClientLocked() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
-	c, err := derpclient.Dial(ctx, e.url, e.priv, nil)
+	c, err := derpclient.Dial(ctx, e.url, e.priv, e.tlsCfg)
 	if err != nil {
 		e.log.Error("derp dial", "url", e.url, "error", err)
 		return

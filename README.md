@@ -32,6 +32,8 @@ go build -o p2p .
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
 | `--target` | *(empty)* | local bridge target for inbound tunnels in DERP mode |
 | `--stun` | `--derp` host `:3478` | STUN server (host:port) for NAT hole punching |
+| `--tls.secure` | `true` | verify the relay's TLS certificate (`false` to trust any cert) |
+| `--tls.caFile` | *(empty)* | PEM CA file to trust the relay's self-signed certificate |
 | `--log.level` | `info` | log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal` |
 | `--log.format` | `json` | log format: `json` or `text` |
 | `--log.output` | `stderr` | log output: `stderr`, `stdout`, `none`, or a file path (size-rotates at 100 MB) |

@@ -8,6 +8,8 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"flag"
@@ -39,6 +41,8 @@ func main() {
 	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
 	target := flag.String("target", "", "local bridge target for inbound tunnels in DERP mode (host:port)")
 	stunAddr := flag.String("stun", "", "STUN server address (host:port); defaults to the --derp host on :3478")
+	tlsSecure := flag.Bool("tls.secure", true, "verify the relay's TLS certificate (set false to trust any cert)")
+	tlsCAFile := flag.String("tls.caFile", "", "PEM CA file to trust the relay's self-signed certificate")
 	logLevel := flag.String("log.level", "info", "log level: trace, debug, info, warn, error, or fatal")
 	logFormat := flag.String("log.format", "json", "log format: json or text")
 	logOutput := flag.String("log.output", "stderr", "log output: stderr, stdout, none, or a file path")
@@ -67,6 +71,7 @@ func main() {
 		if engine.stunAddr == "" {
 			engine.stunAddr = defaultSTUN(*derpURL)
 		}
+		engine.tlsCfg = buildTLSConfig(*tlsSecure, *tlsCAFile)
 		slog.Info("p2p derp engine", "url", *derpURL,
 			"pubkey", base64.RawURLEncoding.EncodeToString(pub[:]),
 			"target", *target)
@@ -224,6 +229,32 @@ func defaultSTUN(derpURL string) string {
 		return ""
 	}
 	return net.JoinHostPort(u.Hostname(), "3478")
+}
+
+// buildTLSConfig mirrors gost's TLS dialer options for the relay connection:
+// secure=false skips certificate verification (InsecureSkipVerify), caFile
+// adds a PEM CA (e.g. the relay's self-signed cert) to the trusted roots.
+// Returns nil when defaults suffice (secure, no CA) so derpclient uses Go's
+// normal verification.
+func buildTLSConfig(secure bool, caFile string) *tls.Config {
+	if secure && caFile == "" {
+		return nil
+	}
+	cfg := &tls.Config{InsecureSkipVerify: !secure}
+	if caFile != "" {
+		data, err := os.ReadFile(caFile)
+		if err != nil {
+			slog.Error("load CA", "file", caFile, "error", err)
+			return cfg
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(data) {
+			slog.Error("load CA", "file", caFile, "error", "no PEM certificates found")
+			return cfg
+		}
+		cfg.RootCAs = pool
+	}
+	return cfg
 }
 
 // defaultKeyPath is where the DERP key lives unless --key overrides it.
