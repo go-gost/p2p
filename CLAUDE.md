@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Standalone host process for the GOST [p2p plugin](https://github.com/go-gost/plugin) control protocol (`github.com/go-gost/plugin/p2p/proto`). GOST calls `OpenTunnel(peer)` over gRPC; this process returns a locally dialable TCP endpoint that bridges to the peer. The GOST side (`x/p2p/`) consumes the returned endpoint as the base connection of any whitelisted chain-node dialer.
 
-Current implementation: **stub + mux + token + DERP relay**. It proves the plugin seam end to end, supports inner dialers `tcp/tls/ws/mtcp/mtls/mws` (mux inners reuse one tunnel as a session), has optional control-plane token auth, and — with `--derp` — relays tunnels cross-machine through a DERP server. Data-plane encryption is end-to-end (the inner protocol's job); STUN/UDP hole punching is a future milestone.
+Current implementation: **stub + mux + token + DERP relay + STUN/UDP hole punching**. It proves the plugin seam end to end, supports inner dialers `tcp/tls/ws/mtcp/mtls/mws` (mux inners reuse one tunnel as a session), has optional control-plane token auth, and — with `--derp` — relays tunnels cross-machine through a DERP server. After a relay session is up, both peers punch a UDP hole (STUN + KCP + smux) and prefer the direct path; the relay stays as fallback. Data-plane encryption is end-to-end (the inner protocol's job).
 
 ## Build & Run
 
@@ -29,6 +29,7 @@ GOWORK=off go build ./...  # standalone build must also pass
 | `--derp` | *(empty)* | DERP relay URL (`wss://host/derp`); enables engine mode |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
 | `--target` | *(empty)* | local bridge target for inbound tunnels in DERP mode |
+| `--stun` | `--derp` host `:3478` | STUN server (host:port) for NAT hole punching |
 | `--debug` | off | slog debug level (tunnel open/close events) |
 
 ## Architecture (two planes)
@@ -43,6 +44,8 @@ GOWORK=off go build ./...  # standalone build must also pass
 
 **DERP engine** ([engine.go](engine.go)): one long-lived WebSocket-DERP connection per host (client package `internal/derpclient`, a minimal DERP subset over the standard WS path — see its package doc for the wire reference @v1.102.3). A packet pump routes inbound packets to per-peer adapters; each peer pair has exactly one `smux` session (role chosen by public-key ordering) over which each tunnel is one stream. Both sides run an accept loop bridging inbound streams to `--target`. The host connects eagerly at startup (it is a rendezvous node) and redials every 5s on disconnect; `--key` is generated on first run and its public key printed — that base64 string is what peers put in their GOST node `addr`.
 
+**Direct data plane** ([direct.go](direct.go)): after the relay smux session is up, both peers query `--stun` from the same UDP socket they'll punch with, exchange sealed candidate frames over the relay control channel (`[0x00][kind]`, kind 0x02), and build a KCP session (`kcp-go/v5`, `NewConn3`/`ServeConn` on that socket) with a priming byte round-trip to confirm the path. smux runs over KCP with the same role-by-key-ordering as the relay. `OpenStream` prefers the direct smux session; on any failure it falls back to relay. The direct session is independent of the DERP transport (kept in a separate `e.directs` map) so it survives relay teardown — only `engine.Close` and the session's own death reclaim it. A failed punch (symmetric NAT) backoff-retries every 30s and traffic stays on relay. Package `internal/stun` is a minimal RFC 5389 binding client.
+
 **Lifecycle**: non-mux inner (tcp/tls/ws): one tunnel per GOST dial; `tunnelConn.Close()` triggers `CloseTunnel` (listener + connections), verified zero-residue in e2e. Mux inner (mtcp/mtls/mws): one tunnel per mux session, kept alive until the session dies or the process exits (gost's own mux semantics); N streams multiplex over it. In DERP mode the engine's smux session has the same shape one level down.
 
 ## Trust boundary (do not weaken)
@@ -51,22 +54,26 @@ By default the control channel is **unauthenticated**: anyone who can reach `--a
 
 A DERP relay with `-verify-clients=false` is an **open relay**: it can observe and drop but not decrypt the bytes (no `DERPMeshKey`, no data-plane encryption at the relay). Confidentiality is the inner dialer's job (`mtls`/`tls`/`wss`).
 
+The hole-punched KCP transport is likewise **unencrypted** (the `block` arg to `NewConn3`/`ServeConn` is nil): anyone on the UDP path can observe it. Candidate frames are sealed to the peer (`PrivateKey.SealTo`) so a malicious relay cannot forge them, but the data path carries no transport-layer crypto — same trust model as the relay, so do not weaken the inner dialer.
+
 ## Future milestones (in rough order)
 
-1. STUN + UDP hole-punched tunnels — needs a reliable-stream layer over UDP; the DERP engine stays as the fallback relay.
-2. Rendezvous presence/address discovery (DERP `PeerPresent` frames are received but not yet surfaced).
+1. ~~STUN + UDP hole-punched tunnels~~ — **shipped** (KCP + smux direct path, DERP relay as fallback).
+2. (Not planned) Name→key discovery via DERP `PeerPresent` — **abandoned**: derper v1.102.3 only sends PeerPresent to mesh watchers, never to open-relay clients, so presence-driven discovery is infeasible. Peers are addressed by their base64 public key directly; any human-friendly name should be a static GOST config mapping, not a p2p-side registry.
 
-(Muxed tunnels shipped in the mux milestone; DERP relay shipped in the derp milestone.)
+(Muxed tunnels shipped in the mux milestone; DERP relay shipped in the derp milestone; hole punching shipped in the M2 milestone.)
 
 ## Verification
 
 ```bash
 go build ./... && go vet ./...
 GOWORK=off go build ./...   # module must build without go.work
-CGO_ENABLED=1 go test -race ./...   # derpclient + engine unit tests
+CGO_ENABLED=1 go test -race ./...   # stun + direct + engine + derpclient unit tests
 
-# E2E (see x/docs/plans/2026-09-06-p2p-derp-relay.md): official derper +
-# two p2p hosts + two gosts, curl through; plus the stub-mode matrix.
+# E2E (see x/docs/plans/2026-09-07-p2p-m2-holepunch.md): official derper with
+# -stun (default on) + two p2p hosts + two gosts; curl through, then kill the
+# derper — traffic continues over the direct path. The relay-only path runs
+# with -stun=false.
 ```
 
 The engine has in-process unit tests (`engine_test.go`, a DERP-style relay in a test server); full relay semantics are verified against a real `derper` in e2e. The x-side contract tests (`x/p2p/plugin/grpc_test.go`) cover the GOST↔host seam.

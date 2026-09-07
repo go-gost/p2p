@@ -36,8 +36,15 @@ func relayKey() derpclient.PrivateKey {
 type relayServer struct {
 	srv *httptest.Server
 
-	mu      sync.Mutex
-	clients map[[32]byte]*relayClient
+	mu       sync.Mutex
+	clients  map[[32]byte]*relayClient
+	dropData bool // when true, drop 0x01 data frames (control still flows)
+}
+
+func (s *relayServer) setDropData(v bool) {
+	s.mu.Lock()
+	s.dropData = v
+	s.mu.Unlock()
 }
 
 type relayClient struct {
@@ -133,15 +140,20 @@ func (s *relayServer) serveClient(ctx context.Context, ws *websocket.Conn) {
 			}
 			var dst [32]byte
 			copy(dst[:], body[:32])
+			payload := body[32:]
 			s.mu.Lock()
 			rc := s.clients[dst]
+			drop := s.dropData && len(payload) > 0 && payload[0] == 0x01
 			s.mu.Unlock()
 			if rc == nil {
 				continue // unknown destination: drop like the real server
 			}
-			pkt := make([]byte, 0, 32+len(body)-32)
+			if drop {
+				continue // drop data frames, keep control frames flowing
+			}
+			pkt := make([]byte, 0, 32+len(payload))
 			pkt = append(pkt, myPub[:]...)
-			pkt = append(pkt, body[32:]...)
+			pkt = append(pkt, payload...)
 			rc.w.write(0x05, pkt)
 		case 0x06: // keepalive
 		case 0x12: // ping → pong

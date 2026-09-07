@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,7 @@ func main() {
 	derpURL := flag.String("derp", "", "DERP relay server URL (wss://host/derp); enables DERP engine mode")
 	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
 	target := flag.String("target", "", "local bridge target for inbound tunnels in DERP mode (host:port)")
+	stunAddr := flag.String("stun", "", "STUN server address (host:port); defaults to the --derp host on :3478")
 	debug := flag.Bool("debug", false, "debug logging")
 	flag.Parse()
 
@@ -55,6 +57,10 @@ func main() {
 			}
 		}
 		engine = newEngine(*derpURL, *target, priv, slog.Default())
+		engine.stunAddr = *stunAddr
+		if engine.stunAddr == "" {
+			engine.stunAddr = defaultSTUN(*derpURL)
+		}
 		slog.Info("p2p derp engine", "url", *derpURL,
 			"pubkey", base64.RawURLEncoding.EncodeToString(pub[:]),
 			"target", *target)
@@ -84,6 +90,16 @@ func main() {
 		slog.Error("serve", "error", err)
 		os.Exit(1)
 	}
+}
+
+// defaultSTUN derives the STUN server address from the DERP URL: the same
+// host, on derper's default STUN port 3478.
+func defaultSTUN(derpURL string) string {
+	u, err := url.Parse(derpURL)
+	if err != nil {
+		return ""
+	}
+	return net.JoinHostPort(u.Hostname(), "3478")
 }
 
 // defaultKeyPath is where the DERP key lives unless --key overrides it.

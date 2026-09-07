@@ -30,16 +30,18 @@ import (
 // ordering so both ends always agree on exactly one session per pair
 // regardless of who dials first. smux allows either side to open streams.
 type Engine struct {
-	url    string
-	target string // local bridge target for inbound streams ("" = refuse inbound)
-	priv   derpclient.PrivateKey
-	pub    derpclient.PublicKey
-	log    *slog.Logger
+	url      string
+	target   string // local bridge target for inbound streams ("" = refuse inbound)
+	stunAddr string // STUN server (host:port); "" disables hole punching
+	priv     derpclient.PrivateKey
+	pub      derpclient.PublicKey
+	log      *slog.Logger
 
-	mu     sync.Mutex
-	client *derpclient.Client
-	peers  map[derpclient.PublicKey]*peerConn
-	stop   chan struct{}
+	mu      sync.Mutex
+	client  *derpclient.Client
+	peers   map[derpclient.PublicKey]*peerConn
+	directs map[derpclient.PublicKey]*directConn
+	stop    chan struct{}
 }
 
 // peerConn is the per-peer packet adapter: smux sees it as a net.Conn, whose
@@ -76,13 +78,14 @@ const (
 
 func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger) *Engine {
 	e := &Engine{
-		url:    url,
-		target: target,
-		priv:   priv,
-		pub:    priv.Public(),
-		peers:  make(map[derpclient.PublicKey]*peerConn),
-		log:    log,
-		stop:   make(chan struct{}),
+		url:     url,
+		target:  target,
+		priv:    priv,
+		pub:     priv.Public(),
+		peers:   make(map[derpclient.PublicKey]*peerConn),
+		directs: make(map[derpclient.PublicKey]*directConn),
+		log:     log,
+		stop:    make(chan struct{}),
 	}
 	// The host is a rendezvous node: it must be connected to the relay for
 	// peers to reach it, and it must recover after the connection drops.
@@ -128,12 +131,21 @@ func (e *Engine) PublicKey() string {
 }
 
 // OpenStream opens a tunnel stream to the peer, establishing the DERP
-// connection and mux session on first use.
+// connection and mux session on first use. An established direct (hole-punched)
+// session is preferred; on any failure it falls back to the relay session.
 func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 	peer, err := parsePeerKey(peerB64)
 	if err != nil {
 		return nil, err
 	}
+	if dc := e.getDirect(peer); dc != nil {
+		if sess := dc.session(); sess != nil {
+			if c, err := openStream(sess, streamOpenTimeout); err == nil {
+				return c, nil
+			}
+		}
+	}
+
 	pc := e.peerConn(peer)
 	pc.mu.Lock()
 	if pc.closed {
@@ -145,7 +157,16 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	// smux.OpenStream has no context form; bound it externally.
+	c, err := openStream(sess, streamOpenTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("derp engine: open stream to %s: %w", peerB64, err)
+	}
+	return c, nil
+}
+
+// openStream opens a smux stream bounded by timeout (smux.OpenStream has no
+// context form; bound it externally).
+func openStream(sess *smux.Session, timeout time.Duration) (net.Conn, error) {
 	type openResult struct {
 		c   net.Conn
 		err error
@@ -155,13 +176,13 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 		s, err := sess.OpenStream()
 		ch <- openResult{s, err}
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), streamOpenTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	select {
 	case r := <-ch:
 		return r.c, r.err
 	case <-ctx.Done():
-		return nil, fmt.Errorf("derp engine: open stream to %s: %w", peerB64, ctx.Err())
+		return nil, ctx.Err()
 	}
 }
 
@@ -213,13 +234,28 @@ func (e *Engine) pump(c *derpclient.Client) {
 			return
 		}
 		e.mu.Lock()
-		pc, stale := e.peers[src], e.client != c
+		stale := e.client != c
 		e.mu.Unlock()
 		if stale {
 			// A teardown replaced this connection while Recv was holding a
 			// packet; routing it into the new session would corrupt it.
 			return
 		}
+		if len(pkt) == 0 {
+			continue
+		}
+		if pkt[0] == frameControl {
+			e.handleControl(src, pkt[1:])
+			continue
+		}
+		if pkt[0] != frameData {
+			continue // unknown frame type: drop (forward compatibility)
+		}
+		pkt = pkt[1:]
+
+		e.mu.Lock()
+		pc := e.peers[src]
+		e.mu.Unlock()
 		if pc == nil {
 			// Packets from unknown peers: create the adapter so an inbound
 			// tunnel (the other side opening a stream) can be served.
@@ -241,6 +277,27 @@ func (e *Engine) pump(c *derpclient.Client) {
 			// lossless delivery) — kill it and let the peer redial.
 			pc.kill(errors.New("derp engine: inbound queue overflow"))
 		}
+	}
+}
+
+// handleControl dispatches a control frame ([kind 1B][payload]) received from
+// src. The source key is relay-authenticated; candidate payloads are
+// additionally sealed to the peer so a malicious relay cannot inject them.
+func (e *Engine) handleControl(src derpclient.PublicKey, body []byte) {
+	if len(body) < 1 {
+		return
+	}
+	switch body[0] {
+	case ctrlPunchCandidates:
+		clear, ok := e.priv.OpenFrom(src, body[1:])
+		if !ok {
+			return
+		}
+		cands, err := decodeCandidates(clear)
+		if err != nil {
+			return
+		}
+		e.directConn(src).onCandidates(cands)
 	}
 }
 
@@ -292,9 +349,17 @@ func (e *Engine) Close() {
 		peers = append(peers, pc)
 	}
 	e.peers = make(map[derpclient.PublicKey]*peerConn)
+	directs := make([]*directConn, 0, len(e.directs))
+	for _, dc := range e.directs {
+		directs = append(directs, dc)
+	}
+	e.directs = make(map[derpclient.PublicKey]*directConn)
 	e.mu.Unlock()
 	for _, pc := range peers {
 		pc.kill(errors.New("engine closed"))
+	}
+	for _, dc := range directs {
+		dc.teardown()
 	}
 	if c != nil {
 		c.Close()
@@ -324,10 +389,13 @@ func (pc *peerConn) ensureSessionLocked() (*smux.Session, error) {
 		return nil, errors.New("derp engine: cannot establish mux session")
 	}
 	pc.startAccept()
+	// Kick off hole punching in the background now that the relay session
+	// exists (idempotent; a no-op when direct is already up or attempting).
+	pc.e.maybeStartDirect(pc.peer)
 	return pc.sess, nil
 }
 
-// startAccept launches the inbound stream loop (once per session).
+// startAccept launches the inbound stream loop (once per relay session).
 func (pc *peerConn) startAccept() {
 	if pc.accepting {
 		return
@@ -339,18 +407,7 @@ func (pc *peerConn) startAccept() {
 			pc.accepting = false
 			pc.mu.Unlock()
 		}()
-		for {
-			stream, err := pc.sess.AcceptStream()
-			if err != nil {
-				return // session dead
-			}
-			if pc.e.target == "" {
-				pc.e.log.Warn("inbound tunnel refused: --target not configured")
-				stream.Close()
-				continue
-			}
-			go bridgeInbound(stream, pc.e.target, pc.e.log)
-		}
+		pc.e.acceptLoop(pc.sess)
 	}()
 }
 
@@ -415,7 +472,12 @@ func (pc *peerConn) Write(p []byte) (int, error) {
 	if c == nil {
 		return 0, errors.New("derp engine: no connection")
 	}
-	if err := c.SendPacket(pc.peer, p); err != nil {
+	// Prefix a data-frame type byte so the peer's pump can distinguish smux
+	// data from control frames.
+	buf := make([]byte, 0, len(p)+1)
+	buf = append(buf, frameData)
+	buf = append(buf, p...)
+	if err := c.SendPacket(pc.peer, buf); err != nil {
 		return 0, err
 	}
 	return len(p), nil
