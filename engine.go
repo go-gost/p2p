@@ -155,7 +155,7 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 	if dc := e.getDirect(peer); dc != nil {
 		if sess := dc.session(); sess != nil {
 			if c, err := openStream(sess, streamOpenTimeout); err == nil {
-				return &openedStream{Conn: c, transport: "direct"}, nil
+				return &openedStream{Conn: c, transport: "direct", peerAddr: dc.peerAddrString()}, nil
 			}
 		}
 	}
@@ -165,7 +165,11 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 	// direct path too instead of always starting on the relay.
 	if sess := e.punchAndWait(peer); sess != nil {
 		if c, err := openStream(sess, streamOpenTimeout); err == nil {
-			return &openedStream{Conn: c, transport: "direct"}, nil
+			pa := ""
+			if dc := e.getDirect(peer); dc != nil {
+				pa = dc.peerAddrString()
+			}
+			return &openedStream{Conn: c, transport: "direct", peerAddr: pa}, nil
 		}
 	}
 
@@ -212,10 +216,14 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 type openedStream struct {
 	net.Conn
 	transport string
+	peerAddr  string // peer's dialed endpoint (direct only; empty for relay)
 }
 
 // Transport returns the path this stream used: "direct" or "derp".
 func (c *openedStream) Transport() string { return c.transport }
+
+// PeerAddr returns the peer's dialed endpoint for direct streams (empty for relay).
+func (c *openedStream) PeerAddr() string { return c.peerAddr }
 
 // openStream opens a smux stream bounded by timeout (smux.OpenStream has no
 // context form; bound it externally).

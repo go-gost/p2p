@@ -157,12 +157,19 @@ func (t *tunnel) bridge(conn net.Conn) {
 	// endpoint handed to the gost client.
 	endpoint := t.ln.Addr().String()
 	transport := ""
+	peerAddr := ""
 	if tw, ok := up.(interface{ Transport() string }); ok {
 		transport = tw.Transport()
+	}
+	if pa, ok := up.(interface{ PeerAddr() string }); ok {
+		peerAddr = pa.PeerAddr()
 	}
 	attrs := []any{"peer", t.target, "endpoint", endpoint}
 	if transport != "" {
 		attrs = append(attrs, "transport", transport)
+	}
+	if peerAddr != "" {
+		attrs = append(attrs, "peerAddr", peerAddr)
 	}
 	start := time.Now()
 	slog.Info(fmt.Sprintf("%s <-> %s", endpoint, t.target), attrs...)

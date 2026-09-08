@@ -71,10 +71,11 @@ type directConn struct {
 
 	cand chan []candidate // peer candidates (buffered)
 
-	mu     sync.Mutex
-	state  directState
-	sess   *smux.Session // direct smux session when up
-	socket *net.UDPConn  // punch socket; owned by us (kcp sets ownConn=false)
+	mu       sync.Mutex
+	state    directState
+	sess     *smux.Session  // direct smux session when up
+	socket   *net.UDPConn   // punch socket; owned by us (kcp sets ownConn=false)
+	peerAddr netip.AddrPort // peer's dialed endpoint (public cross-NAT, local same-NAT)
 }
 
 func (e *Engine) directConn(peer derpclient.PublicKey) *directConn {
@@ -205,12 +206,20 @@ func (dc *directConn) teardown() {
 }
 
 // markUp stores the freshly-built session+token and marks the state up.
-func (dc *directConn) markUp(sess *smux.Session, socket *net.UDPConn) {
+func (dc *directConn) markUp(sess *smux.Session, socket *net.UDPConn, peerAddr netip.AddrPort) {
 	dc.mu.Lock()
 	dc.sess = sess
 	dc.socket = socket
+	dc.peerAddr = peerAddr
 	dc.state = directUp
 	dc.mu.Unlock()
+}
+
+// peerAddrString returns the peer's dialed endpoint, or "" when not punched.
+func (dc *directConn) peerAddrString() string {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.peerAddr.String()
 }
 
 // backoff marks a failed punch and schedules a retry.
@@ -386,7 +395,7 @@ func (dc *directConn) punch() {
 		return
 	}
 
-	dc.markUp(sess, socket)
+	dc.markUp(sess, socket, peerEP)
 	keepSocket = true
 
 	e.log.Debug("direct established", "peer", pname, "role", role,
