@@ -43,7 +43,7 @@ var (
 	// punch before falling back to the relay. Punching is sub-second to ~2s,
 	// so the first connection rides the direct path instead of starting on
 	// the relay.
-	punchWaitTimeout = 3 * time.Second
+	punchWaitTimeout = 5 * time.Second
 	backoffPeriod    = 30 * time.Second
 	stunTimeout      = 3 * time.Second
 	candidateTimeout = 3 * time.Second // per-candidate KCP priming attempt (client dials)
