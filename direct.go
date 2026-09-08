@@ -258,12 +258,6 @@ func (dc *directConn) punch() {
 	}
 	pname := keyName(dc.peer)
 
-	// Drain any stale candidate left by a previous attempt.
-	select {
-	case <-dc.cand:
-	default:
-	}
-
 	// Bind the punch socket to the egress IP toward the STUN server so the
 	// local address we advertise is a concrete, peer-reachable endpoint
 	// (same-NAT / same-LAN peers connect over it directly). Falls back to a
