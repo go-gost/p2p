@@ -1,0 +1,7 @@
+.git
+.github
+dist
+p2p
+p2p.exe
+*.md
+.goreleaser.yaml
