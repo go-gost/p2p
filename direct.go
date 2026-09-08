@@ -145,6 +145,15 @@ func (dc *directConn) onCandidates(cands []candidate) {
 	case dc.cand <- cands:
 	default:
 	}
+	// The peer is punching now: answer immediately instead of waiting out our
+	// backoff, or the two sides' punch windows miss each other and every retry
+	// fails. start() only runs from directNone, so reset a backoff first.
+	dc.mu.Lock()
+	if dc.state == directBackoff {
+		dc.state = directNone
+	}
+	dc.mu.Unlock()
+	dc.start()
 }
 
 // teardown closes the direct session and socket, returning to directNone
@@ -187,7 +196,11 @@ func (dc *directConn) backoff() {
 		case <-time.After(backoffPeriod):
 		}
 		dc.mu.Lock()
-		dc.state = directNone
+		// Only reset if we're still backing off: onCandidates may have already
+		// restarted a punch in response to a peer candidate.
+		if dc.state == directBackoff {
+			dc.state = directNone
+		}
 		dc.mu.Unlock()
 		dc.start()
 	}()
@@ -544,9 +557,17 @@ func decodeCandidates(b []byte) ([]candidate, error) {
 // by the relay and direct sessions; transport names the path the stream
 // arrived over ("derp" relay or "direct" hole punch).
 func (e *Engine) acceptLoop(sess *smux.Session, transport, peer string) {
+	start := time.Now()
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
+			if transport == "direct" {
+				// Direct sessions die when the KCP path drops (e.g. NAT mapping
+				// timeout). Log the lifetime + cause to distinguish that from an
+				// orderly close.
+				e.log.Debug("direct session ended", "peer", peer,
+					"duration", time.Since(start).String(), "error", err)
+			}
 			return // session dead
 		}
 		if e.target == "" {
