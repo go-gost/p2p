@@ -38,7 +38,12 @@ const (
 
 // Direct timing. Vars so tests can shorten them.
 var (
-	punchTimeout     = 10 * time.Second
+	punchTimeout = 10 * time.Second
+	// punchWaitTimeout bounds how long OpenStream blocks waiting for a hole
+	// punch before falling back to the relay. Punching is sub-second to ~2s,
+	// so the first connection rides the direct path instead of starting on
+	// the relay.
+	punchWaitTimeout = 3 * time.Second
 	backoffPeriod    = 30 * time.Second
 	stunTimeout      = 3 * time.Second
 	candidateTimeout = 3 * time.Second // per-candidate KCP priming attempt (client dials)
@@ -101,6 +106,31 @@ func (e *Engine) maybeStartDirect(peer derpclient.PublicKey) {
 		return
 	}
 	e.directConn(peer).start()
+}
+
+// punchAndWait triggers hole punching (when STUN is configured) and blocks
+// until a direct session is up or punchWaitTimeout elapses. It returns nil so
+// the caller falls back to the relay. Candidate exchange rides the DERP
+// control channel, so it needs only the DERP connection — not a relay mux
+// session — and completes well under the timeout.
+func (e *Engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
+	if e.stunAddr == "" {
+		return nil
+	}
+	dc := e.directConn(peer)
+	dc.start()
+	deadline := time.Now().Add(punchWaitTimeout)
+	for time.Now().Before(deadline) {
+		if sess := dc.session(); sess != nil {
+			return sess
+		}
+		select {
+		case <-e.stop:
+			return nil
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return nil
 }
 
 func (dc *directConn) start() {

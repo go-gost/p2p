@@ -18,6 +18,7 @@ import (
 // trigger punching, so they are unaffected.
 func TestMain(m *testing.M) {
 	punchTimeout = 2 * time.Second
+	punchWaitTimeout = 2 * time.Second
 	backoffPeriod = 500 * time.Millisecond
 	stunTimeout = 500 * time.Millisecond
 	os.Exit(m.Run())

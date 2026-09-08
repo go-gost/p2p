@@ -160,6 +160,15 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 		}
 	}
 
+	// No direct session yet: try to punch one (bounded by punchWaitTimeout)
+	// before falling back to the relay, so the first connection can ride the
+	// direct path too instead of always starting on the relay.
+	if sess := e.punchAndWait(peer); sess != nil {
+		if c, err := openStream(sess, streamOpenTimeout); err == nil {
+			return &openedStream{Conn: c, transport: "direct"}, nil
+		}
+	}
+
 	pc := e.peerConn(peer)
 	pc.mu.Lock()
 	if pc.closed {
