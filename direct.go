@@ -369,7 +369,10 @@ func (dc *directConn) punch() {
 	// 5. smux over KCP; role matches the relay session (smaller key is client).
 	cfg := smux.DefaultConfig()
 	cfg.KeepAliveInterval = 10 * time.Second
-	cfg.KeepAliveTimeout = 30 * time.Second
+	// smux decides a session is dead after ~2x KeepAliveTimeout. Keep it short
+	// so a peer that restarts (KCP path drops, no DERP PeerGone on the direct
+	// path) is detected in ~20s instead of ~60s.
+	cfg.KeepAliveTimeout = 10 * time.Second
 	var sess *smux.Session
 	if roleIsClient {
 		sess, err = smux.Client(kcpConn, cfg)

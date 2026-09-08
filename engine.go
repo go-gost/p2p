@@ -479,7 +479,9 @@ func (pc *peerConn) ensureSessionLocked() (*smux.Session, error) {
 	}
 	cfg := smux.DefaultConfig()
 	cfg.KeepAliveInterval = 10 * time.Second
-	cfg.KeepAliveTimeout = 30 * time.Second
+	// Short so a peer that drops (no PeerGone yet, e.g. relay still detecting
+	// the disconnect) is noticed in ~20s instead of ~60s.
+	cfg.KeepAliveTimeout = 10 * time.Second
 	roleIsClient := bytes.Compare(pc.e.pub[:], pc.peer[:]) < 0
 	if roleIsClient {
 		pc.sess, _ = smux.Client(pc, cfg)
