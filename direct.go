@@ -372,6 +372,11 @@ func (dc *directConn) punch() {
 			dc.backoff()
 			return
 		}
+		// The real peer address is what AcceptKCP observed — the client's NAT
+		// mapping — not the local candidate it advertised.
+		if ua, ok := kcpConn.RemoteAddr().(*net.UDPAddr); ok {
+			peerEP = ua.AddrPort()
+		}
 	}
 	e.log.Debug("direct punch: kcp primed", "peer", pname, "peerAddr", peerEP.String())
 
