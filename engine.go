@@ -518,7 +518,7 @@ func (pc *peerConn) startAccept() {
 			pc.accepting = false
 			pc.mu.Unlock()
 		}()
-		pc.e.acceptLoop(pc.sess, "derp", keyName(pc.peer))
+		pc.e.acceptLoop(pc.sess, "derp", keyName(pc.peer), "")
 	}()
 }
 
@@ -620,8 +620,9 @@ func (a dummyAddr) String() string {
 
 // bridgeInbound pipes an inbound tunnel stream to the local target with the
 // same half-close semantics as the stub bridge, logging connect/disconnect in
-// gost style ("<peer> <-> <target>", ">-<" + duration on close).
-func bridgeInbound(stream net.Conn, transport, peer, target string, log *slog.Logger) {
+// gost style ("<peer> <-> <target>", ">-<" + duration on close). peerAddr is
+// the peer's dialed endpoint (direct only; empty for relay).
+func bridgeInbound(stream net.Conn, transport, peer, peerAddr, target string, log *slog.Logger) {
 	defer stream.Close()
 	up, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
@@ -632,13 +633,15 @@ func bridgeInbound(stream net.Conn, transport, peer, target string, log *slog.Lo
 
 	// peer is the remote p2p host key, endpoint the local service the stream
 	// is bridged to (the --target).
+	attrs := []any{"transport", transport, "peer", peer, "endpoint", target}
+	if peerAddr != "" {
+		attrs = append(attrs, "peerAddr", peerAddr)
+	}
 	start := time.Now()
-	log.Info(fmt.Sprintf("%s <-> %s", peer, target),
-		"transport", transport, "peer", peer, "endpoint", target)
+	log.Info(fmt.Sprintf("%s <-> %s", peer, target), attrs...)
 	defer func() {
 		log.Info(fmt.Sprintf("%s >-< %s", peer, target),
-			"transport", transport, "peer", peer, "endpoint", target,
-			"duration", time.Since(start).String())
+			append(append([]any{}, attrs...), "duration", time.Since(start).String())...)
 	}()
 
 	done := make(chan struct{}, 2)

@@ -400,7 +400,7 @@ func (dc *directConn) punch() {
 
 	e.log.Debug("direct established", "peer", pname, "role", role,
 		"local", mine[0].addr.String(), "public", pubEP.String(), "peerAddr", peerEP.String())
-	go e.acceptLoop(sess, "direct", pname)
+	go e.acceptLoop(sess, "direct", pname, peerEP.String())
 }
 
 // primeKCP writes a single byte and waits for it to be echoed back. KCP does
@@ -594,8 +594,9 @@ func decodeCandidates(b []byte) ([]candidate, error) {
 
 // acceptLoop bridges inbound streams on a session to the local target. Shared
 // by the relay and direct sessions; transport names the path the stream
-// arrived over ("derp" relay or "direct" hole punch).
-func (e *Engine) acceptLoop(sess *smux.Session, transport, peer string) {
+// arrived over ("derp" relay or "direct" hole punch), peerAddr is the peer's
+// dialed endpoint (direct only).
+func (e *Engine) acceptLoop(sess *smux.Session, transport, peer, peerAddr string) {
 	start := time.Now()
 	for {
 		stream, err := sess.AcceptStream()
@@ -614,6 +615,6 @@ func (e *Engine) acceptLoop(sess *smux.Session, transport, peer string) {
 			stream.Close()
 			continue
 		}
-		go bridgeInbound(stream, transport, peer, e.target, e.log)
+		go bridgeInbound(stream, transport, peer, peerAddr, e.target, e.log)
 	}
 }
