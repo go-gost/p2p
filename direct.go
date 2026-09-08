@@ -299,31 +299,34 @@ func (dc *directConn) punch() {
 	}
 
 	// 4. Build the KCP session on the shared socket. KCP sends nothing until
-	// there is data, so the client runs a priming round-trip per candidate
-	// (triggers SYN, waits for echo) and moves to the next on failure.
+	// there is data, so the client runs a priming round-trip (triggers SYN,
+	// waits for echo).
+	//
+	// Only ONE candidate is dialed per punch: kcp-go gives each client session
+	// its own readLoop that never exits on Close (it only stops on a socket
+	// read error). Two sessions sharing the socket would race for packets and
+	// drop each other's traffic. Pick the reachable candidate up front: same
+	// NAT (hairpin) dials the peer's local address, otherwise its public one.
 	var kcpConn net.Conn
 	peerEP := peerAddrs[0]
 	if roleIsClient {
-		for _, ep := range peerAddrs {
-			u := net.UDPAddrFromAddrPort(ep)
-			e.log.Debug("direct punch: dial", "peer", pname, "addr", u.String(), "conv", dc.conv())
-			kcpConn, err = kcp.NewConn3(dc.conv(), u, nil, 0, 0, socket)
-			if err == nil {
-				err = primeKCP(kcpConn, candidateTimeout)
-			}
-			if err != nil {
-				e.log.Debug("direct punch: dial failed", "peer", pname, "addr", u.String(), "error", err)
-				kcpConn.Close()
-				continue
-			}
-			peerEP = ep
-			break
+		dial := peerAddrs[len(peerAddrs)-1] // default: public (cross-NAT)
+		if len(peerAddrs) > 1 && pubEP.Addr() == dial.Addr() {
+			dial = peerAddrs[0] // same NAT: local (hairpin)
+		}
+		u := net.UDPAddrFromAddrPort(dial)
+		e.log.Debug("direct punch: dial", "peer", pname, "addr", u.String(), "conv", dc.conv())
+		kcpConn, err = kcp.NewConn3(dc.conv(), u, nil, 0, 0, socket)
+		if err == nil {
+			err = primeKCP(kcpConn, candidateTimeout)
 		}
 		if err != nil {
-			e.log.Debug("direct punch: kcp failed", "peer", pname, "error", err)
+			kcpConn.Close() // NewConn3 never returns nil on success
+			e.log.Debug("direct punch: dial failed", "peer", pname, "addr", u.String(), "error", err)
 			dc.backoff()
 			return
 		}
+		peerEP = dial
 	} else {
 		// Server role: accept any client SYN; the dummy probe opens our NAT
 		// toward every peer candidate (its public mapping included) so the
