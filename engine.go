@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-gost/p2p/internal/derpclient"
 	"github.com/xtaci/smux"
-	"p2p/internal/derpclient"
 )
 
 // Engine connects the host to a DERP rendezvous/relay server and turns
@@ -43,6 +43,7 @@ type Engine struct {
 	client  *derpclient.Client
 	peers   map[derpclient.PublicKey]*peerConn
 	directs map[derpclient.PublicKey]*directConn
+	gone    map[derpclient.PublicKey]bool // peers reported gone (DERP connection dropped)
 	stop    chan struct{}
 }
 
@@ -71,6 +72,14 @@ const (
 	// streamOpenTimeout caps OpenStream (SYN + ack round trip through the
 	// relay).
 	streamOpenTimeout = 10 * time.Second
+	// goneOpenTimeout caps OpenStream to a peer whose DERP connection just
+	// dropped; short so a down peer fails fast instead of burning the full
+	// stream timeout on every attempt.
+	goneOpenTimeout = 3 * time.Second
+	// goneProbeTimeout bounds a request to a peer marked gone (DERP only
+	// notifies PeerGone once): if no traffic from the peer arrives within the
+	// bound the session is torn down so the request fails fast.
+	goneProbeTimeout = 5 * time.Second
 	// dialTimeout caps the DERP connection establishment.
 	dialTimeout = 10 * time.Second
 	// keepAlivePeriod pings the DERP server well below typical proxy idle
@@ -86,6 +95,7 @@ func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger)
 		pub:     priv.Public(),
 		peers:   make(map[derpclient.PublicKey]*peerConn),
 		directs: make(map[derpclient.PublicKey]*directConn),
+		gone:    make(map[derpclient.PublicKey]bool),
 		log:     log,
 		stop:    make(chan struct{}),
 	}
@@ -134,7 +144,9 @@ func (e *Engine) PublicKey() string {
 
 // OpenStream opens a tunnel stream to the peer, establishing the DERP
 // connection and mux session on first use. An established direct (hole-punched)
-// session is preferred; on any failure it falls back to the relay session.
+// session is preferred; on any failure it falls back to the relay session. The
+// returned connection is tagged with the transport it uses ("direct" or
+// "derp") so the caller can log which path the tunnel took.
 func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 	peer, err := parsePeerKey(peerB64)
 	if err != nil {
@@ -143,7 +155,7 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 	if dc := e.getDirect(peer); dc != nil {
 		if sess := dc.session(); sess != nil {
 			if c, err := openStream(sess, streamOpenTimeout); err == nil {
-				return c, nil
+				return &openedStream{Conn: c, transport: "direct"}, nil
 			}
 		}
 	}
@@ -159,12 +171,42 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	c, err := openStream(sess, streamOpenTimeout)
+	// A peer whose DERP connection just dropped gets a short window so opens
+	// fail quickly instead of burning the full stream timeout per attempt.
+	// The gone mark is sticky: only a packet from the peer (pump) clears it.
+	wasGone := e.isGone(peer)
+	to := streamOpenTimeout
+	if wasGone {
+		to = goneOpenTimeout
+	}
+	c, err := openStream(sess, to)
 	if err != nil {
 		return nil, fmt.Errorf("derp engine: open stream to %s: %w", peerB64, err)
 	}
-	return c, nil
+	if wasGone {
+		// Bound the probe: smux opens are fire-and-forget, so a request to a
+		// still-down peer would otherwise hang until the smux keepalive. If no
+		// peer traffic cleared the gone mark by the bound, kill this session so
+		// the request fails fast.
+		go func() {
+			time.Sleep(goneProbeTimeout)
+			if e.isGone(peer) {
+				pc.kill(errors.New("derp engine: peer gone probe timeout"))
+			}
+		}()
+	}
+	return &openedStream{Conn: c, transport: "derp"}, nil
 }
+
+// openedStream is a tunnel stream tagged with the transport it uses, so the
+// opening side can log whether the tunnel rode the direct path or the relay.
+type openedStream struct {
+	net.Conn
+	transport string
+}
+
+// Transport returns the path this stream used: "direct" or "derp".
+func (c *openedStream) Transport() string { return c.transport }
 
 // openStream opens a smux stream bounded by timeout (smux.OpenStream has no
 // context form; bound it externally).
@@ -189,21 +231,29 @@ func openStream(sess *smux.Session, timeout time.Duration) (net.Conn, error) {
 }
 
 // peerConn returns (creating if needed) the adapter for peer, dialing the
-// DERP server and starting the pump on first use.
+// DERP server and starting the pump on first use. A cached adapter that was
+// closed (e.g. the peer process died and its relay session broke) is replaced
+// with a fresh one so the next stream rebuilds instead of failing forever.
 func (e *Engine) peerConn(peer derpclient.PublicKey) *peerConn {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	pc, ok := e.peers[peer]
-	if !ok {
-		e.ensureClientLocked()
-		pc = &peerConn{
-			e:       e,
-			peer:    peer,
-			inbound: make(chan []byte, inboundQueueSize),
-			closeCh: make(chan struct{}),
+	if pc, ok := e.peers[peer]; ok {
+		pc.mu.Lock()
+		closed := pc.closed
+		pc.mu.Unlock()
+		if !closed {
+			return pc
 		}
-		e.peers[peer] = pc
+		delete(e.peers, peer) // drop the dead adapter
 	}
+	e.ensureClientLocked()
+	pc := &peerConn{
+		e:       e,
+		peer:    peer,
+		inbound: make(chan []byte, inboundQueueSize),
+		closeCh: make(chan struct{}),
+	}
+	e.peers[peer] = pc
 	return pc
 }
 
@@ -221,7 +271,7 @@ func (e *Engine) ensureClientLocked() {
 		return
 	}
 	e.client = c
-	e.log.Debug("derp connected", "url", e.url, "server", c.ServerPublicKey())
+	e.log.Debug("derp connected", "url", e.url, "server", keyName(c.ServerPublicKey()))
 	go e.pump(c)
 	go e.keepalive(c)
 }
@@ -231,10 +281,16 @@ func (e *Engine) ensureClientLocked() {
 func (e *Engine) pump(c *derpclient.Client) {
 	for {
 		src, pkt, err := c.Recv()
+		if errors.Is(err, derpclient.ErrPeerGone) {
+			e.peerGone(src)
+			continue
+		}
 		if err != nil {
 			e.teardown(c, err)
 			return
 		}
+		// A packet from the peer proves it is reachable again.
+		e.clearGone(src)
 		e.mu.Lock()
 		stale := e.client != c
 		e.mu.Unlock()
@@ -293,10 +349,12 @@ func (e *Engine) handleControl(src derpclient.PublicKey, body []byte) {
 	case ctrlPunchCandidates:
 		clear, ok := e.priv.OpenFrom(src, body[1:])
 		if !ok {
+			e.log.Debug("direct punch: bad candidate box", "peer", keyName(src))
 			return
 		}
 		cands, err := decodeCandidates(clear)
 		if err != nil {
+			e.log.Debug("direct punch: bad candidate payload", "peer", keyName(src), "error", err)
 			return
 		}
 		e.directConn(src).onCandidates(cands)
@@ -313,6 +371,38 @@ func (e *Engine) keepalive(c *derpclient.Client) {
 			return
 		}
 	}
+}
+
+// peerGone drops everything to a peer whose DERP connection just closed (the
+// DERP server told us). Subsequent streams rebuild against a fresh session, and
+// opens use a short timeout until the peer is reachable again.
+func (e *Engine) peerGone(peer derpclient.PublicKey) {
+	e.mu.Lock()
+	e.gone[peer] = true
+	pc := e.peers[peer]
+	delete(e.peers, peer)
+	dc := e.directs[peer]
+	delete(e.directs, peer)
+	e.mu.Unlock()
+	if pc != nil {
+		pc.kill(errors.New("derp engine: peer gone"))
+	}
+	if dc != nil {
+		dc.teardown()
+	}
+	e.log.Debug("derp peer gone", "peer", keyName(peer))
+}
+
+func (e *Engine) isGone(peer derpclient.PublicKey) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.gone[peer]
+}
+
+func (e *Engine) clearGone(peer derpclient.PublicKey) {
+	e.mu.Lock()
+	delete(e.gone, peer)
+	e.mu.Unlock()
 }
 
 // teardown drops the transport and every session built on it.
@@ -409,7 +499,7 @@ func (pc *peerConn) startAccept() {
 			pc.accepting = false
 			pc.mu.Unlock()
 		}()
-		pc.e.acceptLoop(pc.sess)
+		pc.e.acceptLoop(pc.sess, "derp", keyName(pc.peer))
 	}()
 }
 
@@ -428,7 +518,7 @@ func (pc *peerConn) kill(cause error) {
 	if sess != nil {
 		sess.Close()
 	}
-	pc.e.log.Debug("peer session killed", "peer", pc.peer, "cause", cause)
+	pc.e.log.Debug("peer session killed", "peer", keyName(pc.peer), "cause", cause)
 }
 
 // Read implements net.Conn: drain queued packets, honoring partial reads.
@@ -510,15 +600,27 @@ func (a dummyAddr) String() string {
 }
 
 // bridgeInbound pipes an inbound tunnel stream to the local target with the
-// same half-close semantics as the stub bridge.
-func bridgeInbound(stream net.Conn, target string, log *slog.Logger) {
+// same half-close semantics as the stub bridge, logging connect/disconnect in
+// gost style ("<peer> <-> <target>", ">-<" + duration on close).
+func bridgeInbound(stream net.Conn, transport, peer, target string, log *slog.Logger) {
 	defer stream.Close()
 	up, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
-		log.Debug("inbound bridge dial failed", "target", target, "error", err)
+		log.Debug("inbound bridge dial failed", "transport", transport, "peer", peer, "target", target, "error", err)
 		return
 	}
 	defer up.Close()
+
+	// peer is the remote p2p host key, endpoint the local service the stream
+	// is bridged to (the --target).
+	start := time.Now()
+	log.Info(fmt.Sprintf("%s <-> %s", peer, target),
+		"transport", transport, "peer", peer, "endpoint", target)
+	defer func() {
+		log.Info(fmt.Sprintf("%s >-< %s", peer, target),
+			"transport", transport, "peer", peer, "endpoint", target,
+			"duration", time.Since(start).String())
+	}()
 
 	done := make(chan struct{}, 2)
 	go func() {
@@ -548,4 +650,10 @@ func parsePeerKey(s string) (derpclient.PublicKey, error) {
 	}
 	copy(p[:], b)
 	return p, nil
+}
+
+// keyName is the base64 (raw URL) form of a public key used in logs, matching
+// the peer address GOST passes to OpenTunnel.
+func keyName(k derpclient.PublicKey) string {
+	return base64.RawURLEncoding.EncodeToString(k[:])
 }

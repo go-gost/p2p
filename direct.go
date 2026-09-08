@@ -15,8 +15,8 @@ import (
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 
-	"p2p/internal/derpclient"
-	"p2p/internal/stun"
+	"github.com/go-gost/p2p/internal/derpclient"
+	"github.com/go-gost/p2p/internal/stun"
 )
 
 // Direct (hole-punched) data plane: after a relay smux session is established,
@@ -38,9 +38,10 @@ const (
 
 // Direct timing. Vars so tests can shorten them.
 var (
-	punchTimeout  = 10 * time.Second
-	backoffPeriod = 30 * time.Second
-	stunTimeout   = 3 * time.Second
+	punchTimeout     = 10 * time.Second
+	backoffPeriod    = 30 * time.Second
+	stunTimeout      = 3 * time.Second
+	candidateTimeout = 3 * time.Second // per-candidate KCP priming attempt (client dials)
 )
 
 type directState int
@@ -139,6 +140,7 @@ func (dc *directConn) session() *smux.Session {
 }
 
 func (dc *directConn) onCandidates(cands []candidate) {
+	dc.e.log.Debug("direct punch: peer candidates via relay", "peer", keyName(dc.peer), "candidates", candAddrs(cands))
 	select {
 	case dc.cand <- cands:
 	default:
@@ -177,6 +179,7 @@ func (dc *directConn) backoff() {
 	dc.mu.Lock()
 	dc.state = directBackoff
 	dc.mu.Unlock()
+	dc.e.log.Debug("direct punch: backoff", "peer", keyName(dc.peer), "retryIn", backoffPeriod.String())
 	go func() {
 		select {
 		case <-dc.e.stop:
@@ -206,6 +209,11 @@ func (dc *directConn) conv() uint32 {
 func (dc *directConn) punch() {
 	e := dc.e
 	roleIsClient := bytes.Compare(e.pub[:], dc.peer[:]) < 0
+	role := "server"
+	if roleIsClient {
+		role = "client"
+	}
+	pname := keyName(dc.peer)
 
 	// Drain any stale candidate left by a previous attempt.
 	select {
@@ -213,8 +221,13 @@ func (dc *directConn) punch() {
 	default:
 	}
 
-	socket, err := net.ListenUDP("udp4", nil)
+	// Bind the punch socket to the egress IP toward the STUN server so the
+	// local address we advertise is a concrete, peer-reachable endpoint
+	// (same-NAT / same-LAN peers connect over it directly). Falls back to a
+	// wildcard bind when the IP cannot be determined.
+	socket, err := net.ListenUDP("udp4", bindAddrFor(e.stunAddr))
 	if err != nil {
+		e.log.Debug("direct punch: udp socket", "peer", pname, "error", err)
 		dc.backoff()
 		return
 	}
@@ -225,59 +238,93 @@ func (dc *directConn) punch() {
 		}
 	}()
 
+	e.log.Debug("direct punch: start", "peer", pname, "role", role)
+
 	// 1. Learn our own public endpoint from the same socket we'll punch with,
 	// so the NAT mapping is identical.
 	ctx, cancel := context.WithTimeout(context.Background(), stunTimeout)
 	pubEP, err := stun.Lookup(ctx, e.stunAddr, socket)
 	cancel()
 	if err != nil {
-		e.log.Debug("direct punch: stun", "peer", dc.peer, "error", err)
+		e.log.Debug("direct punch: stun failed", "peer", pname, "error", err)
 		dc.backoff()
 		return
 	}
+	e.log.Debug("direct punch: stun ok", "peer", pname, "public", pubEP.String())
 
-	// 2. Advertise our public endpoint to the peer. (A local candidate would
-	// serve same-NAT hairpin; M2 punches via the public endpoint only.)
-	if err := e.sendCandidates(dc.peer, []candidate{{addr: pubEP}}); err != nil {
+	// 2. Advertise our endpoints to the peer: the local socket address first
+	// (directly reachable when the peers share a network — same NAT/LAN
+	// hairpin), then the STUN public mapping for cross-NAT.
+	localEP := socket.LocalAddr().(*net.UDPAddr).AddrPort()
+	mine := []candidate{{addr: localEP}, {addr: pubEP}}
+	if len(mine) == 2 && mine[0].addr == mine[1].addr {
+		mine = mine[:1] // no NAT: local == public
+	}
+	if err := e.sendCandidates(dc.peer, mine); err != nil {
+		e.log.Debug("direct punch: send candidates failed", "peer", pname, "error", err)
 		dc.backoff()
 		return
 	}
+	e.log.Debug("direct punch: candidates sent", "peer", pname, "candidates", candAddrs(mine))
 
-	// 3. Wait for the peer's candidates.
+	// 3. Wait for the peer's candidates, then dial/accept them in the order
+	// offered (its local address first, public second).
 	ctx, cancel = context.WithTimeout(context.Background(), punchTimeout)
 	defer cancel()
 	cands, ok := dc.waitCandidates(ctx)
 	if !ok {
-		e.log.Debug("direct punch: no candidates", "peer", dc.peer)
+		e.log.Debug("direct punch: no peer candidates", "peer", pname)
 		dc.backoff()
 		return
 	}
-	peerEP, ok := firstIPv4(cands)
-	if !ok {
+	e.log.Debug("direct punch: peer candidates", "peer", pname, "candidates", candAddrs(cands))
+	peerAddrs := ipv4Addrs(cands)
+	if len(peerAddrs) == 0 {
+		e.log.Debug("direct punch: no ipv4 candidate", "peer", pname, "candidates", candAddrs(cands))
 		dc.backoff()
 		return
 	}
-	peerUDP := net.UDPAddrFromAddrPort(peerEP)
 
 	// 4. Build the KCP session on the shared socket. KCP sends nothing until
-	// there is data, so both sides run a priming round-trip below to force the
-	// first packets out and confirm the path end-to-end.
+	// there is data, so the client runs a priming round-trip per candidate
+	// (triggers SYN, waits for echo) and moves to the next on failure.
 	var kcpConn net.Conn
+	peerEP := peerAddrs[0]
 	if roleIsClient {
-		kcpConn, err = kcp.NewConn3(dc.conv(), peerUDP, nil, 0, 0, socket)
-		if err == nil {
-			err = primeKCP(kcpConn, punchTimeout) // triggers SYN, waits for echo
+		for _, ep := range peerAddrs {
+			u := net.UDPAddrFromAddrPort(ep)
+			e.log.Debug("direct punch: dial", "peer", pname, "addr", u.String(), "conv", dc.conv())
+			kcpConn, err = kcp.NewConn3(dc.conv(), u, nil, 0, 0, socket)
+			if err == nil {
+				err = primeKCP(kcpConn, candidateTimeout)
+			}
+			if err != nil {
+				e.log.Debug("direct punch: dial failed", "peer", pname, "addr", u.String(), "error", err)
+				kcpConn.Close()
+				continue
+			}
+			peerEP = ep
+			break
+		}
+		if err != nil {
+			e.log.Debug("direct punch: kcp failed", "peer", pname, "error", err)
+			dc.backoff()
+			return
 		}
 	} else {
-		kcpConn, err = dc.kcpAccept(socket, peerUDP) // AcceptKCP + echo priming byte
-	}
-	if err != nil {
-		if kcpConn != nil {
-			kcpConn.Close()
+		// Server role: accept any client SYN; the dummy probe opens our NAT
+		// toward every peer candidate (its public mapping included) so the
+		// client's SYN can get through on the cross-NAT path. Probing only the
+		// local candidate would leave the NAT closed to the peer's public
+		// address — the hole punch would fail even between cone NATs.
+		kcpConn, err = dc.kcpAccept(socket, peerAddrs)
+		if err != nil {
+			e.log.Debug("direct punch: kcp failed", "peer", pname, "error", err)
+			dc.backoff()
+			return
 		}
-		dc.backoff()
-		return
 	}
+	e.log.Debug("direct punch: kcp primed", "peer", pname, "peerAddr", peerEP.String())
 
 	// 5. smux over KCP; role matches the relay session (smaller key is client).
 	cfg := smux.DefaultConfig()
@@ -291,6 +338,7 @@ func (dc *directConn) punch() {
 	}
 	if err != nil {
 		kcpConn.Close()
+		e.log.Debug("direct punch: smux failed", "peer", pname, "error", err)
 		dc.backoff()
 		return
 	}
@@ -298,8 +346,9 @@ func (dc *directConn) punch() {
 	dc.markUp(sess, socket)
 	keepSocket = true
 
-	e.log.Debug("direct established", "peer", dc.peer)
-	go e.acceptLoop(sess)
+	e.log.Debug("direct established", "peer", pname, "role", role,
+		"local", mine[0].addr.String(), "public", pubEP.String(), "peerAddr", peerEP.String())
+	go e.acceptLoop(sess, "direct", pname)
 }
 
 // primeKCP writes a single byte and waits for it to be echoed back. KCP does
@@ -319,16 +368,16 @@ func primeKCP(c net.Conn, timeout time.Duration) error {
 }
 
 // kcpAccept runs the server role: a KCP listener over the socket, plus a
-// periodic dummy probe to the peer's candidate to open our NAT mapping so the
+// periodic dummy probe to every peer candidate to open our NAT mapping so the
 // client's SYN can get through (the dummy is dropped by the peer's KCP input).
 // It echoes the client's priming byte back to confirm the path.
-func (dc *directConn) kcpAccept(socket *net.UDPConn, peer *net.UDPAddr) (net.Conn, error) {
+func (dc *directConn) kcpAccept(socket *net.UDPConn, peers []netip.AddrPort) (net.Conn, error) {
 	l, err := kcp.ServeConn(nil, 0, 0, socket)
 	if err != nil {
 		return nil, err
 	}
 	stopDummy := make(chan struct{})
-	go dc.dummyProbe(socket, peer, stopDummy)
+	go dc.dummyProbe(socket, peers, stopDummy)
 	defer close(stopDummy)
 
 	l.SetReadDeadline(time.Now().Add(punchTimeout))
@@ -351,7 +400,7 @@ func (dc *directConn) kcpAccept(socket *net.UDPConn, peer *net.UDPAddr) (net.Con
 	return sess, nil
 }
 
-func (dc *directConn) dummyProbe(socket *net.UDPConn, peer *net.UDPAddr, stop <-chan struct{}) {
+func (dc *directConn) dummyProbe(socket *net.UDPConn, peers []netip.AddrPort, stop <-chan struct{}) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	dummy := []byte{0, 0, 0, 0}
@@ -360,7 +409,9 @@ func (dc *directConn) dummyProbe(socket *net.UDPConn, peer *net.UDPAddr, stop <-
 		case <-stop:
 			return
 		case <-ticker.C:
-			socket.WriteToUDP(dummy, peer)
+			for _, p := range peers {
+				socket.WriteToUDP(dummy, net.UDPAddrFromAddrPort(p))
+			}
 		}
 	}
 }
@@ -379,13 +430,45 @@ func (dc *directConn) waitCandidates(ctx context.Context) ([]candidate, bool) {
 	}
 }
 
-func firstIPv4(cands []candidate) (netip.AddrPort, bool) {
+// ipv4Addrs returns the IPv4 candidate endpoints in the order offered.
+func ipv4Addrs(cands []candidate) []netip.AddrPort {
+	var out []netip.AddrPort
 	for _, c := range cands {
 		if c.addr.Addr().Is4() {
-			return c.addr, true
+			out = append(out, c.addr)
 		}
 	}
-	return netip.AddrPort{}, false
+	return out
+}
+
+// candAddrs renders candidate endpoints as strings for logs.
+func candAddrs(cands []candidate) []string {
+	s := make([]string, len(cands))
+	for i, c := range cands {
+		s[i] = c.addr.String()
+	}
+	return s
+}
+
+// bindAddrFor returns a UDPAddr bound to the egress IP used to reach addr, or
+// nil when it cannot be determined (the caller then binds the wildcard
+// address). Binding a concrete IP makes the socket's local address a valid
+// candidate for same-network peers.
+func bindAddrFor(addr string) *net.UDPAddr {
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil
+	}
+	probe, err := net.DialUDP("udp4", nil, ua)
+	if err != nil {
+		return nil
+	}
+	defer probe.Close()
+	ip := probe.LocalAddr().(*net.UDPAddr).IP
+	if ip == nil || ip.IsUnspecified() {
+		return nil
+	}
+	return &net.UDPAddr{IP: ip}
 }
 
 // sendCandidates seals our candidate list to the peer and ships it over the
@@ -458,18 +541,19 @@ func decodeCandidates(b []byte) ([]candidate, error) {
 }
 
 // acceptLoop bridges inbound streams on a session to the local target. Shared
-// by the relay and direct sessions.
-func (e *Engine) acceptLoop(sess *smux.Session) {
+// by the relay and direct sessions; transport names the path the stream
+// arrived over ("derp" relay or "direct" hole punch).
+func (e *Engine) acceptLoop(sess *smux.Session, transport, peer string) {
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
 			return // session dead
 		}
 		if e.target == "" {
-			e.log.Warn("inbound tunnel refused: --target not configured")
+			e.log.Warn("inbound tunnel refused", "transport", transport, "peer", peer)
 			stream.Close()
 			continue
 		}
-		go bridgeInbound(stream, e.target, e.log)
+		go bridgeInbound(stream, transport, peer, e.target, e.log)
 	}
 }

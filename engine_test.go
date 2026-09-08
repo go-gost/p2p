@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"p2p/internal/derpclient"
+	"github.com/go-gost/p2p/internal/derpclient"
 )
 
 // relayServer is an in-process DERP-style relay: clients (engines) connect
@@ -108,6 +108,27 @@ func (s *relayServer) serveClient(ctx context.Context, ws *websocket.Conn) {
 
 	conn := websocket.NetConn(ctx, ws, websocket.MessageBinary)
 	var myPub [32]byte
+	var registered bool
+	defer func() {
+		if !registered {
+			return
+		}
+		// A disconnecting peer is reported gone to everyone else, like the real
+		// derper (PeerGoneReasonDisconnected).
+		s.mu.Lock()
+		delete(s.clients, myPub)
+		others := make([]*frameW, 0, len(s.clients))
+		for _, c := range s.clients {
+			others = append(others, c.w)
+		}
+		s.mu.Unlock()
+		gone := append([]byte{}, myPub[:]...)
+		gone = append(gone, 0x00)
+		for _, oc := range others {
+			oc.write(0x08, gone)
+		}
+	}()
+	notified := map[[32]byte]bool{} // like the real derper: PeerGone once per dst
 	for {
 		var hdr [5]byte
 		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
@@ -132,6 +153,7 @@ func (s *relayServer) serveClient(ctx context.Context, ws *websocket.Conn) {
 			s.mu.Lock()
 			s.clients[myPub] = &relayClient{w: w}
 			s.mu.Unlock()
+			registered = true
 			// ServerInfo: sealed by the server to the client.
 			w.write(0x03, skey.SealTo(clientPub, []byte("{}")))
 		case 0x04: // SendPacket: route by dst key
@@ -146,7 +168,15 @@ func (s *relayServer) serveClient(ctx context.Context, ws *websocket.Conn) {
 			drop := s.dropData && len(payload) > 0 && payload[0] == 0x01
 			s.mu.Unlock()
 			if rc == nil {
-				continue // unknown destination: drop like the real server
+				// Unknown destination: tell the sender the peer is gone once,
+				// like the real derper (PeerGoneReasonNotHere).
+				if !notified[dst] {
+					notified[dst] = true
+					gone := append([]byte{}, dst[:]...)
+					gone = append(gone, 0x01)
+					w.write(0x08, gone)
+				}
+				continue
 			}
 			if drop {
 				continue // drop data frames, keep control frames flowing

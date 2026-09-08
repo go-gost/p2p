@@ -1,4 +1,4 @@
-module p2p
+module github.com/go-gost/p2p
 
 go 1.26.4
 

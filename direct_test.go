@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"p2p/internal/derpclient"
+	"github.com/go-gost/p2p/internal/derpclient"
 )
 
 // TestMain shortens the direct punch timing for the whole package. It is set
@@ -249,12 +249,13 @@ func TestDirectFallbackToRelay(t *testing.T) {
 	roundTrip(t, s2, "still works")
 }
 
-// TestDirectPunchTimeoutStaysOnRelay proves a failed punch (unreachable
-// candidate) leaves the relay path serving and never brings direct up.
-func TestDirectPunchTimeoutStaysOnRelay(t *testing.T) {
+// TestDirectLocalCandidateSameNetwork proves that peers on the same network
+// still punch directly even when the STUN-mapped public address is a blackhole
+// (TEST-NET-1): the local candidate is reached first.
+func TestDirectLocalCandidateSameNetwork(t *testing.T) {
 	rs := &relayServer{}
 	url := rs.start(t)
-	stun := startFakeSTUN(t, "192.0.2.1:9") // TEST-NET-1 blackhole
+	stun := startFakeSTUN(t, "192.0.2.1:9") // public candidate is unreachable
 	echo := startEcho(t)
 
 	privA, _, _ := derpclient.Generate()
@@ -275,11 +276,42 @@ func TestDirectPunchTimeoutStaysOnRelay(t *testing.T) {
 	roundTrip(t, s, "hi")
 	s.Close()
 
-	// Give the punch time to fail.
+	waitFor(t, 5*time.Second, func() bool {
+		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
+	})
+}
+
+// TestDirectStunUnreachableStaysOnRelay proves a punch that cannot even query
+// STUN leaves the relay path serving and never brings direct up.
+func TestDirectStunUnreachableStaysOnRelay(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	// No STUN listener here: Lookup times out and the punch aborts.
+	engineA.stunAddr, engineB.stunAddr = "192.0.2.1:9", "192.0.2.1:9"
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+
+	// Give the (failing) punch time to run.
 	time.Sleep(2 * time.Second)
 
 	if hasDirect(engineA, pubB) || hasDirect(engineB, engineA.pub) {
-		t.Fatal("direct unexpectedly up with unreachable candidate")
+		t.Fatal("direct unexpectedly up with unreachable STUN")
 	}
 
 	s2, err := engineA.OpenStream(engineB.PublicKey())
@@ -288,4 +320,125 @@ func TestDirectPunchTimeoutStaysOnRelay(t *testing.T) {
 	}
 	defer s2.Close()
 	roundTrip(t, s2, "relay only")
+}
+
+// TestRelaySessionRecoversAfterAdapterClosed reproduces the stuck state where a
+// peer's relay adapter is closed (the peer process died) but stays cached: the
+// next OpenStream must drop it and rebuild a fresh session instead of failing
+// with "peer session closed" forever.
+func TestRelaySessionRecoversAfterAdapterClosed(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+
+	// Simulate the peer process dying: the peer's relay adapter on A is closed
+	// (marked closed but left cached), and B's DERP connection drops.
+	engineA.mu.Lock()
+	pc := engineA.peers[pubB]
+	engineA.mu.Unlock()
+	if pc == nil {
+		t.Fatal("no relay adapter to peer")
+	}
+	pc.Close()
+	engineB.Close()
+
+	// The peer "restarts" with the same key.
+	engineB2 := newEngine(url, echo, privB, slog.Default())
+	defer engineB2.Close()
+	engineB2.Connect()
+
+	// The next open must rebuild A's adapter/session and reach the restarted
+	// peer instead of failing with "peer session closed".
+	s2, err := engineA.OpenStream(keyName(pubB))
+	if err != nil {
+		t.Fatalf("reopen after peer restart: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "recovered")
+}
+
+// TestPeerGoneFastFail proves that once a peer's DERP connection drops, a
+// request to the (still down) peer fails fast once the relay reports it gone,
+// instead of hanging until the smux keepalive timeout (~30s).
+func TestPeerGoneFastFail(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+
+	// The peer's DERP connection drops; B is unregistered at the relay (which
+	// notifies A), then stays down. A must learn the peer is gone.
+	engineB.Close()
+	waitFor(t, 5*time.Second, func() bool {
+		rs.mu.Lock()
+		defer rs.mu.Unlock()
+		_, ok := rs.clients[pubB]
+		return !ok
+	})
+	waitFor(t, 5*time.Second, func() bool { return engineA.isGone(pubB) })
+
+	// smux open is async (SYN is fire-and-forget), so the failure surfaces on
+	// the stream. derper notifies PeerGone only once, so the gone probe must
+	// tear the session down after goneProbeTimeout instead of letting the
+	// request hang until the smux keepalive (~30s).
+	start := time.Now()
+	s2, err := engineA.OpenStream(keyName(pubB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	type readRes struct{ err error }
+	done := make(chan readRes, 1)
+	go func() {
+		if _, werr := s2.Write([]byte("ping")); werr != nil {
+			done <- readRes{werr}
+			return
+		}
+		_, rerr := io.ReadFull(s2, make([]byte, 4))
+		done <- readRes{rerr}
+	}()
+	select {
+	case r := <-done:
+		if r.err == nil {
+			t.Fatal("request to down peer unexpectedly succeeded")
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("request to down peer did not fail fast")
+	}
+	if elapsed := time.Since(start); elapsed > 7*time.Second {
+		t.Fatalf("request to down peer took %v, want fast fail (~%v)", elapsed, goneProbeTimeout)
+	}
 }

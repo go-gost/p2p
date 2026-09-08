@@ -47,7 +47,7 @@ go build -o p2p .
 | `--derp` | *(空)* | DERP relay URL（`wss://host/derp`）；启用 engine 模式 |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 私钥文件（hex）；缺失则自动生成 |
 | `--target` | *(空)* | DERP 模式下入站隧道的本地桥接目标 |
-| `--stun` | `--derp` 主机 `:3478` | STUN 服务器（host:port），用于 NAT 打洞 |
+| `--stun` | *(空)* | STUN 服务器（host:port），用于直连打洞；留空则禁用直连（仅走中继）— 需显式开启 |
 | `--tls.secure` | `true` | 校验 relay 的 TLS 证书（`false` 信任任意证书） |
 | `--tls.caFile` | *(空)* | 用于信任 relay 自签证书的 PEM CA 文件 |
 | `--log.level` | `info` | 日志级别：`trace`、`debug`、`info`、`warn`、`error`、`fatal` |

@@ -91,7 +91,6 @@ func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (
 	s.tunnels[t.id] = t
 	s.mu.Unlock()
 	go t.serve()
-	slog.Debug("tunnel opened", "id", t.id, "peer", peer, "endpoint", ln.Addr().String())
 	return &proto.OpenTunnelReply{Ok: true, Id: t.id, Endpoint: ln.Addr().String()}, nil
 }
 
@@ -131,6 +130,8 @@ func (t *tunnel) serve() {
 // stream to the peer opened through the relay. When one direction ends, the
 // peer side is half-closed (CloseWrite) so the other side can still drain;
 // both ends are closed only after both directions are done.
+// bridge logs each tunnel in gost style: "<src> <-> <dst>" on connect and
+// ">-<" with the duration on disconnect.
 func (t *tunnel) bridge(conn net.Conn) {
 	var up net.Conn
 	var err error
@@ -149,6 +150,25 @@ func (t *tunnel) bridge(conn net.Conn) {
 	defer func() {
 		up.Close()
 		conn.Close()
+	}()
+
+	// t.target names the far end of the tunnel in both modes: the peer's
+	// public key (DERP) or the peer host:port (stub). t.ln.Addr() is the local
+	// endpoint handed to the gost client.
+	endpoint := t.ln.Addr().String()
+	transport := ""
+	if tw, ok := up.(interface{ Transport() string }); ok {
+		transport = tw.Transport()
+	}
+	attrs := []any{"peer", t.target, "endpoint", endpoint}
+	if transport != "" {
+		attrs = append(attrs, "transport", transport)
+	}
+	start := time.Now()
+	slog.Info(fmt.Sprintf("%s <-> %s", endpoint, t.target), attrs...)
+	defer func() {
+		slog.Info(fmt.Sprintf("%s >-< %s", endpoint, t.target),
+			append(append([]any{}, attrs...), "duration", time.Since(start).String())...)
 	}()
 
 	done := make(chan struct{}, 2)
@@ -196,5 +216,4 @@ func (t *tunnel) close() {
 	for conn := range t.conns {
 		conn.Close()
 	}
-	slog.Debug("tunnel closed", "id", t.id)
 }

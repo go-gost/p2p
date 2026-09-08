@@ -47,6 +47,10 @@ import (
 	"golang.org/x/crypto/nacl/box"
 )
 
+// ErrPeerGone is returned by Recv when the DERP server reports that a peer we
+// were sending to has disconnected; the returned source is that peer's key.
+var ErrPeerGone = errors.New("derpclient: peer gone")
+
 // Wire constants mirrored from tailscale.com/derp@v1.102.3 (do not invent).
 const (
 	// Magic is the 8-byte DERP magic sent in the FrameServerKey greeting.
@@ -279,8 +283,9 @@ func (c *Client) pong(payload []byte) error {
 }
 
 // Recv blocks until a packet arrives and returns its source key and bytes.
-// KeepAlive, PeerGone/PeerPresent, unknown frame types, and Pong replies are
-// consumed internally; FramePing is answered with FramePong.
+// KeepAlive, PeerPresent, unknown frame types, and Pong replies are consumed
+// internally; FramePing is answered with FramePong. A FramePeerGone returns
+// ErrPeerGone with the departed peer's key as the source.
 func (c *Client) Recv() (src PublicKey, pkt []byte, err error) {
 	for {
 		t, body, err := c.readFrame()
@@ -298,7 +303,15 @@ func (c *Client) Recv() (src PublicKey, pkt []byte, err error) {
 			if len(body) > 0 {
 				c.pong(body)
 			}
-		case frameKeepAlive, framePeerGone, framePeerPresent, framePong, frameServerKey, frameServerInfo:
+		case framePeerGone:
+			// A peer we sent to disconnected; surface it so the caller can drop
+			// the session instead of probing a dead peer.
+			if len(body) < keyLen {
+				continue
+			}
+			copy(src[:], body[:keyLen])
+			return src, nil, ErrPeerGone
+		case frameKeepAlive, framePeerPresent, framePong, frameServerKey, frameServerInfo:
 			// no-op for us
 		default:
 			// Unknown frame type: skip (forward compatibility).

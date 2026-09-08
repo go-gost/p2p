@@ -17,7 +17,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,7 +29,7 @@ import (
 	"google.golang.org/grpc/status"
 	"gopkg.in/natefinch/lumberjack.v2"
 
-	"p2p/internal/derpclient"
+	"github.com/go-gost/p2p/internal/derpclient"
 )
 
 func main() {
@@ -40,7 +39,7 @@ func main() {
 	derpURL := flag.String("derp", "", "DERP relay server URL (wss://host/derp); enables DERP engine mode")
 	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
 	target := flag.String("target", "", "local bridge target for inbound tunnels in DERP mode (host:port)")
-	stunAddr := flag.String("stun", "", "STUN server address (host:port); defaults to the --derp host on :3478")
+	stunAddr := flag.String("stun", "", "STUN server address (host:port) for direct hole punching; empty disables direct (relay only)")
 	tlsSecure := flag.Bool("tls.secure", true, "verify the relay's TLS certificate (set false to trust any cert)")
 	tlsCAFile := flag.String("tls.caFile", "", "PEM CA file to trust the relay's self-signed certificate")
 	logLevel := flag.String("log.level", "info", "log level: trace, debug, info, warn, error, or fatal")
@@ -67,10 +66,9 @@ func main() {
 			}
 		}
 		engine = newEngine(*derpURL, *target, priv, slog.Default())
+		// Hole punching is opt-in: only attempt a direct path when the user
+		// explicitly sets --stun. Empty stunAddr keeps traffic on the relay.
 		engine.stunAddr = *stunAddr
-		if engine.stunAddr == "" {
-			engine.stunAddr = defaultSTUN(*derpURL)
-		}
 		engine.tlsCfg = buildTLSConfig(*tlsSecure, *tlsCAFile)
 		slog.Info("p2p derp engine", "url", *derpURL,
 			"pubkey", base64.RawURLEncoding.EncodeToString(pub[:]),
@@ -128,6 +126,9 @@ func setupLogger(output, format, level string) error {
 	ho := &slog.HandlerOptions{
 		Level:       lvl,
 		ReplaceAttr: replaceAttr,
+		// Attach the caller file:line so debug/trace logs can be located
+		// (matching gost's reportcaller behavior when running verbose).
+		AddSource: lvl <= slog.LevelDebug,
 	}
 	var h slog.Handler
 	switch format {
@@ -199,6 +200,14 @@ func replaceAttr(groups []string, a slog.Attr) slog.Attr {
 		if lvl, ok := a.Value.Any().(slog.Level); ok {
 			a.Value = slog.StringValue(levelString(lvl))
 		}
+	case slog.SourceKey:
+		// Replace slog's nested source object with a gost-style flat "caller"
+		// of the form dir/file.go:line (only present when AddSource is on,
+		// i.e. running at debug/trace).
+		if s, ok := a.Value.Any().(*slog.Source); ok {
+			caller := filepath.Join(filepath.Base(filepath.Dir(s.File)), filepath.Base(s.File))
+			a = slog.String("caller", fmt.Sprintf("%s:%d", caller, s.Line))
+		}
 	}
 	return a
 }
@@ -219,16 +228,6 @@ func levelString(lvl slog.Level) string {
 	default:
 		return "fatal"
 	}
-}
-
-// defaultSTUN derives the STUN server address from the DERP URL: the same
-// host, on derper's default STUN port 3478.
-func defaultSTUN(derpURL string) string {
-	u, err := url.Parse(derpURL)
-	if err != nil {
-		return ""
-	}
-	return net.JoinHostPort(u.Hostname(), "3478")
 }
 
 // buildTLSConfig mirrors gost's TLS dialer options for the relay connection:

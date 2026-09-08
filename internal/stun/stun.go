@@ -82,7 +82,7 @@ func Lookup(ctx context.Context, addr string, conn *net.UDPConn) (netip.AddrPort
 		if binary.BigEndian.Uint16(pkt[0:2]) != bindingSuccess {
 			return netip.AddrPort{}, errors.New("stun: non-success binding response")
 		}
-		return parseXorMapped(pkt[headerLen:])
+		return parseXorMapped(pkt[headerLen:], txn)
 	}
 }
 
@@ -112,7 +112,7 @@ func appendU32(b []byte, v uint32) []byte {
 	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
-func parseXorMapped(attrs []byte) (netip.AddrPort, error) {
+func parseXorMapped(attrs []byte, txn [12]byte) (netip.AddrPort, error) {
 	for len(attrs) >= 4 {
 		typ := binary.BigEndian.Uint16(attrs[0:2])
 		ln := int(binary.BigEndian.Uint16(attrs[2:4]))
@@ -120,14 +120,14 @@ func parseXorMapped(attrs []byte) (netip.AddrPort, error) {
 			return netip.AddrPort{}, errors.New("stun: short attribute")
 		}
 		if typ == attrXorMappedAddr {
-			return decodeXorMapped(attrs[4 : 4+ln])
+			return decodeXorMapped(attrs[4:4+ln], txn)
 		}
 		attrs = attrs[4+((ln+3)&^3):] // attributes are 4-byte aligned
 	}
 	return netip.AddrPort{}, errors.New("stun: no XOR-MAPPED-ADDRESS")
 }
 
-func decodeXorMapped(v []byte) (netip.AddrPort, error) {
+func decodeXorMapped(v []byte, txn [12]byte) (netip.AddrPort, error) {
 	if len(v) < 4 {
 		return netip.AddrPort{}, errors.New("stun: short xor-mapped-address")
 	}
@@ -140,6 +140,24 @@ func decodeXorMapped(v []byte) (netip.AddrPort, error) {
 		var ip [4]byte
 		binary.BigEndian.PutUint32(ip[:], binary.BigEndian.Uint32(v[4:8])^magicCookie)
 		return netip.AddrPortFrom(netip.AddrFrom4(ip), xport), nil
+	case 0x02: // IPv6 (RFC 5389): first 4 bytes xor the magic cookie, the rest xor the txn.
+		if len(v) < 20 {
+			return netip.AddrPort{}, errors.New("stun: short ipv6 xor-mapped-address")
+		}
+		var ip [16]byte
+		copy(ip[:], v[4:20])
+		binary.BigEndian.PutUint32(ip[:4], binary.BigEndian.Uint32(ip[:4])^magicCookie)
+		for i := 4; i < len(ip); i++ {
+			ip[i] ^= txn[i-4]
+		}
+		addr := netip.AddrFrom16(ip)
+		if addr.Is4In6() {
+			// A dual-stack STUN server reports an IPv4 source as an IPv4-mapped
+			// IPv6 address (::ffff:a.b.c.d). Unmap so the IPv4 punching socket
+			// can use it.
+			addr = addr.Unmap()
+		}
+		return netip.AddrPortFrom(addr, xport), nil
 	default:
 		return netip.AddrPort{}, errors.New("stun: unsupported address family")
 	}

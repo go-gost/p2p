@@ -66,7 +66,7 @@ func readFrame(fr *frameReader) (byte, []byte, error) {
 // RecvPacket — enough to prove framing, handshake crypto, and routing shape.
 // Full relay behavior is verified against a real derper in the e2e.
 type miniServer struct {
-	srv *httptest.Server
+	srv  *httptest.Server
 	priv PrivateKey
 	pub  PublicKey
 }
@@ -297,6 +297,65 @@ func TestUnknownFramesSkipped(t *testing.T) {
 	}
 }
 
+func TestRecvPeerGone(t *testing.T) {
+	// The server reports that a peer disconnected; Recv must surface it as
+	// ErrPeerGone with the peer's key rather than skipping it.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/derp", func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{"derp"}, OriginPatterns: []string{"*"},
+			CompressionMode: websocket.CompressionDisabled,
+		})
+		if err != nil {
+			return
+		}
+		defer ws.Close(websocket.StatusInternalError, "bye")
+		conn := websocket.NetConn(r.Context(), ws, websocket.MessageBinary)
+		br := newFrameReader(conn)
+		bw := newFrameWriter(conn)
+		priv, pub, _ := Generate()
+		writeFrame(bw, frameServerKey, append(append([]byte{}, Magic...), pub[:]...))
+		for {
+			ft, body, err := readFrame(br)
+			if err != nil {
+				return
+			}
+			if ft != frameClientInfo {
+				continue
+			}
+			clientPub := PublicKey{}
+			copy(clientPub[:], body[:keyLen])
+			_, ok := priv.OpenFrom(clientPub, body[keyLen:])
+			if !ok {
+				return
+			}
+			writeFrame(bw, frameServerInfo, priv.SealTo(clientPub, []byte("{}")))
+			gonePeer, _, _ := Generate()
+			writeFrame(bw, framePeerGone, append([]byte{}, gonePeer[:]...))
+			writeFrame(bw, frameKeepAlive, nil)
+			// A normal packet follows: if PeerGone were skipped the client
+			// would deliver this instead of reporting the departed peer.
+			pkt := append(append([]byte{}, clientPub[:]...), []byte("after-gone")...)
+			writeFrame(bw, frameRecvPacket, pkt)
+			return
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	priv, _, _ := Generate()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, "ws://"+srv.Listener.Addr().String()+"/derp", priv, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, _, err := c.Recv(); err != ErrPeerGone {
+		t.Fatalf("Recv err = %v, want ErrPeerGone", err)
+	}
+}
+
 func TestBadServerInfoBoxRejected(t *testing.T) {
 	// ServerInfo sealed under a different key than the greeting must be
 	// rejected.
@@ -313,7 +372,7 @@ func TestBadServerInfoBoxRejected(t *testing.T) {
 		conn := websocket.NetConn(r.Context(), ws, websocket.MessageBinary)
 		br := newFrameReader(conn)
 		bw := newFrameWriter(conn)
-		other, _, _ := Generate()   // seals ServerInfo with this key...
+		other, _, _ := Generate()            // seals ServerInfo with this key...
 		greetPriv, greetPub, _ := Generate() // ...but greets with another
 		greeting := append(append([]byte{}, Magic...), greetPub[:]...)
 		writeFrame(bw, frameServerKey, greeting)
