@@ -41,6 +41,7 @@ GOWORK=off go build ./...  # standalone build must also pass
 | `--derp` | *(empty)* | DERP relay URL (`wss://host/derp`); enables engine mode |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
 | `--target` | *(empty)* | local bridge target for inbound tunnels in DERP mode |
+| `--forward` | *(empty)* | static port forward `"listen-addr=peer-key"` (repeatable; DERP mode) |
 | `--stun` | *(empty)* | STUN server (host:port) for direct hole punching; empty disables direct (relay only) — opt-in |
 | `--tls.secure` | `true` | verify the relay's TLS certificate (`false` to trust any cert) |
 | `--tls.caFile` | *(empty)* | PEM CA file to trust the relay's self-signed certificate |

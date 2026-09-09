@@ -47,6 +47,7 @@ go build -o p2p .
 | `--derp` | *(empty)* | DERP relay URL (`wss://host/derp`); enables engine mode |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
 | `--target` | *(empty)* | local bridge target for inbound tunnels in DERP mode |
+| `--forward` | *(empty)* | static port forward `"listen-addr=peer-key"` (repeatable; DERP mode) |
 | `--stun` | *(empty)* | STUN server (host:port) for direct hole punching; empty disables direct (relay only) — opt-in |
 | `--tls.secure` | `true` | verify the relay's TLS certificate (`false` to trust any cert) |
 | `--tls.caFile` | *(empty)* | PEM CA file to trust the relay's self-signed certificate |
@@ -98,7 +99,7 @@ Each host generates a curve25519 keypair on first run and prints its **public ke
 
 ### Hole punching
 
-When both peers are in engine mode, the relay is only used to establish the first session and carry the control channel. In the background each peer queries the derper's built-in STUN server (default port `3478`, `-stun` is on by default) to learn its public UDP endpoint, exchanges it with the peer over the relay, and builds a **KCP** session over the same UDP socket. On success new tunnels open streams over the direct smux session (KCP + smux); the relay session stays up so a direct-path failure silently falls back to relay and re-punches. The direct path keeps working even if the relay drops — only a *new* punch needs the relay back.
+When both peers are in engine mode, the relay is only used to establish the first session and carry the control channel. In the background each peer queries the derper's built-in STUN server (default port `3478`, `-stun` is on by default) to learn its public UDP endpoint, exchanges it with the peer over the relay, and builds a **KCP** session over the same UDP socket. On success new tunnels open streams over the direct smux session (KCP + smux); the relay session stays up so a direct-path failure silently falls back to relay and re-punches. The direct path keeps working even if the relay drops — only a *new* punch needs the relay back. A static `--forward` warms its peer's direct path at startup when `--stun` is set, so the first connection skips the punch latency.
 
 Symmetric NAT defeats UDP punching; those peers stay on relay permanently (periodic retry). The KCP transport is unencrypted, matching the relay's trust model — confidentiality is the inner dialer's job (`mtls`/`tls`/`wss`).
 

@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,9 +75,20 @@ func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (
 		}
 	}
 
-	ln, err := net.Listen("tcp", net.JoinHostPort(s.bind, "0"))
+	t, err := s.startTunnel(net.JoinHostPort(s.bind, "0"), peer)
 	if err != nil {
 		return &proto.OpenTunnelReply{Ok: false, Error: err.Error()}, nil
+	}
+	return &proto.OpenTunnelReply{Ok: true, Id: t.id, Endpoint: t.ln.Addr().String()}, nil
+}
+
+// startTunnel binds a listener on addr and registers a tunnel bridging to
+// peer (a host:port in stub mode, a base64 public key in DERP mode). The
+// returned tunnel is already serving.
+func (s *server) startTunnel(addr, peer string) (*tunnel, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
 	}
 	t := &tunnel{
 		id:     fmt.Sprintf("tunnel-%d", s.seq.Add(1)),
@@ -91,7 +104,35 @@ func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (
 	s.tunnels[t.id] = t
 	s.mu.Unlock()
 	go t.serve()
-	return &proto.OpenTunnelReply{Ok: true, Id: t.id, Endpoint: ln.Addr().String()}, nil
+	return t, nil
+}
+
+// addForward binds a pre-configured endpoint and bridges it to peer. The spec
+// is "listen-addr=peer-key"; DERP mode only — a stub-mode host:port forward is
+// just what gost's own port-forwarding already does.
+func (s *server) addForward(spec string) error {
+	if s.engine == nil {
+		return errors.New("--forward requires --derp (peer key)")
+	}
+	addr, key, ok := strings.Cut(spec, "=")
+	if !ok || addr == "" || key == "" {
+		return fmt.Errorf("want \"listen-addr=peer-key\", got %q", spec)
+	}
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return fmt.Errorf("invalid listen addr %q: %v", addr, err)
+	}
+	peer, err := parsePeerKey(key)
+	if err != nil {
+		return err
+	}
+	if _, err := s.startTunnel(addr, key); err != nil {
+		return err
+	}
+	// Eagerly warm the direct path so the first connection doesn't pay the
+	// punch latency. No-op when --stun is unset; a peer that isn't up yet just
+	// backoff-retries like any failed punch.
+	s.engine.maybeStartDirect(peer)
+	return nil
 }
 
 // CloseTunnel is idempotent: closing an unknown or already-closed id is ok.

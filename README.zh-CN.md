@@ -47,6 +47,7 @@ go build -o p2p .
 | `--derp` | *(空)* | DERP relay URL（`wss://host/derp`）；启用 engine 模式 |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 私钥文件（hex）；缺失则自动生成 |
 | `--target` | *(空)* | DERP 模式下入站隧道的本地桥接目标 |
+| `--forward` | *(空)* | 预配置静态端口转发 `"listen-addr=peer-key"`（可重复；DERP 模式） |
 | `--stun` | *(空)* | STUN 服务器（host:port），用于直连打洞；留空则禁用直连（仅走中继）— 需显式开启 |
 | `--tls.secure` | `true` | 校验 relay 的 TLS 证书（`false` 信任任意证书） |
 | `--tls.caFile` | *(空)* | 用于信任 relay 自签证书的 PEM CA 文件 |
@@ -98,7 +99,7 @@ derper -c /etc/derper/derper.json -hostname derp.example.com -certmode manual -c
 
 ### 打洞
 
-两端都在 engine 模式时，relay 只用于建立首条会话并承载控制面。后台每个 peer 向 derper 内建 STUN 服务器（默认端口 `3478`，`-stun` 默认开启）查询自己的公网 UDP endpoint，经 relay 与对端交换，并在同一 UDP socket 上建立 **KCP** 会话。成功后，新隧道在直连 smux 会话（KCP + smux）上开流；relay 会话保持，直连失败时静默回退 relay 并重新打洞。直连路径即使 relay 掉线也继续工作——只有 *新的* 打洞才需要 relay 回来。
+两端都在 engine 模式时，relay 只用于建立首条会话并承载控制面。后台每个 peer 向 derper 内建 STUN 服务器（默认端口 `3478`，`-stun` 默认开启）查询自己的公网 UDP endpoint，经 relay 与对端交换，并在同一 UDP socket 上建立 **KCP** 会话。成功后，新隧道在直连 smux 会话（KCP + smux）上开流；relay 会话保持，直连失败时静默回退 relay 并重新打洞。直连路径即使 relay 掉线也继续工作——只有 *新的* 打洞才需要 relay 回来。设置 `--stun` 时，预配置的 `--forward` 会在启动时预热其 peer 的直连路径，首个连接无需等待打洞。
 
 对称 NAT 打洞失败；这类 peer 永久留在 relay（周期性重试）。KCP 传输不加密，与 relay 的信任模型一致——保密是内层 dialer 的职责（`mtls`/`tls`/`wss`）。
 

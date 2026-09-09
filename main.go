@@ -39,6 +39,11 @@ func main() {
 	derpURL := flag.String("derp", "", "DERP relay server URL (wss://host/derp); enables DERP engine mode")
 	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
 	target := flag.String("target", "", "local bridge target for inbound tunnels in DERP mode (host:port)")
+	var forwards []string
+	flag.Func("forward", `static port forward "listen-addr=peer-key" (repeatable; DERP mode)`, func(v string) error {
+		forwards = append(forwards, v)
+		return nil
+	})
 	stunAddr := flag.String("stun", "", "STUN server address (host:port) for direct hole punching; empty disables direct (relay only)")
 	tlsSecure := flag.Bool("tls.secure", true, "verify the relay's TLS certificate (set false to trust any cert)")
 	tlsCAFile := flag.String("tls.caFile", "", "PEM CA file to trust the relay's self-signed certificate")
@@ -92,8 +97,15 @@ func main() {
 	// credentials). Empty --token disables checking: the loopback default
 	// remains the only boundary, so keep --addr off-loopback unless both
 	// --token and control TLS are in place.
+	svr := newServer(*bind, engine)
+	for _, spec := range forwards {
+		if err := svr.addForward(spec); err != nil {
+			slog.Error("forward", "spec", spec, "error", err)
+			os.Exit(1)
+		}
+	}
 	s := grpc.NewServer(grpc.UnaryInterceptor(authInterceptor(*token)))
-	proto.RegisterP2PServer(s, newServer(*bind, engine))
+	proto.RegisterP2PServer(s, svr)
 	slog.Info("p2p stub listening", "addr", *addr, "bind", *bind, "auth", *token != "", "derp", *derpURL != "")
 	if err := s.Serve(ln); err != nil {
 		slog.Error("serve", "error", err)
