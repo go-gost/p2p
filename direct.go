@@ -215,6 +215,27 @@ func (dc *directConn) markUp(sess *smux.Session, socket *net.UDPConn, peerAddr n
 	dc.mu.Unlock()
 }
 
+// markDead clears the direct-session state when the accept loop ends (session
+// dead). The opening side notices death through session() and re-punches; the
+// accepting side otherwise stays stuck in directUp and never answers the
+// re-punch candidates, so the pair can never re-establish. The guard ignores a
+// stale session so a concurrent re-punch (markUp) is not clobbered.
+func (dc *directConn) markDead(sess *smux.Session) {
+	dc.mu.Lock()
+	if dc.sess != sess {
+		dc.mu.Unlock()
+		return
+	}
+	dc.sess = nil
+	sock := dc.socket
+	dc.socket = nil
+	dc.state = directNone
+	dc.mu.Unlock()
+	if sock != nil {
+		sock.Close()
+	}
+}
+
 // peerAddrString returns the peer's dialed endpoint, or "" when not punched.
 func (dc *directConn) peerAddrString() string {
 	dc.mu.Lock()
@@ -383,10 +404,12 @@ func (dc *directConn) punch() {
 	// 5. smux over KCP; role matches the relay session (smaller key is client).
 	cfg := smux.DefaultConfig()
 	cfg.KeepAliveInterval = 10 * time.Second
-	// smux decides a session is dead after ~2x KeepAliveTimeout. Keep it short
-	// so a peer that restarts (KCP path drops, no DERP PeerGone on the direct
-	// path) is detected in ~20s instead of ~60s.
-	cfg.KeepAliveTimeout = 10 * time.Second
+	// KeepAliveTimeout must exceed KeepAliveInterval: with them equal, smux's
+	// idle check races the first NOP round-trip and closes an idle session (no
+	// streams yet — e.g. an eagerly warmed --forward) after ~10s. A 3x gap lets
+	// the NOP exchange hold an idle session up while a dead peer is still
+	// noticed within ~30-60s (the relay stays the fallback meanwhile).
+	cfg.KeepAliveTimeout = 30 * time.Second
 	var sess *smux.Session
 	if roleIsClient {
 		sess, err = smux.Client(kcpConn, cfg)
@@ -405,7 +428,10 @@ func (dc *directConn) punch() {
 
 	e.log.Debug("direct established", "peer", pname, "role", role,
 		"local", mine[0].addr.String(), "public", pubEP.String(), "peerAddr", peerEP.String())
-	go e.acceptLoop(sess, "direct", pname, peerEP.String())
+	go func() {
+		e.acceptLoop(sess, "direct", pname, peerEP.String())
+		dc.markDead(sess)
+	}()
 }
 
 // primeKCP writes a single byte and waits for it to be echoed back. KCP does

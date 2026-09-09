@@ -250,6 +250,76 @@ func TestDirectFallbackToRelay(t *testing.T) {
 	roundTrip(t, s2, "still works")
 }
 
+// TestDirectRepunchAfterSessionDeath proves that once a direct session dies on
+// both sides (as it does after an idle keepalive timeout), the pair can
+// re-punch: the accepting side must reset its state when its accept loop ends,
+// or it never answers the re-punch candidates and the direct path is lost for
+// good. This is the bug behind "punch succeeded but the forward re-punched".
+func TestDirectRepunchAfterSessionDeath(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+
+	waitFor(t, 5*time.Second, func() bool {
+		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
+	})
+
+	// Simulate the idle-keepalive death: close the smux session on both sides.
+	// Each side's accept loop ends and markDead must reset the state.
+	for _, e := range []*Engine{engineA, engineB} {
+		peer := pubB
+		if e == engineB {
+			peer = engineA.pub
+		}
+		dc := e.directConn(peer)
+		dc.mu.Lock()
+		sess := dc.sess
+		dc.mu.Unlock()
+		if sess != nil {
+			sess.Close()
+		}
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		dcA := engineA.directConn(pubB)
+		dcA.mu.Lock()
+		a := dcA.state
+		dcA.mu.Unlock()
+		dcB := engineB.directConn(engineA.pub)
+		dcB.mu.Lock()
+		b := dcB.state
+		dcB.mu.Unlock()
+		return a == directNone && b == directNone
+	})
+
+	// Cut relay data; only a re-punched direct path can carry this.
+	rs.setDropData(true)
+	s2, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatalf("open after session death: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "re-punched")
+}
+
 // TestDirectLocalCandidateSameNetwork proves that peers on the same network
 // still punch directly even when the STUN-mapped public address is a blackhole
 // (TEST-NET-1): the local candidate is reached first.
