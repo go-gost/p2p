@@ -320,6 +320,53 @@ func TestDirectRepunchAfterSessionDeath(t *testing.T) {
 	roundTrip(t, s2, "re-punched")
 }
 
+// TestDirectRepunchAfterMissedPeerGone proves that when a peer restarts and
+// its PeerGone is missed (the other side still holds a stale directUp
+// session), the re-punch still succeeds: the stale side must reset on fresh
+// candidates instead of ignoring them.
+func TestDirectRepunchAfterMissedPeerGone(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+
+	waitFor(t, 5*time.Second, func() bool {
+		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
+	})
+
+	// Simulate a missed PeerGone: A's direct session is torn down (the peer
+	// "restarted"), but B still holds its stale directUp session.
+	engineA.directConn(pubB).teardown()
+
+	// Cut relay data; only a re-punched direct path can carry this. B must
+	// reset its stale session on A's fresh candidates.
+	rs.setDropData(true)
+	s2, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatalf("open after missed peer gone: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "re-punched after missed peer gone")
+}
+
 // TestDirectLocalCandidateSameNetwork proves that peers on the same network
 // still punch directly even when the STUN-mapped public address is a blackhole
 // (TEST-NET-1): the local candidate is reached first.

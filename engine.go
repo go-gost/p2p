@@ -487,9 +487,14 @@ func (pc *peerConn) ensureSessionLocked() (*smux.Session, error) {
 	}
 	cfg := smux.DefaultConfig()
 	cfg.KeepAliveInterval = 10 * time.Second
-	// Short so a peer that drops (no PeerGone yet, e.g. relay still detecting
-	// the disconnect) is noticed in ~20s instead of ~60s.
-	cfg.KeepAliveTimeout = 10 * time.Second
+	// KeepAliveTimeout must exceed KeepAliveInterval (as with the direct
+	// session): with them equal, an idle relay session closes after ~10s, its
+	// NOPs stop flowing over the relay, and the relay eventually stops tracking
+	// this peer pair as active — so a peer restart is no longer delivered as
+	// PeerGone and the other side never learns to re-punch. A 3x gap keeps NOPs
+	// flowing (PeerGone keeps working) while a dead peer is still noticed
+	// within ~30-60s.
+	cfg.KeepAliveTimeout = 30 * time.Second
 	roleIsClient := bytes.Compare(pc.e.pub[:], pc.peer[:]) < 0
 	if roleIsClient {
 		pc.sess, _ = smux.Client(pc, cfg)

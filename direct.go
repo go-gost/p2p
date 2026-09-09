@@ -179,11 +179,28 @@ func (dc *directConn) onCandidates(cands []candidate) {
 	// The peer is punching now: answer immediately instead of waiting out our
 	// backoff, or the two sides' punch windows miss each other and every retry
 	// fails. start() only runs from directNone, so reset a backoff first.
+	//
+	// A peer only sends candidates when it has (re)started a punch. If we still
+	// hold a directUp session, it is stale — the peer restarted and we missed
+	// its PeerGone — so tear it down before re-punching, or we'd never answer
+	// the re-punch candidates.
+	var staleSess *smux.Session
+	var staleSock *net.UDPConn
 	dc.mu.Lock()
-	if dc.state == directBackoff {
+	if dc.state == directUp {
+		staleSess, staleSock = dc.sess, dc.socket
+		dc.sess, dc.socket = nil, nil
+		dc.state = directNone
+	} else if dc.state == directBackoff {
 		dc.state = directNone
 	}
 	dc.mu.Unlock()
+	if staleSess != nil {
+		staleSess.Close()
+	}
+	if staleSock != nil {
+		staleSock.Close()
+	}
 	dc.start()
 }
 
