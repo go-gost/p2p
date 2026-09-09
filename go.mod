@@ -13,6 +13,7 @@ require (
 )
 
 require (
+	github.com/goccy/go-yaml v1.19.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.5 // indirect
 	github.com/klauspost/reedsolomon v1.11.8 // indirect
 	github.com/pkg/errors v0.9.1 // indirect

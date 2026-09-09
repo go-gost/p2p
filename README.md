@@ -41,6 +41,7 @@ go build -o p2p .
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `-C` | *(empty)* | config file (YAML); config values are defaults, explicitly-set flags override |
 | `--addr` | `127.0.0.1:8003` | gRPC control-plane listen address |
 | `--bind` | `127.0.0.1` | data-plane listen IP (one ephemeral port per tunnel) |
 | `--token` | *(empty)* | control-plane auth token; empty disables checking |
@@ -54,6 +55,42 @@ go build -o p2p .
 | `--log.level` | `info` | log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal` |
 | `--log.format` | `json` | log format: `json` or `text` |
 | `--log.output` | `stderr` | log output: `stderr`, `stdout`, `none`, or a file path (size-rotates at 100 MB) |
+
+## Configuration file
+
+Every flag can live in a YAML config file instead (gost-style `-C`): a config
+value is the default, and an explicitly-set flag overrides it. `--forward`
+flags and the config `forwards` list are additive.
+
+```bash
+./p2p -C p2p.yaml
+```
+
+```yaml
+addr: 127.0.0.1:8003
+bind: 127.0.0.1
+token: gost
+derp: wss://derp.example.com/derp
+key: peer.key
+target: 127.0.0.1:18080
+stun: stun.example.com:3478
+tls:
+  secure: false
+  caFile: /etc/p2p/ca.pem
+log:
+  level: debug
+  format: text
+  output: /var/log/p2p.log
+  rotation:
+    maxSize: 50
+    maxAge: 7
+    maxBackups: 3
+    localTime: true
+    compress: true
+forwards:
+  - listen: 127.0.0.1:18080
+    peer: <peerB-key>
+```
 
 Point a GOST chain node at it:
 

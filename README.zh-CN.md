@@ -41,6 +41,7 @@ go build -o p2p .
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
+| `-C` | *(空)* | 配置文件（YAML）；配置值作为默认，显式传入的 flag 覆盖 |
 | `--addr` | `127.0.0.1:8003` | gRPC 控制面监听地址 |
 | `--bind` | `127.0.0.1` | 数据面监听 IP（每条隧道一个临时端口） |
 | `--token` | *(空)* | 控制面认证 token；为空则不做校验 |
@@ -54,6 +55,41 @@ go build -o p2p .
 | `--log.level` | `info` | 日志级别：`trace`、`debug`、`info`、`warn`、`error`、`fatal` |
 | `--log.format` | `json` | 日志格式：`json` 或 `text` |
 | `--log.output` | `stderr` | 日志输出：`stderr`、`stdout`、`none` 或文件路径（按 100MB 轮转） |
+
+## 配置文件
+
+所有 flag 都可以写进 YAML 配置文件（gost 风格 `-C`）：配置值作为默认，显式传入的 flag 覆盖；
+`--forward` flag 与配置里的 `forwards` 列表叠加生效。
+
+```bash
+./p2p -C p2p.yaml
+```
+
+```yaml
+addr: 127.0.0.1:8003
+bind: 127.0.0.1
+token: gost
+derp: wss://derp.example.com/derp
+key: peer.key
+target: 127.0.0.1:18080
+stun: stun.example.com:3478
+tls:
+  secure: false
+  caFile: /etc/p2p/ca.pem
+log:
+  level: debug
+  format: text
+  output: /var/log/p2p.log
+  rotation:
+    maxSize: 50
+    maxAge: 7
+    maxBackups: 3
+    localTime: true
+    compress: true
+forwards:
+  - listen: 127.0.0.1:18080
+    peer: <peerB-key>
+```
 
 让 GOST 链节点指向它：
 

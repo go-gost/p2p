@@ -108,15 +108,21 @@ func (s *server) startTunnel(addr, peer string) (*tunnel, error) {
 }
 
 // addForward binds a pre-configured endpoint and bridges it to peer. The spec
-// is "listen-addr=peer-key"; DERP mode only — a stub-mode host:port forward is
-// just what gost's own port-forwarding already does.
+// is the --forward flag form "listen-addr=peer-key".
 func (s *server) addForward(spec string) error {
-	if s.engine == nil {
-		return errors.New("--forward requires --derp (peer key)")
-	}
 	addr, key, ok := strings.Cut(spec, "=")
 	if !ok || addr == "" || key == "" {
 		return fmt.Errorf("want \"listen-addr=peer-key\", got %q", spec)
+	}
+	return s.addForwardAddr(addr, key)
+}
+
+// addForwardAddr binds a pre-configured endpoint and bridges it to peer. DERP
+// mode only — a stub-mode host:port forward is just what gost's own
+// port-forwarding already does.
+func (s *server) addForwardAddr(addr, key string) error {
+	if s.engine == nil {
+		return errors.New("static port forward requires --derp (peer key)")
 	}
 	if _, _, err := net.SplitHostPort(addr); err != nil {
 		return fmt.Errorf("invalid listen addr %q: %v", addr, err)

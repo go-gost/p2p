@@ -33,6 +33,8 @@ import (
 )
 
 func main() {
+	// Flags are overrides on top of the config file; their defaults are only
+	// used as a fallback when neither the config nor the flag sets the value.
 	addr := flag.String("addr", "127.0.0.1:8003", "gRPC listen address (control plane)")
 	bind := flag.String("bind", "127.0.0.1", "data plane listen IP; each tunnel gets an ephemeral port on it")
 	token := flag.String("token", "", "control-plane auth token; empty disables checking (loopback default)")
@@ -50,34 +52,115 @@ func main() {
 	logLevel := flag.String("log.level", "info", "log level: trace, debug, info, warn, error, or fatal")
 	logFormat := flag.String("log.format", "json", "log format: json or text")
 	logOutput := flag.String("log.output", "stderr", "log output: stderr, stdout, none, or a file path")
+	configFile := flag.String("C", "", "config file (YAML)")
 	flag.Parse()
 
-	if err := setupLogger(*logOutput, *logFormat, *logLevel); err != nil {
+	// Record which flags were explicitly set so they override the config.
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	// The config is the single source of truth; flags only override it.
+	cfg := &Config{}
+	if *configFile != "" {
+		c, err := loadConfig(*configFile)
+		if err != nil {
+			slog.Error("load config", "file", *configFile, "error", err)
+			os.Exit(1)
+		}
+		cfg = c
+	}
+
+	// Defaults for anything the config didn't set.
+	if cfg.Addr == "" {
+		cfg.Addr = "127.0.0.1:8003"
+	}
+	if cfg.Bind == "" {
+		cfg.Bind = "127.0.0.1"
+	}
+	if cfg.TLS == nil {
+		cfg.TLS = &TLSConfig{}
+	}
+	if cfg.TLS.Secure == nil {
+		def := true
+		cfg.TLS.Secure = &def
+	}
+	if cfg.Log == nil {
+		cfg.Log = &LogConfig{}
+	}
+	if cfg.Log.Level == "" {
+		cfg.Log.Level = "info"
+	}
+	if cfg.Log.Format == "" {
+		cfg.Log.Format = "json"
+	}
+	if cfg.Log.Output == "" {
+		cfg.Log.Output = "stderr"
+	}
+
+	// Explicitly-set flags override the config.
+	if set["addr"] {
+		cfg.Addr = *addr
+	}
+	if set["bind"] {
+		cfg.Bind = *bind
+	}
+	if set["token"] {
+		cfg.Token = *token
+	}
+	if set["derp"] {
+		cfg.Derp = *derpURL
+	}
+	if set["key"] {
+		cfg.Key = *keyFile
+	}
+	if set["target"] {
+		cfg.Target = *target
+	}
+	if set["stun"] {
+		cfg.Stun = *stunAddr
+	}
+	if set["tls.secure"] {
+		cfg.TLS.Secure = tlsSecure
+	}
+	if set["tls.caFile"] {
+		cfg.TLS.CAFile = *tlsCAFile
+	}
+	if set["log.level"] {
+		cfg.Log.Level = *logLevel
+	}
+	if set["log.format"] {
+		cfg.Log.Format = *logFormat
+	}
+	if set["log.output"] {
+		cfg.Log.Output = *logOutput
+	}
+
+	// Set up the logger from the resolved config before anything else.
+	if err := setupLogger(cfg.Log.Output, cfg.Log.Format, cfg.Log.Level, cfg.Log.Rotation); err != nil {
 		slog.Error("setup logger", "error", err)
 		os.Exit(1)
 	}
 
 	var engine *Engine
-	if *derpURL != "" {
-		priv, pub, err := loadOrCreateKey(*keyFile)
+	if cfg.Derp != "" {
+		priv, pub, err := loadOrCreateKey(cfg.Key)
 		if err != nil {
-			slog.Error("load key", "file", *keyFile, "error", err)
+			slog.Error("load key", "file", cfg.Key, "error", err)
 			os.Exit(1)
 		}
-		if *target != "" {
-			if _, _, err := net.SplitHostPort(*target); err != nil {
-				slog.Error("invalid --target", "value", *target, "error", err)
+		if cfg.Target != "" {
+			if _, _, err := net.SplitHostPort(cfg.Target); err != nil {
+				slog.Error("invalid target", "value", cfg.Target, "error", err)
 				os.Exit(1)
 			}
 		}
-		engine = newEngine(*derpURL, *target, priv, slog.Default())
-		// Hole punching is opt-in: only attempt a direct path when the user
-		// explicitly sets --stun. Empty stunAddr keeps traffic on the relay.
-		engine.stunAddr = *stunAddr
-		engine.tlsCfg = buildTLSConfig(*tlsSecure, *tlsCAFile)
-		slog.Info("p2p derp engine", "url", *derpURL,
+		engine = newEngine(cfg.Derp, cfg.Target, priv, slog.Default())
+		// Hole punching is opt-in: only attempt a direct path when stun is set.
+		engine.stunAddr = cfg.Stun
+		engine.tlsCfg = buildTLSConfig(*cfg.TLS.Secure, cfg.TLS.CAFile)
+		slog.Info("p2p derp engine", "url", cfg.Derp,
 			"pubkey", base64.RawURLEncoding.EncodeToString(pub[:]),
-			"target", *target)
+			"target", cfg.Target)
 		if err := engine.Connect(); err != nil {
 			// Keep serving gRPC: the reconnect ticker retries in the
 			// background, but inbound tunnels stay unreachable until the
@@ -86,27 +169,33 @@ func main() {
 		}
 	}
 
-	ln, err := net.Listen("tcp", *addr)
+	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
-		slog.Error("listen", "addr", *addr, "error", err)
+		slog.Error("listen", "addr", cfg.Addr, "error", err)
 		os.Exit(1)
 	}
 
-	// authInterceptor enforces --token on every RPC via the "token" gRPC
+	// authInterceptor enforces token on every RPC via the "token" gRPC
 	// metadata key sent by the GOST client (x/internal/plugin per-RPC
-	// credentials). Empty --token disables checking: the loopback default
-	// remains the only boundary, so keep --addr off-loopback unless both
-	// --token and control TLS are in place.
-	svr := newServer(*bind, engine)
+	// credentials). Empty token disables checking: the loopback default
+	// remains the only boundary, so keep addr off-loopback unless both token
+	// and control TLS are in place.
+	svr := newServer(cfg.Bind, engine)
 	for _, spec := range forwards {
 		if err := svr.addForward(spec); err != nil {
 			slog.Error("forward", "spec", spec, "error", err)
 			os.Exit(1)
 		}
 	}
-	s := grpc.NewServer(grpc.UnaryInterceptor(authInterceptor(*token)))
+	for _, f := range cfg.Forwards {
+		if err := svr.addForwardAddr(f.Listen, f.Peer); err != nil {
+			slog.Error("forward", "listen", f.Listen, "peer", f.Peer, "error", err)
+			os.Exit(1)
+		}
+	}
+	s := grpc.NewServer(grpc.UnaryInterceptor(authInterceptor(cfg.Token)))
 	proto.RegisterP2PServer(s, svr)
-	slog.Info("p2p stub listening", "addr", *addr, "bind", *bind, "auth", *token != "", "derp", *derpURL != "")
+	slog.Info("p2p stub listening", "addr", cfg.Addr, "bind", cfg.Bind, "auth", cfg.Token != "", "derp", cfg.Derp != "")
 	if err := s.Serve(ln); err != nil {
 		slog.Error("serve", "error", err)
 		os.Exit(1)
@@ -124,13 +213,13 @@ const (
 // config: output (stderr/stdout/none/file), level (trace…fatal), and format
 // (json/text, JSON by default). File output is rotation-backed via lumberjack,
 // the same writer gost uses.
-func setupLogger(output, format, level string) error {
+func setupLogger(output, format, level string, rot *LogRotationConfig) error {
 	lvl, err := parseLogLevel(level)
 	if err != nil {
 		return err
 	}
 
-	w, err := logOutput(output)
+	w, err := logOutput(output, rot)
 	if err != nil {
 		return err
 	}
@@ -176,8 +265,9 @@ func parseLogLevel(s string) (slog.Level, error) {
 }
 
 // logOutput resolves an output destination to a writer. A file path returns a
-// lumberjack writer for size-based rotation.
-func logOutput(output string) (io.Writer, error) {
+// lumberjack writer for size-based rotation; rot (the log.rotation config)
+// overrides lumberjack's defaults.
+func logOutput(output string, rot *LogRotationConfig) (io.Writer, error) {
 	switch output {
 	case "", "stderr":
 		return os.Stderr, nil
@@ -191,9 +281,15 @@ func logOutput(output string) (io.Writer, error) {
 				return nil, err
 			}
 		}
-		// ponytail: rotation knobs (maxSize/maxBackups/maxAge/compress) are not
-		// exposed as flags; lumberjack defaults (100MB, keep all) are fine.
-		return &lumberjack.Logger{Filename: output, MaxSize: 100}, nil
+		l := &lumberjack.Logger{Filename: output}
+		if rot != nil {
+			l.MaxSize = rot.MaxSize
+			l.MaxAge = rot.MaxAge
+			l.MaxBackups = rot.MaxBackups
+			l.LocalTime = rot.LocalTime
+			l.Compress = rot.Compress
+		}
+		return l, nil
 	}
 }
 

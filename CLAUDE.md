@@ -35,6 +35,7 @@ GOWORK=off go build ./...  # standalone build must also pass
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `-C` | *(empty)* | config file (YAML); config values are defaults, explicitly-set flags override |
 | `--addr` | `127.0.0.1:8003` | gRPC control-plane listen address |
 | `--bind` | `127.0.0.1` | data-plane listen IP; each tunnel gets an ephemeral port on it |
 | `--token` | *(empty)* | control-plane auth token; empty disables checking (loopback default) |
@@ -48,6 +49,10 @@ GOWORK=off go build ./...  # standalone build must also pass
 | `--log.level` | `info` | log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal` |
 | `--log.format` | `json` | log format: `json` or `text` |
 | `--log.output` | `stderr` | log output: `stderr`, `stdout`, `none`, or a file path (size-rotates at 100 MB) |
+
+Every flag can instead live in a `-C config.yaml` ([config.go](config.go)); a config value
+is the default and an explicitly-set flag overrides it. `--forward` flags and the config
+`forwards` list are additive, so a config can fully replace the command line.
 
 ## Architecture (two planes)
 
