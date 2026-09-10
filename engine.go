@@ -82,9 +82,21 @@ const (
 	goneProbeTimeout = 5 * time.Second
 	// dialTimeout caps the DERP connection establishment.
 	dialTimeout = 10 * time.Second
+)
+
+// Deployment-dependent timings, adjustable via the `timeouts` config section
+// (applyTimeouts in config.go). Vars, not consts, so tests can shorten them.
+var (
 	// keepAlivePeriod pings the DERP server well below typical proxy idle
 	// timeouts (e.g. Cloudflare's ~100s).
 	keepAlivePeriod = 30 * time.Second
+	// smux keepalive, shared by the relay and direct sessions. KeepAliveTimeout
+	// must stay well above the interval (>= 2x): with them equal, smux's idle
+	// check races the first NOP round-trip and closes an idle session after
+	// ~interval (see docs/2026-09-09-p2p-mutual-punch-design.md, kcp-go deep
+	// dive R1/R2).
+	smuxKeepAliveInterval = 10 * time.Second
+	smuxKeepAliveTimeout  = 30 * time.Second
 )
 
 func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger) *Engine {
@@ -486,15 +498,8 @@ func (pc *peerConn) ensureSessionLocked() (*smux.Session, error) {
 		return pc.sess, nil
 	}
 	cfg := smux.DefaultConfig()
-	cfg.KeepAliveInterval = 10 * time.Second
-	// KeepAliveTimeout must exceed KeepAliveInterval (as with the direct
-	// session): with them equal, an idle relay session closes after ~10s, its
-	// NOPs stop flowing over the relay, and the relay eventually stops tracking
-	// this peer pair as active — so a peer restart is no longer delivered as
-	// PeerGone and the other side never learns to re-punch. A 3x gap keeps NOPs
-	// flowing (PeerGone keeps working) while a dead peer is still noticed
-	// within ~30-60s.
-	cfg.KeepAliveTimeout = 30 * time.Second
+	cfg.KeepAliveInterval = smuxKeepAliveInterval
+	cfg.KeepAliveTimeout = smuxKeepAliveTimeout
 	roleIsClient := bytes.Compare(pc.e.pub[:], pc.peer[:]) < 0
 	if roleIsClient {
 		pc.sess, _ = smux.Client(pc, cfg)

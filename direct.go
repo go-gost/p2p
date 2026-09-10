@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -21,9 +22,11 @@ import (
 
 // Direct (hole-punched) data plane: after a relay smux session is established,
 // both peers independently probe their NAT via STUN, exchange candidates over
-// the relay's control channel, and build a KCP session over a shared UDP
-// socket. When that succeeds, new streams prefer the direct smux session while
-// the relay session stays up as fallback.
+// the relay's control channel, and — symmetrically — both dial the peer's
+// candidate with the same KCP conv (mutual simultaneous open), confirming the
+// path with an echo handshake before any stream rides it. When that succeeds,
+// new streams prefer the direct smux session while the relay session stays up
+// as fallback.
 //
 // The direct session is independent of the DERP transport: once established it
 // keeps serving even if the relay drops (the control plane is gone, so a
@@ -46,7 +49,9 @@ var (
 	punchWaitTimeout = 5 * time.Second
 	backoffPeriod    = 30 * time.Second
 	stunTimeout      = 3 * time.Second
-	candidateTimeout = 3 * time.Second // per-candidate KCP priming attempt (client dials)
+	// seedTimeout bounds the symmetric echo handshake (both peers must see
+	// their own token round-trip before streams ride the session).
+	seedTimeout = 5 * time.Second
 )
 
 type directState int
@@ -74,8 +79,10 @@ type directConn struct {
 	mu       sync.Mutex
 	state    directState
 	sess     *smux.Session  // direct smux session when up
-	socket   *net.UDPConn   // punch socket; owned by us (kcp sets ownConn=false)
+	socket   *net.UDPConn   // punch socket; kcp closes it with the session (ownConn=true)
 	peerAddr netip.AddrPort // peer's dialed endpoint (public cross-NAT, local same-NAT)
+	mine     []candidate    // our candidates for the current punch, answered to the peer
+	lastPeer []candidate    // peer candidates already acted on (dedupes re-announcements)
 }
 
 func (e *Engine) directConn(peer derpclient.PublicKey) *directConn {
@@ -171,7 +178,30 @@ func (dc *directConn) session() *smux.Session {
 }
 
 func (dc *directConn) onCandidates(cands []candidate) {
+	dc.mu.Lock()
+	if sameCandidates(cands, dc.lastPeer) {
+		dc.mu.Unlock()
+		return // a re-announcement of candidates we already acted on
+	}
+	dc.lastPeer = cands
+	mine := dc.mine
+	dc.mu.Unlock()
+
 	dc.e.log.Debug("direct punch: peer candidates via relay", "peer", keyName(dc.peer), "candidates", candAddrs(cands))
+
+	// Answer with our own candidates. A peer that started its punch after we
+	// broadcast — or reconnected to the relay — missed our first announcement,
+	// so without this it waits for candidates we already sent once and never
+	// dials. Answering makes the exchange a request/response: both sides end up
+	// with each other's candidates and dial in the same round. The dedupe above
+	// keeps this from ping-ponging, since the peer's re-announcement of its own
+	// candidates (the same list) is ignored.
+	if mine != nil {
+		if err := dc.e.sendCandidates(dc.peer, mine); err != nil {
+			dc.e.log.Debug("direct punch: answer candidates failed", "peer", keyName(dc.peer), "error", err)
+		}
+	}
+
 	select {
 	case dc.cand <- cands:
 	default:
@@ -298,11 +328,9 @@ func (dc *directConn) conv() uint32 {
 
 func (dc *directConn) punch() {
 	e := dc.e
+	// The smux session role (smaller key = client) is independent of who
+	// dials: both peers dial. See docs/2026-09-09-p2p-mutual-punch-design.md.
 	roleIsClient := bytes.Compare(e.pub[:], dc.peer[:]) < 0
-	role := "server"
-	if roleIsClient {
-		role = "client"
-	}
 	pname := keyName(dc.peer)
 
 	// Bind the punch socket to the egress IP toward the STUN server so the
@@ -315,14 +343,14 @@ func (dc *directConn) punch() {
 		dc.backoff()
 		return
 	}
-	keepSocket := false
+	keep := false
 	defer func() {
-		if !keepSocket {
-			socket.Close()
+		if !keep {
+			socket.Close() // idempotent: the kcp session may own the socket
 		}
 	}()
 
-	e.log.Debug("direct punch: start", "peer", pname, "role", role)
+	e.log.Debug("direct punch: start", "peer", pname)
 
 	// 1. Learn our own public endpoint from the same socket we'll punch with,
 	// so the NAT mapping is identical.
@@ -344,6 +372,11 @@ func (dc *directConn) punch() {
 	if len(mine) == 2 && mine[0].addr == mine[1].addr {
 		mine = mine[:1] // no NAT: local == public
 	}
+	// Remember our candidates so onCandidates can answer a peer that missed this
+	// broadcast (it started its punch late or reconnected to the relay).
+	dc.mu.Lock()
+	dc.mine = mine
+	dc.mu.Unlock()
 	if err := e.sendCandidates(dc.peer, mine); err != nil {
 		e.log.Debug("direct punch: send candidates failed", "peer", pname, "error", err)
 		dc.backoff()
@@ -351,8 +384,8 @@ func (dc *directConn) punch() {
 	}
 	e.log.Debug("direct punch: candidates sent", "peer", pname, "candidates", candAddrs(mine))
 
-	// 3. Wait for the peer's candidates, then dial/accept them in the order
-	// offered (its local address first, public second).
+	// 3. Wait for the peer's candidates (exchanged over the relay control
+	// channel, so this works even while no UDP path exists yet).
 	ctx, cancel = context.WithTimeout(context.Background(), punchTimeout)
 	defer cancel()
 	cands, ok := dc.waitCandidates(ctx)
@@ -369,64 +402,37 @@ func (dc *directConn) punch() {
 		return
 	}
 
-	// 4. Build the KCP session on the shared socket. KCP sends nothing until
-	// there is data, so the client runs a priming round-trip (triggers SYN,
-	// waits for echo).
-	//
-	// Only ONE candidate is dialed per punch: kcp-go gives each client session
-	// its own readLoop that never exits on Close (it only stops on a socket
-	// read error). Two sessions sharing the socket would race for packets and
-	// drop each other's traffic. Pick the reachable candidate up front: same
-	// NAT (hairpin) dials the peer's local address, otherwise its public one.
-	var kcpConn net.Conn
-	peerEP := peerAddrs[0]
-	if roleIsClient {
-		dial := peerAddrs[len(peerAddrs)-1] // default: public (cross-NAT)
-		if len(peerAddrs) > 1 && pubEP.Addr() == dial.Addr() {
-			dial = peerAddrs[0] // same NAT: local (hairpin)
-		}
-		u := net.UDPAddrFromAddrPort(dial)
-		e.log.Debug("direct punch: dial", "peer", pname, "addr", u.String(), "conv", dc.conv())
-		kcpConn, err = kcp.NewConn3(dc.conv(), u, nil, 0, 0, socket)
-		if err == nil {
-			err = primeKCP(kcpConn, candidateTimeout)
-		}
-		if err != nil {
-			kcpConn.Close() // NewConn3 never returns nil on success
-			e.log.Debug("direct punch: dial failed", "peer", pname, "addr", u.String(), "error", err)
-			dc.backoff()
-			return
-		}
-		peerEP = dial
-	} else {
-		// Server role: accept any client SYN; the dummy probe opens our NAT
-		// toward every peer candidate (its public mapping included) so the
-		// client's SYN can get through on the cross-NAT path. Probing only the
-		// local candidate would leave the NAT closed to the peer's public
-		// address — the hole punch would fail even between cone NATs.
-		kcpConn, err = dc.kcpAccept(socket, peerAddrs)
-		if err != nil {
-			e.log.Debug("direct punch: kcp failed", "peer", pname, "error", err)
-			dc.backoff()
-			return
-		}
-		// The real peer address is what AcceptKCP observed — the client's NAT
-		// mapping — not the local candidate it advertised.
-		if ua, ok := kcpConn.RemoteAddr().(*net.UDPAddr); ok {
-			peerEP = ua.AddrPort()
-		}
+	// 4. Mutual dial: both peers build their KCP session with the same conv.
+	// Only ONE candidate is dialed per side — kcp-go spawns one readLoop per
+	// client session, so two sessions on one socket would steal each other's
+	// packets. Same NAT (hairpin) dials the peer's local address, otherwise
+	// its public one; the rule is symmetric, so both sides agree.
+	dial := peerAddrs[len(peerAddrs)-1] // default: public (cross-NAT)
+	if len(peerAddrs) > 1 && pubEP.Addr() == dial.Addr() {
+		dial = peerAddrs[0] // same NAT: local (hairpin)
 	}
-	e.log.Debug("direct punch: kcp primed", "peer", pname, "peerAddr", peerEP.String())
+	u := net.UDPAddrFromAddrPort(dial)
+	e.log.Debug("direct punch: dial", "peer", pname, "addr", u.String(), "conv", dc.conv())
+	// ownConn=true: Close closes the socket, so session death tears down the
+	// readLoop with no separate bookkeeping (kcp-go deep-dive R2).
+	kcpConn, err := kcp.NewConn4(dc.conv(), u, nil, 0, 0, true, socket)
+	if err != nil {
+		e.log.Debug("direct punch: dial failed", "peer", pname, "addr", u.String(), "error", err)
+		dc.backoff()
+		return
+	}
+	if err := seedHandshake(kcpConn, seedTimeout); err != nil {
+		kcpConn.Close()
+		e.log.Debug("direct punch: seed failed", "peer", pname, "addr", u.String(), "error", err)
+		dc.backoff()
+		return
+	}
+	e.log.Debug("direct punch: seed ok", "peer", pname, "peerAddr", dial.String())
 
-	// 5. smux over KCP; role matches the relay session (smaller key is client).
+	// 5. smux over KCP; role by key order (external to who dialed).
 	cfg := smux.DefaultConfig()
-	cfg.KeepAliveInterval = 10 * time.Second
-	// KeepAliveTimeout must exceed KeepAliveInterval: with them equal, smux's
-	// idle check races the first NOP round-trip and closes an idle session (no
-	// streams yet — e.g. an eagerly warmed --forward) after ~10s. A 3x gap lets
-	// the NOP exchange hold an idle session up while a dead peer is still
-	// noticed within ~30-60s (the relay stays the fallback meanwhile).
-	cfg.KeepAliveTimeout = 30 * time.Second
+	cfg.KeepAliveInterval = smuxKeepAliveInterval
+	cfg.KeepAliveTimeout = smuxKeepAliveTimeout
 	var sess *smux.Session
 	if roleIsClient {
 		sess, err = smux.Client(kcpConn, cfg)
@@ -440,80 +446,51 @@ func (dc *directConn) punch() {
 		return
 	}
 
-	dc.markUp(sess, socket, peerEP)
-	keepSocket = true
+	dc.markUp(sess, socket, dial)
+	keep = true
 
-	e.log.Debug("direct established", "peer", pname, "role", role,
-		"local", mine[0].addr.String(), "public", pubEP.String(), "peerAddr", peerEP.String())
+	e.log.Debug("direct established", "peer", pname,
+		"local", mine[0].addr.String(), "public", pubEP.String(), "peerAddr", dial.String())
 	go func() {
-		e.acceptLoop(sess, "direct", pname, peerEP.String())
+		e.acceptLoop(sess, "direct", pname, dial.String())
 		dc.markDead(sess)
 	}()
 }
 
-// primeKCP writes a single byte and waits for it to be echoed back. KCP does
-// not emit anything until data is written, so this both forces the client's
-// SYN out and confirms the path is usable before routing tunnels onto it.
-func primeKCP(c net.Conn, timeout time.Duration) error {
+// seedHandshake runs the symmetric echo handshake over a fresh KCP session.
+// Both peers execute the same four steps — write own token, read the peer's
+// token, echo it back, then require the own token's echo. Success therefore
+// proves a full own->peer->own round trip on both sides; a half-open path
+// (we can receive but our bytes never arrive) fails instead of producing a
+// "false direct" session whose streams would blackhole. KCP retransmits the
+// unacked bytes, so the window also covers a NAT mapping that only opens
+// after the peer's first packet (k3s conntrack-assist).
+func seedHandshake(c net.Conn, timeout time.Duration) error {
 	c.SetDeadline(time.Now().Add(timeout))
-	defer c.SetDeadline(time.Time{}) // clear: the session must outlive priming
-	if _, err := c.Write([]byte{0}); err != nil {
+	defer c.SetDeadline(time.Time{}) // clear: the session must outlive the seed
+
+	var token [1]byte
+	if _, err := rand.Read(token[:]); err != nil {
 		return err
 	}
-	var b [1]byte
-	if _, err := io.ReadFull(c, b[:]); err != nil {
+	if _, err := c.Write(token[:]); err != nil {
 		return err
+	}
+	var peer [1]byte
+	if _, err := io.ReadFull(c, peer[:]); err != nil {
+		return err
+	}
+	if _, err := c.Write(peer[:]); err != nil { // echo the peer's token
+		return err
+	}
+	var echo [1]byte
+	if _, err := io.ReadFull(c, echo[:]); err != nil {
+		return err
+	}
+	if echo[0] != token[0] {
+		return errors.New("derp engine: seed echo mismatch")
 	}
 	return nil
-}
-
-// kcpAccept runs the server role: a KCP listener over the socket, plus a
-// periodic dummy probe to every peer candidate to open our NAT mapping so the
-// client's SYN can get through (the dummy is dropped by the peer's KCP input).
-// It echoes the client's priming byte back to confirm the path.
-func (dc *directConn) kcpAccept(socket *net.UDPConn, peers []netip.AddrPort) (net.Conn, error) {
-	l, err := kcp.ServeConn(nil, 0, 0, socket)
-	if err != nil {
-		return nil, err
-	}
-	stopDummy := make(chan struct{})
-	go dc.dummyProbe(socket, peers, stopDummy)
-	defer close(stopDummy)
-
-	l.SetReadDeadline(time.Now().Add(punchTimeout))
-	sess, err := l.AcceptKCP()
-	if err != nil {
-		l.Close()
-		return nil, err
-	}
-	sess.SetDeadline(time.Now().Add(punchTimeout))
-	defer sess.SetDeadline(time.Time{}) // clear: the session must outlive the echo
-	var b [1]byte
-	if _, err := io.ReadFull(sess, b[:]); err != nil {
-		sess.Close()
-		return nil, err
-	}
-	if _, err := sess.Write(b[:]); err != nil {
-		sess.Close()
-		return nil, err
-	}
-	return sess, nil
-}
-
-func (dc *directConn) dummyProbe(socket *net.UDPConn, peers []netip.AddrPort, stop <-chan struct{}) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	dummy := []byte{0, 0, 0, 0}
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-			for _, p := range peers {
-				socket.WriteToUDP(dummy, net.UDPAddrFromAddrPort(p))
-			}
-		}
-	}
 }
 
 func (dc *directConn) waitCandidates(ctx context.Context) ([]candidate, bool) {
@@ -548,6 +525,21 @@ func candAddrs(cands []candidate) []string {
 		s[i] = c.addr.String()
 	}
 	return s
+}
+
+// sameCandidates reports whether two candidate lists carry the same endpoints,
+// so a peer re-announcing its candidates (or answering ours with the same list)
+// is not mistaken for a fresh punch.
+func sameCandidates(a, b []candidate) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].addr != b[i].addr {
+			return false
+		}
+	}
+	return len(a) > 0
 }
 
 // bindAddrFor returns a UDPAddr bound to the egress IP used to reach addr, or

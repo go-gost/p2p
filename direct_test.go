@@ -1,13 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/smux"
 
 	"github.com/go-gost/p2p/internal/derpclient"
 )
@@ -112,6 +119,214 @@ func roundTrip(t *testing.T, c net.Conn, payload string) {
 	}
 	if string(buf) != payload {
 		t.Fatalf("round trip = %q, want %q", buf, payload)
+	}
+}
+
+// scriptConn is a net.Conn fed by a fixed reader; writes are discarded.
+type scriptConn struct{ io.Reader }
+
+func (scriptConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (scriptConn) Close() error                     { return nil }
+func (scriptConn) LocalAddr() net.Addr              { return nil }
+func (scriptConn) RemoteAddr() net.Addr             { return nil }
+func (scriptConn) SetDeadline(time.Time) error      { return nil }
+func (scriptConn) SetReadDeadline(time.Time) error  { return nil }
+func (scriptConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestSeedHandshake covers the symmetric echo handshake: two peer ends
+// complete when both directions flow; a half-open path (the peer's token
+// arrives but our own echo never comes back) must fail — the false-direct
+// regression this handshake exists to prevent.
+func TestSeedHandshake(t *testing.T) {
+	// success over a real KCP pair: both sides write first, which only works
+	// because KCP buffers writes in its send window (an unbuffered transport
+	// like net.Pipe would deadlock).
+	sockA, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sockA.Close()
+	sockB, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sockB.Close()
+	a, err := kcp.NewConn3(0x5eed, sockB.LocalAddr(), nil, 0, 0, sockA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := kcp.NewConn3(0x5eed, sockA.LocalAddr(), nil, 0, 0, sockB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	errs := make(chan error, 2)
+	go func() { errs <- seedHandshake(a, 5*time.Second) }()
+	go func() { errs <- seedHandshake(b, 5*time.Second) }()
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("seedHandshake: %v", err)
+		}
+	}
+
+	// half-open: peer token arrives (1 byte), then EOF — own echo never comes
+	if err := seedHandshake(scriptConn{Reader: bytes.NewReader([]byte{42})}, time.Second); err == nil {
+		t.Fatal("half-open seed unexpectedly succeeded")
+	}
+}
+
+// TestMutualNewConn3Merge: two kcp.NewConn3 endpoints dialing each other's
+// address with the same conv merge into one working bidirectional session
+// without any listener — the transport-level property the mutual punch
+// relies on.
+func TestMutualNewConn3Merge(t *testing.T) {
+	conv := uint32(0x12345678)
+	sockA, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sockA.Close()
+	sockB, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sockB.Close()
+
+	a, err := kcp.NewConn3(conv, sockB.LocalAddr(), nil, 0, 0, sockA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := kcp.NewConn3(conv, sockA.LocalAddr(), nil, 0, 0, sockB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(2)
+	go func() { // A writes, then reads B's reply
+		defer wg.Done()
+		a.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := a.Write([]byte("hello-from-A")); err != nil {
+			errs <- err
+			return
+		}
+		buf := make([]byte, 64)
+		n, err := a.Read(buf)
+		if err != nil {
+			errs <- err
+			return
+		}
+		if string(buf[:n]) != "hello-from-B" {
+			errs <- fmt.Errorf("A got %q", buf[:n])
+		}
+	}()
+	go func() { // B reads, then writes
+		defer wg.Done()
+		b.SetDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 64)
+		n, err := b.Read(buf)
+		if err != nil {
+			errs <- err
+			return
+		}
+		if string(buf[:n]) != "hello-from-A" {
+			errs <- fmt.Errorf("B got %q", buf[:n])
+			return
+		}
+		if _, err := b.Write([]byte("hello-from-B")); err != nil {
+			errs <- err
+		}
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+// TestMutualKCPWithSmux: smux over a mutual KCP pair, roles by key order
+// (external to who dialed), streams in both directions.
+func TestMutualKCPWithSmux(t *testing.T) {
+	conv := uint32(0x9abcdef0)
+	sockA, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sockA.Close()
+	sockB, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sockB.Close()
+
+	a, err := kcp.NewConn3(conv, sockB.LocalAddr(), nil, 0, 0, sockA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := kcp.NewConn3(conv, sockA.LocalAddr(), nil, 0, 0, sockB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	seeds := make(chan error, 2)
+	go func() { seeds <- seedHandshake(a, 3*time.Second) }()
+	go func() { seeds <- seedHandshake(b, 3*time.Second) }()
+	for i := 0; i < 2; i++ {
+		if err := <-seeds; err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	cfg := smux.DefaultConfig()
+	sessA, err := smux.Client(a, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessA.Close()
+	sessB, err := smux.Server(b, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessB.Close()
+
+	accepted := make(chan *smux.Stream, 1)
+	go func() {
+		s, err := sessB.AcceptStream()
+		if err != nil {
+			t.Errorf("B accept: %v", err)
+			return
+		}
+		accepted <- s
+	}()
+	s1, err := sessA.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Close()
+	bs := <-accepted
+	defer bs.Close()
+
+	s1.SetDeadline(time.Now().Add(5 * time.Second))
+	bs.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := s1.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(bs, buf); err != nil {
+		t.Fatalf("B read: %v", err)
+	}
+	if _, err := bs.Write([]byte("pong")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(s1, buf); err != nil {
+		t.Fatalf("A read: %v", err)
 	}
 }
 
@@ -559,4 +774,79 @@ func TestPeerGoneFastFail(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 7*time.Second {
 		t.Fatalf("request to down peer took %v, want fast fail (~%v)", elapsed, goneProbeTimeout)
 	}
+}
+
+// TestSameCandidates covers the de-duplication that keeps a re-announced
+// candidate list from being mistaken for a fresh punch (and from ping-ponging).
+func TestSameCandidates(t *testing.T) {
+	a := []candidate{
+		{addr: netip.MustParseAddrPort("10.0.0.1:1")},
+		{addr: netip.MustParseAddrPort("1.2.3.4:5")},
+	}
+	same := []candidate{
+		{addr: netip.MustParseAddrPort("10.0.0.1:1")},
+		{addr: netip.MustParseAddrPort("1.2.3.4:5")},
+	}
+	if !sameCandidates(a, same) {
+		t.Fatal("identical lists compared unequal")
+	}
+	if sameCandidates(a, a[:1]) || sameCandidates(a, nil) || sameCandidates(nil, nil) {
+		t.Fatal("shorter or empty list compared equal")
+	}
+	diff := []candidate{
+		{addr: netip.MustParseAddrPort("10.0.0.1:2")},
+		{addr: netip.MustParseAddrPort("1.2.3.4:5")},
+	}
+	if sameCandidates(a, diff) {
+		t.Fatal("different endpoints compared equal")
+	}
+}
+
+// TestDirectPunchStaggeredStart covers the late-start case: A punches while B
+// is down, then B starts and punches. A must end up with B's candidates and B
+// with A's so both dial. The in-process relay sends A a PeerGone when it first
+// broadcasts to the absent B, which makes A fail fast and re-punch once B is up
+// — so this converges here regardless of whether onCandidates answers; the
+// answer (see onCandidates) removes the wasted round that the real deployment
+// shows (a late peer waiting out punchTimeout). This test is the scenario
+// guard, not a strict guard on the answer.
+func TestDirectPunchStaggeredStart(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	if err := engineA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	// A punches alone: nothing answers, so it sits in its candidate wait.
+	engineA.maybeStartDirect(pubB)
+	time.Sleep(300 * time.Millisecond)
+
+	if err := engineB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	// B starts late; its candidates reach A mid-wait, and A must answer.
+	engineB.maybeStartDirect(engineA.pub)
+
+	waitFor(t, 5*time.Second, func() bool {
+		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
+	})
+
+	// Cut relay data; only the (re-punched) direct path can carry this.
+	rs.setDropData(true)
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatalf("open on direct after staggered start: %v", err)
+	}
+	defer s.Close()
+	roundTrip(t, s, "staggered-direct")
 }
