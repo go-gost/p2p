@@ -141,6 +141,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := applyTimeouts(cfg.Timeouts); err != nil {
+		slog.Error("timeouts", "error", err)
+		os.Exit(1)
+	}
+
 	var engine *Engine
 	if cfg.Derp != "" {
 		priv, pub, err := loadOrCreateKey(cfg.Key)

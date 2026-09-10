@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -46,6 +47,12 @@ forwards:
     peer: abc
   - listen: 127.0.0.1:18081
     peer: def
+timeouts:
+  punchWait: 7s
+  backoff: 45s
+  smux:
+    interval: 5s
+    timeout: 10s
 `)
 	c, err := loadConfig(path)
 	if err != nil {
@@ -69,6 +76,12 @@ forwards:
 	if len(c.Forwards) != 2 || c.Forwards[0].Listen != "127.0.0.1:18080" || c.Forwards[0].Peer != "abc" ||
 		c.Forwards[1].Listen != "127.0.0.1:18081" || c.Forwards[1].Peer != "def" {
 		t.Fatalf("forwards = %+v", c.Forwards)
+	}
+	if c.Timeouts == nil || c.Timeouts.PunchWait != 7*time.Second || c.Timeouts.Backoff != 45*time.Second {
+		t.Fatalf("timeouts = %+v", c.Timeouts)
+	}
+	if c.Timeouts.Smux == nil || c.Timeouts.Smux.Interval != 5*time.Second || c.Timeouts.Smux.Timeout != 10*time.Second {
+		t.Fatalf("timeouts.smux = %+v", c.Timeouts.Smux)
 	}
 
 	// omitted secure -> nil pointer (so the merge keeps the default true)
@@ -136,5 +149,55 @@ func TestLogOutputRotation(t *testing.T) {
 	// non-file output is not a lumberjack logger
 	if _, err := logOutput("stderr", &LogRotationConfig{MaxSize: 1}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestApplyTimeouts covers validation and application of the timeouts section:
+// zero values keep defaults, invalid values are rejected, and a valid set is
+// applied to the package-level timing vars.
+func TestApplyTimeouts(t *testing.T) {
+	oldPunchWait, oldBackoff := punchWaitTimeout, backoffPeriod
+	oldI, oldT := smuxKeepAliveInterval, smuxKeepAliveTimeout
+	t.Cleanup(func() {
+		punchWaitTimeout, backoffPeriod = oldPunchWait, oldBackoff
+		smuxKeepAliveInterval, smuxKeepAliveTimeout = oldI, oldT
+	})
+
+	// nil and zero values: no-op
+	if err := applyTimeouts(nil); err != nil {
+		t.Fatalf("nil: %v", err)
+	}
+	if err := applyTimeouts(&TimeoutsConfig{}); err != nil {
+		t.Fatalf("zero: %v", err)
+	}
+	if punchWaitTimeout != oldPunchWait || smuxKeepAliveInterval != oldI {
+		t.Fatal("zero config changed defaults")
+	}
+
+	// negative rejected
+	if err := applyTimeouts(&TimeoutsConfig{PunchWait: -time.Second}); err == nil {
+		t.Fatal("negative punchWait accepted")
+	}
+
+	// smux timeout < 2x interval rejected (equality is the historical footgun)
+	if err := applyTimeouts(&TimeoutsConfig{Smux: &SmuxTimeouts{
+		Interval: 10 * time.Second, Timeout: 19 * time.Second,
+	}}); err == nil {
+		t.Fatal("smux timeout < 2x interval accepted")
+	}
+
+	// valid: applied
+	if err := applyTimeouts(&TimeoutsConfig{
+		PunchWait: 7 * time.Second,
+		Backoff:   45 * time.Second,
+		Smux:      &SmuxTimeouts{Interval: 5 * time.Second, Timeout: 10 * time.Second},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if punchWaitTimeout != 7*time.Second || backoffPeriod != 45*time.Second {
+		t.Fatalf("punchWait=%v backoff=%v", punchWaitTimeout, backoffPeriod)
+	}
+	if smuxKeepAliveInterval != 5*time.Second || smuxKeepAliveTimeout != 10*time.Second {
+		t.Fatalf("smux=%v/%v", smuxKeepAliveInterval, smuxKeepAliveTimeout)
 	}
 }
