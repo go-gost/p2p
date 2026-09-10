@@ -66,7 +66,7 @@ is the default and an explicitly-set flag overrides it. `--forward` flags and th
 
 **DERP engine** ([engine.go](engine.go)): one long-lived WebSocket-DERP connection per host (client package `internal/derpclient`, a minimal DERP subset over the standard WS path — see its package doc for the wire reference @v1.102.3). A packet pump routes inbound packets to per-peer adapters; each peer pair has exactly one `smux` session (role chosen by public-key ordering) over which each tunnel is one stream. Both sides run an accept loop bridging inbound streams to `--target`. The host connects eagerly at startup (it is a rendezvous node) and redials every 5s on disconnect; `--key` is generated on first run and its public key printed — that base64 string is what peers put in their GOST node `addr`.
 
-**Direct data plane** ([direct.go](direct.go)): after the relay smux session is up, both peers query `--stun` from the same UDP socket they'll punch with, exchange sealed candidate frames over the relay control channel (`[0x00][kind]`, kind 0x02), and build a KCP session (`kcp-go/v5`, `NewConn3`/`ServeConn` on that socket) with a priming byte round-trip to confirm the path. smux runs over KCP with the same role-by-key-ordering as the relay. `OpenStream` prefers the direct smux session; on any failure it falls back to relay. The direct session is independent of the DERP transport (kept in a separate `e.directs` map) so it survives relay teardown — only `engine.Close` and the session's own death reclaim it. A failed punch (symmetric NAT) backoff-retries every 30s and traffic stays on relay. Package `internal/stun` is a minimal RFC 5389 binding client.
+**Direct data plane** ([direct.go](direct.go)): after the relay smux session is up, both peers query `--stun` from the same UDP socket they'll punch with, exchange sealed candidate frames over the relay control channel (`[0x00][kind]`, kind 0x02). The punch is **symmetric (mutual simultaneous open)**: both peers dial the peer's candidate with the same deterministic conv via `kcp.NewConn4(..., ownConn=true, socket)` (so session death closes the socket and the readLoop with no separate bookkeeping), then run `seedHandshake` — a symmetric echo where each peer must see its own token round-trip — so a half-open path can never yield a "false direct" session. smux runs over KCP with the same role-by-key-ordering as the relay (independent of who dialed). `OpenStream` prefers the direct smux session; on any failure it falls back to relay. The direct session is independent of the DERP transport (kept in a separate `e.directs` map) so it survives relay teardown — only `engine.Close` and the session's own death reclaim it. A failed punch (symmetric NAT) backoff-retries and traffic stays on relay. Package `internal/stun` is a minimal RFC 5389 binding client. Deployment-dependent timings (punch/seed/backoff/keepalive windows) are adjustable via the `timeouts:` config section — see `applyTimeouts` in [config.go](config.go); internal mechanism timeouts stay hardcoded. A peer answers an incoming candidate list with its own (de-duplicated), so a peer that started its punch late or reconnected to the relay converges in the same round instead of waiting out a timeout.
 
 **Lifecycle**: non-mux inner (tcp/tls/ws): one tunnel per GOST dial; `tunnelConn.Close()` triggers `CloseTunnel` (listener + connections), verified zero-residue in e2e. Mux inner (mtcp/mtls/mws): one tunnel per mux session, kept alive until the session dies or the process exits (gost's own mux semantics); N streams multiplex over it. In DERP mode the engine's smux session has the same shape one level down.
 
@@ -76,7 +76,7 @@ By default the control channel is **unauthenticated**: anyone who can reach `--a
 
 A DERP relay with `-verify-clients=false` is an **open relay**: it can observe and drop but not decrypt the bytes (no `DERPMeshKey`, no data-plane encryption at the relay). Confidentiality is the inner dialer's job (`mtls`/`tls`/`wss`).
 
-The hole-punched KCP transport is likewise **unencrypted** (the `block` arg to `NewConn3`/`ServeConn` is nil): anyone on the UDP path can observe it. Candidate frames are sealed to the peer (`PrivateKey.SealTo`) so a malicious relay cannot forge them, but the data path carries no transport-layer crypto — same trust model as the relay, so do not weaken the inner dialer.
+The hole-punched KCP transport is likewise **unencrypted** (the `block` arg to `NewConn4` is nil): anyone on the UDP path can observe it. Candidate frames are sealed to the peer (`PrivateKey.SealTo`) so a malicious relay cannot forge them, but the data path carries no transport-layer crypto — same trust model as the relay, so do not weaken the inner dialer.
 
 ## Future milestones (in rough order)
 
@@ -92,7 +92,7 @@ go build ./... && go vet ./...
 GOWORK=off go build ./...   # module must build without go.work
 CGO_ENABLED=1 go test -race ./...   # stun + direct + engine + derpclient unit tests
 
-# E2E (see x/docs/plans/2026-09-07-p2p-m2-holepunch.md): official derper with
+# E2E (see docs/2026-09-07-p2p-m2-holepunch.md): official derper with
 # -stun (default on) + two p2p hosts + two gosts; curl through, then kill the
 # derper — traffic continues over the direct path. The relay-only path runs
 # with -stun=false.

@@ -135,7 +135,25 @@ derper -c /etc/derper/derper.json -hostname derp.example.com -certmode manual -c
 
 ### 打洞
 
-两端都在 engine 模式时，relay 只用于建立首条会话并承载控制面。后台每个 peer 向 derper 内建 STUN 服务器（默认端口 `3478`，`-stun` 默认开启）查询自己的公网 UDP endpoint，经 relay 与对端交换，并在同一 UDP socket 上建立 **KCP** 会话。成功后，新隧道在直连 smux 会话（KCP + smux）上开流；relay 会话保持，直连失败时静默回退 relay 并重新打洞。直连路径即使 relay 掉线也继续工作——只有 *新的* 打洞才需要 relay 回来。设置 `--stun` 时，预配置的 `--forward` 会在启动时预热其 peer 的直连路径，首个连接无需等待打洞。
+两端都在 engine 模式时，relay 只用于建立首条会话并承载控制面。后台每个 peer 向 derper 内建 STUN 服务器（默认端口 `3478`，`-stun` 默认开启）查询自己的公网 UDP endpoint，经 relay 与对端交换，并在同一 UDP socket 上建立 **KCP** 会话。
+
+打洞是**对称**的：双方各自以同一确定性 KCP conv 向对端候选拨号（互撞同时打开），且只有**双方都完成 echo 握手**（各自看到自己的 token 完整往返）后会话才可用——半通路径永远不会产生「假直连」。这消除了旧版「一边 dial、一边 accept」的不对称——当只有一个方向能打通时会失败（典型：k3s pod 内的 peer，其入站 UDP 需要 pod 先发出过包）。
+
+成功后，新隧道在直连 smux 会话（KCP + smux）上开流；relay 会话保持，直连失败时静默回退 relay 并重新打洞。直连路径即使 relay 掉线也继续工作——只有 *新的* 打洞才需要 relay 回来。设置 `--stun` 时，预配置的 `--forward` 会在启动时预热其 peer 的直连路径，首个连接无需等待打洞。
+
+时间参数仅经配置文件调整（不加 flag）；未设即用默认，非法值启动即报错：
+
+```yaml
+timeouts:
+  punchWait: 5s       # 流等待直连的上限，超时回落 relay
+  punch: 10s          # 打洞全程窗口（候选等待 + 拨号/seed）
+  seed: 5s            # 对称 echo 握手窗口
+  backoff: 30s        # 打洞失败后的重试间隔
+  derpKeepAlive: 30s  # DERP 保活（须低于代理空闲超时）
+  smux:
+    interval: 10s
+    timeout: 30s      # 必须 >= 2x interval
+```
 
 对称 NAT 打洞失败；这类 peer 永久留在 relay（周期性重试）。KCP 传输不加密，与 relay 的信任模型一致——保密是内层 dialer 的职责（`mtls`/`tls`/`wss`）。
 
