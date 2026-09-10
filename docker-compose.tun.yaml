@@ -1,0 +1,120 @@
+# tun-to-tun over p2p -- deploy ONE side of the link on this host.
+#
+# Each machine runs this same file with its own tun address and the peer's
+# public key. Two nodes configured as 10.10.0.1/30 and 10.10.0.2/30 end up with
+# a persistent tun <-> tun link: one long-lived stream that prefers the
+# hole-punched direct path and falls back to the DERP relay.
+#
+# The p2p host does NOT create or configure the tun: the entrypoint below
+# creates it (`ip tuntap add`) inside the container's own network namespace and
+# then hands it to p2p. That needs root + NET_ADMIN + /dev/net/tun, which is
+# why the service does not use the image's non-root default.
+#
+# ---------------------------------------------------------------------------
+# SETUP (per host)
+#
+#   1. Create `.env` next to this file with this side's address:
+#
+#        TUN_ADDR=10.10.0.1/30          # the peer uses 10.10.0.2/30
+#
+#      Optional overrides (the defaults are shown):
+#
+#        # DERP=wss://derp.gost.run/derp   # relay URL; must include /derp
+#        # STUN=stun-server:3478     # empty = relay only; set to try direct
+#        # TLS_SECURE=false               # for a relay with a self-signed cert
+#        # LOG_LEVEL=debug                # shows hole-punch / stream detail
+#
+#   2. Start it, then read the public key this host generated (one-time):
+#
+#        docker compose -f docker-compose.tun.yaml up -d
+#        docker compose -f docker-compose.tun.yaml logs p2p | grep pubkey
+#
+#   3. Exchange public keys with the peer's operator and add theirs:
+#
+#        PEER_KEY=<peer's public key>
+#
+#        docker compose -f docker-compose.tun.yaml up -d --force-recreate
+#
+#   The key persists in a named volume, so step 2 is one-time. Both sides must
+#   set PEER_KEY even though only the smaller public key actually opens the
+#   stream -- the other side is served by its normal accept path.
+#
+# VERIFY
+#   docker compose -f docker-compose.tun.yaml exec p2p ping -c3 10.10.0.2
+#
+# TEARDOWN
+#   docker compose -f docker-compose.tun.yaml down -v
+#
+# ---------------------------------------------------------------------------
+# NOTES
+#
+#  * STUN is OFF by default (relay only). To try the direct path set STUN to a
+#    server whose UDP port is actually reachable: the default relay sits behind
+#    Cloudflare, which does not forward UDP, so `derp.gost.run:3478` stays
+#    silent -- use e.g. `derp.ginuerzh.top:3478`.
+#  * RELAY TLS: the default relay serves a valid certificate, so verification
+#    is on. If you point DERP at a relay with a self-signed certificate (e.g.
+#    `wss://derp.ginuerzh.top:8443/derp`, Traefik's default cert), set
+#    TLS_SECURE=false or the handshake is rejected.
+#  * The relay URL must include the path: `wss://host:8443/derp`, not just
+#    host:port -- the bare form returns derper's status page, not an upgrade.
+#  * RELAY FIRST: the link is a single long-lived stream, so it keeps the
+#    transport it opened on. If the first connection lands on the relay it
+#    moves to the direct path on its next reconnect (~30s backoff), not
+#    mid-stream.
+#  * MTU is capped at 1420 so a full packet fits inside the relay/KCP framing.
+#  * The tun lives inside the container. To let the host (and its other
+#    containers) route over it, run the service with `network_mode: host` and
+#    add routes on the host.
+#  * A Go bool flag needs `=`: `--tls.secure=false`. Written as `--tls.secure
+#    false`, the flag parses as true and "false" becomes a stray argument.
+#  * Shell variables inside `command` are written `$$VAR`: a single `$` would be
+#    interpolated by compose, not by the shell.
+
+name: p2p-tun
+
+services:
+  p2p:
+    image: gogost/p2p:latest
+    # Device link needs root + NET_ADMIN + /dev/net/tun (the image's default
+    # user is non-root).
+    user: "0"
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # Recreate the device so a container restart is idempotent.
+        ip link del p2p0 2>/dev/null || true
+        ip tuntap add dev p2p0 mode tun
+        ip addr add "$$TUN_ADDR" dev p2p0
+        ip link set p2p0 mtu 1420
+        ip link set p2p0 up
+
+        set -- --derp "$$DERP" --key "$$KEY_FILE" --log.level "$$LOG_LEVEL" \
+               "--tls.secure=$$TLS_SECURE"
+        if [ -n "$$STUN" ]; then set -- "$$@" --stun "$$STUN"; fi
+        if [ -n "$$PEER_KEY" ]; then
+          set -- "$$@" --link "p2p0=$$PEER_KEY"
+        else
+          echo "PEER_KEY is empty: starting WITHOUT a device link."
+          echo "This host's public key is in the logs (grep pubkey); put the"
+          echo "peer's key in PEER_KEY and recreate."
+        fi
+        exec p2p "$$@"
+    environment:
+      DERP: ${DERP:-wss://derp.gost.run/derp}
+      STUN: ${STUN:-}
+      TLS_SECURE: ${TLS_SECURE:-true}
+      KEY_FILE: /keys/p2p.key
+      TUN_ADDR: ${TUN_ADDR:?set TUN_ADDR in .env, e.g. 10.10.0.1/30}
+      PEER_KEY: ${PEER_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}   # debug shows hole-punch / stream detail
+    volumes:
+      - key:/keys
+    restart: unless-stopped
+
+volumes:
+  key:

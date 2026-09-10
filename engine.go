@@ -45,6 +45,13 @@ type Engine struct {
 	directs map[derpclient.PublicKey]*directConn
 	gone    map[derpclient.PublicKey]bool // peers reported gone (DERP connection dropped)
 	stop    chan struct{}
+
+	// Device-link mode (set once before use; nil = normal forward/target mode):
+	// an existing local tun/tap is bridged to the peer's same-kind device over
+	// one stream. link is the currently active link stream, or nil when down.
+	dev    io.ReadWriteCloser
+	linkMu sync.Mutex
+	link   net.Conn
 }
 
 // peerConn is the per-peer packet adapter: smux sees it as a net.Conn, whose
@@ -484,6 +491,11 @@ func (e *Engine) Close() {
 	}
 	if c != nil {
 		c.Close()
+	}
+	if e.dev != nil {
+		// Release the device fd (the device itself persists if it was created
+		// persistent). devReadLoop unblocks with an error and returns.
+		e.dev.Close()
 	}
 }
 

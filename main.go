@@ -46,6 +46,11 @@ func main() {
 		forwards = append(forwards, v)
 		return nil
 	})
+	var links []string
+	flag.Func("link", `device link "device=peer-key" (e.g. "p2p0=<key>" or "tap:veth0=<key>"); DERP mode`, func(v string) error {
+		links = append(links, v)
+		return nil
+	})
 	stunAddr := flag.String("stun", "", "STUN server address (host:port) for direct hole punching; empty disables direct (relay only)")
 	tlsSecure := flag.Bool("tls.secure", true, "verify the relay's TLS certificate (set false to trust any cert)")
 	tlsCAFile := flag.String("tls.caFile", "", "PEM CA file to trust the relay's self-signed certificate")
@@ -146,6 +151,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Device links are additive (flag + config), mirroring forwards. A link
+	// requires DERP mode, is mutually exclusive with --target (forward), and
+	// only one is supported in this version.
+	linkSpecs := append(append([]string{}, links...), cfg.Links...)
+	if len(linkSpecs) > 0 {
+		if cfg.Derp == "" {
+			slog.Error("link", "error", "--link requires --derp")
+			os.Exit(1)
+		}
+		if cfg.Target != "" {
+			slog.Error("link", "error", "--link is mutually exclusive with --target")
+			os.Exit(1)
+		}
+		if len(forwards)+len(cfg.Forwards) > 0 {
+			slog.Error("link", "error", "--link is mutually exclusive with --forward")
+			os.Exit(1)
+		}
+		if len(linkSpecs) > 1 {
+			slog.Error("link", "error", "only one --link is supported")
+			os.Exit(1)
+		}
+	}
+
 	var engine *Engine
 	if cfg.Derp != "" {
 		priv, pub, err := loadOrCreateKey(cfg.Key)
@@ -171,6 +199,25 @@ func main() {
 			// background, but inbound tunnels stay unreachable until the
 			// first successful connection.
 			slog.Warn("derp connect", "error", err)
+		}
+		if len(linkSpecs) > 0 {
+			name, kind, peer, err := parseLink(linkSpecs[0])
+			if err != nil {
+				slog.Error("link", "spec", linkSpecs[0], "error", err)
+				os.Exit(1)
+			}
+			dev, err := openDevice(name, kind)
+			if err != nil {
+				slog.Error("open device", "name", name, "type", kind.String(), "error", err)
+				os.Exit(1)
+			}
+			engine.dev = dev
+			if err := engine.addLink(peer); err != nil {
+				slog.Error("link", "peer", peer, "error", err)
+				os.Exit(1)
+			}
+			engine.startDevice()
+			slog.Info("device link", "device", name, "type", kind.String())
 		}
 	}
 

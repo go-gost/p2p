@@ -650,6 +650,13 @@ func (e *Engine) acceptLoop(sess *smux.Session, transport, peer, peerAddr string
 			}
 			return // session dead
 		}
+		if e.dev != nil {
+			// Device-link mode: an inbound stream is the peer's device link,
+			// bridged to our local device. Device mode is exclusive with
+			// --target, so no forward stream can arrive here.
+			go e.serveLink(stream)
+			continue
+		}
 		if e.target == "" {
 			e.log.Warn("inbound tunnel refused", "transport", transport, "peer", peer)
 			stream.Close()
