@@ -24,9 +24,6 @@ type Config struct {
 	Log      *LogConfig      `yaml:"log,omitempty"`
 	Timeouts *TimeoutsConfig `yaml:"timeouts,omitempty"`
 	Forwards []ForwardConfig `yaml:"forwards,omitempty"`
-	// Links are device links ("device=peer-key", mirroring the --link flag),
-	// additive with the flag.
-	Links []string `yaml:"links,omitempty"`
 }
 
 // TimeoutsConfig tunes deployment-dependent timings. Zero values keep the

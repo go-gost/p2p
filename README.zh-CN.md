@@ -4,7 +4,7 @@
 
 为 [GOST](https://github.com/go-gost/gost) 的 [p2p 插件](https://github.com/go-gost/plugin) 协议服务的隧道宿主进程。它让 GOST 通过本进程打开的隧道，建立到链节点的网络通路——穿越策略（rendezvous、relay、打洞）完全由插件决定，GOST 侧永远只看到一条本地可拨号的普通 endpoint。
 
-**当前状态：stub + mux + DERP relay + STUN/UDP 打洞 + 设备链。** 宿主用本地 TCP 转发桥接隧道：stub 模式（回环）直接转发，**DERP relay** 模式（engine）跨机/NAT。engine 模式下，relay 会话建立后，两端各自用 STUN 探测 NAT 并打 UDP 洞；直连路径（KCP + smux）建立后，新隧道走直连、relay 保持为回退。支持内层 dialer `tcp/tls/ws/mtcp/mtls/mws`——mux 一族把一条隧道复用成多路会话。控制面支持可选 token 认证（`--token`）。还可以把一个已存在的 tun/tap 直接桥接到对端的同类设备（`--link`，Linux）——一条最小点对点链路。
+**当前状态：stub + mux + DERP relay + STUN/UDP 打洞 + 数据报通道。** 宿主用本地 TCP 转发桥接隧道：stub 模式（回环）直接转发，**DERP relay** 模式（engine）跨机/NAT。engine 模式下，relay 会话建立后，两端各自用 STUN 探测 NAT 并打 UDP 洞；直连路径（KCP + smux）建立后，新隧道走直连、relay 保持为回退。支持内层 dialer `tcp/tls/ws/mtcp/mtls/mws/udp`——mux 一族把一条隧道复用成多路会话，`udp` 则要求一个**数据报 endpoint** 而不是字节流（tun 链路靠它：设备归 GOST 管，本进程只是管道）。
 
 ## 工作原理
 
@@ -49,7 +49,6 @@ go build -o p2p .
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 私钥文件（hex）；缺失则自动生成 |
 | `--target` | *(空)* | DERP 模式下入站隧道的本地桥接目标 |
 | `--forward` | *(空)* | 预配置静态端口转发 `"listen-addr=peer-key"`（可重复；DERP 模式） |
-| `--link` | *(空)* | 设备链 `"device=peer-key"`（`"p2p0=<key>"`、`"tap:veth0=<key>"`）；DERP 模式、仅 Linux、与 `--target`/`--forward` 互斥、单条 |
 | `--stun` | *(空)* | STUN 服务器（host:port），用于直连打洞；留空则禁用直连（仅走中继）— 需显式开启 |
 | `--tls.secure` | `true` | 校验 relay 的 TLS 证书（`false` 信任任意证书） |
 | `--tls.caFile` | *(空)* | 用于信任 relay 自签证书的 PEM CA 文件 |
@@ -60,7 +59,7 @@ go build -o p2p .
 ## 配置文件
 
 所有 flag 都可以写进 YAML 配置文件（gost 风格 `-C`）：配置值作为默认，显式传入的 flag 覆盖；
-`--forward` flag 与配置里的 `forwards` 列表叠加生效（`--link` / `links` 同理）。
+`--forward` flag 与配置里的 `forwards` 列表叠加生效。
 
 ```bash
 ./p2p -C p2p.yaml
@@ -90,8 +89,6 @@ log:
 forwards:
   - listen: 127.0.0.1:18080
     peer: <peerB-key>
-# links:                            # 设备链（Linux）；与 target/forwards 互斥
-#   - "p2p0=<peerB-key>"
 ```
 
 让 GOST 链节点指向它：
@@ -162,26 +159,42 @@ timeouts:
 
 derper 的 STUN 服务器只应答 Tailscale 的 binding-request 方言（`SOFTWARE` + `FINGERPRINT` 属性），并绑定与 `-a` 相同的 IP。用显式 IP 运行 derper（`-a 1.2.3.4:443`），使 STUN 在对端要查询的地址族上可达；用通配 `-a :443` 时它会绑到 IPv6-only，默认的 IPv4 `--stun`（`derp host :3478`）够不着——此时需显式设置 `--stun`。
 
-## 设备链（tun/tap，Linux）
+## 数据报通道（tun 链路，Linux）
 
-`--link "device=peer-key"` 把一个**已存在**的本地 tun/tap 直接桥接到对端的同类设备，走一条持久流——一条最小点对点链路，也是 tun-to-tun 的基础。与 `--forward` 不同，它不涉及本地 listener：两端各自桥接**自己的**设备。
-
-p2p 宿主**既不创建也不配置**该设备——地址、路由、MTU、admin-up 都由你负责——且设备必须是**空闲的**：tun 是独占打开的，因此不能与已持有它的进程（例如 gost 的 tun listener）共用。目前仅支持 Linux。
-
-在容器镜像里需要 `--cap-add=NET_ADMIN --device /dev/net/tun`（以及 `--user 0`，因为默认用户是非 root）；镜像已内置 `iproute2`（用于 `ip tuntap`/`ip addr`/`ip link`）以及 `iptables`、`nftables` 用于 NAT/转发。
+链节点把 dialer 设为 `udp` 时，本宿主返回的不是字节流而是一个**数据报 endpoint**：一个本地 UDP socket，其每个数据报按 2 字节长度前缀成帧、一报一帧地送到对端的流上，从而在字节流数据面上保住包边界。tun-to-tun 链路正是靠它——**设备由 GOST 拥有**（`tun` listener 创建并配置设备，`tun` handler 桥接），本宿主只是管道。tun 是独占打开的，设备无法共用，让 GOST 用自己的 tun 栈才是重点。
 
 ```bash
-# 两端均以 root：创建持久、未被 attach 的 tun 并配置
-ip tuntap add dev p2p0 mode tun
-ip addr add 10.10.0.1/30 dev p2p0        # 另一端为 10.10.0.2/30
-ip link set p2p0 up
-
-./p2p --derp wss://derp.example.com/derp --key a.key --link "p2p0=<peerB-key>"
+# 两端都一样：没有 --target，也不碰设备。对端公钥写进 GOST 的节点 addr。
+./p2p --derp wss://derp.example.com/derp --key a.key --addr 127.0.0.1:8003 --stun derp.example.com:3478
 ```
 
-`tap` 同理，用 `tap:` 前缀（`--link "tap:veth0=<key>"`），构成一条 L2 链路（两节点=一根交叉网线；多于两个不在范围内）。设备被当作不透明的 chunk 设备：每次读变成一帧（带 2 字节长度前缀），对 tun/tap 保住包边界、对流设备保住字节流——因此两端必须是**同类设备**（流源接到包汇会把边界打乱）。
+```yaml
+# GOST 侧（两端各一份；见 gost 仓库的 play/p2p-tun.yaml）
+p2ps:
+  - name: p2p-1
+    plugin: {type: grpc, addr: 127.0.0.1:8003}
+services:
+  - name: tun-0
+    addr: :0                      # tun listener 不绑任何 socket
+    handler: {type: tun, chain: chain-0}      # 有 chain 无 forwarder = 客户端模式
+    listener:
+      type: tun
+      metadata: {name: p2p0, net: 10.10.0.1/30, mtu: 1420}   # 对端为 10.10.0.2/30
+chains:
+  - name: chain-0
+    hops:
+      - name: hop-0
+        nodes:
+          - name: node-0
+            addr: <peerB-key>     # p2p 模式下 addr 就是 peer 公钥
+            dialer: {type: udp}   # 数据报语义
+            connector: {type: forward}   # 透传（默认 connector 是 http）
+            metadata: {p2p: p2p-1}
+```
 
-链路优先走直连（打洞）路径，失败回退 relay，与隧道一致。发起方——**公钥较小**的一端——打开流；另一端由常规 accept 路径服务。`--link` 与 `--target`/`--forward` 互斥，仅支持一条 link，且数据面**不加密**，与其余数据面一致。
+每个 peer 一条通道，被到它的所有隧道共享并做引用计数：GOST 每次拨号开一条隧道、重连时关闭，因此最后一条关闭时 endpoint 被拆除、下次 Open 时重建。只有**公钥较小**的一端打开流，另一端由常规 accept 路径服务。链路优先走直连（打洞）路径，失败回退 relay，与隧道一致。`network=udp` 需要 engine 模式（`--derp`）：通道以 peer 公钥寻址。
+
+endpoint 从收到的报文里学习 client 地址——GOST 在拨号后立刻发一个空数据报自报家门——重拨（新源端口）会接管，因此暂时无话可说的一端依然可达。流断开期间读到的数据报直接丢弃（IP 能容忍丢包）。数据面**不加密**，与其余数据面一致：这里没有内层 dialer 可托付，仅在可信链路上使用，或在链路之上自行加密。
 
 ## 安全
 
@@ -189,13 +202,13 @@ ip link set p2p0 up
 
 `-verify-clients=false` 的 DERP relay 是开放中继：它能看到并丢弃字节，但永远不解密。保密是内层协议的职责（用 `mtls`/`tls`/`wss` 内层 dialer）；relay 是传输，不是信任。
 
-**设备链**同样是明文：IP/以太帧经 relay 或打洞路径不加密传输，而且与隧道不同，它没有内层 dialer 来加密。仅在可信链路上使用，或在其之上自行加密。
+**数据报通道**同样是明文：IP 包经 relay 或打洞路径不加密传输，而且与隧道不同，本宿主里没有东西给它加密（GOST 的 `tls`/`mtls` dialer 对 `udp` 隧道不适用）。仅在可信链路上使用，或在链路之上自行加密。
 
 ## Roadmap
 
 1. ~~STUN + UDP 打洞隧道~~——已交付（KCP + smux 直连，DERP relay 回退）。
 2. rendezvous 地址发现——已放弃：derper v1.102.3 只向 mesh watcher 发送 `PeerPresent`，从不发给开放中继客户端，因此基于 presence 的名字发现不可行。peer 以 base64 公钥寻址；人类可读名字应放在 GOST 配置里，而非 p2p 侧的注册表。
-3. 设备链（tun/tap 走隧道）——已交付（`--link`，Linux）：attach 一个已存在的 tun/tap，经直连或 relay 的持久流桥接到对端的同类设备。
+3. 数据报通道（tun/tap 走隧道）——已交付（`network=udp`）：每 peer 一个 UDP endpoint，成帧后走直连或 relay 的持久流。设备本身归 GOST（`tun` listener/handler），本宿主只是管道。
 
 ## License
 

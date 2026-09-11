@@ -2,13 +2,16 @@
 #
 # Each machine runs this same file with its own tun address and the peer's
 # public key. Two nodes configured as 10.10.0.1/30 and 10.10.0.2/30 end up with
-# a persistent tun <-> tun link: one long-lived stream that prefers the
+# a persistent tun <-> tun link: one p2p datagram channel that prefers the
 # hole-punched direct path and falls back to the DERP relay.
 #
-# The p2p host does NOT create or configure the tun: the entrypoint below
-# creates it (`ip tuntap add`) inside the container's own network namespace and
-# then hands it to p2p. That needs root + NET_ADMIN + /dev/net/tun, which is
-# why the service does not use the image's non-root default.
+# Two services, because the device belongs to GOST, not to p2p:
+#   p2p  -- the pipe (DERP relay, hole punching, one datagram endpoint/peer)
+#   gost -- creates and configures the tun (name/net/mtu) and bridges it to the
+#           channel; its chain node carries the peer's public key
+# Both run with network_mode: host, so gost reaches the p2p control plane on
+# loopback and the tun lands in the host network namespace (where you can route
+# over it). Only gost needs root + NET_ADMIN + /dev/net/tun.
 #
 # ---------------------------------------------------------------------------
 # SETUP (per host)
@@ -22,25 +25,26 @@
 #        # DERP=wss://derp.gost.run/derp   # relay URL; must include /derp
 #        # STUN=stun-server:3478     # empty = relay only; set to try direct
 #        # TLS_SECURE=false               # for a relay with a self-signed cert
-#        # LOG_LEVEL=debug                # shows hole-punch / stream detail
+#        # TUN_NAME=p2p0                  # tun device name
+#        # LOG_LEVEL=debug                # shows hole-punch / channel detail
 #
 #   2. Start it, then read the public key this host generated (one-time):
 #
-#        docker compose -f docker-compose.tun.yaml up -d
+#        docker compose -f docker-compose.tun.yaml up -d p2p
 #        docker compose -f docker-compose.tun.yaml logs p2p | grep pubkey
 #
 #   3. Exchange public keys with the peer's operator and add theirs:
 #
 #        PEER_KEY=<peer's public key>
 #
-#        docker compose -f docker-compose.tun.yaml up -d --force-recreate
+#        docker compose -f docker-compose.tun.yaml up -d
 #
 #   The key persists in a named volume, so step 2 is one-time. Both sides must
 #   set PEER_KEY even though only the smaller public key actually opens the
-#   stream -- the other side is served by its normal accept path.
+#   channel -- the other side is served by its normal accept path.
 #
 # VERIFY
-#   docker compose -f docker-compose.tun.yaml exec p2p ping -c3 10.10.0.2
+#   docker compose -f docker-compose.tun.yaml exec gost ping -c3 10.10.0.2
 #
 # TEARDOWN
 #   docker compose -f docker-compose.tun.yaml down -v
@@ -58,62 +62,105 @@
 #    TLS_SECURE=false or the handshake is rejected.
 #  * The relay URL must include the path: `wss://host:8443/derp`, not just
 #    host:port -- the bare form returns derper's status page, not an upgrade.
-#  * RELAY FIRST: the link is a single long-lived stream, so it keeps the
+#  * RELAY FIRST: the channel is a single long-lived stream, so it keeps the
 #    transport it opened on. If the first connection lands on the relay it
 #    moves to the direct path on its next reconnect (~30s backoff), not
 #    mid-stream.
 #  * MTU is capped at 1420 so a full packet fits inside the relay/KCP framing.
-#  * The tun lives inside the container. To let the host (and its other
-#    containers) route over it, run the service with `network_mode: host` and
-#    add routes on the host.
+#  * host networking means the tun and the routes live on the host -- no
+#    container netns to route out of, and STUN/UDP punching sees the host's
+#    real NAT mapping.
 #  * A Go bool flag needs `=`: `--tls.secure=false`. Written as `--tls.secure
 #    false`, the flag parses as true and "false" becomes a stray argument.
 #  * Shell variables inside `command` are written `$$VAR`: a single `$` would be
-#    interpolated by compose, not by the shell.
+#    interpolated by compose, not by the shell. The gost config is generated
+#    in-container so TUN_ADDR/PEER_KEY stay environment-driven.
 
 name: p2p-tun
 
 services:
   p2p:
     image: gogost/p2p:latest
-    # Device link needs root + NET_ADMIN + /dev/net/tun (the image's default
-    # user is non-root).
-    user: "0"
-    cap_add: [NET_ADMIN]
-    devices:
-      - /dev/net/tun:/dev/net/tun
+    network_mode: host          # STUN/punching must see the host's NAT mapping
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        # Recreate the device so a container restart is idempotent.
-        ip link del p2p0 2>/dev/null || true
-        ip tuntap add dev p2p0 mode tun
-        ip addr add "$$TUN_ADDR" dev p2p0
-        ip link set p2p0 mtu 1420
-        ip link set p2p0 up
-
         set -- --derp "$$DERP" --key "$$KEY_FILE" --log.level "$$LOG_LEVEL" \
                "--tls.secure=$$TLS_SECURE"
         if [ -n "$$STUN" ]; then set -- "$$@" --stun "$$STUN"; fi
-        if [ -n "$$PEER_KEY" ]; then
-          set -- "$$@" --link "p2p0=$$PEER_KEY"
-        else
-          echo "PEER_KEY is empty: starting WITHOUT a device link."
-          echo "This host's public key is in the logs (grep pubkey); put the"
-          echo "peer's key in PEER_KEY and recreate."
-        fi
         exec p2p "$$@"
     environment:
       DERP: ${DERP:-wss://derp.gost.run/derp}
       STUN: ${STUN:-}
       TLS_SECURE: ${TLS_SECURE:-true}
       KEY_FILE: /keys/p2p.key
-      TUN_ADDR: ${TUN_ADDR:?set TUN_ADDR in .env, e.g. 10.10.0.1/30}
-      PEER_KEY: ${PEER_KEY:-}
-      LOG_LEVEL: ${LOG_LEVEL:-info}   # debug shows hole-punch / stream detail
+      LOG_LEVEL: ${LOG_LEVEL:-info}   # debug shows hole-punch / channel detail
     volumes:
       - key:/keys
+    restart: unless-stopped
+
+  gost:
+    image: gogost/gost:latest
+    # The tun device needs root + NET_ADMIN + /dev/net/tun.
+    user: "0"
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    network_mode: host          # shares loopback with p2p; tun lands on the host
+    depends_on: [p2p]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -z "$$PEER_KEY" ]; then
+          echo "PEER_KEY is empty: start the p2p service and take the peer's key"
+          echo "from its logs (grep pubkey) before starting gost." >&2
+          exit 1
+        fi
+        mkdir -p /etc/gost
+        cat > /etc/gost/tun.yaml <<EOF
+        p2ps:
+          - name: p2p-1
+            plugin:
+              type: grpc
+              addr: 127.0.0.1:8003
+              token: $${TOKEN}
+        services:
+          - name: tun-0
+            addr: :0
+            handler:
+              type: tun
+              chain: chain-0
+            listener:
+              type: tun
+              metadata:
+                name: $${TUN_NAME}
+                net: $${TUN_ADDR}
+                mtu: 1420
+        chains:
+          - name: chain-0
+            hops:
+              - name: hop-0
+                nodes:
+                  - name: node-0
+                    addr: $${PEER_KEY}
+                    dialer:
+                      type: udp
+                    connector:
+                      type: forward
+                    metadata:
+                      p2p: p2p-1
+        log:
+          level: $${LOG_LEVEL}
+        EOF
+        exec gost -C /etc/gost/tun.yaml
+    environment:
+      TUN_ADDR: ${TUN_ADDR:?set TUN_ADDR in .env, e.g. 10.10.0.1/30}
+      TUN_NAME: ${TUN_NAME:-p2p0}
+      PEER_KEY: ${PEER_KEY:-}
+      TOKEN: ${TOKEN:-}            # must match the p2p host's --token
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     restart: unless-stopped
 
 volumes:

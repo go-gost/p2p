@@ -33,6 +33,7 @@ import (
 type Engine struct {
 	url      string
 	target   string      // local bridge target for inbound streams ("" = refuse inbound)
+	bind     string      // data-plane listen IP for datagram channels (loopback default)
 	stunAddr string      // STUN server (host:port); "" disables hole punching
 	tlsCfg   *tls.Config // relay TLS options; nil = default verification
 	priv     derpclient.PrivateKey
@@ -43,15 +44,9 @@ type Engine struct {
 	client  *derpclient.Client
 	peers   map[derpclient.PublicKey]*peerConn
 	directs map[derpclient.PublicKey]*directConn
+	chans   map[derpclient.PublicKey]*channel
 	gone    map[derpclient.PublicKey]bool // peers reported gone (DERP connection dropped)
 	stop    chan struct{}
-
-	// Device-link mode (set once before use; nil = normal forward/target mode):
-	// an existing local tun/tap is bridged to the peer's same-kind device over
-	// one stream. link is the currently active link stream, or nil when down.
-	dev    io.ReadWriteCloser
-	linkMu sync.Mutex
-	link   net.Conn
 }
 
 // peerConn is the per-peer packet adapter: smux sees it as a net.Conn, whose
@@ -110,10 +105,12 @@ func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger)
 	e := &Engine{
 		url:     url,
 		target:  target,
+		bind:    "127.0.0.1",
 		priv:    priv,
 		pub:     priv.Public(),
 		peers:   make(map[derpclient.PublicKey]*peerConn),
 		directs: make(map[derpclient.PublicKey]*directConn),
+		chans:   make(map[derpclient.PublicKey]*channel),
 		gone:    make(map[derpclient.PublicKey]bool),
 		log:     log,
 		stop:    make(chan struct{}),
@@ -482,6 +479,11 @@ func (e *Engine) Close() {
 		directs = append(directs, dc)
 	}
 	e.directs = make(map[derpclient.PublicKey]*directConn)
+	chans := make([]*channel, 0, len(e.chans))
+	for _, ch := range e.chans {
+		chans = append(chans, ch)
+	}
+	e.chans = make(map[derpclient.PublicKey]*channel)
 	e.mu.Unlock()
 	for _, pc := range peers {
 		pc.kill(errors.New("engine closed"))
@@ -489,13 +491,11 @@ func (e *Engine) Close() {
 	for _, dc := range directs {
 		dc.teardown()
 	}
+	for _, ch := range chans {
+		ch.teardown()
+	}
 	if c != nil {
 		c.Close()
-	}
-	if e.dev != nil {
-		// Release the device fd (the device itself persists if it was created
-		// persistent). devReadLoop unblocks with an error and returns.
-		e.dev.Close()
 	}
 }
 
@@ -540,7 +540,7 @@ func (pc *peerConn) startAccept() {
 			pc.accepting = false
 			pc.mu.Unlock()
 		}()
-		pc.e.acceptLoop(pc.sess, "derp", keyName(pc.peer), "")
+		pc.e.acceptLoop(pc.sess, "derp", pc.peer, "")
 	}()
 }
 

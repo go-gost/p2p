@@ -452,7 +452,7 @@ func (dc *directConn) punch() {
 	e.log.Debug("direct established", "peer", pname,
 		"local", mine[0].addr.String(), "public", pubEP.String(), "peerAddr", dial.String())
 	go func() {
-		e.acceptLoop(sess, "direct", pname, dial.String())
+		e.acceptLoop(sess, "direct", dc.peer, dial.String())
 		dc.markDead(sess)
 	}()
 }
@@ -632,11 +632,11 @@ func decodeCandidates(b []byte) ([]candidate, error) {
 	return cands, nil
 }
 
-// acceptLoop bridges inbound streams on a session to the local target. Shared
-// by the relay and direct sessions; transport names the path the stream
-// arrived over ("derp" relay or "direct" hole punch), peerAddr is the peer's
-// dialed endpoint (direct only).
-func (e *Engine) acceptLoop(sess *smux.Session, transport, peer, peerAddr string) {
+// acceptLoop dispatches inbound streams on a session. Shared by the relay and
+// direct sessions; transport names the path the stream arrived over ("derp"
+// relay or "direct" hole punch), peerAddr is the peer's dialed endpoint
+// (direct only).
+func (e *Engine) acceptLoop(sess *smux.Session, transport string, peer derpclient.PublicKey, peerAddr string) {
 	start := time.Now()
 	for {
 		stream, err := sess.AcceptStream()
@@ -645,23 +645,41 @@ func (e *Engine) acceptLoop(sess *smux.Session, transport, peer, peerAddr string
 				// Direct sessions die when the KCP path drops (e.g. NAT mapping
 				// timeout). Log the lifetime + cause to distinguish that from an
 				// orderly close.
-				e.log.Debug("direct session ended", "peer", peer,
+				e.log.Debug("direct session ended", "peer", keyName(peer),
 					"duration", time.Since(start).String(), "error", err)
 			}
 			return // session dead
 		}
-		if e.dev != nil {
-			// Device-link mode: an inbound stream is the peer's device link,
-			// bridged to our local device. Device mode is exclusive with
-			// --target, so no forward stream can arrive here.
-			go e.serveLink(stream)
-			continue
-		}
-		if e.target == "" {
-			e.log.Warn("inbound tunnel refused", "transport", transport, "peer", peer)
-			stream.Close()
-			continue
-		}
-		go bridgeInbound(stream, transport, peer, peerAddr, e.target, e.log)
+		// Classification reads the stream's leading bytes, so it runs in the
+		// stream's own goroutine: a silent stream must not stall the accept
+		// loop (and with it every other stream on the session).
+		go e.serveInbound(stream, transport, peer, peerAddr)
 	}
+}
+
+// serveInbound routes one inbound stream: a stream tagged with the datagram
+// channel magic carries the peer's udp channel, anything else is a normal
+// tunnel stream bridged to --target.
+func (e *Engine) serveInbound(stream net.Conn, transport string, peer derpclient.PublicKey, peerAddr string) {
+	if tagged, c := peekTag(stream); tagged {
+		ch := e.channel(peer)
+		if ch == nil {
+			// The local gost has not dialled its endpoint yet (a startup race,
+			// not an error): drop the stream and let the opener's backoff retry.
+			e.log.Debug("channel stream refused", "transport", transport, "peer", keyName(peer))
+			c.Close()
+			return
+		}
+		ch.serveStream(c)
+		return
+	} else if c != stream {
+		stream = c // untagged: replay the bytes consumed by the partial peek
+	}
+
+	if e.target == "" {
+		e.log.Warn("inbound tunnel refused", "transport", transport, "peer", keyName(peer))
+		stream.Close()
+		return
+	}
+	bridgeInbound(stream, transport, keyName(peer), peerAddr, e.target, e.log)
 }

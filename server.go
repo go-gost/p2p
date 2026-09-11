@@ -52,21 +52,52 @@ func newServer(bind string, engine *Engine) *server {
 
 type tunnel struct {
 	id     string
-	target string  // stub mode: peer host:port
-	engine *Engine // derp mode: stream source
-	peer   string  // derp mode: peer public key (base64)
+	target string   // stub mode: peer host:port
+	engine *Engine  // derp mode: stream source
+	peer   string   // derp mode: peer public key (base64)
+	ch     *channel // udp tunnels: the peer channel this tunnel holds a reference on
 	ln     net.Listener
 	mu     sync.Mutex
 	conns  map[net.Conn]struct{}
 }
 
 func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (*proto.OpenTunnelReply, error) {
+	network := req.Network
+	if network == "" {
+		network = "tcp"
+	}
+	if network != "tcp" && network != "udp" {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid network %q", req.Network)
+	}
+	if network == "udp" && s.engine == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "udp tunnel requires derp mode (peer key)")
+	}
+
 	peer := req.Peer
 	if s.engine != nil {
 		// DERP mode: the peer is a public key; validate its shape now and
 		// fail fast with a clear error.
-		if _, err := parsePeerKey(peer); err != nil {
+		key, err := parsePeerKey(peer)
+		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid peer %q: %v", peer, err)
+		}
+		if network == "udp" {
+			// A datagram tunnel is one channel per peer, shared by every gost
+			// dial to it: all of them see the same endpoint, and the channel
+			// lives until the last one closes.
+			ch, err := s.engine.openChannel(key)
+			if err != nil {
+				return &proto.OpenTunnelReply{Ok: false, Error: err.Error()}, nil
+			}
+			t := &tunnel{
+				id:   fmt.Sprintf("tunnel-%d", s.seq.Add(1)),
+				peer: peer,
+				ch:   ch,
+			}
+			s.mu.Lock()
+			s.tunnels[t.id] = t
+			s.mu.Unlock()
+			return &proto.OpenTunnelReply{Ok: true, Id: t.id, Endpoint: ch.sock.LocalAddr().String()}, nil
 		}
 	} else {
 		host, port, err := net.SplitHostPort(req.Peer)
@@ -148,7 +179,11 @@ func (s *server) CloseTunnel(ctx context.Context, req *proto.CloseTunnelRequest)
 	delete(s.tunnels, req.Id)
 	s.mu.Unlock()
 	if ok {
-		t.close()
+		if t.ch != nil {
+			t.ch.release() // tears the channel down with its last reference
+		} else {
+			t.close()
+		}
 	}
 	return &proto.CloseTunnelReply{Ok: true}, nil
 }
