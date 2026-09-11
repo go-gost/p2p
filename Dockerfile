@@ -18,15 +18,12 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 
 # Runtime environment. Non-root (uid 10001) by default.
 #
-# Device link (--link) tun/tap: iproute2 (`ip tuntap/addr/link`) creates and
-# configures the device, iptables/nftables set NAT/forwarding rules. Creating a
-# tun/tap, changing rules or addresses all require CAP_NET_ADMIN, and /dev/net/tun
-# must be visible in the container, so run as root or with capabilities for the
-# device link, e.g.:
-#   docker run --cap-add=NET_ADMIN --device /dev/net/tun --user 0 ...
-# (stub/DERP modes need none of this and keep the non-root default.)
+# No device or capability is needed: this host only bridges tunnels and, for a
+# datagram channel, binds a loopback UDP endpoint. tun/tap belongs to GOST --
+# the tun listener creates and configures the device and needs
+# CAP_NET_ADMIN + /dev/net/tun in *its* container, not in this one.
 FROM alpine:3.23
-RUN apk add --no-cache ca-certificates iproute2 iptables nftables \
+RUN apk add --no-cache ca-certificates \
  && adduser -D -u 10001 p2p
 COPY --from=build /p2p /usr/local/bin/p2p
 USER p2p
