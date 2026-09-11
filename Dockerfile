@@ -22,6 +22,14 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # datagram channel, binds a loopback UDP endpoint. tun/tap belongs to GOST --
 # the tun listener creates and configures the device and needs
 # CAP_NET_ADMIN + /dev/net/tun in *its* container, not in this one.
+#
+# The DERP key persists by mounting the home directory, the way the derper
+# image is run: `-v key:/home/p2p`, with the key at the default
+# $HOME/.config/p2p/key-v1 (no --key needed). adduser creates that home owned
+# by p2p, so a fresh volume seeds from it with the right ownership. Do not
+# invent a second mount path for the key: a volume mounted where the image has
+# no such directory is created root:root, and this non-root user then cannot
+# write the key at all.
 FROM alpine:3.23
 RUN apk add --no-cache ca-certificates \
  && adduser -D -u 10001 p2p
