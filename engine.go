@@ -33,7 +33,6 @@ import (
 type Engine struct {
 	url      string
 	target   string      // local bridge target for inbound streams ("" = refuse inbound)
-	bind     string      // data-plane listen IP for datagram channels (loopback default)
 	stunAddr string      // STUN server (host:port); "" disables hole punching
 	tlsCfg   *tls.Config // relay TLS options; nil = default verification
 	priv     derpclient.PrivateKey
@@ -105,7 +104,6 @@ func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger)
 	e := &Engine{
 		url:     url,
 		target:  target,
-		bind:    "127.0.0.1",
 		priv:    priv,
 		pub:     priv.Public(),
 		peers:   make(map[derpclient.PublicKey]*peerConn),

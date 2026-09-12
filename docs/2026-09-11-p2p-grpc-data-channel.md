@@ -1,5 +1,8 @@
 # P2P: replace the local endpoint with a gRPC data channel
 
+> Status: **Phase 1 + Phase 2 implemented** (2026-09-12). Release steps
+> (plugin tag + go.mod re-pins) pending.
+
 ## Context
 
 The p2p plugin exposes its data plane as a **local dialable endpoint**: the host
@@ -112,10 +115,10 @@ return is the abort — verified against grpc-go v1.83.2: `WriteStatus` →
 saying that exists for exactly this pattern).
 
 **Framing:** the GOST-side conn carries its own `WriteFrame`/`ReadFrame`/
-`MaxFrame` for the framed (udp) mode; the peer datagram channel keeps its copy
-in `p2p/frame.go`. In udp the GOST side's frames cross the host as raw bytes
-and are parsed by the peer channel's `ReadFrame`, so the two formats MUST stay
-wire-compatible — note the coupling in both files.
+`MaxFrame` for the framed (udp) mode. No host parses frames: the GOST-side
+bytes cross both hosts verbatim and the **peer's GOST-side conn** parses them.
+(The host-side helpers, `p2p/frame.go`, were deleted with the Phase 2
+byte-pipe rewrite — framing now exists only on the GOST side.)
 
 - `type Stream interface { Send(*proto.Chunk) error; Recv() (*proto.Chunk, error); Context() context.Context }`
   — satisfied by both `proto.P2P_TunnelClient` and `proto.P2P_TunnelServer`.
@@ -271,11 +274,10 @@ release.
 - **Host side (`p2p/udp.go`):** the `channel`'s local edge is today a
   `sock net.PacketConn`; the gRPC stream takes its place, and the host pipes it
   raw (`io.Copy` both ways, via `p2p/streamconn.go`'s `streamConn`). Framing
-  stays a GOST-side concern: GOST's framed conn emits frame bytes, the host
-  copies them verbatim, and the peer channel's `ReadFrame` (`p2p/frame.go`)
-  consumes them; the reverse path is the same. The empty-datagram
-  client-announce hack falls away (the stream, not a client address,
-  identifies the local edge).
+  stays a GOST-side concern: GOST's framed conn emits frame bytes, the hosts
+  copy them verbatim, and the **peer's GOST-side conn** parses them; the
+  reverse path is the same. The empty-datagram client-announce hack falls away
+  (the stream, not a client address, identifies the local edge).
   - `channel` keeps its refcount and `loop`/`serveStream`; drop `sock`,
     `readLocal`, and the `client` address tracking. `OpenTunnel(network=udp)`
     opens the channel again (refs=1, `record.ch`) and returns the id; the

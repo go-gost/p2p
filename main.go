@@ -37,7 +37,6 @@ func main() {
 	// Flags are overrides on top of the config file; their defaults are only
 	// used as a fallback when neither the config nor the flag sets the value.
 	addr := flag.String("addr", "127.0.0.1:8003", "gRPC listen address (control plane)")
-	bind := flag.String("bind", "127.0.0.1", "deprecated: no effect (tunnels no longer open local endpoints)")
 	token := flag.String("token", "", "control-plane auth token; empty disables checking (loopback default)")
 	derpURL := flag.String("derp", "", "DERP relay server URL (wss://host/derp); enables DERP engine mode")
 	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
@@ -71,19 +70,9 @@ func main() {
 		cfg = c
 	}
 
-	// --bind fed the per-tunnel endpoint listeners, which the stream data
-	// plane replaced: after this change it has no effect (its last reader is
-	// the udp channel socket, sidelined with the udp data plane). Captured
-	// before the default is applied so only an explicitly configured value
-	// warns.
-	bindConfigured := cfg.Bind != "" || set["bind"]
-
 	// Defaults for anything the config didn't set.
 	if cfg.Addr == "" {
 		cfg.Addr = "127.0.0.1:8003"
-	}
-	if cfg.Bind == "" {
-		cfg.Bind = "127.0.0.1"
 	}
 	if cfg.TLS == nil {
 		cfg.TLS = &TLSConfig{}
@@ -108,9 +97,6 @@ func main() {
 	// Explicitly-set flags override the config.
 	if set["addr"] {
 		cfg.Addr = *addr
-	}
-	if set["bind"] {
-		cfg.Bind = *bind
 	}
 	if set["token"] {
 		cfg.Token = *token
@@ -154,10 +140,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if bindConfigured {
-		slog.Warn("bind is deprecated and has no effect: tunnels no longer open local endpoints; it will be removed in a future release")
-	}
-
 	var engine *Engine
 	if cfg.Derp != "" {
 		priv, pub, err := loadOrCreateKey(cfg.Key)
@@ -174,7 +156,6 @@ func main() {
 		engine = newEngine(cfg.Derp, cfg.Target, priv, slog.Default())
 		// Hole punching is opt-in: only attempt a direct path when stun is set.
 		engine.stunAddr = cfg.Stun
-		engine.bind = cfg.Bind
 		engine.tlsCfg = buildTLSConfig(*cfg.TLS.Secure, cfg.TLS.CAFile)
 		slog.Info("p2p derp engine", "url", cfg.Derp,
 			"pubkey", base64.RawURLEncoding.EncodeToString(pub[:]),
@@ -200,7 +181,7 @@ func main() {
 	// token disables checking: the loopback default remains the only
 	// boundary, so keep addr off-loopback unless both token and control TLS
 	// are in place.
-	svr := newServer(cfg.Bind, engine)
+	svr := newServer(engine)
 	for _, spec := range forwards {
 		if err := svr.addForward(spec); err != nil {
 			slog.Error("forward", "spec", spec, "error", err)
@@ -218,7 +199,7 @@ func main() {
 		grpc.StreamInterceptor(streamAuthInterceptor(cfg.Token)),
 	)
 	proto.RegisterP2PServer(s, svr)
-	slog.Info("p2p stub listening", "addr", cfg.Addr, "bind", cfg.Bind, "auth", cfg.Token != "", "derp", cfg.Derp != "")
+	slog.Info("p2p listening", "addr", cfg.Addr, "auth", cfg.Token != "", "derp", cfg.Derp != "")
 	if err := s.Serve(ln); err != nil {
 		slog.Error("serve", "error", err)
 		os.Exit(1)

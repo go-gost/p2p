@@ -41,7 +41,6 @@ import (
 // token travels over a plaintext channel today.
 type server struct {
 	proto.UnimplementedP2PServer
-	bind    string
 	engine  *Engine // DERP engine mode; nil = stub mode
 	mu      sync.Mutex
 	seq     atomic.Int64
@@ -57,9 +56,8 @@ var (
 	gcInterval = 5 * time.Second
 )
 
-func newServer(bind string, engine *Engine) *server {
+func newServer(engine *Engine) *server {
 	s := &server{
-		bind:    bind,
 		engine:  engine,
 		tunnels: make(map[string]*tunnel),
 	}
@@ -116,22 +114,40 @@ func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (
 	if network == "" {
 		network = "tcp"
 	}
-	switch network {
-	case "tcp":
-	case "udp":
-		// The datagram data plane arrives with the Phase 2 stream-edge
-		// rewrite; failing loudly beats a tunnel that can never carry data.
-		return nil, status.Error(codes.Unimplemented, "udp tunnel not implemented")
-	default:
+	if network != "tcp" && network != "udp" {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid network %q", req.Network)
+	}
+	if network == "udp" && s.engine == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "udp tunnel requires derp mode (peer key)")
 	}
 
 	peer := req.Peer
 	if s.engine != nil {
 		// DERP mode: the peer is a public key; validate its shape now and
 		// fail fast with a clear error.
-		if _, err := parsePeerKey(peer); err != nil {
+		key, err := parsePeerKey(peer)
+		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid peer %q: %v", peer, err)
+		}
+		if network == "udp" {
+			// A datagram tunnel is one channel per peer, shared by every gost
+			// dial to it: the channel pairs the peer edge with the latest
+			// tunnel's local edge and outlives individual dials; the record's
+			// release is what drops its reference.
+			t := &tunnel{
+				id:        newTunnelID(),
+				target:    peer,
+				peer:      peer,
+				engine:    s.engine,
+				network:   "udp",
+				ch:        s.engine.openChannel(key),
+				createdAt: time.Now(),
+				conns:     make(map[net.Conn]struct{}),
+			}
+			s.mu.Lock()
+			s.tunnels[t.id] = t
+			s.mu.Unlock()
+			return &proto.OpenTunnelReply{Ok: true, Id: t.id}, nil
 		}
 	} else {
 		host, port, err := net.SplitHostPort(peer)

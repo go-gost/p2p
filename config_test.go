@@ -23,7 +23,6 @@ func TestLoadConfig(t *testing.T) {
 	}
 
 	write(`addr: 0.0.0.0:8003
-bind: 0.0.0.0
 token: gost
 derp: wss://derp.example.com/derp
 key: peer.key
@@ -58,7 +57,7 @@ timeouts:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Addr != "0.0.0.0:8003" || c.Bind != "0.0.0.0" || c.Token != "gost" ||
+	if c.Addr != "0.0.0.0:8003" || c.Token != "gost" ||
 		c.Derp != "wss://derp.example.com/derp" || c.Key != "peer.key" ||
 		c.Target != "127.0.0.1:18080" || c.Stun != "stun.example.com:3478" {
 		t.Fatalf("flat fields = %+v", c)

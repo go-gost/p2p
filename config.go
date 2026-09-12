@@ -14,7 +14,6 @@ import (
 // supplies the default and an explicitly-set flag overrides it.
 type Config struct {
 	Addr     string          `yaml:"addr,omitempty"`
-	Bind     string          `yaml:"bind,omitempty"`
 	Token    string          `yaml:"token,omitempty"`
 	Derp     string          `yaml:"derp,omitempty"`
 	Key      string          `yaml:"key,omitempty"`

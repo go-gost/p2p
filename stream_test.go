@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
+	"log/slog"
 	"net"
 	"testing"
 	"time"
 
+	"github.com/go-gost/p2p/internal/derpclient"
 	"github.com/go-gost/plugin/p2p/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -98,7 +101,7 @@ func waitTunnelCount(t *testing.T, s *server, want int) {
 }
 
 func TestTunnelRoundTrip(t *testing.T) {
-	svr := newServer("127.0.0.1", nil)
+	svr := newServer(nil)
 	c := startTestServer(t, svr)
 	echo := startTCPEcho(t)
 
@@ -133,7 +136,7 @@ func TestTunnelRoundTrip(t *testing.T) {
 }
 
 func TestTunnelUnknownID(t *testing.T) {
-	svr := newServer("127.0.0.1", nil)
+	svr := newServer(nil)
 	c := startTestServer(t, svr)
 
 	sctx, cancel := context.WithCancel(context.Background())
@@ -154,12 +157,12 @@ func TestTunnelUnknownID(t *testing.T) {
 }
 
 func TestOpenTunnelValidation(t *testing.T) {
-	svr := newServer("127.0.0.1", nil)
+	svr := newServer(nil)
 	c := startTestServer(t, svr)
 
-	// udp has no data plane yet (Phase 2): fail loudly.
-	if _, err := c.OpenTunnel(context.Background(), &proto.OpenTunnelRequest{Peer: "127.0.0.1:9999", Network: "udp"}); status.Code(err) != codes.Unimplemented {
-		t.Fatalf("udp OpenTunnel err = %v, want Unimplemented", err)
+	// udp needs the DERP engine (a peer key); stub mode rejects it.
+	if _, err := c.OpenTunnel(context.Background(), &proto.OpenTunnelRequest{Peer: "127.0.0.1:9999", Network: "udp"}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("udp OpenTunnel err = %v, want InvalidArgument", err)
 	}
 	// Unknown network is a request error.
 	if _, err := c.OpenTunnel(context.Background(), &proto.OpenTunnelRequest{Peer: "127.0.0.1:9999", Network: "sctp"}); status.Code(err) != codes.InvalidArgument {
@@ -182,7 +185,7 @@ func TestPendingGC(t *testing.T) {
 	pendingTTL, gcInterval = 50*time.Millisecond, 10*time.Millisecond
 	defer func() { pendingTTL, gcInterval = oldTTL, oldInterval }()
 
-	svr := newServer("127.0.0.1", nil)
+	svr := newServer(nil)
 	c := startTestServer(t, svr)
 
 	// Abandoned setup: OpenTunnel without a stream must not leak.
@@ -209,7 +212,7 @@ func TestPendingGC(t *testing.T) {
 // parked Recv must come back (grpc-go finishStream cancels the stream) — the
 // client conn must not hang after the peer goes away.
 func TestPeerEOFEndsTunnel(t *testing.T) {
-	svr := newServer("127.0.0.1", nil)
+	svr := newServer(nil)
 	c := startTestServer(t, svr)
 
 	// A target that greets once, then closes: the peer end goes away first.
@@ -245,7 +248,7 @@ func TestPeerEOFEndsTunnel(t *testing.T) {
 // stream presenting a live tunnel's id is rejected and leaves the first
 // stream working.
 func TestTunnelIDSingleUse(t *testing.T) {
-	svr := newServer("127.0.0.1", nil)
+	svr := newServer(nil)
 	c := startTestServer(t, svr)
 	echo := startTCPEcho(t)
 
@@ -282,11 +285,105 @@ func TestTunnelIDSingleUse(t *testing.T) {
 	}
 }
 
+// dialUDPStream runs the two-RPC setup for a udp tunnel and returns the
+// client-side data conn.
+func dialUDPStream(t *testing.T, c proto.P2PClient, peer string) (net.Conn, *proto.OpenTunnelReply) {
+	t.Helper()
+	reply, err := c.OpenTunnel(context.Background(), &proto.OpenTunnelRequest{Peer: peer, Network: "udp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reply.Ok {
+		t.Fatalf("OpenTunnel not ok: %s", reply.Error)
+	}
+	sctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sctx = metadata.AppendToOutgoingContext(sctx, "id", reply.Id)
+	stream, err := c.Tunnel(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newStreamConn(stream, cancel), reply
+}
+
+// TestUDPTunnelEndToEnd wires two servers and engines through the test relay:
+// a udp tunnel on each side, then bytes written on one Tunnel stream come out
+// of the other — the datagram channel paired each peer edge with its local
+// edge and pipes bytes through untouched.
+func TestUDPTunnelEndToEnd(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+
+	privA, pubA, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, "", privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+	if err := engineA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create both channels up front (the OpenTunnels below reuse them), so the
+	// opener's very first peer-edge attempt finds the responder's channel.
+	chA := engineA.openChannel(pubB)
+	defer chA.release()
+	chB := engineB.openChannel(pubA)
+	defer chB.release()
+
+	svrA := newServer(engineA)
+	svrB := newServer(engineB)
+	cA := startTestServer(t, svrA)
+	cB := startTestServer(t, svrB)
+
+	keyA := base64.RawURLEncoding.EncodeToString(pubA[:])
+	keyB := base64.RawURLEncoding.EncodeToString(pubB[:])
+
+	connA, _ := dialUDPStream(t, cA, keyB)
+	defer connA.Close()
+	connB, _ := dialUDPStream(t, cB, keyA)
+	defer connB.Close()
+
+	// Both channels must have their peer edge up before data flows.
+	waitStream(t, engineA.channel(pubB))
+	waitStream(t, engineB.channel(pubA))
+
+	connA.SetDeadline(time.Now().Add(5 * time.Second))
+	connB.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := connA.Write([]byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 3)
+	if _, err := io.ReadFull(connB, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "one" {
+		t.Fatalf("A->B = %q, want one", buf)
+	}
+	if _, err := connB.Write([]byte("back")); err != nil {
+		t.Fatal(err)
+	}
+	buf2 := make([]byte, 4)
+	if _, err := io.ReadFull(connA, buf2); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf2) != "back" {
+		t.Fatalf("B->A = %q, want back", buf2)
+	}
+
+	// Closing one side tears its record (and channel reference) down.
+	connA.Close()
+	waitTunnelCount(t, svrA, 0)
+}
+
 // TestStreamTokenCheck covers the defense-in-depth stream interceptor: the
 // token check gates Tunnel while the unary OpenTunnel stays open (its own
 // interceptor is a separate concern).
 func TestStreamTokenCheck(t *testing.T) {
-	svr := newServer("127.0.0.1", nil)
+	svr := newServer(nil)
 	c := startTestServer(t, svr, grpc.StreamInterceptor(streamAuthInterceptor("secret")))
 	echo := startTCPEcho(t)
 

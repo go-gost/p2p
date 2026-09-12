@@ -10,35 +10,44 @@ import (
 	"github.com/go-gost/p2p/internal/derpclient"
 )
 
-// Datagram channel: the per-peer UDP tunnel. The local gost dials a UDP
-// endpoint bound here; every datagram received on it is framed onto the peer's
-// stream, and every frame read from that stream is written back to the last
-// client address seen. This is what carries a tun link end to end: the tunnel
-// is a byte stream, the endpoint is the datagram edge on each side, and the
-// framing in between preserves packet boundaries.
+// Datagram channel: the per-peer UDP tunnel. It has two byte-stream edges and
+// pumps bytes between them:
+//
+//   - the peer edge — a persistent stream to the other host through the relay
+//     or the hole-punched path (opener: the smaller key; responder: the
+//     acceptLoop's tagged stream);
+//   - the local edge — the Tunnel gRPC stream of the latest gost tunnel to
+//     this peer (one per dial; last dial wins, as the endpoint's
+//     last-client-wins did).
+//
+// The host never parses the data: the GOST-side conn frames datagrams into
+// 2-byte-prefixed frames and the peer's GOST-side conn parses them, so the
+// frames travel through verbatim. Bytes are dropped while the opposite edge
+// is absent or down — IP tolerates loss, exactly like the endpoint model.
 //
 // Role by public-key ordering, the same rule as the mux session: the smaller
-// key opens the stream (loop), the larger is served by acceptLoop. Each side
-// creates its channel when its own gost dials, so nothing has to be learned
-// from the peer.
+// key opens the stream (loop), the larger is served by acceptLoop.
 type channel struct {
 	e    *Engine
 	peer derpclient.PublicKey
 
-	sock net.PacketConn
 	stop chan struct{} // closed by teardown; ends loop
 
 	mu     sync.Mutex
-	stream net.Conn // current upstream stream; nil while the channel is down
+	stream net.Conn // peer edge: current upstream stream; nil while the channel is down
+	local  net.Conn // local edge: the latest tunnel's stream; nil until a gost dials
 	refs   int      // gost tunnels holding this channel open
 	closed bool
-	client net.Addr // last client address seen on the endpoint (nil until gost dials)
 }
+
+// channelChunkSize bounds one pump read; frame bytes from the GOST side
+// arrive in chunks at most this size.
+const channelChunkSize = 32 * 1024
 
 // openChannel returns the peer's channel, creating and starting it on first
 // use, and takes a reference on it. The channel outlives individual gost
 // tunnels: it is torn down when the last one closes.
-func (e *Engine) openChannel(peer derpclient.PublicKey) (*channel, error) {
+func (e *Engine) openChannel(peer derpclient.PublicKey) *channel {
 	e.mu.Lock()
 	if ch, ok := e.chans[peer]; ok {
 		ch.mu.Lock()
@@ -46,37 +55,28 @@ func (e *Engine) openChannel(peer derpclient.PublicKey) (*channel, error) {
 			ch.refs++
 			ch.mu.Unlock()
 			e.mu.Unlock()
-			return ch, nil
+			return ch
 		}
 		ch.mu.Unlock()
 		delete(e.chans, peer) // drop the dead channel
 	}
 
-	sock, err := net.ListenPacket("udp", net.JoinHostPort(e.bind, "0"))
-	if err != nil {
-		e.mu.Unlock()
-		return nil, err
-	}
 	ch := &channel{
 		e:    e,
 		peer: peer,
-		sock: sock,
 		stop: make(chan struct{}),
 		refs: 1,
 	}
 	e.chans[peer] = ch
 	e.mu.Unlock()
 
-	go ch.readLocal()
 	if bytes.Compare(e.pub[:], peer[:]) < 0 {
-		e.log.Info("channel role", "peer", keyName(peer), "role", "opener",
-			"endpoint", sock.LocalAddr().String())
+		e.log.Info("channel role", "peer", keyName(peer), "role", "opener")
 		go ch.loop()
 	} else {
-		e.log.Info("channel role", "peer", keyName(peer), "role", "responder",
-			"endpoint", sock.LocalAddr().String())
+		e.log.Info("channel role", "peer", keyName(peer), "role", "responder")
 	}
-	return ch, nil
+	return ch
 }
 
 // channel returns the peer's live channel, or nil when it has none (or its
@@ -97,11 +97,35 @@ func (e *Engine) channel(peer derpclient.PublicKey) *channel {
 	return ch
 }
 
+// attachLocal publishes c as the channel's local edge and starts its pump.
+// The returned channel is closed when this edge's tunnel ends: the gost
+// closed its stream (the read fails and the pump exits), a newer dial
+// replaced it, or the channel was torn down. Only the edge's own pump closes
+// it, so it cannot double-close.
+func (ch *channel) attachLocal(c net.Conn) <-chan struct{} {
+	done := make(chan struct{})
+	ch.mu.Lock()
+	if ch.closed {
+		ch.mu.Unlock()
+		c.Close()
+		close(done)
+		return done
+	}
+	// Last dial wins: the previous edge is closed, which ends its pump.
+	old := ch.local
+	ch.local = c
+	ch.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+	go ch.pumpLocal(c, done)
+	return done
+}
+
 // release drops one reference; the last one tears the channel down and removes
-// it, so the next openChannel rebuilds it with a fresh endpoint. Reference
+// it, so the next openChannel rebuilds it with a fresh peer edge. Reference
 // count and map entry are updated under the engine lock, so an open racing a
-// close sees either the live channel or a fresh one — never a torn-down
-// endpoint.
+// close sees either the live channel or a fresh one — never a torn-down one.
 func (ch *channel) release() {
 	ch.e.mu.Lock()
 	ch.mu.Lock()
@@ -114,6 +138,8 @@ func (ch *channel) release() {
 	ch.closed = true
 	stream := ch.stream
 	ch.stream = nil
+	local := ch.local
+	ch.local = nil
 	if ch.e.chans[ch.peer] == ch {
 		delete(ch.e.chans, ch.peer)
 	}
@@ -121,6 +147,9 @@ func (ch *channel) release() {
 	ch.e.mu.Unlock()
 
 	ch.stopLoop(stream)
+	if local != nil {
+		local.Close() // its pump exits and closes the edge's done
+	}
 }
 
 // teardown closes the channel regardless of references (engine shutdown).
@@ -134,17 +163,20 @@ func (ch *channel) teardown() bool {
 	ch.closed = true
 	stream := ch.stream
 	ch.stream = nil
+	local := ch.local
+	ch.local = nil
 	ch.mu.Unlock()
 
 	ch.stopLoop(stream)
+	if local != nil {
+		local.Close()
+	}
 	return true
 }
 
-// stopLoop stops the opener loop and unblocks the endpoint reader and the
-// stream reader.
+// stopLoop stops the opener loop and unblocks the peer-edge reader.
 func (ch *channel) stopLoop(stream net.Conn) {
 	close(ch.stop)
-	ch.sock.Close()
 	if stream != nil {
 		stream.Close()
 	}
@@ -166,15 +198,14 @@ func (ch *channel) loop() {
 		c, err := ch.e.OpenStream(pname)
 		if err == nil {
 			// The channel may have been torn down while the stream was opening:
-			// serving it would feed a dead channel (and its endpoint socket is
-			// already closed).
+			// serving it would feed a dead channel.
 			if ch.stopped() {
 				c.Close()
 				return
 			}
 			// The tag goes out before the stream is published (setStream /
-			// serveStream), so a datagram frame can never precede it and make
-			// the responder read frame bytes as the tag.
+			// serveStream), so a frame byte can never precede it and make the
+			// responder read payload as the tag.
 			_, err = c.Write([]byte(channelTag))
 		}
 		if err != nil {
@@ -200,9 +231,10 @@ func (ch *channel) loop() {
 	}
 }
 
-// serveStream publishes c as the channel's upstream stream and pumps frames
-// from it until it dies. Frames read while no client is known (the local gost
-// has not dialled the endpoint yet) are dropped: IP tolerates loss.
+// serveStream publishes c as the channel's peer edge and pumps bytes from it
+// to the local edge until it dies. Bytes read while no local is attached are
+// dropped: IP tolerates loss (the GOST-side frames are carried verbatim; the
+// host never parses them).
 func (ch *channel) serveStream(c net.Conn) {
 	ch.setStream(c)
 	defer func() {
@@ -210,58 +242,58 @@ func (ch *channel) serveStream(c net.Conn) {
 		c.Close()
 	}()
 
+	buf := make([]byte, channelChunkSize)
 	for {
-		p, err := readFrame(c)
+		n, err := c.Read(buf)
+		if n > 0 {
+			ch.mu.Lock()
+			local := ch.local
+			ch.mu.Unlock()
+			if local != nil {
+				if _, werr := local.Write(buf[:n]); werr != nil {
+					// Drop and keep serving: a write error (e.g. the gost edge
+					// just died) must not cost the whole channel a reconnect.
+					ch.e.log.Debug("channel: write local", "peer", keyName(ch.peer), "error", werr)
+				}
+			}
+		}
 		if err != nil {
 			return
 		}
-		if len(p) == 0 {
-			continue
-		}
-		ch.mu.Lock()
-		client := ch.client
-		ch.mu.Unlock()
-		if client == nil {
-			continue
-		}
-		if _, err := ch.sock.WriteTo(p, client); err != nil {
-			// Drop and keep serving: a datagram error (e.g. a stale client
-			// address) must not cost the whole channel a reconnect.
-			ch.e.log.Debug("channel: write endpoint", "peer", keyName(ch.peer), "error", err)
-		}
 	}
 }
 
-// readLocal pumps datagrams from the endpoint onto the current upstream stream
-// for the lifetime of the channel. The last client seen wins: gost dials with
-// a new source port on every re-dial. An empty datagram carries no payload but
-// still announces the client (gost sends one right after dialling), which is
-// how a peer that speaks first stays reachable.
-func (ch *channel) readLocal() {
-	buf := make([]byte, maxFrame)
+// pumpLocal moves bytes from the local edge onto the peer edge; done is closed
+// when the edge ends (gost closed the stream, or the edge was replaced/torn
+// down). Bytes are dropped while the peer edge is down.
+func (ch *channel) pumpLocal(c net.Conn, done chan struct{}) {
+	defer func() {
+		ch.clearLocal(c)
+		c.Close()
+		close(done)
+	}()
+
+	buf := make([]byte, channelChunkSize)
 	for {
-		n, addr, err := ch.sock.ReadFrom(buf)
+		n, err := c.Read(buf)
+		if n > 0 {
+			ch.mu.Lock()
+			s := ch.stream
+			ch.mu.Unlock()
+			if s != nil {
+				if _, werr := s.Write(buf[:n]); werr != nil {
+					ch.e.log.Debug("channel: write stream", "peer", keyName(ch.peer), "error", werr)
+				}
+			}
+		}
 		if err != nil {
-			return // endpoint closed
-		}
-		ch.mu.Lock()
-		ch.client = addr
-		s := ch.stream
-		ch.mu.Unlock()
-		if n <= 0 {
-			continue
-		}
-		if s == nil {
-			continue // channel down: drop
-		}
-		if err := writeFrame(s, buf[:n]); err != nil {
-			ch.e.log.Debug("channel: write stream", "peer", keyName(ch.peer), "error", err)
+			return
 		}
 	}
 }
 
-// setStream publishes c as the current upstream stream, replacing (and
-// closing) a predecessor.
+// setStream publishes c as the current peer edge, replacing (and closing) a
+// predecessor.
 func (ch *channel) setStream(c net.Conn) {
 	ch.mu.Lock()
 	old := ch.stream
@@ -272,12 +304,22 @@ func (ch *channel) setStream(c net.Conn) {
 	}
 }
 
-// clearStream drops c if it is still the current stream (a reconnect may
+// clearStream drops c if it is still the current peer edge (a reconnect may
 // already have replaced it).
 func (ch *channel) clearStream(c net.Conn) {
 	ch.mu.Lock()
 	if ch.stream == c {
 		ch.stream = nil
+	}
+	ch.mu.Unlock()
+}
+
+// clearLocal drops c if it is still the current local edge (a newer dial may
+// already have replaced it).
+func (ch *channel) clearLocal(c net.Conn) {
+	ch.mu.Lock()
+	if ch.local == c {
+		ch.local = nil
 	}
 	ch.mu.Unlock()
 }

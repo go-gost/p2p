@@ -43,17 +43,27 @@ func (s *server) Tunnel(stream proto.P2P_TunnelServer) error {
 	}
 	defer s.dropTunnel(t)
 
+	// The host side of the stream stays a raw byte pipe in every network
+	// mode: for udp the framing travels through as bytes (GOST side frames,
+	// the peer's GOST side parses), so the host never touches it.
+	// No abort: a server stream is aborted by this handler returning.
+	conn := newStreamConn(stream, nil)
+
+	if t.network == "udp" {
+		// A udp tunnel's stream is the datagram channel's local edge: the
+		// channel pumps bytes between it and the peer edge. The handler parks
+		// until the channel is done with this edge — a newer dial replaced
+		// it, the channel was torn down, or the gost closed the stream (the
+		// edge's read fails and its pump exits, closing done).
+		<-t.ch.attachLocal(conn)
+		return nil
+	}
+
 	up, err := t.openPeer()
 	if err != nil {
 		slog.Debug("tunnel open peer failed", "tunnel", shortID(t.id), "target", t.target, "error", err)
 		return status.Errorf(codes.Unavailable, "open peer: %v", err)
 	}
-
-	// The host side of the stream stays a raw byte pipe in every network
-	// mode: for udp the framing travels through as bytes (GOST side frames,
-	// the peer datagram channel parses), so the host never touches it.
-	// No abort: a server stream is aborted by this handler returning.
-	conn := newStreamConn(stream, nil)
 	t.pipe(conn, up, "stream:"+shortID(t.id), t.target)
 	return nil
 }

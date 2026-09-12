@@ -13,7 +13,7 @@ import (
 // binds a real listener and registers one tunnel; the engine is a zero value
 // because startTunnel never calls an engine method during construction.
 func TestAddForward(t *testing.T) {
-	s := newServer("127.0.0.1", nil)
+	s := newServer(nil)
 
 	// DERP mode gate: no engine → error even for an otherwise-valid spec.
 	if err := s.addForward("127.0.0.1:0=x"); err == nil {
@@ -65,7 +65,7 @@ func TestForwardSurvivesGC(t *testing.T) {
 	pendingTTL, gcInterval = 30*time.Millisecond, 10*time.Millisecond
 	defer func() { pendingTTL, gcInterval = oldTTL, oldInterval }()
 
-	s := newServer("127.0.0.1", nil)
+	s := newServer(nil)
 	s.engine = &Engine{}
 
 	_, pub, err := derpclient.Generate()
