@@ -41,7 +41,7 @@ func newTestChannel(t *testing.T, e *Engine, peer derpclient.PublicKey) *channel
 // until the channel sees it.
 func attachStream(t *testing.T, ch *channel, c net.Conn) {
 	t.Helper()
-	go ch.serveStream(c)
+	go ch.serveStream(c, "test")
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		ch.mu.Lock()
@@ -344,6 +344,26 @@ func TestEngineIdleStreamBridged(t *testing.T) {
 	}
 	if string(buf) != "hello" {
 		t.Fatalf("greeting = %q, want %q", buf, "hello")
+	}
+}
+
+// TestChannelRetryDelay pins the peer-edge reconnect cadence: a stream that
+// lived (peer restart / path drop) resets to the fast floor — that was the
+// "tun-to-tun takes ~80s to reconnect" complaint — while an outright open
+// failure doubles towards the punch backoff and never exceeds it. Assertions
+// derive from the ambient backoffPeriod (TestMain shortens it for the package).
+func TestChannelRetryDelay(t *testing.T) {
+	if got := channelRetryDelay(backoffPeriod, false); got != channelRetryMin {
+		t.Fatalf("after a live stream: delay = %v, want %v (fast reconnect)", got, channelRetryMin)
+	}
+	if got, want := channelRetryDelay(channelRetryMin, true), min(2*channelRetryMin, backoffPeriod); got != want {
+		t.Fatalf("first open failure: delay = %v, want %v", got, want)
+	}
+	if got := channelRetryDelay(backoffPeriod, true); got != backoffPeriod {
+		t.Fatalf("open failure at the cap: delay = %v, want %v", got, backoffPeriod)
+	}
+	if got := channelRetryDelay(backoffPeriod*4, true); got > backoffPeriod {
+		t.Fatalf("open failure grew past the cap: %v > %v", got, backoffPeriod)
 	}
 }
 

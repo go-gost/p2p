@@ -670,7 +670,7 @@ func (e *Engine) serveInbound(stream net.Conn, transport string, peer derpclient
 			c.Close()
 			return
 		}
-		ch.serveStream(c)
+		ch.serveStream(c, transport)
 		return
 	} else if c != stream {
 		stream = c // untagged: replay the bytes consumed by the partial peek
