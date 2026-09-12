@@ -1,8 +1,9 @@
-// P2P stub host: grpc control plane + TCP bridge data plane.
+// P2P host: gRPC control plane + tunnel data streams.
 //
-// The GOST side calls OpenTunnel(peer) over gRPC; the stub responds with a
-// local TCP endpoint that bridges to the peer address. This milestone only
-// proves the plugin seam — no NAT traversal, rendezvous, or encryption.
+// The GOST side calls OpenTunnel(peer) over gRPC, then carries tunnel data on
+// the Tunnel bidi stream bound to the returned id. This host bridges each
+// tunnel to the peer (stub mode) or through a DERP relay (engine mode); no
+// local endpoint is opened per tunnel.
 package main
 
 import (
@@ -36,7 +37,7 @@ func main() {
 	// Flags are overrides on top of the config file; their defaults are only
 	// used as a fallback when neither the config nor the flag sets the value.
 	addr := flag.String("addr", "127.0.0.1:8003", "gRPC listen address (control plane)")
-	bind := flag.String("bind", "127.0.0.1", "data plane listen IP; each tunnel gets an ephemeral port on it")
+	bind := flag.String("bind", "127.0.0.1", "deprecated: no effect (tunnels no longer open local endpoints)")
 	token := flag.String("token", "", "control-plane auth token; empty disables checking (loopback default)")
 	derpURL := flag.String("derp", "", "DERP relay server URL (wss://host/derp); enables DERP engine mode")
 	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
@@ -69,6 +70,13 @@ func main() {
 		}
 		cfg = c
 	}
+
+	// --bind fed the per-tunnel endpoint listeners, which the stream data
+	// plane replaced: after this change it has no effect (its last reader is
+	// the udp channel socket, sidelined with the udp data plane). Captured
+	// before the default is applied so only an explicitly configured value
+	// warns.
+	bindConfigured := cfg.Bind != "" || set["bind"]
 
 	// Defaults for anything the config didn't set.
 	if cfg.Addr == "" {
@@ -146,6 +154,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	if bindConfigured {
+		slog.Warn("bind is deprecated and has no effect: tunnels no longer open local endpoints; it will be removed in a future release")
+	}
+
 	var engine *Engine
 	if cfg.Derp != "" {
 		priv, pub, err := loadOrCreateKey(cfg.Key)
@@ -181,11 +193,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	// authInterceptor enforces token on every RPC via the "token" gRPC
+	// authInterceptor enforces the token on unary RPCs via the "token" gRPC
 	// metadata key sent by the GOST client (x/internal/plugin per-RPC
-	// credentials). Empty token disables checking: the loopback default
-	// remains the only boundary, so keep addr off-loopback unless both token
-	// and control TLS are in place.
+	// credentials). Stream RPCs (Tunnel) get streamAuthInterceptor as defense
+	// in depth; the stream's real credential is its unguessable id. Empty
+	// token disables checking: the loopback default remains the only
+	// boundary, so keep addr off-loopback unless both token and control TLS
+	// are in place.
 	svr := newServer(cfg.Bind, engine)
 	for _, spec := range forwards {
 		if err := svr.addForward(spec); err != nil {
@@ -199,7 +213,10 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	s := grpc.NewServer(grpc.UnaryInterceptor(authInterceptor(cfg.Token)))
+	s := grpc.NewServer(
+		grpc.UnaryInterceptor(authInterceptor(cfg.Token)),
+		grpc.StreamInterceptor(streamAuthInterceptor(cfg.Token)),
+	)
 	proto.RegisterP2PServer(s, svr)
 	slog.Info("p2p stub listening", "addr", cfg.Addr, "bind", cfg.Bind, "auth", cfg.Token != "", "derp", cfg.Derp != "")
 	if err := s.Serve(ln); err != nil {
@@ -423,5 +440,25 @@ func authInterceptor(want string) grpc.UnaryServerInterceptor {
 			}
 		}
 		return handler(ctx, req)
+	}
+}
+
+// streamAuthInterceptor is the stream-RPC counterpart of authInterceptor
+// (Tunnel). The stream's actual credential is its unguessable id, checked by
+// the handler; this token check is defense in depth and costs nothing — the
+// GOST client's per-RPC credentials already attach the token to every RPC,
+// streams included.
+func streamAuthInterceptor(want string) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if want != "" {
+			got := ""
+			if md, ok := metadata.FromIncomingContext(ss.Context()); ok && len(md["token"]) > 0 {
+				got = md["token"][0]
+			}
+			if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+				return status.Error(codes.Unauthenticated, "invalid token")
+			}
+		}
+		return handler(srv, ss)
 	}
 }

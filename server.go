@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -17,15 +19,19 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// server is the stub P2P service. Each OpenTunnel creates a local listener
-// whose accepted connections are bridged to the peer target.
+// server is the P2P service. OpenTunnel authorizes a tunnel and allocates its
+// id; the tunnel's data travels on the Tunnel stream bound to that id (see
+// stream.go) — there is no local endpoint.
 //
 // Two data-plane modes:
-//   - stub mode (default): bridge() dials the peer host:port directly. Only
-//     meaningful on loopback / trusted networks.
-//   - DERP engine mode (engine != nil): bridge() opens a mux stream to the
+//   - stub mode (default): the peer end of a tunnel is the peer host:port
+//     dialed directly. Only meaningful on loopback / trusted networks.
+//   - DERP engine mode (engine != nil): the peer end is a mux stream to the
 //     peer through the DERP relay; "peer" is the peer host's base64 public
 //     key instead of a host:port.
+//
+// --forward static port forwards keep a local listener (startTunnel) and are
+// the only tunnels with one.
 //
 // Trust boundary: the control channel is unauthenticated — any process that
 // can reach the gRPC address can make this plugin dial arbitrary host:port
@@ -42,90 +48,178 @@ type server struct {
 	tunnels map[string]*tunnel
 }
 
+// pendingTTL bounds how long an OpenTunnel record may wait for its Tunnel
+// stream before the GC reclaims it: a client can die between the two RPCs,
+// and there is no CloseTunnel to clean up after it. gcInterval is the sweep
+// cadence. Vars so tests can shorten them.
+var (
+	pendingTTL = 10 * time.Second
+	gcInterval = 5 * time.Second
+)
+
 func newServer(bind string, engine *Engine) *server {
-	return &server{
+	s := &server{
 		bind:    bind,
 		engine:  engine,
 		tunnels: make(map[string]*tunnel),
 	}
+	go s.gcPending(gcInterval)
+	return s
 }
 
 type tunnel struct {
 	id     string
-	target string   // stub mode: peer host:port
+	target string   // far end as passed to OpenTunnel: peer host:port (stub) or public key (DERP)
 	engine *Engine  // derp mode: stream source
 	peer   string   // derp mode: peer public key (base64)
 	ch     *channel // udp tunnels: the peer channel this tunnel holds a reference on
 	ln     net.Listener
-	mu     sync.Mutex
-	conns  map[net.Conn]struct{}
+
+	// network, createdAt, attached describe stream-backed records; they are
+	// guarded by the server lock (the GC reads them there).
+	network   string
+	createdAt time.Time
+	attached  bool // the Tunnel handler has claimed the record
+
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
 }
 
+// newTunnelID returns a cryptographically random tunnel id: it is the
+// credential of the Tunnel stream, so it must be unguessable (the old
+// guessable tunnel-%d scheme must not be reused for it).
+func newTunnelID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand.Read is documented to always succeed; a fallback here
+		// would mint a predictable credential.
+		panic(fmt.Sprintf("p2p: tunnel id: %v", err))
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+// shortID is the id prefix used in logs; the full id is a credential and must
+// never be logged.
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+// OpenTunnel authorizes a tunnel and allocates its id; the client presents
+// the id as the "id" metadata key on the Tunnel stream. No endpoint is
+// returned — the stream is the data plane. A record whose stream never
+// arrives is reclaimed by the pending GC.
 func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (*proto.OpenTunnelReply, error) {
 	network := req.Network
 	if network == "" {
 		network = "tcp"
 	}
-	if network != "tcp" && network != "udp" {
+	switch network {
+	case "tcp":
+	case "udp":
+		// The datagram data plane arrives with the Phase 2 stream-edge
+		// rewrite; failing loudly beats a tunnel that can never carry data.
+		return nil, status.Error(codes.Unimplemented, "udp tunnel not implemented")
+	default:
 		return nil, status.Errorf(codes.InvalidArgument, "invalid network %q", req.Network)
-	}
-	if network == "udp" && s.engine == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "udp tunnel requires derp mode (peer key)")
 	}
 
 	peer := req.Peer
 	if s.engine != nil {
 		// DERP mode: the peer is a public key; validate its shape now and
 		// fail fast with a clear error.
-		key, err := parsePeerKey(peer)
-		if err != nil {
+		if _, err := parsePeerKey(peer); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid peer %q: %v", peer, err)
 		}
-		if network == "udp" {
-			// A datagram tunnel is one channel per peer, shared by every gost
-			// dial to it: all of them see the same endpoint, and the channel
-			// lives until the last one closes.
-			ch, err := s.engine.openChannel(key)
-			if err != nil {
-				return &proto.OpenTunnelReply{Ok: false, Error: err.Error()}, nil
-			}
-			t := &tunnel{
-				id:   fmt.Sprintf("tunnel-%d", s.seq.Add(1)),
-				peer: peer,
-				ch:   ch,
-			}
-			s.mu.Lock()
-			s.tunnels[t.id] = t
-			s.mu.Unlock()
-			return &proto.OpenTunnelReply{Ok: true, Id: t.id, Endpoint: ch.sock.LocalAddr().String()}, nil
-		}
 	} else {
-		host, port, err := net.SplitHostPort(req.Peer)
+		host, port, err := net.SplitHostPort(peer)
 		if err != nil || host == "" || port == "" {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid peer %q", req.Peer)
 		}
 	}
 
-	t, err := s.startTunnel(net.JoinHostPort(s.bind, "0"), peer)
-	if err != nil {
-		return &proto.OpenTunnelReply{Ok: false, Error: err.Error()}, nil
+	t := &tunnel{
+		id:        newTunnelID(),
+		target:    peer,
+		network:   network,
+		createdAt: time.Now(),
+		conns:     make(map[net.Conn]struct{}),
 	}
-	return &proto.OpenTunnelReply{Ok: true, Id: t.id, Endpoint: t.ln.Addr().String()}, nil
+	if s.engine != nil {
+		t.engine = s.engine
+		t.peer = peer
+	}
+	s.mu.Lock()
+	s.tunnels[t.id] = t
+	s.mu.Unlock()
+	return &proto.OpenTunnelReply{Ok: true, Id: t.id}, nil
+}
+
+// gcPending reclaims records whose Tunnel stream never arrived — the only
+// cleanup for an abandoned setup, now that CloseTunnel is gone; the other
+// teardown path is the Tunnel handler returning.
+func (s *server) gcPending(interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for range t.C {
+		now := time.Now()
+		var stale []*tunnel
+		s.mu.Lock()
+		for id, tn := range s.tunnels {
+			// Only stream-backed records are GC candidates: a --forward tunnel
+			// has a listener and lives for the process's lifetime.
+			if tn.ln == nil && !tn.attached && now.Sub(tn.createdAt) > pendingTTL {
+				stale = append(stale, tn)
+				delete(s.tunnels, id)
+			}
+		}
+		s.mu.Unlock()
+		for _, tn := range stale {
+			slog.Info("pending tunnel reclaimed", "tunnel", shortID(tn.id), "ttl", pendingTTL.String())
+			s.dropTunnel(tn)
+		}
+	}
+}
+
+// dropTunnel removes t from the registry and tears it down. A channel-holding
+// record releases its channel reference — release is refcounted, so a channel
+// shared with another live tunnel to the same peer survives; never teardown()
+// a channel here. Everything else closes its listener (--forward only) and
+// tracked connections.
+//
+// dropTunnel replaces CloseTunnel: it runs when a Tunnel handler returns
+// (stream end IS the teardown) and from the pending GC.
+func (s *server) dropTunnel(t *tunnel) {
+	s.mu.Lock()
+	if s.tunnels[t.id] == t {
+		delete(s.tunnels, t.id)
+	}
+	s.mu.Unlock()
+
+	if t.ch != nil {
+		t.ch.release()
+		return
+	}
+	t.close()
 }
 
 // startTunnel binds a listener on addr and registers a tunnel bridging to
 // peer (a host:port in stub mode, a base64 public key in DERP mode). The
-// returned tunnel is already serving.
+// returned tunnel is already serving. Only --forward uses this path.
 func (s *server) startTunnel(addr, peer string) (*tunnel, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 	t := &tunnel{
-		id:     fmt.Sprintf("tunnel-%d", s.seq.Add(1)),
-		target: peer,
-		ln:     ln,
-		conns:  make(map[net.Conn]struct{}),
+		id:        fmt.Sprintf("tunnel-%d", s.seq.Add(1)),
+		target:    peer,
+		network:   "tcp",
+		createdAt: time.Now(),
+		ln:        ln,
+		conns:     make(map[net.Conn]struct{}),
 	}
 	if s.engine != nil {
 		t.engine = s.engine
@@ -172,22 +266,6 @@ func (s *server) addForwardAddr(addr, key string) error {
 	return nil
 }
 
-// CloseTunnel is idempotent: closing an unknown or already-closed id is ok.
-func (s *server) CloseTunnel(ctx context.Context, req *proto.CloseTunnelRequest) (*proto.CloseTunnelReply, error) {
-	s.mu.Lock()
-	t, ok := s.tunnels[req.Id]
-	delete(s.tunnels, req.Id)
-	s.mu.Unlock()
-	if ok {
-		if t.ch != nil {
-			t.ch.release() // tears the channel down with its last reference
-		} else {
-			t.close()
-		}
-	}
-	return &proto.CloseTunnelReply{Ok: true}, nil
-}
-
 func (s *server) Status(ctx context.Context, req *proto.StatusRequest) (*proto.StatusReply, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -207,37 +285,46 @@ func (t *tunnel) serve() {
 	}
 }
 
-// bridge copies bytes in both directions between conn and the target: in
-// stub mode the peer host:port dialed directly; in DERP engine mode a mux
-// stream to the peer opened through the relay. When one direction ends, the
-// peer side is half-closed (CloseWrite) so the other side can still drain;
-// both ends are closed only after both directions are done.
-// bridge logs each tunnel in gost style: "<src> <-> <dst>" on connect and
-// ">-<" with the duration on disconnect.
-func (t *tunnel) bridge(conn net.Conn) {
-	var up net.Conn
-	var err error
+// openPeer connects the tunnel's far end: a mux stream to the peer through
+// the relay (DERP engine mode) or a direct dial of the peer host:port (stub
+// mode).
+func (t *tunnel) openPeer() (net.Conn, error) {
 	if t.engine != nil {
-		up, err = t.engine.OpenStream(t.peer)
-	} else {
-		up, err = net.DialTimeout("tcp", t.target, 5*time.Second)
+		return t.engine.OpenStream(t.peer)
 	}
+	return net.DialTimeout("tcp", t.target, 5*time.Second)
+}
+
+// bridge copies bytes in both directions between an accepted --forward
+// connection and the tunnel's peer end.
+func (t *tunnel) bridge(conn net.Conn) {
+	up, err := t.openPeer()
 	if err != nil {
 		slog.Debug("bridge dial failed", "tunnel", t.id, "target", t.target, "error", err)
 		conn.Close()
 		return
 	}
+	t.pipe(conn, up, t.ln.Addr().String(), t.target)
+}
+
+// pipe copies bytes in both directions between conn (the local edge: an
+// --forward connection or a Tunnel stream) and up (the peer end). When one
+// direction ends, the destination is half-closed (CloseWrite) so the other
+// side can still drain, falling back to a full close for conn types without
+// CloseWrite (mux and stream-backed conns) — that matches the previous
+// tunnelConn semantics, so a peer EOF truncates the reverse direction as it
+// does today. Both ends are closed only after both directions are done.
+// pipe logs each tunnel in gost style: "<src> <-> <dst>" on connect and
+// ">-<" with the duration on disconnect.
+func (t *tunnel) pipe(conn, up net.Conn, endpoint, target string) {
 	defer t.untrackConn(conn)
 	t.trackConn(up)
 	defer func() {
+		t.untrackConn(up)
 		up.Close()
 		conn.Close()
 	}()
 
-	// t.target names the far end of the tunnel in both modes: the peer's
-	// public key (DERP) or the peer host:port (stub). t.ln.Addr() is the local
-	// endpoint handed to the gost client.
-	endpoint := t.ln.Addr().String()
 	transport := ""
 	peerAddr := ""
 	if tw, ok := up.(interface{ Transport() string }); ok {
@@ -246,7 +333,7 @@ func (t *tunnel) bridge(conn net.Conn) {
 	if pa, ok := up.(interface{ PeerAddr() string }); ok {
 		peerAddr = pa.PeerAddr()
 	}
-	attrs := []any{"peer", t.target, "endpoint", endpoint}
+	attrs := []any{"peer", target, "endpoint", endpoint}
 	if transport != "" {
 		attrs = append(attrs, "transport", transport)
 	}
@@ -254,9 +341,9 @@ func (t *tunnel) bridge(conn net.Conn) {
 		attrs = append(attrs, "peerAddr", peerAddr)
 	}
 	start := time.Now()
-	slog.Info(fmt.Sprintf("%s <-> %s", endpoint, t.target), attrs...)
+	slog.Info(fmt.Sprintf("%s <-> %s", endpoint, target), attrs...)
 	defer func() {
-		slog.Info(fmt.Sprintf("%s >-< %s", endpoint, t.target),
+		slog.Info(fmt.Sprintf("%s >-< %s", endpoint, target),
 			append(append([]any{}, attrs...), "duration", time.Since(start).String())...)
 	}()
 
@@ -298,8 +385,12 @@ func (t *tunnel) untrackConn(conn net.Conn) {
 	t.mu.Unlock()
 }
 
+// close stops the tunnel: the listener (--forward only; nil for stream
+// records), then every tracked connection.
 func (t *tunnel) close() {
-	t.ln.Close() // stops accept; no new conns
+	if t.ln != nil {
+		t.ln.Close() // stops accept; no new conns
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for conn := range t.conns {

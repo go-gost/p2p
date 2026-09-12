@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"testing"
+	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
 )
@@ -50,6 +51,35 @@ func TestAddForward(t *testing.T) {
 	}
 	if got.Tunnels != 1 {
 		t.Fatalf("tunnel count = %d, want 1", got.Tunnels)
+	}
+
+	for _, tn := range s.tunnels {
+		tn.close()
+	}
+}
+
+// TestForwardSurvivesGC: --forward listeners live for the process lifetime —
+// the pending GC must only reclaim stream records (those without a listener).
+func TestForwardSurvivesGC(t *testing.T) {
+	oldTTL, oldInterval := pendingTTL, gcInterval
+	pendingTTL, gcInterval = 30*time.Millisecond, 10*time.Millisecond
+	defer func() { pendingTTL, gcInterval = oldTTL, oldInterval }()
+
+	s := newServer("127.0.0.1", nil)
+	s.engine = &Engine{}
+
+	_, pub, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := base64.RawURLEncoding.EncodeToString(pub[:])
+	if err := s.addForward("127.0.0.1:0=" + key); err != nil {
+		t.Fatalf("addForward(valid) = %v, want nil", err)
+	}
+
+	time.Sleep(120 * time.Millisecond) // > TTL: several sweeps must skip it
+	if got := tunnelCount(s); got != 1 {
+		t.Fatalf("forward tunnel reclaimed by the GC: count = %d, want 1", got)
 	}
 
 	for _, tn := range s.tunnels {
