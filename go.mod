@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/coder/websocket v1.8.14
-	github.com/go-gost/plugin v0.7.0
+	github.com/go-gost/plugin v0.8.0
 	github.com/goccy/go-yaml v1.19.2
 	github.com/xtaci/kcp-go/v5 v5.6.72
 	github.com/xtaci/smux v1.5.57
