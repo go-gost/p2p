@@ -347,6 +347,58 @@ func TestEngineIdleStreamBridged(t *testing.T) {
 	}
 }
 
+// TestChannelFastRetryAfterRefusal: while the responder's gost has not opened
+// a udp tunnel, the opener's peer-edge stream is refused at once; once the
+// responder's channel appears the opener must recover quickly (the fast
+// retry), not wait out the 30s punch backoff.
+func TestChannelFastRetryAfterRefusal(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+
+	// Force the opener role on A: the smaller public key opens the stream.
+	var privA, privB derpclient.PrivateKey
+	var pubA, pubB derpclient.PublicKey
+	for {
+		privA, pubA, _ = derpclient.Generate()
+		privB, pubB, _ = derpclient.Generate()
+		if bytes.Compare(pubA[:], pubB[:]) < 0 {
+			break
+		}
+	}
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, "", privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+	if err := engineA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	chA := engineA.openChannel(pubB) // the opener starts its loop at once
+	defer chA.release()
+
+	// B's channel (and so A's first attempt) is absent now: the attempt is
+	// refused; B appears shortly after.
+	time.Sleep(500 * time.Millisecond)
+	chB := engineB.openChannel(pubA)
+	defer chB.release()
+	attachLocal(t, chB)
+
+	deadline := time.Now().Add(8 * time.Second) // << backoffPeriod: guards the fast retry
+	for time.Now().Before(deadline) {
+		chA.mu.Lock()
+		up := chA.stream != nil
+		chA.mu.Unlock()
+		if up {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("opener did not recover after the refusal (fast retry missing)")
+}
+
 // TestChannelRefcount covers the channel lifecycle: tunnels to the same peer
 // share one channel, it survives until the last one closes, and the next open
 // rebuilds it (with a fresh loop, so a stale one cannot feed it).

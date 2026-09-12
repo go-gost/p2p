@@ -44,6 +44,12 @@ type channel struct {
 // arrive in chunks at most this size.
 const channelChunkSize = 32 * 1024
 
+// channelRetryFast is the reconnect delay after a peer-edge stream that died
+// almost at once — the responder refusing it because its gost has not opened
+// a udp tunnel yet. Waiting out the punch backoff (30s) would keep the link
+// dark for up to that whole period after both sides are finally up.
+const channelRetryFast = 2 * time.Second
+
 // openChannel returns the peer's channel, creating and starting it on first
 // use, and takes a reference on it. The channel outlives individual gost
 // tunnels: it is torn down when the last one closes.
@@ -208,25 +214,24 @@ func (ch *channel) loop() {
 			// responder read payload as the tag.
 			_, err = c.Write([]byte(channelTag))
 		}
+		delay := backoffPeriod
 		if err != nil {
 			if c != nil {
 				c.Close()
 			}
 			ch.e.log.Debug("channel: open stream", "peer", pname, "error", err)
 		} else {
-			transport := ""
-			if tw, ok := c.(interface{ Transport() string }); ok {
-				transport = tw.Transport()
-			}
-			ch.e.log.Info("channel up", "peer", pname, "transport", transport)
+			start := time.Now()
 			ch.serveStream(c)
-			ch.e.log.Info("channel down", "peer", pname)
+			if time.Since(start) < channelRetryFast {
+				delay = channelRetryFast // refused (peer gost not up): retry fast
+			}
 		}
 
 		select {
 		case <-ch.stop:
 			return
-		case <-time.After(backoffPeriod):
+		case <-time.After(delay):
 		}
 	}
 }
@@ -234,12 +239,20 @@ func (ch *channel) loop() {
 // serveStream publishes c as the channel's peer edge and pumps bytes from it
 // to the local edge until it dies. Bytes read while no local is attached are
 // dropped: IP tolerates loss (the GOST-side frames are carried verbatim; the
-// host never parses them).
+// host never parses them). The up/down logs live here (not in the opener's
+// loop) so the responder, which attaches streams through serveInbound, logs
+// them identically.
 func (ch *channel) serveStream(c net.Conn) {
 	ch.setStream(c)
+	transport := ""
+	if tw, ok := c.(interface{ Transport() string }); ok {
+		transport = tw.Transport()
+	}
+	ch.e.log.Info("channel up", "peer", keyName(ch.peer), "transport", transport)
 	defer func() {
 		ch.clearStream(c)
 		c.Close()
+		ch.e.log.Info("channel down", "peer", keyName(ch.peer))
 	}()
 
 	buf := make([]byte, channelChunkSize)
