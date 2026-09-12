@@ -1,9 +1,9 @@
 # P2P: replace the local endpoint with a gRPC data channel
 
-> Status: **Phase 1 + Phase 2 implemented and e2e-verified** (2026-09-12):
-> nested-netns TCP tunnel (200 through the stream, no per-tunnel listeners)
-> and tun-to-tun ping over the datagram channel, both through a real derper.
-> Release steps (plugin tag + go.mod re-pins) pending.
+> Status: **Phase 1 + Phase 2 implemented, e2e-verified, and released**
+> (2026-09-12): nested-netns TCP + tun e2e through a real derper; plugin
+> v0.8.0 tagged, x v0.17.0 tagged, p2p pushed, gost bumped to x v0.17.0
+> and its `GOWORK=off` build verified.
 
 ## Context
 
