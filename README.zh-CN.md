@@ -2,20 +2,20 @@
 
 [English](README.md) · **简体中文**
 
-为 [GOST](https://github.com/go-gost/gost) 的 [p2p 插件](https://github.com/go-gost/plugin) 协议服务的隧道宿主进程。它让 GOST 通过本进程打开的隧道，建立到链节点的网络通路——穿越策略（rendezvous、relay、打洞）完全由插件决定，GOST 侧永远只看到一条本地可拨号的普通 endpoint。
+为 [GOST](https://github.com/go-gost/gost) 的 [p2p 插件](https://github.com/go-gost/plugin) 协议服务的隧道宿主进程。它让 GOST 通过本进程打开的隧道，建立到链节点的网络通路——穿越策略（rendezvous、relay、打洞）完全由插件决定，GOST 侧永远只看到一条普通的字节流（`Tunnel` gRPC 流）来承载它的协议。
 
-**当前状态：stub + mux + DERP relay + STUN/UDP 打洞 + 数据报通道。** 宿主用本地 TCP 转发桥接隧道：stub 模式（回环）直接转发，**DERP relay** 模式（engine）跨机/NAT。engine 模式下，relay 会话建立后，两端各自用 STUN 探测 NAT 并打 UDP 洞；直连路径（KCP + smux）建立后，新隧道走直连、relay 保持为回退。支持内层 dialer `tcp/tls/ws/mtcp/mtls/mws/udp`——mux 一族把一条隧道复用成多路会话，`udp` 则要求一个**数据报 endpoint** 而不是字节流（tun 链路靠它：设备归 GOST 管，本进程只是管道）。
+**当前状态：stub + mux + DERP relay + STUN/UDP 打洞 + 数据报通道。** 宿主用本地 TCP 转发桥接隧道：stub 模式（回环）直接转发，**DERP relay** 模式（engine）跨机/NAT。engine 模式下，relay 会话建立后，两端各自用 STUN 探测 NAT 并打 UDP 洞；直连路径（KCP + smux）建立后，新隧道走直连、relay 保持为回退。支持内层 dialer `tcp/tls/ws/mtcp/mtls/mws/udp`——mux 一族把一条隧道复用成多路会话，`udp` 则要求一条**数据报流**而不是字节流（tun 链路靠它：设备归 GOST 管，本进程只是管道）。
 
 ## 工作原理
 
 ```
-GOST client ──OpenTunnel(peer)──▶ p2p host (gRPC, :8003)
-GOST client ◀─{id, endpoint}─────  p2p host
-GOST client ──dial endpoint─────▶ p2p host ──bridge──▶ peer (host:port)
+GOST client ──OpenTunnel(peer, network)──▶ p2p host (gRPC, :8003)
+GOST client ◀──{ok, id}────────────────────  p2p host
+GOST client ══Tunnel 流（"id" metadata）══▶ p2p host ──bridge──▶ peer
 ```
 
 - `peer` 不透明：语义由插件定义（DERP 模式下是 base64 公钥，stub 模式下是 `host:port`）。
-- `endpoint` 不透明：v1 是一个本地可拨号的 TCP `host:port`。GOST 侧关闭连接即关闭隧道。
+- `OpenTunnel` 只做授权并返回一个密码学随机、单次使用的 `id`。**数据走绑定该 id 的 `Tunnel` gRPC 流**（经 `id` metadata 键）——没有本地 endpoint 可拨，因此 GOST 与本宿主之间的防火墙挡不住数据面。关闭流即关闭隧道；流的生命期就是隧道的生命期。
 - GOST 侧接线（tunnel dialer、配置）在 `go-gost/x`（`x/p2p/`）；线上契约在 `go-gost/plugin`（`p2p/proto`）。
 
 ## 定位：一个通用的 P2P 连通性原语
@@ -36,14 +36,13 @@ GOST client ──dial endpoint─────▶ p2p host ──bridge──▶
 
 ```bash
 go build -o p2p .
-./p2p --addr 127.0.0.1:8003 --bind 127.0.0.1
+./p2p --addr 127.0.0.1:8003
 ```
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `-C` | *(空)* | 配置文件（YAML）；配置值作为默认，显式传入的 flag 覆盖 |
 | `--addr` | `127.0.0.1:8003` | gRPC 控制面监听地址 |
-| `--bind` | `127.0.0.1` | 数据面监听 IP（每条隧道一个临时端口） |
 | `--token` | *(空)* | 控制面认证 token；为空则不做校验 |
 | `--derp` | *(空)* | DERP relay URL（`wss://host/derp`）；启用 engine 模式 |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 私钥文件（hex）；缺失则自动生成 |
@@ -67,7 +66,6 @@ go build -o p2p .
 
 ```yaml
 addr: 127.0.0.1:8003
-bind: 127.0.0.1
 token: gost
 derp: wss://derp.example.com/derp
 key: peer.key
@@ -161,7 +159,7 @@ derper 的 STUN 服务器只应答 Tailscale 的 binding-request 方言（`SOFTW
 
 ## 数据报通道（tun 链路，Linux）
 
-链节点把 dialer 设为 `udp` 时，本宿主返回的不是字节流而是一个**数据报 endpoint**：一个本地 UDP socket，其每个数据报按 2 字节长度前缀成帧、一报一帧地送到对端的流上，从而在字节流数据面上保住包边界。tun-to-tun 链路正是靠它——**设备由 GOST 拥有**（`tun` listener 创建并配置设备，`tun` handler 桥接），本宿主只是管道。tun 是独占打开的，设备无法共用，让 GOST 用自己的 tun 栈才是重点。
+链节点把 dialer 设为 `udp` 时，请求的是一条**数据报流**（`network=udp`）而非字节流。它和其他隧道一样由 `Tunnel` 流承载：在本宿主内，每端把持久的 per-peer 边（通往对端的直连或 relay 流）与最新一条 GOST 隧道的流配对，在两边之间泵字节。GOST 侧 conn 把每个数据报成帧（2 字节长度前缀），对端 GOST 侧 conn 解帧——包边界因此穿过字节流数据面，而**本宿主完全不解析数据**。tun-to-tun 链路正是靠它——**设备由 GOST 拥有**（`tun` listener 创建并配置设备，`tun` handler 桥接），本宿主只是管道。tun 是独占打开的，设备无法共用，让 GOST 用自己的 tun 栈才是重点。
 
 ```bash
 # 两端都一样：没有 --target，也不碰设备。对端公钥写进 GOST 的节点 addr。
@@ -192,9 +190,9 @@ chains:
             metadata: {p2p: p2p-1}
 ```
 
-每个 peer 一条通道，被到它的所有隧道共享并做引用计数：GOST 每次拨号开一条隧道、重连时关闭，因此最后一条关闭时 endpoint 被拆除、下次 Open 时重建。只有**公钥较小**的一端打开流，另一端由常规 accept 路径服务。链路优先走直连（打洞）路径，失败回退 relay，与隧道一致。`network=udp` 需要 engine 模式（`--derp`）：通道以 peer 公钥寻址。
+每个 peer 一条通道，被到它的所有隧道共享并做引用计数：GOST 每次拨号开一条隧道、重连时关闭，因此最后一条关闭时通道被拆除、下次 Open 时重建。只有**公钥较小**的一端打开 peer 边的流，另一端由常规 accept 路径服务。重拨会接管本地边（后拨者胜），而 peer 边在其断线期间以退避重连，本地边持续存活。链路优先走直连（打洞）路径，失败回退 relay，与隧道一致。`network=udp` 需要 engine 模式（`--derp`）：通道以 peer 公钥寻址。
 
-endpoint 从收到的报文里学习 client 地址——GOST 在拨号后立刻发一个空数据报自报家门——重拨（新源端口）会接管，因此暂时无话可说的一端依然可达。流断开期间读到的数据报直接丢弃（IP 能容忍丢包）。数据面**不加密**，与其余数据面一致：这里没有内层 dialer 可托付，仅在可信链路上使用，或在链路之上自行加密。
+任一侧暂时没有活边时字节直接丢弃（IP 能容忍丢包），因此暂时无话可说的一端依然可达。数据面**不加密**，与其余数据面一致：这里没有内层 dialer 可托付，仅在可信链路上使用，或在链路之上自行加密。
 
 ## 安全
 
@@ -208,7 +206,7 @@ endpoint 从收到的报文里学习 client 地址——GOST 在拨号后立刻�
 
 1. ~~STUN + UDP 打洞隧道~~——已交付（KCP + smux 直连，DERP relay 回退）。
 2. rendezvous 地址发现——已放弃：derper v1.102.3 只向 mesh watcher 发送 `PeerPresent`，从不发给开放中继客户端，因此基于 presence 的名字发现不可行。peer 以 base64 公钥寻址；人类可读名字应放在 GOST 配置里，而非 p2p 侧的注册表。
-3. 数据报通道（tun/tap 走隧道）——已交付（`network=udp`）：每 peer 一个 UDP endpoint，成帧后走直连或 relay 的持久流。设备本身归 GOST（`tun` listener/handler），本宿主只是管道。
+3. 数据报通道（tun/tap 走隧道）——已交付（`network=udp`）：每 peer 一条字节管道，把对端流与最新一条 GOST 隧道的流对接，全部在彼此的 `Tunnel` 流内承载。设备本身归 GOST（`tun` listener/handler），本宿主只是管道。
 
 ## License
 

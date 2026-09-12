@@ -2,20 +2,20 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-Tunnel host process for [GOST](https://github.com/go-gost/gost)'s [p2p plugin](https://github.com/go-gost/plugin) protocol. It lets GOST establish the network path to a chain node through a tunnel opened by this process — the traversal strategy (rendezvous, relay, hole punching) is entirely up to the plugin, and GOST only ever sees a plain local endpoint to dial.
+Tunnel host process for [GOST](https://github.com/go-gost/gost)'s [p2p plugin](https://github.com/go-gost/plugin) protocol. It lets GOST establish the network path to a chain node through a tunnel opened by this process — the traversal strategy (rendezvous, relay, hole punching) is entirely up to the plugin, and GOST only ever sees a plain byte stream (the `Tunnel` gRPC stream) to carry its protocol over.
 
-**Status: stub + mux + DERP relay + STUN/UDP hole punching + datagram channels.** The host bridges tunnels with a local TCP forward, either directly (stub mode, loopback) or through a **DERP relay** (engine mode, cross-machine/NAT). In engine mode, after a relay session is up, both peers probe their NAT via STUN and punch a UDP hole; once the direct path (KCP + smux) is established, new tunnels flow over it while the relay stays up as fallback. Inner dialers `tcp/tls/ws/mtcp/mtls/mws/udp` are supported — the mux family reuses one tunnel as a multiplexed session, and `udp` asks for a **datagram endpoint** instead of a byte stream (this is what carries a tun link: GOST owns the device, this host is only the pipe).
+**Status: stub + mux + DERP relay + STUN/UDP hole punching + datagram channels.** The host bridges tunnels with a local TCP forward, either directly (stub mode, loopback) or through a **DERP relay** (engine mode, cross-machine/NAT). In engine mode, after a relay session is up, both peers probe their NAT via STUN and punch a UDP hole; once the direct path (KCP + smux) is established, new tunnels flow over it while the relay stays up as fallback. Inner dialers `tcp/tls/ws/mtcp/mtls/mws/udp` are supported — the mux family reuses one tunnel as a multiplexed session, and `udp` asks for a **datagram stream** instead of a byte stream (this is what carries a tun link: GOST owns the device, this host is only the pipe).
 
 ## How it works
 
 ```
-GOST client ──OpenTunnel(peer)──▶ p2p host (gRPC, :8003)
-GOST client ◀─{id, endpoint}─────  p2p host
-GOST client ──dial endpoint─────▶ p2p host ──bridge──▶ peer (host:port)
+GOST client ──OpenTunnel(peer, network)──▶ p2p host (gRPC, :8003)
+GOST client ◀──{ok, id}────────────────────  p2p host
+GOST client ══Tunnel stream ("id" key)════▶ p2p host ──bridge──▶ peer
 ```
 
 - `peer` is opaque: its semantics are defined by the plugin (a base64 public key in DERP mode, a plain `host:port` in stub mode).
-- `endpoint` is opaque: v1 is a locally dialable TCP `host:port`. Closing the connection on the GOST side closes the tunnel.
+- `OpenTunnel` only authorizes the tunnel and returns a cryptographically random, single-use `id`. The **data rides the `Tunnel` gRPC stream** bound to that id (sent as the `id` metadata key) — there is no local endpoint to dial, so a firewall between GOST and this host can't block the data path. Closing the stream closes the tunnel; the stream's lifetime *is* the tunnel's lifetime.
 - The GOST-side wiring (tunnel dialer, config) lives in `go-gost/x` (`x/p2p/`); the wire contract lives in `go-gost/plugin` (`p2p/proto`).
 
 ## Positioning: a generic P2P connectivity primitive
@@ -36,14 +36,13 @@ It provides **reachability, not policy** — the same layering as IP/TCP:
 
 ```bash
 go build -o p2p .
-./p2p --addr 127.0.0.1:8003 --bind 127.0.0.1
+./p2p --addr 127.0.0.1:8003
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `-C` | *(empty)* | config file (YAML); config values are defaults, explicitly-set flags override |
 | `--addr` | `127.0.0.1:8003` | gRPC control-plane listen address |
-| `--bind` | `127.0.0.1` | data-plane listen IP (one ephemeral port per tunnel) |
 | `--token` | *(empty)* | control-plane auth token; empty disables checking |
 | `--derp` | *(empty)* | DERP relay URL (`wss://host/derp`); enables engine mode |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
@@ -68,7 +67,6 @@ flags and the config `forwards` list are additive.
 
 ```yaml
 addr: 127.0.0.1:8003
-bind: 127.0.0.1
 token: gost
 derp: wss://derp.example.com/derp
 key: peer.key
@@ -162,13 +160,16 @@ The derper's STUN server answers only Tailscale's binding-request dialect (`SOFT
 
 ## Datagram channels (a tun link, Linux)
 
-A chain node whose dialer is `udp` asks this host for a **datagram endpoint** instead of a
-byte stream: a local UDP socket whose datagrams are length-prefixed onto the peer's stream,
-one datagram per frame, so packet boundaries survive the byte-stream data plane. That is
-what makes a tun-to-tun link possible — **GOST owns the device** (the `tun` listener creates
-and configures it, the `tun` handler bridges it), this host is only the pipe. A tun device
-is exclusive-open, so the device cannot be shared: GOST having its own tun stack is the
-whole point.
+A chain node whose dialer is `udp` asks for a **datagram stream** (`network=udp`) instead of
+a byte stream. The `Tunnel` stream carries it like any other tunnel; on each side this host
+pairs the persistent per-peer edge (the direct-or-relay stream to the other host) with the
+latest gost tunnel's stream and pumps bytes between them. The GOST-side conn frames each
+datagram into a length-prefixed frame and the peer's GOST-side conn parses it, so packet
+boundaries survive the byte-stream data plane and **this host never parses the data**. That
+is what makes a tun-to-tun link possible — **GOST owns the device** (the `tun` listener
+creates and configures it, the `tun` handler bridges it), this host is only the pipe. A tun
+device is exclusive-open, so the device cannot be shared: GOST having its own tun stack is
+the whole point.
 
 ```bash
 # both ends: no --target, no device flags. The peer's key goes in the GOST node addr.
@@ -200,18 +201,18 @@ chains:
 ```
 
 One channel exists per peer, shared by every tunnel to it and reference-counted: GOST opens
-a tunnel per dial and closes it on reconnect, so the endpoint is torn down when the last one
-closes and rebuilt on the next open. Only the host with the **smaller public key** opens the
-stream; the other side is served by its normal accept path. The link prefers the direct
-(hole-punched) path and falls back to the relay, exactly like a tunnel. `network=udp`
-requires engine mode (`--derp`): a channel is addressed by peer key.
+a tunnel per dial and closes it on reconnect, so the channel is torn down when the last one
+closes and rebuilt on the next open. Only the host with the **smaller public key** opens
+the peer edge's stream; the other side is served by its normal accept path. A re-dial takes
+over the local edge (last dial wins), and the peer edge reconnects with backoff across its
+own downtime while the local edge persists. The link prefers the direct (hole-punched) path
+and falls back to the relay, exactly like a tunnel. `network=udp` requires engine mode
+(`--derp`): a channel is addressed by peer key.
 
-The endpoint learns its client from the packets it receives — GOST announces itself with an
-empty datagram right after dialling — and a re-dial (new source port) takes over, so a
-side that has nothing to send yet is still reachable. Datagrams read while the stream is
-down are dropped (IP tolerates loss). The data path is **unencrypted** like the rest of the
-data plane: there is no inner dialer here to secure it, so run it over a trusted path or add
-your own encryption above it.
+Bytes are dropped whenever one side has no live edge yet (IP tolerates loss), so a side
+that has nothing to send yet is still reachable. The data path is **unencrypted** like the
+rest of the data plane: there is no inner dialer here to secure it, so run it over a trusted
+path or add your own encryption above it.
 
 ## Security
 
@@ -225,7 +226,7 @@ A **datagram channel** is plaintext too: IP packets cross the relay or hole-punc
 
 1. ~~STUN + UDP hole-punched tunnels~~ — shipped (KCP + smux direct path, DERP relay as fallback).
 2. Rendezvous address discovery — abandoned: derper v1.102.3 only sends `PeerPresent` to mesh watchers, never to open-relay clients, so presence-driven name discovery is infeasible. Peers are addressed by base64 public key; a human-friendly name belongs in the GOST config, not a p2p-side registry.
-3. Datagram channels (tun/tap over the tunnel) — shipped (`network=udp`): a per-peer UDP endpoint framed onto a persistent direct-or-relay stream. The device itself is GOST's (the `tun` listener/handler), this host is only the pipe.
+3. Datagram channels (tun/tap over the tunnel) — shipped (`network=udp`): a per-peer byte pipe between the peer's stream and the latest gost tunnel's stream, carried inside the same `Tunnel` streams. The device itself is GOST's (the `tun` listener/handler), this host is only the pipe.
 
 ## License
 
