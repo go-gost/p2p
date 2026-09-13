@@ -125,7 +125,6 @@ func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (
 	if network == "udp" && s.engine.hubEnabled() {
 		return nil, status.Errorf(codes.PermissionDenied, "udp tunnel is reserved by hub mode")
 	}
-
 	peer := req.Peer
 	if s.engine != nil {
 		// DERP mode: the peer is a public key; validate its shape now and
@@ -139,6 +138,13 @@ func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (
 			// dial to it: the channel pairs the peer edge with the latest
 			// tunnel's local edge and outlives individual dials; the record's
 			// release is what drops its reference.
+			// A dial is the intent to connect: start the punch now instead of only
+			// once a stream is opened (which never happens for the responder half
+			// of the key orders), and tell the peer a datagram channel is wanted.
+			s.engine.maybeStartDirect(key)
+			if err := s.engine.sendDialUDP(key); err != nil {
+				slog.Debug("udp dial notice", "peer", peer, "error", err)
+			}
 			t := &tunnel{
 				id:        newTunnelID(),
 				target:    peer,

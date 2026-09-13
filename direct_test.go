@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"github.com/xtaci/smux"
 
 	"github.com/go-gost/p2p/internal/derpclient"
+	"github.com/go-gost/plugin/p2p/proto"
 )
 
 // TestMain shortens the direct punch timing for the whole package. It is set
@@ -849,4 +851,32 @@ func TestDirectPunchStaggeredStart(t *testing.T) {
 	}
 	defer s.Close()
 	roundTrip(t, s, "staggered-direct")
+}
+
+// TestUDPDialStartsPunch: dialling a udp tunnel starts hole punching even when
+// this side will not open the channel stream -- otherwise, in the half of the
+// key orders where the peer is the opener, neither side ever sends candidates
+// and the direct path never gets a chance.
+func TestUDPDialStartsPunch(t *testing.T) {
+	e := newTestEngine(t)
+	e.stunAddr = "127.0.0.1:3478" // non-empty only: the punch itself fails fast
+	_, peer, _ := derpclient.Generate()
+
+	s := newServer(e)
+	if _, err := s.OpenTunnel(context.Background(), &proto.OpenTunnelRequest{
+		Peer: keyName(peer), Network: "udp",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dc := e.getDirect(peer)
+	if dc == nil {
+		t.Fatal("udp dial did not start a punch")
+	}
+	dc.mu.Lock()
+	state := dc.state
+	dc.mu.Unlock()
+	if state == directNone {
+		t.Fatal("udp dial left the punch unstarted")
+	}
 }
