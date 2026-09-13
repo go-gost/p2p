@@ -46,9 +46,8 @@ go build -o p2p .
 | `--token` | *(empty)* | control-plane auth token; empty disables checking |
 | `--derp` | *(empty)* | DERP relay URL (`wss://host/derp`); enables engine mode |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
-| `--target` | *(empty)* | inbound bridge target (repeatable; `"host:port"` = tcp, `"udp://host:port"` = udp; DERP mode) |
+| `--target` | *(empty)* | inbound bridge target (repeatable; bare `"host:port"` feeds the tcp pool, `"udp://host:port"` the udp pool; DERP mode) |
 | `--forward` | *(empty)* | static port forward `"listen-addr=peer-key"` (repeatable; DERP mode) |
-| `--allow` | *(empty)* | hub mode: peer public key allowed to reach the tun server (repeatable; DERP mode) |
 | `--stun` | *(empty)* | STUN server (host:port) for direct hole punching; empty disables direct (relay only) — opt-in |
 | `--tls.secure` | `true` | verify the relay's TLS certificate (`false` to trust any cert) |
 | `--tls.caFile` | *(empty)* | PEM CA file to trust the relay's self-signed certificate |
@@ -215,55 +214,55 @@ that has nothing to send yet is still reachable. The data path is **unencrypted*
 rest of the data plane: there is no inner dialer here to secure it, so run it over a trusted
 path or add your own encryption above it.
 
-## Hub mode (many NAT'd spokes → one NAT'd hub, Linux)
+## UDP target (a global datagram outlet)
 
-The link above is point-to-point. Hub mode covers the common shape where **several peers
-behind NAT** (each a `tun` *client*) must reach **one peer behind NAT that holds a single tun
-device** (a `tun` *server*). The hub never dials anyone — each spoke dials the hub, and the
-hub serves them all through one device.
-
-It works because GOST's `tun` **server** mode is already a hub: the handler binds a UDP
-socket and demultiplexes N UDP peers onto one device (`h.routes: IP → UDPAddr`, registered by
-each client's keepalive and authenticated by the handler's `auther`). So this host adds one
-thing per allowed spoke: a datagram channel whose **local edge is a UDP socket dialed to that
-tun server** (the frame↔datagram adapter), instead of a GOST tunnel's stream. The server then
-sees each spoke as an ordinary UDP client — demultiplexing, keepalive route registration, and
-passphrase auth all work unchanged. **The spoke needs no special config** beyond a normal
-`tun` client pointed at the hub's key.
+A `udp://` `--target` is a **global datagram outlet** — a datagram channel's second kind of
+*end*, and unlike the per-peer channel it is **not bound to any peer**. Every inbound datagram
+stream (a stream prefixed with the `P2PU` tag) picks a target from the udp pool, dials it, and
+is bridged to it for the stream's lifetime: the stream's frames become raw IP datagrams at the
+outlet, and each datagram comes back framed on the stream. The outlet side keeps **zero
+per-peer state** — no prebuilt channel, no per-key socket, nothing that outlives a single
+stream. This is the shape a `tun` *server* behind NAT wants: many NAT'd `tun` clients reach one
+NAT'd peer that holds a single tun device.
 
 ```bash
-# hub: p2p in hub mode (a udp target is the tun server; one --allow per spoke key)
-./p2p --derp wss://derp.example.com/derp --key hub.key \
-      --target udp://127.0.0.1:8421 --allow <spokeA-key> --allow <spokeB-key> \
-      --stun derp.example.com:3478
+# outlet side: p2p with a udp target pointing at the tun server — no --allow, no per-peer config
+./p2p --derp wss://derp.example.com/derp --key outlet.key \
+      --target udp://127.0.0.1:8421 --stun derp.example.com:3478
 
-# hub: GOST tun SERVER — do NOT set tun.p2p (that flag is the single-peer mode)
+# outlet side: GOST tun SERVER — do NOT set tun.p2p (that flag is the single-peer mode)
 #   gost -L "tun://127.0.0.1:8421?net=10.10.0.1/24&keepalive=true&ttl=10s&token=<passphrase>"
 #   auther: user = each spoke's tun IP, password = the shared passphrase
-#   sysctl -w net.ipv4.ip_forward=1     # to reach a network behind the hub
+#   sysctl -w net.ipv4.ip_forward=1     # to reach a network behind the outlet
 ```
 
 The spoke is a stock `tun` client: `net 10.10.0.<n>/24`, `keepalive: true`, the same `token`,
-and a `route` for whatever lies behind the hub; its chain node addr is the **hub's key** with
-`dialer: udp` / `connector: forward`, exactly like the point-to-point link.
+and a `route` for whatever lies behind the outlet; its chain node addr is the **outlet host's
+key** with `dialer: udp` / `connector: forward`, exactly like the point-to-point link.
 
-- **One device, N peers.** Each spoke takes a distinct IP in the hub's tun subnet; the server
-  keys routes by that IP. Spoke↔spoke needs no extra config (same /24 → the device → the
-  per-peer route); reaching a network behind the hub is the hub kernel's job (`ip_forward` +
-  routes).
-- **Two layers, both required.** `--allow` is **admission** (which peer keys may use the hub
-  at all); the tun `token`/passphrase is the **data plane** (per-IP auth of the keepalive).
-  `--allow` is fail-closed: hub mode must name at least one key *and* at least one `udp://`
-  target, or startup fails.
-- **`keepalive` is for the server side.** Set it on the spokes (their peer is the tun server,
-  which echoes). Do **not** set it on a point-to-point p2p link: there the peer is another
-  `tun` client that discards the heartbeat without echoing, so an idle link hits its 3×ttl
-  read deadline and redials. The hub's server-side `keepalive/ttl` doubles as the route TTL
-  (3×ttl), so an absent spoke's route expires instead of black-holing.
+- **Two ends, one rendezvous.** A datagram channel pairs two *ends*, and p2p special-cases
+  neither. End (1) is a local GOST udp `Tunnel` stream — the per-peer `channel` above, the
+  generic rendezvous a tun-to-tun link uses and a spoke dialling an outlet also uses. End (2)
+  is a udp `--target` — this global outlet. Which end a host holds is a deployment shape, not
+  a mode. The opener is decided by public-key order (the smaller key opens): the channel side
+  opens through its own loop, while the outlet side — which has no channel — opens when the
+  peer's in-band udp-dial notice arrives; a host that holds a channel never runs that loop too.
+- **Admission is the caller's, not p2p's.** Who may use the outlet is decided above this
+  layer: the tun `auther`'s per-spoke passphrase, the relay's `-verify-clients=true`, or
+  simply port binding/firewall. **An unauthenticated `udp://` outlet is equivalent to exposing
+  an unauthenticated tun server on the data plane** — put the tun handler's `token`/passphrase
+  (or an equivalent) in front of it.
+- **`keepalive` is the tun app's job, above p2p.** The outlet's source port changes whenever
+  the peer edge is (re)established, so the tun server's route (keyed by spoke IP) is refreshed
+  by the tun client's next keepalive — the tun application's responsibility, not a p2p
+  contract. A tun client that never sends keepalive will, after its first reconnect, have the
+  server's downstream pointed at a dead port. Set `keepalive` on the spokes (their peer is the
+  tun server, which echoes and registers their route); the server-side `keepalive/ttl` also
+  expires an absent spoke's route instead of black-holing.
 
 `--target` is repeatable and feeds two pools: a bare `host:port` is a **tcp** target (inbound
-byte-stream tunnels), `udp://host:port` is a **udp** target (hub channels). Multiple udp
-targets round-robin spokes across tun servers.
+byte-stream tunnels), `udp://host:port` is a **udp** target (the outlet above). Multiple udp
+targets round-robin inbound datagram streams across outlets.
 
 ## Security
 
@@ -273,14 +272,17 @@ A DERP relay with `-verify-clients=false` is an open relay: it sees and can drop
 
 A **datagram channel** is plaintext too: IP packets cross the relay or hole-punched path unencrypted, and unlike a tunnel dialer there is nothing above them in this host to secure them. Run it only over a trusted path, or add your own encryption above the link (GOST's `tls`/`mtls` dialers do not apply to a `udp` tunnel).
 
-**Hub mode** adds an admission layer: `--allow` gates which peer keys may reach the tun server at all (fail-closed), on top of the tun handler's `token`/passphrase. Both are required — the allowlist is admission, the passphrase is the data plane.
+**A udp outlet** shifts admission to the caller: p2p holds none. Who may reach the outlet's tun
+server is decided above — the tun `auther`'s per-spoke passphrase, the relay's
+`-verify-clients=true`, or port binding/firewall. An outlet with nothing in front of it is an
+unauthenticated tun server exposed on the data plane.
 
 ## Roadmap
 
 1. ~~STUN + UDP hole-punched tunnels~~ — shipped (KCP + smux direct path, DERP relay as fallback).
 2. Rendezvous address discovery — abandoned: derper v1.102.3 only sends `PeerPresent` to mesh watchers, never to open-relay clients, so presence-driven name discovery is infeasible. Peers are addressed by base64 public key; a human-friendly name belongs in the GOST config, not a p2p-side registry.
 3. Datagram channels (tun/tap over the tunnel) — shipped (`network=udp`): a per-peer byte pipe between the peer's stream and the latest gost tunnel's stream, carried inside the same `Tunnel` streams. The device itself is GOST's (the `tun` listener/handler), this host is only the pipe.
-4. Hub mode — shipped: `--allow` plus a `udp://` target gives each allowed spoke a datagram channel whose local edge is a UDP socket to the hub's `tun` server, so many NAT'd spokes reach one NAT'd hub device (the server's per-IP route table is GOST's).
+4. UDP target outlet — shipped: a `udp://` target is a global datagram outlet (stream-level, no per-peer state), so many NAT'd spokes reach one NAT'd peer holding a single `tun` device (the server's per-IP route table is GOST's). Admission is the caller's.
 
 ## License
 

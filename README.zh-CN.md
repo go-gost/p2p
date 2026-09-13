@@ -46,9 +46,8 @@ go build -o p2p .
 | `--token` | *(空)* | 控制面认证 token；为空则不做校验 |
 | `--derp` | *(空)* | DERP relay URL（`wss://host/derp`）；启用 engine 模式 |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 私钥文件（hex）；缺失则自动生成 |
-| `--target` | *(空)* | 入站隧道桥接目标（可重复；`"host:port"` = tcp，`"udp://host:port"` = udp；DERP 模式） |
+| `--target` | *(空)* | 入站隧道桥接目标（可重复；裸 `"host:port"` 进 tcp 池，`"udp://host:port"` 进 udp 池；DERP 模式） |
 | `--forward` | *(空)* | 预配置静态端口转发 `"listen-addr=peer-key"`（可重复；DERP 模式） |
-| `--allow` | *(空)* | hub 模式：允许接入 tun server 的 peer 公钥（可重复；DERP 模式） |
 | `--stun` | *(空)* | STUN 服务器（host:port），用于直连打洞；留空则禁用直连（仅走中继）— 需显式开启 |
 | `--tls.secure` | `true` | 校验 relay 的 TLS 证书（`false` 信任任意证书） |
 | `--tls.caFile` | *(空)* | 用于信任 relay 自签证书的 PEM CA 文件 |
@@ -195,31 +194,28 @@ chains:
 
 任一侧暂时没有活边时字节直接丢弃（IP 能容忍丢包），因此暂时无话可说的一端依然可达。数据面**不加密**，与其余数据面一致：这里没有内层 dialer 可托付，仅在可信链路上使用，或在链路之上自行加密。
 
-## Hub 模式（多个 NAT 后的 spoke → 一个 NAT 后的 hub，Linux）
+## UDP target(全局数据报出口)
 
-上面的链路是点对点的。Hub 模式覆盖常见形态：**多个 NAT 后的 peer**（各自是 `tun` *client*）要访问**一个 NAT 后、持有一块 tun 设备的 peer**（`tun` *server*）。hub 从不主动拨号——每个 spoke 拨向 hub，hub 用同一块设备服务所有人。
-
-之所以成立，是因为 GOST 的 `tun` **server** 模式本身就是一个 hub：handler 在服务地址绑一个 UDP socket，把 N 个 UDP 对端解复用到同一块设备（`h.routes: IP → UDPAddr`，由每个 client 的 keepalive 注册、经 handler 的 `auther` 认证）。所以本宿主对每个允许的 spoke 只加一件事：一条数据报通道，其**本地边是一个拨向该 tun server 的 UDP socket**（帧↔数据报适配器），而不是某条 GOST 隧道的流。于是 server 把每个 spoke 当作普通 UDP 客户端——解复用、keepalive 路由注册、passphrase 认证全部原样生效。**spoke 侧无需任何特殊配置**，就是一个普通的 `tun` client，node addr 填 hub 公钥。
+`udp://` 的 `--target` 是一个**全局数据报出口**——它是数据报通道的第二种*端*，与上面的 per-peer 通道不同，**不绑定任何 peer**。每条入站的带 `P2PU` 标记的数据报流都从 udp 池里取一个 target、拨它，并在该流的生命期内与它桥接：流上的帧在出口变成裸 IP 数据报，每个数据报又成帧回写到流上。出口侧**零 per-peer 状态**——没有预建通道、没有 per-key socket，没有任何东西活得比一条流更久。这正是 NAT 后的 `tun` *server* 想要的形态：多个 NAT 后的 `tun` client 访问一个 NAT 后、持有单块 tun 设备的 peer。
 
 ```bash
-# hub：p2p 开 hub 模式（udp target 即 tun server；每个 spoke 一条 --allow）
-./p2p --derp wss://derp.example.com/derp --key hub.key \
-      --target udp://127.0.0.1:8421 --allow <spokeA-key> --allow <spokeB-key> \
-      --stun derp.example.com:3478
+# 出口侧：p2p 带一个指向 tun server 的 udp target —— 无 --allow、无 per-peer 配置
+./p2p --derp wss://derp.example.com/derp --key outlet.key \
+      --target udp://127.0.0.1:8421 --stun derp.example.com:3478
 
-# hub：GOST tun SERVER —— 不要设 tun.p2p（那个旗标是单 peer 模式）
+# 出口侧：GOST tun SERVER —— 不要设 tun.p2p（那个旗标是单 peer 模式）
 #   gost -L "tun://127.0.0.1:8421?net=10.10.0.1/24&keepalive=true&ttl=10s&token=<passphrase>"
 #   auther：user = 各 spoke 的 tun IP，password = 共享 passphrase
-#   sysctl -w net.ipv4.ip_forward=1     # 要访问 hub 身后的网络时
+#   sysctl -w net.ipv4.ip_forward=1     # 要访问出口身后的网络时
 ```
 
-spoke 就是原样的 `tun` client：`net 10.10.0.<n>/24`、`keepalive: true`、同一个 `token`、指向 hub 身后网络的 `route`；链节点 addr 填 **hub 公钥**，`dialer: udp` / `connector: forward`，与点对点链路完全一致。
+spoke 就是原样的 `tun` client：`net 10.10.0.<n>/24`、`keepalive: true`、同一个 `token`、指向出口身后网络的 `route`；链节点 addr 填 **出口宿主公钥**，`dialer: udp` / `connector: forward`，与点对点链路完全一致。
 
-- **一块设备，N 个 peer。** 每个 spoke 在 hub 的 tun 子网里取不同 IP，server 按 IP 建路由。spoke↔spoke 无需额外配置（同 /24 → 设备 → per-peer 路由）；访问 hub 身后的网络是 hub 内核的职责（`ip_forward` + 路由）。
-- **两层，缺一不可。** `--allow` 是**准入**（哪些 peer 公钥能用这个 hub）；tun 的 `token`/passphrase 是**数据面**（对 keepalive 做 per-IP 认证）。`--allow` 是 fail closed：hub 模式必须至少给一个 key、且至少有一个 `udp://` target，否则启动报错。
-- **`keepalive` 是给 server 侧用的。** 在 spoke 上设（其对端是 tun server，会回显）。**点对点 p2p 链路不要设**：那里对端是另一个 `tun` client，只丢弃心跳、不回显，空闲时该侧会撞上 3×ttl 读死线并重拨。hub 的 server 侧 `keepalive/ttl` 同时是路由 TTL（3×ttl），离场 spoke 的路由会过期，不再向死地址黑洞发送。
+- **两个端，一个 rendezvous。** 数据报通道配对的是两个*端*，p2p 不为任何一端特化。端 (1) 是本机的一条 GOST udp `Tunnel` 流——即上面的 per-peer `channel`，tun-to-tun 链路与 spoke 拨向出口都用这个通用 rendezvous。端 (2) 是 udp 的 `--target`——即这里的全局出口。一台宿主持哪一端是部署形态，不是模式。开流方由公钥序决定（公钥较小者开）：channel 侧经自己的 loop 开；出口侧没有 channel，靠对端带内的 udp dial 通知触发；持 channel 的一侧不会再跑那条 loop。
+- **准入在调用方，不在 p2p。** 谁可用该出口由本层之上决定：tun `auther` 的 per-spoke passphrase、relay 的 `-verify-clients=true`，或简单的端口绑定/防火墙。**未认证的 `udp://` 出口等价于在数据面上直接暴露一个未认证的 tun server**——请在它前面放上 tun handler 的 `token`/passphrase（或等价物）。
+- **`keepalive` 是 tun app 的职责，在 p2p 之上。** 出口侧源端口随 peer 边（重）建立而变，因此 tun server 按 spoke IP 建的路由要靠 tun client 的下一次 keepalive 刷新——这是 tun 应用的义务，不是 p2p 的契约。从不发 keepalive 的 tun client，在其第一次重连后，server 的下行就会指向一个死端口。在 spoke 上设 `keepalive`（其对端是 tun server，会回显并注册路由）；server 侧的 `keepalive/ttl` 也会让离场 spoke 的路由过期，而不是向死地址黑洞发送。
 
-`--target` 可重复，分成两个池：裸 `host:port` 是 **tcp** 目标（入站字节流隧道），`udp://host:port` 是 **udp** 目标（hub 通道）。多个 udp target 会把 spoke 轮询分摊到多个 tun server。
+`--target` 可重复，分成两个池：裸 `host:port` 是 **tcp** 目标（入站字节流隧道），`udp://host:port` 是 **udp** 目标（上面的出口）。多个 udp target 会把入站数据报流轮询分摊到多个出口。
 
 ## 安全
 
@@ -229,14 +225,14 @@ spoke 就是原样的 `tun` client：`net 10.10.0.<n>/24`、`keepalive: true`、
 
 **数据报通道**同样是明文：IP 包经 relay 或打洞路径不加密传输，而且与隧道不同，本宿主里没有东西给它加密（GOST 的 `tls`/`mtls` dialer 对 `udp` 隧道不适用）。仅在可信链路上使用，或在链路之上自行加密。
 
-**Hub 模式**增加一层准入：`--allow` 决定哪些 peer 公钥能访问 tun server（fail closed），叠加在 tun handler 的 `token`/passphrase 之上。两者缺一不可——白名单是准入，passphrase 是数据面。
+**udp 出口**把准入交给调用方：p2p 不做准入。谁可访问出口的 tun server 由上层决定——tun `auther` 的 per-spoke passphrase、relay 的 `-verify-clients=true`，或端口绑定/防火墙。前面没有东西挡着的出口，就是一个暴露在数据面上的未认证 tun server。
 
 ## Roadmap
 
 1. ~~STUN + UDP 打洞隧道~~——已交付（KCP + smux 直连，DERP relay 回退）。
 2. rendezvous 地址发现——已放弃：derper v1.102.3 只向 mesh watcher 发送 `PeerPresent`，从不发给开放中继客户端，因此基于 presence 的名字发现不可行。peer 以 base64 公钥寻址；人类可读名字应放在 GOST 配置里，而非 p2p 侧的注册表。
 3. 数据报通道（tun/tap 走隧道）——已交付（`network=udp`）：每 peer 一条字节管道，把对端流与最新一条 GOST 隧道的流对接，全部在彼此的 `Tunnel` 流内承载。设备本身归 GOST（`tun` listener/handler），本宿主只是管道。
-4. Hub 模式——已交付：`--allow` 加一个 `udp://` target，就为每个允许的 spoke 建一条数据报通道，其本地边是拨向 hub `tun` server 的 UDP socket，于是多个 NAT 后的 spoke 能访问一个 NAT 后的 hub 设备（server 的 per-IP 路由表是 GOST 的）。
+4. UDP target 出口——已交付：`udp://` target 是一个全局数据报出口（流级、零 per-peer 状态），于是多个 NAT 后的 spoke 能访问一个 NAT 后、持有单块 `tun` 设备的 peer（server 的 per-IP 路由表是 GOST 的）。准入在调用方。
 
 ## License
 
