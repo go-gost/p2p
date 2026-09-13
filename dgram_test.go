@@ -150,6 +150,52 @@ func TestDgramEdgeReadSpansReads(t *testing.T) {
 	}
 }
 
+// TestServeTargetStreamBridgesFramesToTarget: a tagged inbound stream is served
+// purely from the udp pool -- frames on the stream become datagrams at the
+// target, and a target datagram comes back as frames on the stream. No channel
+// and no per-peer state is involved.
+func TestServeTargetStreamBridgesFramesToTarget(t *testing.T) {
+	e := newTestEngine(t)
+	stub, spec := startHubStub(t)
+	if err := e.addTargets([]string{spec}); err != nil {
+		t.Fatal(err)
+	}
+	target, _ := e.targets.pick("udp")
+
+	stream, peerSide := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		e.serveTargetStream(stream, target)
+		close(done)
+	}()
+
+	// stream -> target: one framed datagram comes out as one datagram; echo a
+	// datagram back to the source the stub sees.
+	go peerSide.Write(appendFrame(nil, []byte("hello")))
+	stub.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, maxFrame)
+	n, from, err := stub.ReadFromUDP(buf)
+	if err != nil || string(buf[:n]) != "hello" {
+		t.Fatalf("target got %q, %v; want hello", buf[:n], err)
+	}
+	if _, err := stub.WriteToUDP([]byte("world"), from); err != nil {
+		t.Fatal(err)
+	}
+
+	// target -> stream: that datagram comes back framed.
+	want := appendFrame(nil, []byte("world"))
+	if got := readN(t, peerSide, len(want)); !bytes.Equal(got, want) {
+		t.Fatalf("stream got %x, want %x", got, want)
+	}
+
+	peerSide.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveTargetStream did not return after the stream closed")
+	}
+}
+
 // TestDgramEdgeCloseWakesRead: Close unblocks a parked Read.
 func TestDgramEdgeCloseWakesRead(t *testing.T) {
 	_, edge := startUDPStub(t)

@@ -37,6 +37,7 @@ const (
 	frameData    = 0x01 // [0x01][smux byte stream]
 
 	ctrlPunchCandidates = 0x02 // sealed candidate list
+	ctrlDialUDP         = 0x03 // sealed udp-tunnel dial notice
 )
 
 // Direct timing. Vars so tests can shorten them.
@@ -569,6 +570,13 @@ func (e *Engine) sendCandidates(peer derpclient.PublicKey, cands []candidate) er
 	return e.sendControl(peer, ctrlPunchCandidates, e.priv.SealTo(peer, encodeCandidates(cands)))
 }
 
+// sendDialUDP tells peer that this host has dialled a udp tunnel toward it, so
+// a peer holding a udp target knows a datagram channel is wanted. Sealed so a
+// malicious relay cannot forge the notice on a peer's behalf.
+func (e *Engine) sendDialUDP(peer derpclient.PublicKey) error {
+	return e.sendControl(peer, ctrlDialUDP, e.priv.SealTo(peer, nil))
+}
+
 // sendControl sends a control frame ([frameControl][kind][payload]) to peer.
 func (e *Engine) sendControl(peer derpclient.PublicKey, kind byte, payload []byte) error {
 	e.mu.Lock()
@@ -661,26 +669,28 @@ func (e *Engine) acceptLoop(sess *smux.Session, transport string, peer derpclien
 // channel magic carries the peer's udp channel, anything else is a normal
 // tunnel stream bridged to --target.
 func (e *Engine) serveInbound(stream net.Conn, transport string, peer derpclient.PublicKey, peerAddr string) {
-	// Hub mode is fail-closed across both stream kinds: a peer that is not on
-	// the allowlist is refused before classification, so an untagged stream
-	// cannot be bridged to the tcp target either. Hub channels are prebuilt, so
-	// an allowlisted peer needs no special handling here.
-	if e.hubDenied(peer) {
-		e.log.Warn("hub peer refused", "transport", transport, "peer", keyName(peer))
-		stream.Close()
-		return
-	}
-
 	if tagged, c := peekTag(stream); tagged {
-		ch := e.channel(peer)
-		if ch == nil {
-			// The local gost has not dialled its endpoint yet (a startup race,
-			// not an error): drop the stream and let the opener's backoff retry.
-			e.log.Debug("channel stream refused", "transport", transport, "peer", keyName(peer))
+		// Two kinds of datagram end, resolved here:
+		//   - the channel side (this host has a local gost udp tunnel for peer):
+		//     the peer edge pairs with that gost stream -- the generic path, used
+		//     by tun-to-tun and wherever this host holds a local udp dial;
+		//   - the target side (no local gost udp tunnel): serve straight from the
+		//     udp target pool for the stream's lifetime, zero per-peer state.
+		//     Whether this peer may use the target is the caller's business
+		//     (tun auther / firewall), not the transport's.
+		if ch := e.channel(peer); ch != nil {
+			ch.serveStream(c, transport)
+			return
+		}
+		target, ok := e.targets.pick("udp")
+		if !ok {
+			e.log.Debug("datagram stream refused (no udp target)", "transport", transport, "peer", keyName(peer))
 			c.Close()
 			return
 		}
-		ch.serveStream(c, transport)
+		e.log.Info("datagram channel up", "transport", transport, "peer", keyName(peer))
+		e.serveTargetStream(c, target)
+		e.log.Info("datagram channel down", "transport", transport, "peer", keyName(peer))
 		return
 	} else if c != stream {
 		stream = c // untagged: replay the bytes consumed by the partial peek

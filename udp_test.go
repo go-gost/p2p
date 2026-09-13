@@ -454,3 +454,145 @@ func TestChannelRefcount(t *testing.T) {
 		t.Fatal("rebuilt channel shares the stale stop channel (a stale loop could feed it)")
 	}
 }
+
+// TestDatagramDialerHandsOverToChannel: when a channel appears after the dial
+// notice (the interleave startDatagramDialer's guard targets), the dialer
+// loop's first iteration returns on the channel -- but it must still drop its
+// e.dialers entry. A stale entry burns one of the 256 slots and makes
+// startDatagramDialer early-return forever, so the target side could never
+// re-arm once that channel goes away.
+func TestDatagramDialerHandsOverToChannel(t *testing.T) {
+	e := newTestEngine(t)
+	// A responder-role peer: openChannel starts no loop, so the setup is
+	// deterministic.
+	var peer derpclient.PublicKey
+	for {
+		_, peer, _ = derpclient.Generate()
+		if bytes.Compare(e.pub[:], peer[:]) < 0 {
+			break
+		}
+	}
+
+	ch := e.openChannel(peer) // the channel that races in after the notice
+
+	// Reconstruct the interleave's outcome: the channel is already up, yet the
+	// dialer entry got registered anyway (startDatagramDialer's pre-lock check
+	// raced past openChannel). Run the loop exactly as startDatagramDialer
+	// would.
+	e.mu.Lock()
+	stop := make(chan struct{})
+	e.dialers[peer] = stop
+	e.mu.Unlock()
+	go e.datagramDialerLoop(peer, stop)
+
+	waitFor(t, 3*time.Second, func() bool {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return len(e.dialers) == 0
+	})
+
+	// The channel later ends: the target side must be able to re-arm.
+	ch.release()
+	e.startDatagramDialer(peer)
+	e.mu.Lock()
+	n := len(e.dialers)
+	e.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("dialer did not re-arm after the channel went away: %d entries", n)
+	}
+	e.stopDatagramDialer(peer)
+}
+
+// TestStopDatagramDialerOwnedIgnoresSuccessor: a loop's owned cleanup must only
+// drop its own entry. A successor registered under the same peer (re-armed
+// after a re-announce, while the stale loop is still exiting) must survive, or
+// the new opener would be deleted and closed silently.
+func TestStopDatagramDialerOwnedIgnoresSuccessor(t *testing.T) {
+	e := newTestEngine(t)
+	_, peer, _ := derpclient.Generate()
+
+	mine := make(chan struct{})
+	successor := make(chan struct{})
+	e.mu.Lock()
+	e.dialers[peer] = successor // the successor owns the slot
+	e.mu.Unlock()
+
+	e.stopDatagramDialerOwned(peer, mine) // the stale loop exiting
+
+	e.mu.Lock()
+	got := e.dialers[peer]
+	e.mu.Unlock()
+	if got != successor {
+		t.Fatal("owned cleanup clobbered the successor's dialer entry")
+	}
+	select {
+	case <-successor:
+		t.Fatal("owned cleanup closed the successor's stop channel")
+	default:
+	}
+
+	// Owning cleanup does drop its own entry.
+	e.stopDatagramDialerOwned(peer, successor)
+	e.mu.Lock()
+	n := len(e.dialers)
+	e.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("owned cleanup left %d entries, want 0", n)
+	}
+}
+
+// TestMaxDatagramDialersCap: the opener count is bounded so a flood of
+// announcing peers cannot exhaust fds/goroutines. At the cap startDatagramDialer
+// must refuse; once a slot frees it must register exactly one entry. Map-level
+// setup: no 256 goroutines are spun up.
+func TestMaxDatagramDialersCap(t *testing.T) {
+	e := newTestEngine(t)
+	_, newPeer, _ := derpclient.Generate()
+
+	// Pre-fill to the cap with distinct dummy keys, each with its own stop.
+	e.mu.Lock()
+	dummies := make([]derpclient.PublicKey, 0, maxDatagramDialers)
+	for i := 0; i < maxDatagramDialers; i++ {
+		k := derpclient.PublicKey{byte(i), byte(i >> 8)}
+		e.dialers[k] = make(chan struct{})
+		dummies = append(dummies, k)
+	}
+	e.mu.Unlock()
+
+	// At the cap: refused, count unchanged.
+	e.startDatagramDialer(newPeer)
+	e.mu.Lock()
+	_, present := e.dialers[newPeer]
+	n := len(e.dialers)
+	e.mu.Unlock()
+	if present {
+		t.Fatal("startDatagramDialer registered past the cap")
+	}
+	if n != maxDatagramDialers {
+		t.Fatalf("dialer count = %d, want %d (cap unchanged)", n, maxDatagramDialers)
+	}
+
+	// Free one slot: the next start registers exactly one entry.
+	e.mu.Lock()
+	delete(e.dialers, dummies[0])
+	e.mu.Unlock()
+	e.startDatagramDialer(newPeer)
+	e.mu.Lock()
+	_, present = e.dialers[newPeer]
+	n = len(e.dialers)
+	e.mu.Unlock()
+	if !present {
+		t.Fatal("startDatagramDialer did not register after a slot freed")
+	}
+	if n != maxDatagramDialers {
+		t.Fatalf("dialer count = %d, want %d after re-register", n, maxDatagramDialers)
+	}
+
+	// Stop the real loop we started and clear the dummies.
+	e.stopDatagramDialer(newPeer)
+	e.mu.Lock()
+	for _, k := range dummies[1:] {
+		delete(e.dialers, k)
+	}
+	e.mu.Unlock()
+}

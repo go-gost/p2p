@@ -65,6 +65,13 @@ func channelRetryDelay(prev time.Duration, openFailed bool) time.Duration {
 // use, and takes a reference on it. The channel outlives individual gost
 // tunnels: it is torn down when the last one closes.
 func (e *Engine) openChannel(peer derpclient.PublicKey) *channel {
+	// A channel takes over the peer edge: stop any target-side opener loop so it
+	// does not fight ch.loop over setStream (last-wins). The stop is only
+	// observed at the dialer's next round -- a serveTargetStream already in
+	// flight runs to its current stream's end -- so takeover converges within a
+	// backoff round, not instantly, when the same host is both a udp outlet and
+	// a local udp dialer for the peer.
+	e.stopDatagramDialer(peer)
 	e.mu.Lock()
 	if ch, ok := e.chans[peer]; ok {
 		ch.mu.Lock()
@@ -233,7 +240,7 @@ func (ch *channel) loop() {
 	delay := channelRetryMin
 	for {
 		openFailed := false
-		c, err := ch.e.OpenStream(pname)
+		c, err := ch.e.openTaggedStream(pname)
 		if err == nil {
 			// The channel may have been torn down while the stream was opening:
 			// serving it would feed a dead channel.
@@ -241,10 +248,6 @@ func (ch *channel) loop() {
 				c.Close()
 				return
 			}
-			// The tag goes out before the stream is published (setStream /
-			// serveStream), so a frame byte can never precede it and make the
-			// responder read payload as the tag.
-			_, err = c.Write([]byte(channelTag))
 		}
 		if err != nil {
 			openFailed = true
@@ -403,3 +406,180 @@ type prefixConn struct {
 }
 
 func (c *prefixConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// serveTargetStream bridges one inbound datagram stream to a udp target from
+// the pool: frame bytes from the stream become datagrams at the target, and
+// each datagram comes back as a frame. It is the receive half of a datagram
+// channel; nothing outlives the stream, so there is no per-peer state.
+// Either direction ending tears the pair down.
+func (e *Engine) serveTargetStream(stream net.Conn, target string) {
+	defer stream.Close()
+	c, err := net.Dial("udp", target)
+	if err != nil {
+		e.log.Debug("datagram target dial", "target", target, "error", err)
+		return
+	}
+	uc, ok := c.(*net.UDPConn)
+	if !ok {
+		c.Close()
+		e.log.Debug("datagram target is not udp", "target", target)
+		return
+	}
+	edge := newDgramEdge(uc)
+	defer edge.Close()
+
+	done := make(chan struct{}, 2)
+	go func() { // stream frames -> target datagrams
+		buf := make([]byte, channelChunkSize)
+		for {
+			n, err := stream.Read(buf)
+			if n > 0 {
+				if _, werr := edge.Write(buf[:n]); werr != nil {
+					e.log.Debug("datagram target write", "target", target, "error", werr)
+				}
+			}
+			if err != nil {
+				done <- struct{}{}
+				return
+			}
+		}
+	}()
+	go func() { // target datagrams -> stream frames
+		buf := make([]byte, channelChunkSize)
+		for {
+			n, err := edge.Read(buf)
+			if n > 0 {
+				if _, werr := stream.Write(buf[:n]); werr != nil {
+					e.log.Debug("datagram stream write", "target", target, "error", werr)
+				}
+			}
+			if err != nil {
+				done <- struct{}{}
+				return
+			}
+		}
+	}()
+	<-done
+}
+
+// maxDatagramDialers bounds the per-peer opener loops, so an unbounded stream of
+// announcing peers cannot exhaust fds/goroutines.
+const maxDatagramDialers = 256
+
+// startDatagramDialer keeps a datagram peer edge to peer alive: open a tagged
+// stream, bridge it to a udp target for the stream's lifetime, back off, repeat.
+// It runs only on the pure target side, only when it owns the smaller key and a
+// udp target exists, and only after the peer announces a udp dial. Idempotent
+// per peer.
+func (e *Engine) startDatagramDialer(peer derpclient.PublicKey) {
+	// The channel side already owns the peer edge (ch.loop); a second opener
+	// would fight it over setStream. This dialer is for the pure target side.
+	if e.channel(peer) != nil {
+		return
+	}
+	e.mu.Lock()
+	if _, ok := e.dialers[peer]; ok {
+		e.mu.Unlock()
+		return
+	}
+	if len(e.dialers) >= maxDatagramDialers {
+		e.mu.Unlock()
+		e.log.Warn("datagram dialer limit reached", "peer", keyName(peer))
+		return
+	}
+	stop := make(chan struct{})
+	e.dialers[peer] = stop
+	e.mu.Unlock()
+	go e.datagramDialerLoop(peer, stop)
+}
+
+// stopDatagramDialer ends peer's opener loop (peer gone / engine shutdown).
+func (e *Engine) stopDatagramDialer(peer derpclient.PublicKey) {
+	e.mu.Lock()
+	stop := e.dialers[peer]
+	delete(e.dialers, peer)
+	e.mu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
+}
+
+// stopDatagramDialerOwned is a loop's own cleanup: it drops and closes the entry
+// only while it is still this loop's stop channel, so an exiting loop cannot
+// delete a successor's entry that handleControl registered in the meantime
+// (clearStream / clearLocal / the chans identity check are the same pattern).
+// Closing stop is safe: the loop is its only receiver and is exiting.
+func (e *Engine) stopDatagramDialerOwned(peer derpclient.PublicKey, stop chan struct{}) {
+	e.mu.Lock()
+	if e.dialers[peer] != stop {
+		e.mu.Unlock()
+		return
+	}
+	delete(e.dialers, peer)
+	e.mu.Unlock()
+	close(stop)
+}
+
+// openTaggedStream opens a stream to peer and writes the datagram-channel tag
+// before returning it: the tag must precede any frame byte, or the responder
+// would read payload as the tag. The stream is closed on a tag-write failure,
+// so a non-nil error never leaves the caller owning a stream.
+func (e *Engine) openTaggedStream(pname string) (net.Conn, error) {
+	c, err := e.OpenStream(pname)
+	if err != nil {
+		return nil, err
+	}
+	if _, werr := c.Write([]byte(channelTag)); werr != nil {
+		c.Close()
+		return nil, werr
+	}
+	return c, nil
+}
+
+// datagramDialerLoop is the target side's peer-edge loop. It re-checks for a
+// channel each round: a channel that appears after the notice owns the peer
+// edge, and a second opener would fight ch.loop over setStream (last-wins), so
+// the dialer hands over deterministically.
+func (e *Engine) datagramDialerLoop(peer derpclient.PublicKey, stop chan struct{}) {
+	pname := keyName(peer)
+	// Every exit path must drop this peer's dialer entry: a stale entry would
+	// consume one of the 256 slots AND make startDatagramDialer early-return
+	// forever, so the target side could never re-arm after the channel goes
+	// away. The owned form no-ops when a `<-stop` exit already removed the
+	// entry, and never clobbers a successor's.
+	defer e.stopDatagramDialerOwned(peer, stop)
+	delay := channelRetryMin
+	for {
+		if e.channel(peer) != nil {
+			return
+		}
+		openFailed := false
+		c, err := e.openTaggedStream(pname)
+		if err != nil {
+			openFailed = true
+			if c != nil {
+				c.Close()
+			}
+			e.log.Debug("datagram dial: open stream", "peer", pname, "error", err)
+		} else if target, ok := e.targets.pick("udp"); ok {
+			e.log.Info("datagram channel up", "peer", pname)
+			e.serveTargetStream(c, target)
+			e.log.Info("datagram channel down", "peer", pname)
+		} else {
+			// Unreachable today: startDatagramDialer only runs with a udp target
+			// and the pool is fixed after startup. Retrying would spin, so stop
+			// instead.
+			e.log.Debug("datagram dial: no udp target", "peer", pname)
+			c.Close()
+			return
+		}
+		select {
+		case <-e.stop:
+			return
+		case <-stop:
+			return
+		case <-time.After(delay):
+		}
+		delay = channelRetryDelay(delay, openFailed)
+	}
+}

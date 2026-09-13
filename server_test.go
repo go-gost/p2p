@@ -7,9 +7,6 @@ import (
 	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
-	"github.com/go-gost/plugin/p2p/proto"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // TestAddForward covers spec parsing and the DERP-mode gate. A valid spec
@@ -87,29 +84,5 @@ func TestForwardSurvivesGC(t *testing.T) {
 
 	for _, tn := range s.tunnels {
 		tn.close()
-	}
-}
-
-// TestOpenTunnelHubRefusesUDP: with hub mode on, a udp OpenTunnel is refused —
-// the hub owns those channels, so a stray GOST dial cannot replace a hub edge.
-// tcp is unaffected.
-func TestOpenTunnelHubRefusesUDP(t *testing.T) {
-	e := newTestEngine(t)
-	_, spec := startHubStub(t)
-	if err := e.addTargets([]string{spec}); err != nil {
-		t.Fatal(err)
-	}
-	_, key, _ := derpclient.Generate()
-	if err := e.EnableHub([]derpclient.PublicKey{key}); err != nil {
-		t.Fatal(err)
-	}
-	s := newServer(e)
-	peer := keyName(key)
-
-	if _, err := s.OpenTunnel(context.Background(), &proto.OpenTunnelRequest{Peer: peer, Network: "udp"}); status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("hub udp OpenTunnel = %v, want PermissionDenied", err)
-	}
-	if _, err := s.OpenTunnel(context.Background(), &proto.OpenTunnelRequest{Peer: peer, Network: "tcp"}); err != nil {
-		t.Fatalf("hub tcp OpenTunnel = %v, want nil", err)
 	}
 }

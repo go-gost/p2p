@@ -36,8 +36,8 @@ func parseTarget(v string) (targetSpec, error) {
 
 // targetPool holds bridge targets grouped by network and hands them out
 // round-robin (k8s-Service style, no health checking). Each network has its
-// own cursor so consumers — inbound tcp tunnels, hub udp channels — never
-// disturb one another's rotation.
+// own cursor so consumers — inbound tcp tunnels and the udp datagram outlets —
+// never disturb one another's rotation.
 type targetPool struct {
 	byNetwork map[string][]string
 	rr        map[string]*atomic.Uint64
