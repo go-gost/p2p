@@ -45,11 +45,6 @@ func main() {
 		targets = append(targets, v)
 		return nil
 	})
-	var allow []string
-	flag.Func("allow", "hub mode: peer public key allowed to reach the tun server (repeatable; DERP mode)", func(v string) error {
-		allow = append(allow, v)
-		return nil
-	})
 	var forwards []string
 	flag.Func("forward", `static port forward "listen-addr=peer-key" (repeatable; DERP mode)`, func(v string) error {
 		forwards = append(forwards, v)
@@ -146,28 +141,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Hub mode: the allow list (config + --allow) turns the host into a hub for
-	// those peers. It needs engine mode — a peer key is the only addressing
-	// scheme — so an allow list without --derp is a startup error, not a silent
-	// no-op.
-	allowKeys := append(cfg.Allow, allow...)
-	var hubKeys []derpclient.PublicKey
-	for _, s := range allowKeys {
-		if strings.TrimSpace(s) == "" {
-			continue
-		}
-		k, err := parsePeerKey(s)
-		if err != nil {
-			slog.Error("allow", "value", s, "error", err)
-			os.Exit(1)
-		}
-		hubKeys = append(hubKeys, k)
-	}
-	if len(hubKeys) > 0 && cfg.Derp == "" {
-		slog.Error("hub mode requires --derp (a peer key)")
-		os.Exit(1)
-	}
-
 	var engine *Engine
 	if cfg.Derp != "" {
 		priv, pub, err := loadOrCreateKey(cfg.Key)
@@ -194,14 +167,6 @@ func main() {
 			// background, but inbound tunnels stay unreachable until the
 			// first successful connection.
 			slog.Warn("derp connect", "error", err)
-		}
-		// EnableHub fails closed on a missing udp target.
-		if len(hubKeys) > 0 {
-			if err := engine.EnableHub(hubKeys); err != nil {
-				slog.Error("hub mode", "error", err)
-				os.Exit(1)
-			}
-			slog.Info("hub mode enabled", "spokes", len(hubKeys))
 		}
 	}
 

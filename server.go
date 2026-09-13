@@ -120,11 +120,6 @@ func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (
 	if network == "udp" && s.engine == nil {
 		return nil, status.Errorf(codes.InvalidArgument, "udp tunnel requires derp mode (peer key)")
 	}
-	// In hub mode the host owns every datagram channel: refuse a udp tunnel so
-	// a stray GOST dial cannot replace a hub edge (attachLocal is last-dial-wins).
-	if network == "udp" && s.engine.hubEnabled() {
-		return nil, status.Errorf(codes.PermissionDenied, "udp tunnel is reserved by hub mode")
-	}
 	peer := req.Peer
 	if s.engine != nil {
 		// DERP mode: the peer is a public key; validate its shape now and

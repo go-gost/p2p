@@ -19,7 +19,6 @@ type Config struct {
 	Key      string          `yaml:"key,omitempty"`
 	Target   string          `yaml:"target,omitempty"`
 	Targets  []string        `yaml:"targets,omitempty"`
-	Allow    []string        `yaml:"allow,omitempty"`
 	Stun     string          `yaml:"stun,omitempty"`
 	TLS      *TLSConfig      `yaml:"tls,omitempty"`
 	Log      *LogConfig      `yaml:"log,omitempty"`

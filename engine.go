@@ -40,15 +40,14 @@ type Engine struct {
 	pub      derpclient.PublicKey
 	log      *slog.Logger
 
-	mu       sync.Mutex
-	client   *derpclient.Client
-	peers    map[derpclient.PublicKey]*peerConn
-	directs  map[derpclient.PublicKey]*directConn
-	chans    map[derpclient.PublicKey]*channel
-	dialers  map[derpclient.PublicKey]chan struct{} // pure target side: per-peer datagram opener loops
-	gone     map[derpclient.PublicKey]bool          // peers reported gone (DERP connection dropped)
-	hubAllow map[derpclient.PublicKey]bool          // non-nil = hub mode; peers not listed are refused
-	stop     chan struct{}
+	mu      sync.Mutex
+	client  *derpclient.Client
+	peers   map[derpclient.PublicKey]*peerConn
+	directs map[derpclient.PublicKey]*directConn
+	chans   map[derpclient.PublicKey]*channel
+	dialers map[derpclient.PublicKey]chan struct{} // pure target side: per-peer datagram opener loops
+	gone    map[derpclient.PublicKey]bool          // peers reported gone (DERP connection dropped)
+	stop    chan struct{}
 }
 
 // peerConn is the per-peer packet adapter: smux sees it as a net.Conn, whose
@@ -432,52 +431,6 @@ func (e *Engine) handleControl(src derpclient.PublicKey, body []byte) {
 }
 
 // keepalive keeps the DERP connection alive through proxy/CDN idle timeouts.
-// allowlist is fail-closed — serveInbound refuses any peer not listed. Needs at
-// least one key and at least one udp target.
-func (e *Engine) EnableHub(keys []derpclient.PublicKey) error {
-	if len(keys) == 0 {
-		return errors.New("hub mode: no peer keys")
-	}
-	if !e.targets.has("udp") {
-		return errors.New("hub mode: no udp:// target (the tun server)")
-	}
-
-	// Build the channels before taking e.mu: openChannel takes it itself.
-	for _, k := range keys {
-		target, _ := e.targets.pick("udp")
-		if err := e.addHubChannel(k, target); err != nil {
-			return err
-		}
-	}
-
-	e.mu.Lock()
-	e.hubAllow = make(map[derpclient.PublicKey]bool, len(keys))
-	for _, k := range keys {
-		e.hubAllow[k] = true
-	}
-	e.mu.Unlock()
-	return nil
-}
-
-// hubDenied reports whether peer must be refused: hub mode is on and the peer
-// is not on the allowlist. It fails open when hub mode is off, leaving existing
-// deployments unchanged.
-func (e *Engine) hubDenied(peer derpclient.PublicKey) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.hubAllow == nil {
-		return false
-	}
-	return !e.hubAllow[peer]
-}
-
-// hubEnabled reports whether hub mode is on (any allowlist was published).
-func (e *Engine) hubEnabled() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.hubAllow != nil
-}
-
 func (e *Engine) keepalive(c *derpclient.Client) {
 	ticker := time.NewTicker(keepAlivePeriod)
 	defer ticker.Stop()

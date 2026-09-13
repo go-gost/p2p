@@ -28,9 +28,6 @@ derp: wss://derp.example.com/derp
 key: peer.key
 target: 127.0.0.1:18080
 stun: stun.example.com:3478
-allow:
-  - AAAA
-  - BBBB
 tls:
   secure: false
   caFile: /etc/p2p/ca.pem
@@ -64,9 +61,6 @@ timeouts:
 		c.Derp != "wss://derp.example.com/derp" || c.Key != "peer.key" ||
 		c.Target != "127.0.0.1:18080" || c.Stun != "stun.example.com:3478" {
 		t.Fatalf("flat fields = %+v", c)
-	}
-	if len(c.Allow) != 2 || c.Allow[0] != "AAAA" || c.Allow[1] != "BBBB" {
-		t.Fatalf("allow = %+v", c.Allow)
 	}
 	if c.TLS == nil || c.TLS.Secure == nil || *c.TLS.Secure != false || c.TLS.CAFile != "/etc/p2p/ca.pem" {
 		t.Fatalf("tls = %+v", c.TLS)

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -101,25 +100,6 @@ func (e *Engine) openChannel(peer derpclient.PublicKey) *channel {
 		e.log.Info("channel role", "peer", keyName(peer), "role", "responder")
 	}
 	return ch
-}
-
-// addHubChannel gives peer a datagram channel whose local edge is a UDP socket
-// dialed to target (the hub's tun server). Unlike a dial-in channel there is no
-// reference counting: the hub holds the channel for the process's lifetime and
-// Engine.Close reclaims it.
-func (e *Engine) addHubChannel(peer derpclient.PublicKey, target string) error {
-	conn, err := net.Dial("udp", target)
-	if err != nil {
-		return fmt.Errorf("hub channel to %s: %w", target, err)
-	}
-	uc, ok := conn.(*net.UDPConn)
-	if !ok {
-		conn.Close()
-		return fmt.Errorf("hub target %q is not a udp address", target)
-	}
-	ch := e.openChannel(peer) // refs=1, held for the process's lifetime
-	ch.attachLocal(newDgramEdge(uc))
-	return nil
 }
 
 // channel returns the peer's live channel, or nil when it has none (or its
