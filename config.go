@@ -18,6 +18,8 @@ type Config struct {
 	Derp     string          `yaml:"derp,omitempty"`
 	Key      string          `yaml:"key,omitempty"`
 	Target   string          `yaml:"target,omitempty"`
+	Targets  []string        `yaml:"targets,omitempty"`
+	Allow    []string        `yaml:"allow,omitempty"`
 	Stun     string          `yaml:"stun,omitempty"`
 	TLS      *TLSConfig      `yaml:"tls,omitempty"`
 	Log      *LogConfig      `yaml:"log,omitempty"`
@@ -87,6 +89,17 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return &c, nil
+}
+
+// targetList merges the legacy scalar `target` with the `targets` list, scalar
+// first, into the raw spec list the engine parses.
+func (c *Config) targetList() []string {
+	specs := make([]string, 0, len(c.Targets)+1)
+	if c.Target != "" {
+		specs = append(specs, c.Target)
+	}
+	specs = append(specs, c.Targets...)
+	return specs
 }
 
 // applyTimeouts validates and applies the timeouts config to the package-level

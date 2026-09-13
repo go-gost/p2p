@@ -661,6 +661,16 @@ func (e *Engine) acceptLoop(sess *smux.Session, transport string, peer derpclien
 // channel magic carries the peer's udp channel, anything else is a normal
 // tunnel stream bridged to --target.
 func (e *Engine) serveInbound(stream net.Conn, transport string, peer derpclient.PublicKey, peerAddr string) {
+	// Hub mode is fail-closed across both stream kinds: a peer that is not on
+	// the allowlist is refused before classification, so an untagged stream
+	// cannot be bridged to the tcp target either. Hub channels are prebuilt, so
+	// an allowlisted peer needs no special handling here.
+	if e.hubDenied(peer) {
+		e.log.Warn("hub peer refused", "transport", transport, "peer", keyName(peer))
+		stream.Close()
+		return
+	}
+
 	if tagged, c := peekTag(stream); tagged {
 		ch := e.channel(peer)
 		if ch == nil {
@@ -676,10 +686,11 @@ func (e *Engine) serveInbound(stream net.Conn, transport string, peer derpclient
 		stream = c // untagged: replay the bytes consumed by the partial peek
 	}
 
-	if e.target == "" {
+	target, ok := e.targets.pick("tcp")
+	if !ok {
 		e.log.Warn("inbound tunnel refused", "transport", transport, "peer", keyName(peer))
 		stream.Close()
 		return
 	}
-	bridgeInbound(stream, transport, keyName(peer), peerAddr, e.target, e.log)
+	bridgeInbound(stream, transport, keyName(peer), peerAddr, target, e.log)
 }

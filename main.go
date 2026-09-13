@@ -40,7 +40,16 @@ func main() {
 	token := flag.String("token", "", "control-plane auth token; empty disables checking (loopback default)")
 	derpURL := flag.String("derp", "", "DERP relay server URL (wss://host/derp); enables DERP engine mode")
 	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
-	target := flag.String("target", "", "local bridge target for inbound tunnels in DERP mode (host:port)")
+	var targets []string
+	flag.Func("target", `inbound bridge target (repeatable; "host:port" = tcp, "udp://host:port" = udp; DERP mode)`, func(v string) error {
+		targets = append(targets, v)
+		return nil
+	})
+	var allow []string
+	flag.Func("allow", "hub mode: peer public key allowed to reach the tun server (repeatable; DERP mode)", func(v string) error {
+		allow = append(allow, v)
+		return nil
+	})
 	var forwards []string
 	flag.Func("forward", `static port forward "listen-addr=peer-key" (repeatable; DERP mode)`, func(v string) error {
 		forwards = append(forwards, v)
@@ -107,9 +116,6 @@ func main() {
 	if set["key"] {
 		cfg.Key = *keyFile
 	}
-	if set["target"] {
-		cfg.Target = *target
-	}
 	if set["stun"] {
 		cfg.Stun = *stunAddr
 	}
@@ -140,6 +146,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Hub mode: the allow list (config + --allow) turns the host into a hub for
+	// those peers. It needs engine mode — a peer key is the only addressing
+	// scheme — so an allow list without --derp is a startup error, not a silent
+	// no-op.
+	allowKeys := append(cfg.Allow, allow...)
+	var hubKeys []derpclient.PublicKey
+	for _, s := range allowKeys {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		k, err := parsePeerKey(s)
+		if err != nil {
+			slog.Error("allow", "value", s, "error", err)
+			os.Exit(1)
+		}
+		hubKeys = append(hubKeys, k)
+	}
+	if len(hubKeys) > 0 && cfg.Derp == "" {
+		slog.Error("hub mode requires --derp (a peer key)")
+		os.Exit(1)
+	}
+
 	var engine *Engine
 	if cfg.Derp != "" {
 		priv, pub, err := loadOrCreateKey(cfg.Key)
@@ -147,24 +175,33 @@ func main() {
 			slog.Error("load key", "file", cfg.Key, "error", err)
 			os.Exit(1)
 		}
-		if cfg.Target != "" {
-			if _, _, err := net.SplitHostPort(cfg.Target); err != nil {
-				slog.Error("invalid target", "value", cfg.Target, "error", err)
-				os.Exit(1)
-			}
+		// Config targets and --target flags are additive; the engine parses and
+		// validates them, so a malformed spec fails startup loudly.
+		specs := append(cfg.targetList(), targets...)
+		engine = newEngine(cfg.Derp, "", priv, slog.Default())
+		if err := engine.addTargets(specs); err != nil {
+			slog.Error("target", "error", err)
+			os.Exit(1)
 		}
-		engine = newEngine(cfg.Derp, cfg.Target, priv, slog.Default())
 		// Hole punching is opt-in: only attempt a direct path when stun is set.
 		engine.stunAddr = cfg.Stun
 		engine.tlsCfg = buildTLSConfig(*cfg.TLS.Secure, cfg.TLS.CAFile)
 		slog.Info("p2p derp engine", "url", cfg.Derp,
 			"pubkey", base64.RawURLEncoding.EncodeToString(pub[:]),
-			"target", cfg.Target)
+			"targets", specs)
 		if err := engine.Connect(); err != nil {
 			// Keep serving gRPC: the reconnect ticker retries in the
 			// background, but inbound tunnels stay unreachable until the
 			// first successful connection.
 			slog.Warn("derp connect", "error", err)
+		}
+		// EnableHub fails closed on a missing udp target.
+		if len(hubKeys) > 0 {
+			if err := engine.EnableHub(hubKeys); err != nil {
+				slog.Error("hub mode", "error", err)
+				os.Exit(1)
+			}
+			slog.Info("hub mode enabled", "spokes", len(hubKeys))
 		}
 	}
 

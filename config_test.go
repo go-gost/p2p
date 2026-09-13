@@ -28,6 +28,9 @@ derp: wss://derp.example.com/derp
 key: peer.key
 target: 127.0.0.1:18080
 stun: stun.example.com:3478
+allow:
+  - AAAA
+  - BBBB
 tls:
   secure: false
   caFile: /etc/p2p/ca.pem
@@ -61,6 +64,9 @@ timeouts:
 		c.Derp != "wss://derp.example.com/derp" || c.Key != "peer.key" ||
 		c.Target != "127.0.0.1:18080" || c.Stun != "stun.example.com:3478" {
 		t.Fatalf("flat fields = %+v", c)
+	}
+	if len(c.Allow) != 2 || c.Allow[0] != "AAAA" || c.Allow[1] != "BBBB" {
+		t.Fatalf("allow = %+v", c.Allow)
 	}
 	if c.TLS == nil || c.TLS.Secure == nil || *c.TLS.Secure != false || c.TLS.CAFile != "/etc/p2p/ca.pem" {
 		t.Fatalf("tls = %+v", c.TLS)
@@ -112,6 +118,44 @@ timeouts:
 	}
 	if len(c.Forwards) != 0 || c.TLS != nil || c.Log != nil || c.Addr != "" {
 		t.Fatalf("empty config = %+v, want zero value", c)
+	}
+}
+
+// TestConfigTargetsMerge: the legacy scalar `target` and the `targets` list
+// merge into one list (scalar first), and either alone works.
+func TestConfigTargetsMerge(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "p2p.yaml")
+	write := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("target: 127.0.0.1:18080\ntargets:\n  - udp://127.0.0.1:8421\n  - 127.0.0.1:18081\n")
+	c, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"127.0.0.1:18080", "udp://127.0.0.1:8421", "127.0.0.1:18081"}
+	if got := c.targetList(); !equalStrings(got, want) {
+		t.Fatalf("merged targets = %q, want %q", got, want)
+	}
+
+	write("targets:\n  - udp://127.0.0.1:8421\n")
+	if c, _ = loadConfig(path); !equalStrings(c.targetList(), []string{"udp://127.0.0.1:8421"}) {
+		t.Fatalf("list only = %q", c.targetList())
+	}
+
+	write("target: 127.0.0.1:18080\n")
+	if c, _ = loadConfig(path); !equalStrings(c.targetList(), []string{"127.0.0.1:18080"}) {
+		t.Fatalf("scalar only = %q", c.targetList())
+	}
+
+	write("")
+	if c, _ = loadConfig(path); len(c.targetList()) != 0 {
+		t.Fatalf("empty = %q, want none", c.targetList())
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,20 +33,21 @@ import (
 // regardless of who dials first. smux allows either side to open streams.
 type Engine struct {
 	url      string
-	target   string      // local bridge target for inbound streams ("" = refuse inbound)
+	targets  *targetPool // inbound bridge targets; an empty tcp pool refuses inbound tunnels
 	stunAddr string      // STUN server (host:port); "" disables hole punching
 	tlsCfg   *tls.Config // relay TLS options; nil = default verification
 	priv     derpclient.PrivateKey
 	pub      derpclient.PublicKey
 	log      *slog.Logger
 
-	mu      sync.Mutex
-	client  *derpclient.Client
-	peers   map[derpclient.PublicKey]*peerConn
-	directs map[derpclient.PublicKey]*directConn
-	chans   map[derpclient.PublicKey]*channel
-	gone    map[derpclient.PublicKey]bool // peers reported gone (DERP connection dropped)
-	stop    chan struct{}
+	mu       sync.Mutex
+	client   *derpclient.Client
+	peers    map[derpclient.PublicKey]*peerConn
+	directs  map[derpclient.PublicKey]*directConn
+	chans    map[derpclient.PublicKey]*channel
+	gone     map[derpclient.PublicKey]bool // peers reported gone (DERP connection dropped)
+	hubAllow map[derpclient.PublicKey]bool // non-nil = hub mode; peers not listed are refused
+	stop     chan struct{}
 }
 
 // peerConn is the per-peer packet adapter: smux sees it as a net.Conn, whose
@@ -103,7 +105,7 @@ var (
 func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger) *Engine {
 	e := &Engine{
 		url:     url,
-		target:  target,
+		targets: newTargetPool(),
 		priv:    priv,
 		pub:     priv.Public(),
 		peers:   make(map[derpclient.PublicKey]*peerConn),
@@ -113,10 +115,81 @@ func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger)
 		log:     log,
 		stop:    make(chan struct{}),
 	}
+	if target != "" {
+		if err := e.addTargets([]string{target}); err != nil {
+			log.Error("target", "value", target, "error", err)
+		}
+	}
 	// The host is a rendezvous node: it must be connected to the relay for
 	// peers to reach it, and it must recover after the connection drops.
 	go e.reconnect()
 	return e
+}
+
+// addTargets parses each target spec (a bare "host:port" is tcp, "udp://…" is
+// udp) and adds it to the pool. Blank entries are skipped; the first malformed
+// spec is returned so startup fails loudly.
+func (e *Engine) addTargets(specs []string) error {
+	for _, s := range specs {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		sp, err := parseTarget(s)
+		if err != nil {
+			return err
+		}
+		e.targets.add(sp)
+	}
+	return nil
+}
+
+// EnableHub turns this host into a hub: every allowed peer key gets a datagram
+// channel whose local edge is a UDP socket dialed to the tun server, so the
+// peer's tun client is served as an ordinary UDP client of that server. The
+// allowlist is fail-closed — serveInbound refuses any peer not listed. Needs at
+// least one key and at least one udp target.
+func (e *Engine) EnableHub(keys []derpclient.PublicKey) error {
+	if len(keys) == 0 {
+		return errors.New("hub mode: no peer keys")
+	}
+	if !e.targets.has("udp") {
+		return errors.New("hub mode: no udp:// target (the tun server)")
+	}
+
+	// Build the channels before taking e.mu: openChannel takes it itself.
+	for _, k := range keys {
+		target, _ := e.targets.pick("udp")
+		if err := e.addHubChannel(k, target); err != nil {
+			return err
+		}
+	}
+
+	e.mu.Lock()
+	e.hubAllow = make(map[derpclient.PublicKey]bool, len(keys))
+	for _, k := range keys {
+		e.hubAllow[k] = true
+	}
+	e.mu.Unlock()
+	return nil
+}
+
+// hubDenied reports whether peer must be refused: hub mode is on and the peer
+// is not on the allowlist. It fails open when hub mode is off, leaving existing
+// deployments unchanged.
+func (e *Engine) hubDenied(peer derpclient.PublicKey) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.hubAllow == nil {
+		return false
+	}
+	return !e.hubAllow[peer]
+}
+
+// hubEnabled reports whether hub mode is on (any allowlist was published).
+func (e *Engine) hubEnabled() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.hubAllow != nil
 }
 
 // reconnect redials the relay whenever there is no live connection. It runs

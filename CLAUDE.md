@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Standalone host process for the GOST [p2p plugin](https://github.com/go-gost/plugin) control protocol (`github.com/go-gost/plugin/p2p/proto`). GOST calls `OpenTunnel(peer)` over gRPC, then carries the tunnel's data on the `Tunnel` bidi stream bound to the returned id — no local endpoint is opened per tunnel (a firewall between GOST and this host used to block it). The GOST side (`x/p2p/`) uses that stream as the base connection of any whitelisted chain-node dialer.
 
-Current implementation: **stub + mux + token + DERP relay + STUN/UDP hole punching + datagram channels**. It proves the plugin seam end to end, supports inner dialers `tcp/tls/ws/mtcp/mtls/mws/udp` (mux inners reuse one tunnel as a session; udp asks for a datagram stream instead of a byte stream), has optional control-plane token auth, and — with `--derp` — relays tunnels cross-machine through a DERP server. After a relay session is up, both peers punch a UDP hole (STUN + KCP + smux) and prefer the direct path; the relay stays as fallback. Data-plane encryption is end-to-end (the inner protocol's job). A udp tunnel is a **datagram channel**: two byte-stream edges (the peer edge and the latest gost tunnel's stream) with bytes pumped between them; the GOST-side conn frames the datagrams and the peer's GOST-side conn parses them, so this host never touches the framing (see Datagram channel below).
+Current implementation: **stub + mux + token + DERP relay + STUN/UDP hole punching + datagram channels + hub mode**. It proves the plugin seam end to end, supports inner dialers `tcp/tls/ws/mtcp/mtls/mws/udp` (mux inners reuse one tunnel as a session; udp asks for a datagram stream instead of a byte stream), has optional control-plane token auth, and — with `--derp` — relays tunnels cross-machine through a DERP server. After a relay session is up, both peers punch a UDP hole (STUN + KCP + smux) and prefer the direct path; the relay stays as fallback. Data-plane encryption is end-to-end (the inner protocol's job). A udp tunnel is a **datagram channel**: two byte-stream edges (the peer edge and the latest gost tunnel's stream) with bytes pumped between them; the GOST-side conn frames the datagrams and the peer's GOST-side conn parses them, so this host never touches the framing (see Datagram channel below).
 
 ### Positioning / contract boundary
 
@@ -40,8 +40,9 @@ GOWORK=off go build ./...  # standalone build must also pass
 | `--token` | *(empty)* | control-plane auth token; empty disables checking (loopback default) |
 | `--derp` | *(empty)* | DERP relay URL (`wss://host/derp`); enables engine mode |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
-| `--target` | *(empty)* | local bridge target for inbound tunnels in DERP mode |
+| `--target` | *(empty)* | inbound bridge target (repeatable; `"host:port"` = tcp, `"udp://host:port"` = udp; DERP mode) |
 | `--forward` | *(empty)* | static port forward `"listen-addr=peer-key"` (repeatable; DERP mode) |
+| `--allow` | *(empty)* | hub mode: peer key allowed to reach the tun server (repeatable; DERP mode) |
 | `--stun` | *(empty)* | STUN server (host:port) for direct hole punching; empty disables direct (relay only) — opt-in |
 | `--tls.secure` | `true` | verify the relay's TLS certificate (`false` to trust any cert) |
 | `--tls.caFile` | *(empty)* | PEM CA file to trust the relay's self-signed certificate |
@@ -50,8 +51,9 @@ GOWORK=off go build ./...  # standalone build must also pass
 | `--log.output` | `stderr` | log output: `stderr`, `stdout`, `none`, or a file path (size-rotates at 100 MB) |
 
 Every flag can instead live in a `-C config.yaml` ([config.go](config.go)); a config value
-is the default and an explicitly-set flag overrides it. `--forward` flags and the config
-`forwards` list are additive, so a config can fully replace the command line.
+is the default and an explicitly-set flag overrides it. `--forward`, `--target` and `--allow`
+flags are additive with their config lists (`forwards`, `targets`, `allow`), so a config can
+fully replace the command line.
 
 ## Architecture (two planes)
 
@@ -76,6 +78,8 @@ There is no `CloseTunnel`: the stream ending is the close.
 
 The host **never parses the data**: the GOST-side conn frames datagrams into 2-byte-prefixed frames and the peer's GOST-side conn parses them, so frame bytes travel through verbatim, both ways. Bytes are dropped while the opposite edge is absent or down (IP tolerates loss). One channel per peer, reference-counted by open tunnels: `OpenTunnel(network=udp)` takes a reference (`record.ch`), the `Tunnel` handler's teardown (`dropTunnel`) is the only decrement, and the last one tears the channel down. GOST's `udp` dialer is the only user today: its tunnel carries a tun link end to end (the `play/p2p-tun.yaml` example in the gost repo) — GOST owns and configures the device, this host is only the pipe. The data path is unencrypted like the rest of the data plane.
 
+**Hub mode** (`--allow` + a `udp://` target; [engine.go](engine.go) `EnableHub`, [udp.go](udp.go) `addHubChannel`): many NAT'd peers ("spokes") reach one NAT'd peer holding a single tun device (a GOST `tun` *server*). For each allowed key the host prebuilds one datagram channel at startup whose local edge is a `dgramEdge` — a UDP socket dialed to the tun server that converts the GOST-side 2-byte frames to and from raw IP datagrams ([frame.go](frame.go) + [dgram.go](dgram.go); the host cannot import `x/p2p/streamconn`) — instead of waiting for a gost tunnel to supply the local edge. The server's own per-IP route table then demultiplexes the spokes, so a spoke is a stock `tun` client with no host-side config. The allowlist is **fail-closed**, enforced at the top of `serveInbound` *before* the tag peek (so a non-listed peer cannot bridge an untagged stream to the tcp target either); hub mode also refuses `OpenTunnel(network=udp)` outright, since the host owns those channels. Hub channels are never released — `Engine.Close` reclaims them. The hub's tun handler must NOT set `tun.p2p` (that flag collapses the route table to a single peer). This relies on the x-side keepalive fix in `x/handler/tun`: the client keepalive was gated on `network == "udp"`, so it was dead on a p2p link and routes never registered.
+
 **Lifecycle**: non-mux inner (tcp/tls/ws): one tunnel per GOST dial; closing the tunnel conn ends the `Tunnel` stream, which drops the record (zero-residue verified in e2e). An `OpenTunnel` whose stream never arrives is reclaimed by the ~10 s pending GC. Mux inner (mtcp/mtls/mws): one tunnel per mux session, kept alive until the session dies or the process exits (gost's own mux semantics); N streams multiplex over it. In DERP mode the engine's smux session has the same shape one level down.
 
 ## Trust boundary (do not weaken)
@@ -85,6 +89,8 @@ By default the control channel is **unauthenticated**: anyone who can reach `--a
 A DERP relay with `-verify-clients=false` is an **open relay**: it can observe and drop but not decrypt the bytes (no `DERPMeshKey`, no data-plane encryption at the relay). Confidentiality is the inner dialer's job (`mtls`/`tls`/`wss`).
 
 The hole-punched KCP transport is likewise **unencrypted** (the `block` arg to `NewConn4` is nil): anyone on the UDP path can observe it. Candidate frames are sealed to the peer (`PrivateKey.SealTo`) so a malicious relay cannot forge them, but the data path carries no transport-layer crypto — same trust model as the relay, so do not weaken the inner dialer.
+
+**Hub mode** adds an admission layer: `--allow` decides which peer keys may reach the tun server at all (enforced before stream classification, fail-closed), while the tun handler's `token`/passphrase guards the data plane. Both are required — the allowlist is admission, the passphrase is the data plane.
 
 ## Future milestones (in rough order)
 
