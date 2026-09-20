@@ -289,9 +289,19 @@ func (s *server) addForwardAddr(addr, key string) error {
 }
 
 func (s *server) Status(ctx context.Context, req *proto.StatusRequest) (*proto.StatusReply, error) {
+	reply := &proto.StatusReply{}
+	// Transport stats come from the DERP engine; a stub-mode server (--derp
+	// unset) has no engine and reports zeros there.
+	if s.engine != nil {
+		direct, derp := s.engine.transportCounts()
+		reply.DirectPeers, reply.DerpPeers = int32(direct), int32(derp)
+		reply.PunchAttempts, reply.PunchSuccess,
+			reply.StreamsDirect, reply.StreamsDerp = s.engine.stats.snapshot()
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return &proto.StatusReply{Tunnels: int32(len(s.tunnels))}, nil
+	reply.Tunnels = int32(len(s.tunnels))
+	s.mu.Unlock()
+	return reply, nil
 }
 
 // serve accepts connections until the tunnel is closed, bridging each one

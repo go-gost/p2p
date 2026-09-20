@@ -264,6 +264,30 @@ key** with `dialer: udp` / `connector: forward`, exactly like the point-to-point
 byte-stream tunnels), `udp://host:port` is a **udp** target (the outlet above). Multiple udp
 targets round-robin inbound datagram streams across outlets.
 
+## Transport stats
+
+The host reports its direct/relay statistics over the existing gRPC `Status`
+RPC, so you can tell whether hole punching actually works for your peers:
+
+```bash
+grpcurl -plaintext 127.0.0.1:8003 proto.P2P/Status
+```
+
+```json
+{
+  "tunnels": 4,
+  "directPeers": 12, "derpPeers": 3,
+  "punchAttempts": 45, "punchSuccess": 15,
+  "streamsDirect": 210, "streamsDerp": 30
+}
+```
+
+`directPeers`/`derpPeers` are gauges — where each peer's traffic goes *right
+now*; `punch*` and `streams*` are cumulative since start. A `punchAttempts`
+that climbs while `punchSuccess` stays flat means hole punching is being tried
+and failing (symmetric NAT / CGNAT) — the case IPv6 or port mapping would
+address. With `--token` set, add `-H 'token: <token>'`.
+
 ## Security
 
 The control channel is unauthenticated by default: any process that can reach `--addr` can make this host dial arbitrary addresses. Keep `--addr` on loopback (the default). For cross-machine deployment set `--token` (the GOST client sends it as gRPC metadata) **and** control TLS — the token alone travels over a plaintext gRPC channel today.

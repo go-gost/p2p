@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 	"gopkg.in/natefinch/lumberjack.v2"
 
@@ -201,6 +202,10 @@ func main() {
 		grpc.StreamInterceptor(streamAuthInterceptor(cfg.Token)),
 	)
 	proto.RegisterP2PServer(s, svr)
+	// Reflection lets an operator query Status (transport stats) with
+	// grpcurl without shipping the .proto. With --token set it also needs
+	// -H 'token: ...', since reflection is a stream RPC.
+	reflection.Register(s)
 	slog.Info("p2p listening", "addr", cfg.Addr, "auth", cfg.Token != "", "derp", cfg.Derp != "")
 	if err := s.Serve(ln); err != nil {
 		slog.Error("serve", "error", err)

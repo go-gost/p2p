@@ -15,7 +15,126 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/go-gost/p2p/internal/derpclient"
+	"github.com/xtaci/smux"
 )
+
+// newTestSess returns a live smux session over an in-memory pipe, for tests
+// that only need a session whose IsClosed() can be flipped.
+func newTestSess(t *testing.T) *smux.Session {
+	t.Helper()
+	c1, c2 := net.Pipe()
+	sess, err := smux.Client(c1, smux.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		sess.Close()
+		c2.Close()
+	})
+	return sess
+}
+
+// TestDirectLiveNoSideEffect pins the one trap in the transport-stats feature:
+// the gauge probe must report a dead session without the teardown and re-punch
+// that session() performs, or a Status query would churn connections. If live()
+// ever delegates to session(), the state assertion below fails.
+func TestDirectLiveNoSideEffect(t *testing.T) {
+	sess := newTestSess(t)
+	dc := &directConn{peer: derpclient.PublicKey{1}, sess: sess, state: directUp}
+
+	if !dc.live() {
+		t.Fatal("live() = false for an open session, want true")
+	}
+
+	sess.Close()
+
+	if dc.live() {
+		t.Fatal("live() = true for a closed session, want false")
+	}
+	dc.mu.Lock()
+	state := dc.state
+	dc.mu.Unlock()
+	if state != directUp {
+		t.Fatalf("live() mutated state to %v, want directUp (side-effect free)", state)
+	}
+}
+
+// TestTransportCounts covers the gauge classification: a peer with a live
+// direct session counts as direct and must not also be counted as derp; peers
+// on the relay alone count as derp.
+func TestTransportCounts(t *testing.T) {
+	e := &Engine{
+		directs: make(map[derpclient.PublicKey]*directConn),
+		peers:   make(map[derpclient.PublicKey]*peerConn),
+	}
+
+	peerDirect := derpclient.PublicKey{1}
+	peerRelay := derpclient.PublicKey{2}
+
+	dc := &directConn{e: e, peer: peerDirect, sess: newTestSess(t), state: directUp}
+	e.directs[peerDirect] = dc
+	e.peers[peerDirect] = &peerConn{}
+	e.peers[peerRelay] = &peerConn{}
+
+	direct, derp := e.transportCounts()
+	if direct != 1 {
+		t.Fatalf("direct = %d, want 1", direct)
+	}
+	if derp != 1 {
+		t.Fatalf("derp = %d, want 1 (the direct peer must not double-count)", derp)
+	}
+
+	// Losing the direct session moves that peer into the relay column.
+	dc.mu.Lock()
+	sess := dc.sess
+	dc.mu.Unlock()
+	sess.Close()
+
+	direct, derp = e.transportCounts()
+	if direct != 0 || derp != 2 {
+		t.Fatalf("after session death: direct = %d, derp = %d, want 0, 2", direct, derp)
+	}
+}
+
+// TestTransportStatsCounters drives a real punch and checks the counters the
+// status reply reads.
+func TestTransportStatsCounters(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "stats")
+	s.Close()
+
+	waitFor(t, 5*time.Second, func() bool { return hasDirect(engineA, pubB) })
+
+	punchAttempts, punchSuccess, streamsDirect, _ := engineA.stats.snapshot()
+	if punchAttempts < 1 {
+		t.Fatalf("punchAttempts = %d, want >= 1", punchAttempts)
+	}
+	if punchSuccess < 1 {
+		t.Fatalf("punchSuccess = %d, want >= 1", punchSuccess)
+	}
+	if streamsDirect < 1 {
+		t.Fatalf("streamsDirect = %d, want >= 1", streamsDirect)
+	}
+}
 
 // relayServer is an in-process DERP-style relay: clients (engines) connect
 // over WebSocket, and every SendPacket is forwarded to its destination key

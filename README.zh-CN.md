@@ -217,6 +217,29 @@ spoke 就是原样的 `tun` client：`net 10.10.0.<n>/24`、`keepalive: true`、
 
 `--target` 可重复，分成两个池：裸 `host:port` 是 **tcp** 目标（入站字节流隧道），`udp://host:port` 是 **udp** 目标（上面的出口）。多个 udp target 会把入站数据报流轮询分摊到多个出口。
 
+## Transport 统计
+
+宿主通过既有的 gRPC `Status` RPC 暴露直连/中继统计，用来判断打洞在你自己的
+peer 群体里到底有没有生效：
+
+```bash
+grpcurl -plaintext 127.0.0.1:8003 proto.P2P/Status
+```
+
+```json
+{
+  "tunnels": 4,
+  "directPeers": 12, "derpPeers": 3,
+  "punchAttempts": 45, "punchSuccess": 15,
+  "streamsDirect": 210, "streamsDerp": 30
+}
+```
+
+`directPeers`/`derpPeers` 是 gauge——每个 peer **当前**实际走哪条路；`punch*`
+与 `streams*` 是自启动以来的累计值。`punchAttempts` 一直涨而 `punchSuccess`
+不动，说明打洞在被尝试但失败（对称 NAT / CGNAT）——正是 IPv6 或端口映射要解决
+的场景。设了 `--token` 时加 `-H 'token: <token>'`。
+
 ## 安全
 
 控制面默认**未认证**：任何能访问 `--addr` 的进程都能让本宿主拨任意地址。让 `--addr` 保持回环（默认值）。跨机部署需设 `--token`（GOST client 以 gRPC metadata 发送）**且**配控制面 TLS——仅凭 token 目前走的是明文 gRPC 通道。

@@ -178,6 +178,15 @@ func (dc *directConn) session() *smux.Session {
 	return nil
 }
 
+// live reports whether a usable direct session exists, without side effects.
+// Unlike session() it never tears down a dead session or schedules a re-punch:
+// a status query must not trigger connection churn.
+func (dc *directConn) live() bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.state == directUp && dc.sess != nil && !dc.sess.IsClosed()
+}
+
 func (dc *directConn) onCandidates(cands []candidate) {
 	dc.mu.Lock()
 	if sameCandidates(cands, dc.lastPeer) {
@@ -261,6 +270,7 @@ func (dc *directConn) markUp(sess *smux.Session, socket *net.UDPConn, peerAddr n
 	dc.peerAddr = peerAddr
 	dc.state = directUp
 	dc.mu.Unlock()
+	dc.e.stats.punchSuccess.Add(1)
 }
 
 // markDead clears the direct-session state when the accept loop ends (session
@@ -333,6 +343,7 @@ func (dc *directConn) punch() {
 	// dials: both peers dial. See docs/2026-09-09-p2p-mutual-punch-design.md.
 	roleIsClient := bytes.Compare(e.pub[:], dc.peer[:]) < 0
 	pname := keyName(dc.peer)
+	e.stats.punchAttempts.Add(1)
 
 	// Bind the punch socket to the egress IP toward the STUN server so the
 	// local address we advertise is a concrete, peer-reachable endpoint
@@ -658,6 +669,7 @@ func (e *Engine) acceptLoop(sess *smux.Session, transport string, peer derpclien
 			}
 			return // session dead
 		}
+		e.stats.countStream(transport)
 		// Classification reads the stream's leading bytes, so it runs in the
 		// stream's own goroutine: a silent stream must not stall the accept
 		// loop (and with it every other stream on the session).

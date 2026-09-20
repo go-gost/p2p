@@ -7,7 +7,56 @@ import (
 	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
+	"github.com/go-gost/plugin/p2p/proto"
 )
+
+// TestStatusNoEngine covers stub mode (--derp unset): Status must report zeros
+// rather than dereferencing a nil engine.
+func TestStatusNoEngine(t *testing.T) {
+	s := newServer(nil)
+	reply, err := s.Status(context.Background(), &proto.StatusRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Tunnels != 0 || reply.DirectPeers != 0 || reply.DerpPeers != 0 ||
+		reply.PunchAttempts != 0 || reply.PunchSuccess != 0 ||
+		reply.StreamsDirect != 0 || reply.StreamsDerp != 0 {
+		t.Fatalf("stub-mode Status = %+v, want all zeros", reply)
+	}
+}
+
+// TestStatusReportsTransportStats covers engine mode: the gauges and counters
+// reach the reply.
+func TestStatusReportsTransportStats(t *testing.T) {
+	e := &Engine{
+		directs: make(map[derpclient.PublicKey]*directConn),
+		peers:   make(map[derpclient.PublicKey]*peerConn),
+	}
+	e.stats.punchAttempts.Store(7)
+	e.stats.punchSuccess.Store(3)
+	e.stats.streamsDirect.Store(11)
+	e.stats.streamsDerp.Store(5)
+
+	peerDirect := derpclient.PublicKey{1}
+	peerRelay := derpclient.PublicKey{2}
+	dc := &directConn{e: e, peer: peerDirect, sess: newTestSess(t), state: directUp}
+	e.directs[peerDirect] = dc
+	e.peers[peerRelay] = &peerConn{}
+
+	s := newServer(e)
+	reply, err := s.Status(context.Background(), &proto.StatusRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.DirectPeers != 1 || reply.DerpPeers != 1 {
+		t.Fatalf("gauges = %d/%d, want 1/1", reply.DirectPeers, reply.DerpPeers)
+	}
+	if reply.PunchAttempts != 7 || reply.PunchSuccess != 3 ||
+		reply.StreamsDirect != 11 || reply.StreamsDerp != 5 {
+		t.Fatalf("counters = %d/%d/%d/%d, want 7/3/11/5",
+			reply.PunchAttempts, reply.PunchSuccess, reply.StreamsDirect, reply.StreamsDerp)
+	}
+}
 
 // TestAddForward covers spec parsing and the DERP-mode gate. A valid spec
 // binds a real listener and registers one tunnel; the engine is a zero value

@@ -12,6 +12,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
@@ -48,6 +49,65 @@ type Engine struct {
 	dialers map[derpclient.PublicKey]chan struct{} // pure target side: per-peer datagram opener loops
 	gone    map[derpclient.PublicKey]bool          // peers reported gone (DERP connection dropped)
 	stop    chan struct{}
+
+	stats engineStats
+}
+
+// engineStats holds the transport counters reported by Status. They are
+// cumulative since process start; the fields are safe for concurrent use.
+type engineStats struct {
+	punchAttempts atomic.Int64 // hole-punch attempts
+	punchSuccess  atomic.Int64 // attempts that reached a live direct session
+	streamsDirect atomic.Int64 // streams opened over a direct path
+	streamsDerp   atomic.Int64 // streams opened over the relay
+}
+
+// snapshot returns the counters in StatusReply field order.
+func (s *engineStats) snapshot() (punchAttempts, punchSuccess, streamsDirect, streamsDerp int64) {
+	return s.punchAttempts.Load(), s.punchSuccess.Load(), s.streamsDirect.Load(), s.streamsDerp.Load()
+}
+
+// countStream records one stream opened over the given transport ("direct" or
+// "derp").
+func (s *engineStats) countStream(transport string) {
+	if transport == "direct" {
+		s.streamsDirect.Add(1)
+		return
+	}
+	s.streamsDerp.Add(1)
+}
+
+// transportCounts returns how many peers currently ride a direct session and
+// how many are on the relay only. It probes each directConn with the
+// side-effect-free live() rather than session(): session() tears down a dead
+// session and schedules a re-punch, which a status query must never do. The
+// engine lock is released before probing, so directConn.mu is never taken
+// while holding it.
+func (e *Engine) transportCounts() (direct, derp int) {
+	e.mu.Lock()
+	directs := make([]*directConn, 0, len(e.directs))
+	for _, dc := range e.directs {
+		directs = append(directs, dc)
+	}
+	peers := make([]derpclient.PublicKey, 0, len(e.peers))
+	for p := range e.peers {
+		peers = append(peers, p)
+	}
+	e.mu.Unlock()
+
+	liveDirect := make(map[derpclient.PublicKey]struct{}, len(directs))
+	for _, dc := range directs {
+		if dc.live() {
+			liveDirect[dc.peer] = struct{}{}
+			direct++
+		}
+	}
+	for _, p := range peers {
+		if _, ok := liveDirect[p]; !ok {
+			derp++
+		}
+	}
+	return
 }
 
 // peerConn is the per-peer packet adapter: smux sees it as a net.Conn, whose
@@ -194,6 +254,7 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 	if dc := e.getDirect(peer); dc != nil {
 		if sess := dc.session(); sess != nil {
 			if c, err := openStream(sess, streamOpenTimeout); err == nil {
+				e.stats.countStream("direct")
 				return &openedStream{Conn: c, transport: "direct", peerAddr: dc.peerAddrString()}, nil
 			}
 		}
@@ -208,6 +269,7 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 			if dc := e.getDirect(peer); dc != nil {
 				pa = dc.peerAddrString()
 			}
+			e.stats.countStream("direct")
 			return &openedStream{Conn: c, transport: "direct", peerAddr: pa}, nil
 		}
 	}
@@ -247,6 +309,7 @@ func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
 			}
 		}()
 	}
+	e.stats.countStream("derp")
 	return &openedStream{Conn: c, transport: "derp"}, nil
 }
 
