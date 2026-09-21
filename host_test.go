@@ -45,6 +45,14 @@ func TestProviderStubEcho(t *testing.T) {
 	}
 	defer conn.Close()
 
+	// gost's forward connector logs LocalAddr/RemoteAddr, so a tunnel conn must
+	// return non-nil addresses (String on a nil net.Addr panics).
+	if conn.LocalAddr() == nil || conn.RemoteAddr() == nil {
+		t.Fatalf("nil conn addr: local=%v remote=%v", conn.LocalAddr(), conn.RemoteAddr())
+	}
+	_ = conn.LocalAddr().String()
+	_ = conn.RemoteAddr().String()
+
 	msg := []byte("hello over in-process p2p")
 	if _, err := conn.Write(msg); err != nil {
 		t.Fatal(err)

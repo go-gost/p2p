@@ -75,7 +75,12 @@ func (h *Host) openTunnelStream(ctx context.Context, network, peer string) (net.
 		defer h.server.dropTunnel(t)
 		_ = h.server.serveTunnel(t, serverSide, cancel)
 	}()
-	return newStreamConn(clientSide, cancel), nil
+	conn := newStreamConn(clientSide, cancel)
+	// Synthetic addresses: the tunnel has no socket, but connectors read
+	// LocalAddr/RemoteAddr and call String on them.
+	conn.local = streamAddr{network: network, addr: "p2p"}
+	conn.remote = streamAddr{network: network, addr: peer}
+	return conn, nil
 }
 
 // normalizeNetwork maps a dialer network to the two the tunnel protocol

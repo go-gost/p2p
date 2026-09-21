@@ -37,6 +37,8 @@ type tunnelStream interface {
 type streamConn struct {
 	stream tunnelStream
 	abort  func() // tests: cancels the client-side stream on Close; nil in the host handler
+	local  net.Addr
+	remote net.Addr
 
 	chunks chan []byte
 	closed chan struct{}
@@ -54,6 +56,8 @@ func newStreamConn(stream tunnelStream, abort func()) *streamConn {
 	c := &streamConn{
 		stream: stream,
 		abort:  abort,
+		local:  streamAddr{},
+		remote: streamAddr{},
 		chunks: make(chan []byte, 1),
 		closed: make(chan struct{}),
 		done:   make(chan struct{}),
@@ -61,6 +65,17 @@ func newStreamConn(stream tunnelStream, abort func()) *streamConn {
 	go c.pump()
 	return c
 }
+
+// streamAddr is the synthetic address of a tunnel carried by a stream. The
+// tunnel has no socket, but callers read LocalAddr/RemoteAddr and call String
+// on them (gost's forward connector logs both), so they must be non-nil.
+type streamAddr struct {
+	network string
+	addr    string
+}
+
+func (a streamAddr) Network() string { return a.network }
+func (a streamAddr) String() string  { return a.addr }
 
 // pump moves chunks from Recv to Read; every exit funnels through run's
 // return value, so a reader parked in Read always wakes.
@@ -200,8 +215,8 @@ func (c *streamConn) termErr() error {
 	return net.ErrClosed
 }
 
-func (c *streamConn) LocalAddr() net.Addr  { return nil }
-func (c *streamConn) RemoteAddr() net.Addr { return nil }
+func (c *streamConn) LocalAddr() net.Addr  { return c.local }
+func (c *streamConn) RemoteAddr() net.Addr { return c.remote }
 
 func (c *streamConn) SetDeadline(t time.Time) error {
 	if err := c.SetReadDeadline(t); err != nil {
