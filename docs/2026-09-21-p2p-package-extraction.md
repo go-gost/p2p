@@ -1,6 +1,6 @@
 # p2p 包化重构计划(package main → 可导入库 + 进程内 Provider)
 
-> Status: **Phase 1 + Phase 2 已实现(2026-09-21),门禁全绿,待提交/发布**。
+> Status: **Phase 1 + Phase 2 已实现(2026-09-21),门禁全绿,已随 v0.4.0 发布(提交 0950c90/eecb83d/203f669/3548ec4)**。
 > 目标读者:实施 agent。本文是唯一权威稿;`.memory/notes/p2p-engine-extraction-plan.md` 是进入 Plan 模式前的早期草稿,已过时,实施时按本文更新。
 
 ## Context
