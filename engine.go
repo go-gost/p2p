@@ -33,13 +33,17 @@ import (
 // ordering so both ends always agree on exactly one session per pair
 // regardless of who dials first. smux allows either side to open streams.
 type Engine struct {
-	url      string
-	targets  *targetPool // inbound bridge targets; an empty tcp pool refuses inbound tunnels
-	stunAddr string      // STUN server (host:port); "" disables hole punching
-	tlsCfg   *tls.Config // relay TLS options; nil = default verification
-	priv     derpclient.PrivateKey
-	pub      derpclient.PublicKey
-	log      *slog.Logger
+	url         string
+	targets     *targetPool    // inbound bridge targets; an empty tcp pool refuses inbound tunnels
+	direct      bool           // master direct switch (--direct); false = relay-only
+	stunAddr    string         // STUN server (host:port); "" disables the IPv4 direct path
+	v6Addr      *net.UDPAddr   // explicit IPv6 egress override (tests); nil = probe each round
+	v6Available bool           // host had a global IPv6 egress at startup (gates direct)
+	v6Announce  v6AnnounceFunc // test seam: overrides the advertised IPv6 endpoint
+	tlsCfg      *tls.Config    // relay TLS options; nil = default verification
+	priv        derpclient.PrivateKey
+	pub         derpclient.PublicKey
+	log         *slog.Logger
 
 	mu      sync.Mutex
 	client  *derpclient.Client
@@ -166,6 +170,7 @@ func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger)
 	e := &Engine{
 		url:     url,
 		targets: newTargetPool(),
+		direct:  true,
 		priv:    priv,
 		pub:     priv.Public(),
 		peers:   make(map[derpclient.PublicKey]*peerConn),
@@ -490,6 +495,13 @@ func (e *Engine) handleControl(src derpclient.PublicKey, body []byte) {
 		if e.targets.has("udp") && e.channel(src) == nil && bytes.Compare(e.pub[:], src[:]) < 0 {
 			e.startDatagramDialer(src)
 		}
+	case ctrlCaps:
+		clear, ok := e.priv.OpenFrom(src, body[1:])
+		if !ok || len(clear) < 1 {
+			e.log.Debug("direct punch: bad caps box", "peer", keyName(src))
+			return
+		}
+		e.directConn(src).addCaps(clear[0])
 	}
 }
 

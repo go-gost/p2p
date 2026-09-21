@@ -186,3 +186,12 @@ timeouts:
 
 **正面结论**：窗口 WND_SND/WND_RCV=32 段（≈45KB/会话方向）；`update()` 自适应 flush 间隔
 （`SystemTimedSched` 自重排）；均与本设计兼容，无需调参。
+
+## 附录：IPv6 直连带来的差异（2026-09-20）
+
+`docs/2026-09-20-p2p-ipv6-direct.md` 落地后，本设计的两点断言不再成立：
+
+- **拨号目标规则**：v4 仍是「hairpin 检测 + 单候选」，但新增 v6 族——双方候选列表都含 v6 时优先 v6（取对端第一个 v6 候选），同轮内失败再退 v4。
+- **「对 engine.go 零改动」**：不再成立。新增控制帧 kind `ctrlCaps`（0x04，sealed 能力位域，`handleControl` 新增 case）与 `Engine.direct`/`v6Addr`/`v6Announce` 字段、门控 `directEnabled()`。
+
+不变的部分：互撞拨号、确定性 conv、`seedHandshake` 的 own→peer→own 判据、每 socket 一会话、`onCandidates` 的 request/response 收敛——v6 只是多了一个候选族与一条同轮回退路径。

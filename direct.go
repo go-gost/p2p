@@ -38,7 +38,21 @@ const (
 
 	ctrlPunchCandidates = 0x02 // sealed candidate list
 	ctrlDialUDP         = 0x03 // sealed udp-tunnel dial notice
+	ctrlCaps            = 0x04 // sealed capability bitfield (forward-looking seam)
 )
+
+// Capability bits exchanged via ctrlCaps. Bit 0 marks IPv6 awareness. The frame
+// is a forward-looking negotiation seam: IPv6 selection does NOT depend on it —
+// the candidate list is the in-band signal (a peer that offers a v6 candidate
+// supports v6) — so an unset bit changes no behavior today. It is re-sent with
+// every candidate broadcast so a lost frame or a late-joining peer cannot
+// permanently degrade negotiation; the receiver ORs the bits.
+const capsIPv6 uint8 = 1 << 0
+
+// v6AnnounceFunc maps the bound IPv6 punch socket's port to the endpoint to
+// advertise. Production advertises the socket's own local address; tests
+// override it to force an unreachable candidate.
+type v6AnnounceFunc func(port uint16) netip.AddrPort
 
 // Direct timing. Vars so tests can shorten them.
 var (
@@ -84,6 +98,7 @@ type directConn struct {
 	peerAddr netip.AddrPort // peer's dialed endpoint (public cross-NAT, local same-NAT)
 	mine     []candidate    // our candidates for the current punch, answered to the peer
 	lastPeer []candidate    // peer candidates already acted on (dedupes re-announcements)
+	peerCaps uint8          // capability bits the peer advertised via ctrlCaps
 }
 
 func (e *Engine) directConn(peer derpclient.PublicKey) *directConn {
@@ -107,23 +122,33 @@ func (e *Engine) getDirect(peer derpclient.PublicKey) *directConn {
 	return e.directs[peer]
 }
 
-// maybeStartDirect kicks off hole punching if STUN is configured. Idempotent:
-// it only transitions directNone -> directAttempting, so concurrent triggers
-// from OpenStream and pump converge on a single punch goroutine.
+// directEnabled reports whether a punch has any candidate source: a configured
+// STUN server (IPv4), a usable global IPv6 egress, or an explicit v6 override.
+// Side-effect free, so it is safe on the OpenStream/status paths.
+func (e *Engine) directEnabled() bool {
+	if !e.direct {
+		return false
+	}
+	return e.stunAddr != "" || e.v6Addr != nil || e.v6Available
+}
+
+// maybeStartDirect kicks off hole punching when a candidate source exists.
+// Idempotent: it only transitions directNone -> directAttempting, so concurrent
+// triggers from OpenStream and pump converge on a single punch goroutine.
 func (e *Engine) maybeStartDirect(peer derpclient.PublicKey) {
-	if e.stunAddr == "" {
+	if !e.directEnabled() {
 		return
 	}
 	e.directConn(peer).start()
 }
 
-// punchAndWait triggers hole punching (when STUN is configured) and blocks
+// punchAndWait triggers hole punching when a candidate source exists and blocks
 // until a direct session is up or punchWaitTimeout elapses. It returns nil so
 // the caller falls back to the relay. Candidate exchange rides the DERP
 // control channel, so it needs only the DERP connection — not a relay mux
 // session — and completes well under the timeout.
 func (e *Engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
-	if e.stunAddr == "" {
+	if !e.directEnabled() {
 		return nil
 	}
 	dc := e.directConn(peer)
@@ -294,6 +319,23 @@ func (dc *directConn) markDead(sess *smux.Session) {
 	}
 }
 
+// addCaps ORs the capability bits the peer advertised. Capabilities are
+// cumulative: a re-announcement never clears a bit already set.
+func (dc *directConn) addCaps(bits uint8) {
+	dc.mu.Lock()
+	dc.peerCaps |= bits
+	dc.mu.Unlock()
+}
+
+// supports reports whether the peer has advertised all of the given capability
+// bits. Kept for the negotiation seam; IPv6 selection does not depend on it
+// (the candidate list is the in-band signal).
+func (dc *directConn) supports(bits uint8) bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.peerCaps&bits == bits
+}
+
 // peerAddrString returns the peer's dialed endpoint, or "" when not punched.
 func (dc *directConn) peerAddrString() string {
 	dc.mu.Lock()
@@ -345,128 +387,183 @@ func (dc *directConn) punch() {
 	pname := keyName(dc.peer)
 	e.stats.punchAttempts.Add(1)
 
-	// Bind the punch socket to the egress IP toward the STUN server so the
-	// local address we advertise is a concrete, peer-reachable endpoint
-	// (same-NAT / same-LAN peers connect over it directly). Falls back to a
-	// wildcard bind when the IP cannot be determined.
-	socket, err := net.ListenUDP("udp4", bindAddrFor(e.stunAddr))
-	if err != nil {
-		e.log.Debug("direct punch: udp socket", "peer", pname, "error", err)
+	// 1. Collect one socket + candidate set per available family. A family that
+	// cannot be set up is dropped and the round continues on whatever remains,
+	// so an unreachable STUN server no longer aborts a v6-capable punch.
+	type family struct {
+		name string
+		v6   bool
+		sock *net.UDPConn
+		mine []candidate
+	}
+	var fams []family
+	if e.stunAddr != "" {
+		if sock, mine, err := e.collectV4(); err != nil {
+			e.log.Debug("direct punch: v4 unavailable", "peer", pname, "error", err)
+		} else {
+			fams = append(fams, family{name: "v4", sock: sock, mine: mine})
+		}
+	}
+	// Resolve the IPv6 source for this round: an explicit override wins (tests),
+	// otherwise re-probe — an egress that appeared or changed since startup is
+	// then picked up on the next backoff retry without a restart.
+	v6 := e.v6Addr
+	if v6 == nil && e.v6Available {
+		v6 = v6Egress()
+	}
+	if v6 != nil {
+		if sock, mine, err := e.collectV6(v6); err != nil {
+			e.log.Debug("direct punch: v6 unavailable", "peer", pname, "error", err)
+		} else {
+			fams = append(fams, family{name: "v6", v6: true, sock: sock, mine: mine})
+		}
+	}
+	// Every socket is closed on all exits except the winner, which is handed to
+	// markUp. Closing an already-closed socket (a failed family's session owns
+	// it via ownConn=true) is a harmless no-op.
+	closeFams := func() {
+		for i := range fams {
+			if fams[i].sock != nil {
+				fams[i].sock.Close()
+				fams[i].sock = nil
+			}
+		}
+	}
+	if len(fams) == 0 {
 		dc.backoff()
 		return
 	}
-	keep := false
-	defer func() {
-		if !keep {
-			socket.Close() // idempotent: the kcp session may own the socket
-		}
-	}()
-
 	e.log.Debug("direct punch: start", "peer", pname)
 
-	// 1. Learn our own public endpoint from the same socket we'll punch with,
-	// so the NAT mapping is identical.
-	ctx, cancel := context.WithTimeout(context.Background(), stunTimeout)
-	pubEP, err := stun.Lookup(ctx, e.stunAddr, socket)
-	cancel()
-	if err != nil {
-		e.log.Debug("direct punch: stun failed", "peer", pname, "error", err)
-		dc.backoff()
-		return
+	// 2. Advertise our endpoints (v4 then v6) and our capabilities, then wait
+	// for the peer's list (exchanged over the relay control channel, so this
+	// works even while no UDP path exists yet).
+	var mine []candidate
+	for i := range fams {
+		mine = append(mine, fams[i].mine...)
 	}
-	e.log.Debug("direct punch: stun ok", "peer", pname, "public", pubEP.String())
-
-	// 2. Advertise our endpoints to the peer: the local socket address first
-	// (directly reachable when the peers share a network — same NAT/LAN
-	// hairpin), then the STUN public mapping for cross-NAT.
-	localEP := socket.LocalAddr().(*net.UDPAddr).AddrPort()
-	mine := []candidate{{addr: localEP}, {addr: pubEP}}
-	if len(mine) == 2 && mine[0].addr == mine[1].addr {
-		mine = mine[:1] // no NAT: local == public
-	}
-	// Remember our candidates so onCandidates can answer a peer that missed this
-	// broadcast (it started its punch late or reconnected to the relay).
 	dc.mu.Lock()
 	dc.mine = mine
 	dc.mu.Unlock()
+	if err := e.sendCaps(dc.peer, capsIPv6); err != nil {
+		e.log.Debug("direct punch: send caps failed", "peer", pname, "error", err)
+	}
 	if err := e.sendCandidates(dc.peer, mine); err != nil {
 		e.log.Debug("direct punch: send candidates failed", "peer", pname, "error", err)
+		closeFams()
 		dc.backoff()
 		return
 	}
 	e.log.Debug("direct punch: candidates sent", "peer", pname, "candidates", candAddrs(mine))
 
-	// 3. Wait for the peer's candidates (exchanged over the relay control
-	// channel, so this works even while no UDP path exists yet).
-	ctx, cancel = context.WithTimeout(context.Background(), punchTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), punchTimeout)
 	defer cancel()
 	cands, ok := dc.waitCandidates(ctx)
 	if !ok {
 		e.log.Debug("direct punch: no peer candidates", "peer", pname)
+		closeFams()
 		dc.backoff()
 		return
 	}
+	peerV4 := ipv4Addrs(cands)
+	peerV6 := v6Addrs(cands)
 	e.log.Debug("direct punch: peer candidates", "peer", pname, "candidates", candAddrs(cands))
-	peerAddrs := ipv4Addrs(cands)
-	if len(peerAddrs) == 0 {
-		e.log.Debug("direct punch: no ipv4 candidate", "peer", pname, "candidates", candAddrs(cands))
+
+	// 3. Family order: IPv6 when both sides offer it, otherwise IPv4. The
+	// predicate uses only the two candidate lists, so both peers compute the
+	// same order (docs/2026-09-20-p2p-ipv6-direct.md).
+	i4, i6 := -1, -1
+	for i := range fams {
+		switch fams[i].name {
+		case "v4":
+			i4 = i
+		case "v6":
+			i6 = i
+		}
+	}
+	has4 := i4 >= 0 && len(peerV4) > 0
+	has6 := i6 >= 0 && len(peerV6) > 0
+	var order []int
+	if has6 {
+		order = append(order, i6) // v6 preferred
+	}
+	if has4 {
+		order = append(order, i4)
+	}
+	if len(order) == 0 {
+		e.log.Debug("direct punch: no shared family", "peer", pname, "candidates", candAddrs(cands))
+		closeFams()
 		dc.backoff()
 		return
 	}
 
-	// 4. Mutual dial: both peers build their KCP session with the same conv.
-	// Only ONE candidate is dialed per side — kcp-go spawns one readLoop per
-	// client session, so two sessions on one socket would steal each other's
-	// packets. Same NAT (hairpin) dials the peer's local address, otherwise
-	// its public one; the rule is symmetric, so both sides agree.
-	dial := peerAddrs[len(peerAddrs)-1] // default: public (cross-NAT)
-	if len(peerAddrs) > 1 && pubEP.Addr() == dial.Addr() {
-		dial = peerAddrs[0] // same NAT: local (hairpin)
-	}
-	u := net.UDPAddrFromAddrPort(dial)
-	e.log.Debug("direct punch: dial", "peer", pname, "addr", u.String(), "conv", dc.conv())
-	// ownConn=true: Close closes the socket, so session death tears down the
-	// readLoop with no separate bookkeeping (kcp-go deep-dive R2).
-	kcpConn, err := kcp.NewConn4(dc.conv(), u, nil, 0, 0, true, socket)
-	if err != nil {
-		e.log.Debug("direct punch: dial failed", "peer", pname, "addr", u.String(), "error", err)
-		dc.backoff()
+	// 4. Try each family once, in order. Per-family sockets preserve the kcp
+	// "one socket, one session" rule; both families failing backs off. The seed
+	// handshake requires a full own->peer->own round trip on both sides, so a
+	// one-way v6 path fails on both peers and both fall back to v4 in this
+	// round.
+	for _, idx := range order {
+		f := &fams[idx]
+		var dial netip.AddrPort
+		if f.v6 {
+			// Both sides advertise their single egress address, so "first" is
+			// unambiguous.
+			dial = peerV6[0]
+		} else {
+			// Same hairpin rule as before: prefer the peer's public address,
+			// but dial its local one when both share a NAT (same public IP).
+			dial = peerV4[len(peerV4)-1]
+			if len(peerV4) > 1 && f.mine[len(f.mine)-1].addr.Addr() == dial.Addr() {
+				dial = peerV4[0]
+			}
+		}
+		u := net.UDPAddrFromAddrPort(dial)
+		e.log.Debug("direct punch: dial", "peer", pname, "family", f.name, "addr", u.String(), "conv", dc.conv())
+		// ownConn=true: Close closes the socket, so session death tears down the
+		// readLoop with no separate bookkeeping (kcp-go deep-dive R2).
+		kcpConn, err := kcp.NewConn4(dc.conv(), u, nil, 0, 0, true, f.sock)
+		if err != nil {
+			e.log.Debug("direct punch: dial failed", "peer", pname, "family", f.name, "addr", u.String(), "error", err)
+			continue
+		}
+		if err := seedHandshake(kcpConn, seedTimeout); err != nil {
+			kcpConn.Close() // ownConn=true closes f.sock with it
+			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", u.String(), "error", err)
+			continue
+		}
+
+		// 5. smux over KCP; role by key order (external to who dialed).
+		cfg := smux.DefaultConfig()
+		cfg.KeepAliveInterval = smuxKeepAliveInterval
+		cfg.KeepAliveTimeout = smuxKeepAliveTimeout
+		var sess *smux.Session
+		if roleIsClient {
+			sess, err = smux.Client(kcpConn, cfg)
+		} else {
+			sess, err = smux.Server(kcpConn, cfg)
+		}
+		if err != nil {
+			kcpConn.Close()
+			e.log.Debug("direct punch: smux failed", "peer", pname, "family", f.name, "error", err)
+			continue
+		}
+
+		sock := f.sock
+		f.sock = nil // owned by the session
+		closeFams()  // drop the unused family's socket
+		dc.markUp(sess, sock, dial)
+		e.log.Debug("direct established", "peer", pname, "family", f.name,
+			"mine", candAddrs(f.mine), "peerAddr", dial.String())
+		go func() {
+			e.acceptLoop(sess, "direct", dc.peer, dial.String())
+			dc.markDead(sess)
+		}()
 		return
 	}
-	if err := seedHandshake(kcpConn, seedTimeout); err != nil {
-		kcpConn.Close()
-		e.log.Debug("direct punch: seed failed", "peer", pname, "addr", u.String(), "error", err)
-		dc.backoff()
-		return
-	}
-	e.log.Debug("direct punch: seed ok", "peer", pname, "peerAddr", dial.String())
 
-	// 5. smux over KCP; role by key order (external to who dialed).
-	cfg := smux.DefaultConfig()
-	cfg.KeepAliveInterval = smuxKeepAliveInterval
-	cfg.KeepAliveTimeout = smuxKeepAliveTimeout
-	var sess *smux.Session
-	if roleIsClient {
-		sess, err = smux.Client(kcpConn, cfg)
-	} else {
-		sess, err = smux.Server(kcpConn, cfg)
-	}
-	if err != nil {
-		kcpConn.Close()
-		e.log.Debug("direct punch: smux failed", "peer", pname, "error", err)
-		dc.backoff()
-		return
-	}
-
-	dc.markUp(sess, socket, dial)
-	keep = true
-
-	e.log.Debug("direct established", "peer", pname,
-		"local", mine[0].addr.String(), "public", pubEP.String(), "peerAddr", dial.String())
-	go func() {
-		e.acceptLoop(sess, "direct", dc.peer, dial.String())
-		dc.markDead(sess)
-	}()
+	// Every available family failed this round.
+	closeFams()
+	dc.backoff()
 }
 
 // seedHandshake runs the symmetric echo handshake over a fresh KCP session.
@@ -530,6 +627,19 @@ func ipv4Addrs(cands []candidate) []netip.AddrPort {
 	return out
 }
 
+// v6Addrs returns the IPv6 candidate endpoints in the order offered. A
+// v4-mapped address (Is4In6) is excluded: encodeCandidates normalizes it to
+// family 4, so it is an IPv4 endpoint and is handled by ipv4Addrs.
+func v6Addrs(cands []candidate) []netip.AddrPort {
+	var out []netip.AddrPort
+	for _, c := range cands {
+		if a := c.addr.Addr(); a.Is6() && !a.Is4In6() {
+			out = append(out, c.addr)
+		}
+	}
+	return out
+}
+
 // candAddrs renders candidate endpoints as strings for logs.
 func candAddrs(cands []candidate) []string {
 	s := make([]string, len(cands))
@@ -575,10 +685,87 @@ func bindAddrFor(addr string) *net.UDPAddr {
 	return &net.UDPAddr{IP: ip}
 }
 
+// collectV4 binds an IPv4 punch socket to the egress IP toward the STUN server
+// (so the local address we advertise is concrete and the NAT mapping is
+// identical) and learns our public endpoint from STUN over that same socket.
+func (e *Engine) collectV4() (*net.UDPConn, []candidate, error) {
+	sock, err := net.ListenUDP("udp4", bindAddrFor(e.stunAddr))
+	if err != nil {
+		return nil, nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), stunTimeout)
+	pubEP, err := stun.Lookup(ctx, e.stunAddr, sock)
+	cancel()
+	if err != nil {
+		sock.Close()
+		return nil, nil, err
+	}
+	localEP := sock.LocalAddr().(*net.UDPAddr).AddrPort()
+	mine := []candidate{{addr: localEP}, {addr: pubEP}}
+	if localEP == pubEP {
+		mine = mine[:1] // no NAT: local == public
+	}
+	return sock, mine, nil
+}
+
+// collectV6 binds the IPv6 punch socket to src, the host's egress address.
+// IPv6 has no address translation, so the bound address is itself the reachable
+// endpoint: binding it (rather than the wildcard) makes the send source
+// deterministic, so kcp's strict source filter accepts the peer's replies even
+// on a multi-homed host.
+func (e *Engine) collectV6(src *net.UDPAddr) (*net.UDPConn, []candidate, error) {
+	sock, err := net.ListenUDP("udp6", &net.UDPAddr{IP: src.IP})
+	if err != nil {
+		return nil, nil, err
+	}
+	ap := sock.LocalAddr().(*net.UDPAddr).AddrPort()
+	if e.v6Announce != nil {
+		ap = e.v6Announce(ap.Port())
+	}
+	return sock, []candidate{{addr: ap}}, nil
+}
+
+// v6ProbeAddr is a global IPv6 anycast used only for a route lookup (no packet
+// is sent): DialUDP reports the local source address the host would use to
+// reach it, which is the egress address the direct path binds and advertises.
+const v6ProbeAddr = "2001:4860:4860::8888:53"
+
+// v6Egress probes the host's IPv6 egress. A package var so tests can substitute;
+// production uses detectV6Egress.
+var v6Egress = detectV6Egress
+
+// detectV6Egress returns the local IPv6 source address for a global destination,
+// or nil when the host has no usable global IPv6 egress. A host with only
+// on-link (e.g. ULA) addresses has no route to a global destination and gets
+// nil, which is what we want: such an address is not reachable by a remote peer.
+func detectV6Egress() *net.UDPAddr {
+	ua, err := net.ResolveUDPAddr("udp6", v6ProbeAddr)
+	if err != nil {
+		return nil
+	}
+	probe, err := net.DialUDP("udp6", nil, ua)
+	if err != nil {
+		return nil
+	}
+	defer probe.Close()
+	ip := probe.LocalAddr().(*net.UDPAddr).IP
+	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		return nil
+	}
+	return &net.UDPAddr{IP: ip}
+}
+
 // sendCandidates seals our candidate list to the peer and ships it over the
 // relay control channel.
 func (e *Engine) sendCandidates(peer derpclient.PublicKey, cands []candidate) error {
 	return e.sendControl(peer, ctrlPunchCandidates, e.priv.SealTo(peer, encodeCandidates(cands)))
+}
+
+// sendCaps advertises our capability bits to the peer. Re-sent with every
+// candidate broadcast (idempotent) so a lost frame or a late-joining peer
+// cannot permanently degrade negotiation; the peer ORs the bits.
+func (e *Engine) sendCaps(peer derpclient.PublicKey, caps uint8) error {
+	return e.sendControl(peer, ctrlCaps, e.priv.SealTo(peer, []byte{caps}))
 }
 
 // sendDialUDP tells peer that this host has dialled a udp tunnel toward it, so
@@ -602,13 +789,26 @@ func (e *Engine) sendControl(peer derpclient.PublicKey, kind byte, payload []byt
 	return c.SendPacket(peer, buf)
 }
 
+// encodeCandidates writes the candidate list as [count]([family][addr][port])*,
+// choosing family 4 or 6 per address. A v4-mapped address is normalized to IPv4
+// so it round-trips as family 4 (and As4 never sees a 16-byte address).
 func encodeCandidates(cands []candidate) []byte {
-	buf := make([]byte, 0, 1+len(cands)*8)
+	buf := make([]byte, 0, 1+len(cands)*19) // family + 16B addr + 2B port (v6 worst case)
 	buf = append(buf, byte(len(cands)))
 	for _, c := range cands {
-		buf = append(buf, 4) // family: IPv4
-		ip := c.addr.Addr().As4()
-		buf = append(buf, ip[:]...)
+		a := c.addr.Addr()
+		if a.Is4In6() {
+			a = a.Unmap()
+		}
+		if a.Is4() {
+			buf = append(buf, 4)
+			ip := a.As4()
+			buf = append(buf, ip[:]...)
+		} else {
+			buf = append(buf, 6)
+			ip := a.As16()
+			buf = append(buf, ip[:]...)
+		}
 		var p [2]byte
 		binary.BigEndian.PutUint16(p[:], c.addr.Port())
 		buf = append(buf, p[:]...)

@@ -51,7 +51,8 @@ func main() {
 		forwards = append(forwards, v)
 		return nil
 	})
-	stunAddr := flag.String("stun", "", "STUN server address (host:port) for direct hole punching; empty disables direct (relay only)")
+	stunAddr := flag.String("stun", "", "STUN server address (host:port) for the IPv4 direct path; IPv6 is independent of STUN")
+	direct := flag.Bool("direct", true, "attempt a direct (hole-punched) path; false forces relay-only")
 	tlsSecure := flag.Bool("tls.secure", true, "verify the relay's TLS certificate (set false to trust any cert)")
 	tlsCAFile := flag.String("tls.caFile", "", "PEM CA file to trust the relay's self-signed certificate")
 	logLevel := flag.String("log.level", "info", "log level: trace, debug, info, warn, error, or fatal")
@@ -98,6 +99,10 @@ func main() {
 	if cfg.Log.Output == "" {
 		cfg.Log.Output = "stderr"
 	}
+	if cfg.Direct == nil {
+		def := true
+		cfg.Direct = &def
+	}
 
 	// Explicitly-set flags override the config.
 	if set["addr"] {
@@ -114,6 +119,9 @@ func main() {
 	}
 	if set["stun"] {
 		cfg.Stun = *stunAddr
+	}
+	if set["direct"] {
+		cfg.Direct = direct
 	}
 	if set["tls.secure"] {
 		cfg.TLS.Secure = tlsSecure
@@ -157,8 +165,15 @@ func main() {
 			slog.Error("target", "error", err)
 			os.Exit(1)
 		}
-		// Hole punching is opt-in: only attempt a direct path when stun is set.
+		// Direct is on by default; --direct=false forces relay-only. The master
+		// switch is independent of --stun: IPv6 direct needs no STUN server.
+		engine.direct = *cfg.Direct
 		engine.stunAddr = cfg.Stun
+		if *cfg.Direct {
+			// Probe once to gate direct; punch re-probes each round, so a
+			// changed egress does not require a restart.
+			engine.v6Available = v6Egress() != nil
+		}
 		engine.tlsCfg = buildTLSConfig(*cfg.TLS.Secure, cfg.TLS.CAFile)
 		slog.Info("p2p derp engine", "url", cfg.Derp,
 			"pubkey", base64.RawURLEncoding.EncodeToString(pub[:]),

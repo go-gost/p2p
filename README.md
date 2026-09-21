@@ -48,7 +48,8 @@ go build -o p2p .
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
 | `--target` | *(empty)* | inbound bridge target (repeatable; bare `"host:port"` feeds the tcp pool, `"udp://host:port"` the udp pool; DERP mode) |
 | `--forward` | *(empty)* | static port forward `"listen-addr=peer-key"` (repeatable; DERP mode) |
-| `--stun` | *(empty)* | STUN server (host:port) for direct hole punching; empty disables direct (relay only) — opt-in |
+| `--stun` | *(empty)* | STUN server (host:port) for the IPv4 direct path; IPv6 direct works without STUN |
+| `--direct` | `true` | attempt a direct (hole-punched) path; `false` forces relay-only |
 | `--tls.secure` | `true` | verify the relay's TLS certificate (`false` to trust any cert) |
 | `--tls.caFile` | *(empty)* | PEM CA file to trust the relay's self-signed certificate |
 | `--log.level` | `info` | log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal` |
@@ -138,7 +139,7 @@ When both peers are in engine mode, the relay is only used to establish the firs
 
 The punch is **symmetric**: both peers dial the peer's candidate with the same deterministic KCP conv (mutual simultaneous open), and a session is only used once **both** sides complete the echo handshake — each peer must see its own token round-trip, so a half-open path can never produce a "false direct" session. This removes the old "one side dials, the other accepts" asymmetry, which failed when only one direction could be punched (e.g. a peer inside a k3s pod whose inbound UDP needs the peer to have sent first).
 
-On success new tunnels open streams over the direct smux session (KCP + smux); the relay session stays up so a direct-path failure silently falls back to relay and re-punches. The direct path keeps working even if the relay drops — only a *new* punch needs the relay back. A static `--forward` warms its peer's direct path at startup when `--stun` is set, so the first connection skips the punch latency.
+On success new tunnels open streams over the direct smux session (KCP + smux); the relay session stays up so a direct-path failure silently falls back to relay and re-punches. The direct path keeps working even if the relay drops — only a *new* punch needs the relay back. A static `--forward` warms its peer's direct path at startup when `--stun` is set, so the first connection skips the punch latency. Direct is on by default (`--direct=false` forces relay-only). IPv6 is a first-class candidate family: a host with a global IPv6 egress binds and advertises that address (no STUN, no NAT), and both peers prefer IPv6 when both offer it, retrying IPv4 in the same round if the v6 path does not complete.
 
 Timings are tunable from the config file only (not flags); unset values keep the defaults, and invalid values fail at startup:
 

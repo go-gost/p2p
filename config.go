@@ -20,6 +20,7 @@ type Config struct {
 	Target   string          `yaml:"target,omitempty"`
 	Targets  []string        `yaml:"targets,omitempty"`
 	Stun     string          `yaml:"stun,omitempty"`
+	Direct   *bool           `yaml:"direct,omitempty"`
 	TLS      *TLSConfig      `yaml:"tls,omitempty"`
 	Log      *LogConfig      `yaml:"log,omitempty"`
 	Timeouts *TimeoutsConfig `yaml:"timeouts,omitempty"`

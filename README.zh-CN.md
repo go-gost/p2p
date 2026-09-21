@@ -48,7 +48,8 @@ go build -o p2p .
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 私钥文件（hex）；缺失则自动生成 |
 | `--target` | *(空)* | 入站隧道桥接目标（可重复；裸 `"host:port"` 进 tcp 池，`"udp://host:port"` 进 udp 池；DERP 模式） |
 | `--forward` | *(空)* | 预配置静态端口转发 `"listen-addr=peer-key"`（可重复；DERP 模式） |
-| `--stun` | *(空)* | STUN 服务器（host:port），用于直连打洞；留空则禁用直连（仅走中继）— 需显式开启 |
+| `--stun` | *(空)* | STUN 服务器（host:port），用于 IPv4 直连路径；IPv6 直连无需 STUN |
+| `--direct` | `true` | 尝试直连（打洞）路径；`false` 强制仅走中继 |
 | `--tls.secure` | `true` | 校验 relay 的 TLS 证书（`false` 信任任意证书） |
 | `--tls.caFile` | *(空)* | 用于信任 relay 自签证书的 PEM CA 文件 |
 | `--log.level` | `info` | 日志级别：`trace`、`debug`、`info`、`warn`、`error`、`fatal` |
@@ -137,7 +138,7 @@ derper -c /etc/derper/derper.json -hostname derp.example.com -certmode manual -c
 
 打洞是**对称**的：双方各自以同一确定性 KCP conv 向对端候选拨号（互撞同时打开），且只有**双方都完成 echo 握手**（各自看到自己的 token 完整往返）后会话才可用——半通路径永远不会产生「假直连」。这消除了旧版「一边 dial、一边 accept」的不对称——当只有一个方向能打通时会失败（典型：k3s pod 内的 peer，其入站 UDP 需要 pod 先发出过包）。
 
-成功后，新隧道在直连 smux 会话（KCP + smux）上开流；relay 会话保持，直连失败时静默回退 relay 并重新打洞。直连路径即使 relay 掉线也继续工作——只有 *新的* 打洞才需要 relay 回来。设置 `--stun` 时，预配置的 `--forward` 会在启动时预热其 peer 的直连路径，首个连接无需等待打洞。
+成功后，新隧道在直连 smux 会话（KCP + smux）上开流；relay 会话保持，直连失败时静默回退 relay 并重新打洞。直连路径即使 relay 掉线也继续工作——只有 *新的* 打洞才需要 relay 回来。设置 `--stun` 时，预配置的 `--forward` 会在启动时预热其 peer 的直连路径，首个连接无需等待打洞。直连默认开启（`--direct=false` 强制仅走中继）。IPv6 是一等候选族：有全局 IPv6 出口的宿主会绑定并广播该地址（无需 STUN、无 NAT）；当两端都提供 IPv6 时优先走 IPv6，若该路径未打通则在同一轮内回退 IPv4。
 
 时间参数仅经配置文件调整（不加 flag）；未设即用默认，非法值启动即报错：
 
