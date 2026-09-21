@@ -1,5 +1,9 @@
 # p2p:IPv6 直连支持 —— 实施计划
 
+> Status: **implemented, e2e-verified, and tagged v0.3.0** (2026-09-21).
+> `ipv6-direct` runs green in the e2e suite; `TestV6ProbeAddrResolves` guards
+> the probe-address bracket regression that scenario surfaced.
+
 ## Context(为什么做)
 
 2026-09-12 的 NAT 调研把「IPv6 直连」列为覆盖率提升的第一名:双栈双方若都有全局 v6,**根本不需要打洞**——v6 通常不做地址转换,地址本身就可达;即便 CPE 有状态防火墙,地址也不变、只是被过滤,双方同时发包即可打开 pinhole。而对称 NAT/CGNAT 场景下打洞必失败、永远退 relay,正是上一阶段(direct/relay 统计)要量化的问题。
