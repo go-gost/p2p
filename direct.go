@@ -725,10 +725,12 @@ func (e *Engine) collectV6(src *net.UDPAddr) (*net.UDPConn, []candidate, error) 
 	return sock, []candidate{{addr: ap}}, nil
 }
 
-// v6ProbeAddr is a global IPv6 anycast used only for a route lookup (no packet
+// v6ProbeAddr is a global IPv6 address used only for a route lookup (no packet
 // is sent): DialUDP reports the local source address the host would use to
 // reach it, which is the egress address the direct path binds and advertises.
-const v6ProbeAddr = "2001:4860:4860::8888:53"
+// ResolveUDPAddr wants a host:port, so the address must be bracketed; the port
+// itself is never used.
+const v6ProbeAddr = "[2001:4860:4860::8888]:53"
 
 // v6Egress probes the host's IPv6 egress. A package var so tests can substitute;
 // production uses detectV6Egress.

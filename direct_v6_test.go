@@ -348,3 +348,14 @@ func TestV4OnlyPeerStillDirectV4(t *testing.T) {
 	defer s2.Close()
 	roundTrip(t, s2, "v4 only")
 }
+
+// TestV6ProbeAddrResolves guards a regression where the probe address was
+// written without brackets ("2001:4860:4860::8888:53"), so ResolveUDPAddr
+// always failed with "too many colons" and detectV6Egress returned nil even on
+// hosts with a usable global IPv6 egress. The direct v6 tests substitute the
+// v6Egress package var, so they could not catch this.
+func TestV6ProbeAddrResolves(t *testing.T) {
+	if _, err := net.ResolveUDPAddr("udp6", v6ProbeAddr); err != nil {
+		t.Fatalf("v6ProbeAddr %q does not resolve: %v", v6ProbeAddr, err)
+	}
+}
