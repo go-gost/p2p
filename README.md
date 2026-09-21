@@ -133,6 +133,35 @@ derper -c /etc/derper/derper.json -hostname derp.example.com -certmode manual -c
 
 Each host generates a curve25519 keypair on first run and prints its **public key** (base64) at startup. In DERP mode the GOST chain node's `addr` is the *peer host's public key*, not a `host:port`. Everything else on the GOST side is unchanged.
 
+### DERP wire frames
+
+The relay link is a WebSocket carrying DERP binary frames. Two layers are worth knowing: the DERP protocol itself (shared with every Tailscale client) and the small p2p framing this host puts *inside* a relayed packet.
+
+**DERP frame** — `[type 1B][length 4B big-endian][body]`, from `tailscale.com/derp@v1.102.3`:
+
+| Type | Name | Body |
+|---|---|---|
+| `0x01` | ServerKey | 8-byte magic (`DERP` + key emoji) + 32-byte server public key |
+| `0x02` | ClientInfo | 32-byte client pubkey + 24-byte nonce + NaCl-box(JSON `{Version, CanAckPings}`) to the server key |
+| `0x03` | ServerInfo | 24-byte nonce + NaCl-box(JSON); token-bucket hints, advisory |
+| `0x04` | SendPacket | 32-byte destination pubkey + packet bytes (≤ 64 KiB) |
+| `0x05` | RecvPacket | v2: 32-byte **source** pubkey + packet bytes |
+| `0x06` | KeepAlive | none — no-op |
+| `0x08` | PeerGone | 32-byte pubkey + 1-byte reason (informational) |
+| `0x09` | PeerPresent | 32-byte pubkey (informational; derper only sends it to mesh watchers) |
+| `0x12` / `0x13` | Ping / Pong | 8-byte payload; `Recv` echoes a Ping back as Pong |
+
+Handshake: the server greets with `ServerKey`, the client replies `ClientInfo` (boxed to the server key, proving possession of its private key), the server answers `ServerInfo`. Everything else is `SendPacket`/`RecvPacket`. **Unknown frame types are skipped** (the reference client's `recv` switch has no default case) — the same forward-compat rule applies here. The client is addressed purely by its 32-byte public key; the base64 form is that key.
+
+**p2p packet framing** — the bytes inside every `SendPacket`/`RecvPacket` start with a type byte:
+
+| Byte | Meaning |
+|---|---|
+| `0x00` | control frame: `[0x00][kind 1B][NaCl-boxed payload]` |
+| `0x01` | data frame: `[0x01][smux byte stream]` — one DERP packet per smux write |
+
+Control kinds: `0x02` punch candidates (sealed `[count]([family][addr][port])*`), `0x03` udp-tunnel dial notice (sealed, empty), `0x04` capability bitfield (sealed 1 byte; bit 0 = IPv6-aware, re-sent with each broadcast and OR'd by the receiver). All control payloads are sealed to the peer key (`PrivateKey.SealTo`), so the relay can route but not forge them. Control frames are consumed by the engine; data frames feed the per-peer smux session.
+
 ### Hole punching
 
 When both peers are in engine mode, the relay is only used to establish the first session and carry the control channel. In the background each peer queries the derper's built-in STUN server (default port `3478`, `-stun` is on by default) to learn its public UDP endpoint, exchanges it with the peer over the relay, and builds a **KCP** session over the same UDP socket.

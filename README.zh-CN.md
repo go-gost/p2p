@@ -132,6 +132,35 @@ derper -c /etc/derper/derper.json -hostname derp.example.com -certmode manual -c
 
 每个宿主首次运行会生成一对 curve25519 密钥，并在启动时打印它的**公钥**（base64）。DERP 模式下，GOST 链节点的 `addr` 是 *peer 宿主的公钥*，而不是 `host:port`。GOST 侧其余配置不变。
 
+### DERP 帧格式
+
+relay 链路是一条承载 DERP 二进制帧的 WebSocket。值得了解的有两层：DERP 协议本身（与所有 Tailscale 客户端共用），以及本宿主放进被中继包**内部**的一层很小的 p2p 分帧。
+
+**DERP 帧** —— `[type 1B][length 4B 大端][body]`，取自 `tailscale.com/derp@v1.102.3`：
+
+| Type | 名称 | Body |
+|---|---|---|
+| `0x01` | ServerKey | 8 字节 magic（`DERP` + 钥匙 emoji）+ 32 字节服务器公钥 |
+| `0x02` | ClientInfo | 32 字节客户端公钥 + 24 字节 nonce + 用服务器公钥的 NaCl-box（JSON `{Version, CanAckPings}`） |
+| `0x03` | ServerInfo | 24 字节 nonce + NaCl-box（JSON）；token-bucket 提示，仅供参考 |
+| `0x04` | SendPacket | 32 字节目标公钥 + 包体（≤ 64 KiB） |
+| `0x05` | RecvPacket | v2：32 字节**来源**公钥 + 包体 |
+| `0x06` | KeepAlive | 无 —— no-op |
+| `0x08` | PeerGone | 32 字节公钥 + 1 字节原因（信息性） |
+| `0x09` | PeerPresent | 32 字节公钥（信息性；derper 只发给 mesh watcher） |
+| `0x12` / `0x13` | Ping / Pong | 8 字节载荷；`Recv` 收到 Ping 会回一个 Pong |
+
+握手：服务器先发 `ServerKey`，客户端回 `ClientInfo`（用服务器公钥 box，以证明持有私钥），服务器再回 `ServerInfo`。其余全部是 `SendPacket`/`RecvPacket`。**未知帧类型直接跳过**（参考客户端的 `recv` switch 没有 default 分支）——同样的前向兼容规则。客户端只靠 32 字节公钥寻址；base64 形式就是该公钥。
+
+**p2p 分帧** —— 每个 `SendPacket`/`RecvPacket` 内部的字节以一个类型字节开头：
+
+| 字节 | 含义 |
+|---|---|
+| `0x00` | 控制帧：`[0x00][kind 1B][NaCl-box 载荷]` |
+| `0x01` | 数据帧：`[0x01][smux 字节流]` —— 每次 smux 写对应一个 DERP 包 |
+
+控制 kind：`0x02` 打洞候选（sealed `[count]([family][addr][port])*`）、`0x03` udp 隧道拨号通知（sealed，空）、`0x04` 能力位域（sealed 1 字节；bit 0 = 支持 IPv6，随每次广播重发、接收方 OR）。所有控制载荷都用对端公钥 seal（`PrivateKey.SealTo`），relay 只能路由、无法伪造。控制帧由 engine 消费；数据帧喂给每个 peer 的 smux 会话。
+
 ### 打洞
 
 两端都在 engine 模式时，relay 只用于建立首条会话并承载控制面。后台每个 peer 向 derper 内建 STUN 服务器（默认端口 `3478`，`-stun` 默认开启）查询自己的公网 UDP endpoint，经 relay 与对端交换，并在同一 UDP socket 上建立 **KCP** 会话。
