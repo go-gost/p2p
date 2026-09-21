@@ -41,7 +41,7 @@ import (
 // token travels over a plaintext channel today.
 type server struct {
 	proto.UnimplementedP2PServer
-	engine  *Engine // DERP engine mode; nil = stub mode
+	engine  *engine // DERP engine mode; nil = stub mode
 	log     *slog.Logger
 	mu      sync.Mutex
 	seq     atomic.Int64
@@ -58,7 +58,7 @@ var (
 	gcInterval = 5 * time.Second
 )
 
-func newServer(engine *Engine) *server {
+func newServer(engine *engine) *server {
 	s := &server{
 		engine:  engine,
 		log:     slog.Default(),
@@ -100,7 +100,7 @@ func (s *server) registerTunnel(t *tunnel) {
 type tunnel struct {
 	id     string
 	target string   // far end as passed to OpenTunnel: peer host:port (stub) or public key (DERP)
-	engine *Engine  // derp mode: stream source
+	engine *engine  // derp mode: stream source
 	peer   string   // derp mode: peer public key (base64)
 	ch     *channel // udp tunnels: the peer channel this tunnel holds a reference on
 	ln     net.Listener

@@ -17,6 +17,10 @@ type pipeStream struct {
 }
 
 func (p *pipeStream) Send(c *proto.Chunk) error {
+	// Copy the payload: the caller may reuse its buffer once Write returns
+	// (io.Copy does), and unlike the gRPC path's synchronous marshal there is
+	// nothing else here that copies before the chunk is queued.
+	c = &proto.Chunk{Data: append([]byte(nil), c.GetData()...)}
 	select {
 	case p.send <- c:
 		return nil

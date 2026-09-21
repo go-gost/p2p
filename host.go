@@ -25,7 +25,7 @@ type Host struct {
 	cfg *Config
 	log *slog.Logger
 
-	engine *Engine // nil = stub mode
+	engine *engine // nil = stub mode
 	server *server
 
 	mu     sync.Mutex
@@ -36,7 +36,12 @@ type Host struct {
 
 	prepareOnce sync.Once
 	prepareErr  error
-	closeOnce   sync.Once
+	// forwardErr is set when a static forward fails to register. That is a
+	// configuration error (bad listen address, no --derp, port in use), unlike
+	// a transient DERP connect failure, so Start/Serve return it instead of
+	// serving without the forward.
+	forwardErr error
+	closeOnce  sync.Once
 }
 
 // Option configures a Host.
@@ -81,7 +86,7 @@ func New(cfg *Config, opts ...Option) (*Host, error) {
 		}
 		h.engine.direct = *cfg.Direct
 		h.engine.stunAddr = cfg.Stun
-		h.engine.tlsCfg = buildTLSConfig(*cfg.TLS.Secure, cfg.TLS.CAFile)
+		h.engine.tlsCfg = buildTLSConfig(*cfg.TLS.Secure, cfg.TLS.CAFile, h.log)
 	}
 
 	h.server = newServer(h.engine)
@@ -116,6 +121,8 @@ func applyDefaults(cfg *Config) {
 // A failed DERP connection is not fatal — the engine retries in the background
 // and inbound tunnels stay unreachable until it connects — so Start logs it and
 // continues. Embedding callers that need strict startup can check the error.
+// A failed forward registration is a configuration error, not a transient one:
+// Start/Serve return it (see forwardErr) rather than serve without the forward.
 func (h *Host) Connect() error {
 	h.prepareOnce.Do(func() {
 		if h.engine != nil {
@@ -128,6 +135,7 @@ func (h *Host) Connect() error {
 		}
 		for _, f := range h.cfg.Forwards {
 			if err := h.server.addForwardAddr(f.Listen, f.Peer); err != nil {
+				h.forwardErr = err
 				h.prepareErr = err
 				return
 			}
@@ -138,12 +146,16 @@ func (h *Host) Connect() error {
 
 // Start connects the engine and begins serving the gRPC control plane on
 // Config.Addr in the background. It returns the resolved listen address, which
-// is useful with ":0".
+// is useful with ":0". A DERP connect failure is only logged (the engine
+// retries); a forward registration failure is returned.
 func (h *Host) Start() (string, error) {
 	if h.isClosed() {
 		return "", net.ErrClosed
 	}
 	if err := h.Connect(); err != nil {
+		if h.forwardErr != nil {
+			return "", err
+		}
 		h.log.Warn("derp connect", "error", err)
 	}
 	ln, err := net.Listen("tcp", h.cfg.Addr)
@@ -160,11 +172,16 @@ func (h *Host) Start() (string, error) {
 }
 
 // Serve connects the engine and blocks, serving the gRPC control plane on ln.
+// Forward registration failures are returned; a DERP connect failure is only
+// logged (the engine retries).
 func (h *Host) Serve(ln net.Listener) error {
 	if h.isClosed() {
 		return net.ErrClosed
 	}
 	if err := h.Connect(); err != nil {
+		if h.forwardErr != nil {
+			return err
+		}
 		h.log.Warn("derp connect", "error", err)
 	}
 	h.recordListener(ln)

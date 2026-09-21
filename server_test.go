@@ -28,7 +28,7 @@ func TestStatusNoEngine(t *testing.T) {
 // TestStatusReportsTransportStats covers engine mode: the gauges and counters
 // reach the reply.
 func TestStatusReportsTransportStats(t *testing.T) {
-	e := &Engine{
+	e := &engine{
 		directs: make(map[derpclient.PublicKey]*directConn),
 		peers:   make(map[derpclient.PublicKey]*peerConn),
 	}
@@ -69,7 +69,7 @@ func TestAddForward(t *testing.T) {
 		t.Fatal("addForward without --derp = nil, want error")
 	}
 
-	s.engine = &Engine{}
+	s.engine = &engine{}
 
 	// Malformed specs.
 	for _, spec := range []string{
@@ -115,7 +115,7 @@ func TestForwardSurvivesGC(t *testing.T) {
 	defer func() { pendingTTL, gcInterval = oldTTL, oldInterval }()
 
 	s := newServer(nil)
-	s.engine = &Engine{}
+	s.engine = &engine{}
 
 	_, pub, err := derpclient.Generate()
 	if err != nil {

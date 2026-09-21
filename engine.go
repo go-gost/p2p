@@ -19,7 +19,7 @@ import (
 	"github.com/xtaci/smux"
 )
 
-// Engine connects the host to a DERP rendezvous/relay server and turns
+// engine connects the host to a DERP rendezvous/relay server and turns
 // relayed packets into one smux session per peer. The peer address is the
 // base64 (raw URL) encoding of its 32-byte curve25519 public key — the same
 // string GOST passes to OpenTunnel as "peer".
@@ -32,7 +32,7 @@ import (
 // Session role (smux.Client vs smux.Server) is decided by public-key
 // ordering so both ends always agree on exactly one session per pair
 // regardless of who dials first. smux allows either side to open streams.
-type Engine struct {
+type engine struct {
 	url         string
 	targets     *targetPool    // inbound bridge targets; an empty tcp pool refuses inbound tunnels
 	direct      bool           // master direct switch (--direct); false = relay-only
@@ -87,7 +87,7 @@ func (s *engineStats) countStream(transport string) {
 // session and schedules a re-punch, which a status query must never do. The
 // engine lock is released before probing, so directConn.mu is never taken
 // while holding it.
-func (e *Engine) transportCounts() (direct, derp int) {
+func (e *engine) transportCounts() (direct, derp int) {
 	e.mu.Lock()
 	directs := make([]*directConn, 0, len(e.directs))
 	for _, dc := range e.directs {
@@ -118,7 +118,7 @@ func (e *Engine) transportCounts() (direct, derp int) {
 // writes become DERP SendPackets and whose reads drain packets routed by the
 // connection pump.
 type peerConn struct {
-	e       *Engine
+	e       *engine
 	peer    derpclient.PublicKey
 	inbound chan []byte
 
@@ -166,8 +166,8 @@ var (
 	smuxKeepAliveTimeout  = 30 * time.Second
 )
 
-func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger) *Engine {
-	e := &Engine{
+func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger) *engine {
+	e := &engine{
 		url:     url,
 		targets: newTargetPool(),
 		direct:  true,
@@ -195,7 +195,7 @@ func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger)
 // addTargets parses each target spec (a bare "host:port" is tcp, "udp://…" is
 // udp) and adds it to the pool. Blank entries are skipped; the first malformed
 // spec is returned so startup fails loudly.
-func (e *Engine) addTargets(specs []string) error {
+func (e *engine) addTargets(specs []string) error {
 	for _, s := range specs {
 		if strings.TrimSpace(s) == "" {
 			continue
@@ -211,7 +211,7 @@ func (e *Engine) addTargets(specs []string) error {
 
 // reconnect redials the relay whenever there is no live connection. It runs
 // for the lifetime of the engine; OpenStream also triggers a dial on demand.
-func (e *Engine) reconnect() {
+func (e *engine) reconnect() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -230,7 +230,7 @@ func (e *Engine) reconnect() {
 
 // Connect dials the relay eagerly (used at startup so inbound tunnels work
 // immediately instead of waiting for the reconnect ticker).
-func (e *Engine) Connect() error {
+func (e *engine) Connect() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.ensureClientLocked()
@@ -242,7 +242,7 @@ func (e *Engine) Connect() error {
 
 // PublicKey returns the engine's public key, base64 (raw URL) encoded — the
 // string other hosts put in their GOST node addr.
-func (e *Engine) PublicKey() string {
+func (e *engine) PublicKey() string {
 	return base64.RawURLEncoding.EncodeToString(e.pub[:])
 }
 
@@ -251,7 +251,7 @@ func (e *Engine) PublicKey() string {
 // session is preferred; on any failure it falls back to the relay session. The
 // returned connection is tagged with the transport it uses ("direct" or
 // "derp") so the caller can log which path the tunnel took.
-func (e *Engine) OpenStream(peerB64 string) (net.Conn, error) {
+func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 	peer, err := parsePeerKey(peerB64)
 	if err != nil {
 		return nil, err
@@ -358,7 +358,7 @@ func openStream(sess *smux.Session, timeout time.Duration) (net.Conn, error) {
 // DERP server and starting the pump on first use. A cached adapter that was
 // closed (e.g. the peer process died and its relay session broke) is replaced
 // with a fresh one so the next stream rebuilds instead of failing forever.
-func (e *Engine) peerConn(peer derpclient.PublicKey) *peerConn {
+func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if pc, ok := e.peers[peer]; ok {
@@ -383,7 +383,7 @@ func (e *Engine) peerConn(peer derpclient.PublicKey) *peerConn {
 
 // ensureClientLocked dials the DERP server and starts the pump + keepalive
 // goroutines. Caller must hold e.mu.
-func (e *Engine) ensureClientLocked() {
+func (e *engine) ensureClientLocked() {
 	if e.client != nil {
 		return
 	}
@@ -402,7 +402,7 @@ func (e *Engine) ensureClientLocked() {
 
 // pump routes inbound packets to the owning peer adapter; a transport error
 // tears down the connection and all sessions (the next OpenStream redials).
-func (e *Engine) pump(c *derpclient.Client) {
+func (e *engine) pump(c *derpclient.Client) {
 	for {
 		src, pkt, err := c.Recv()
 		if errors.Is(err, derpclient.ErrPeerGone) {
@@ -465,7 +465,7 @@ func (e *Engine) pump(c *derpclient.Client) {
 // handleControl dispatches a control frame ([kind 1B][payload]) received from
 // src. The source key is relay-authenticated; candidate payloads are
 // additionally sealed to the peer so a malicious relay cannot inject them.
-func (e *Engine) handleControl(src derpclient.PublicKey, body []byte) {
+func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
 	if len(body) < 1 {
 		return
 	}
@@ -506,7 +506,7 @@ func (e *Engine) handleControl(src derpclient.PublicKey, body []byte) {
 }
 
 // keepalive keeps the DERP connection alive through proxy/CDN idle timeouts.
-func (e *Engine) keepalive(c *derpclient.Client) {
+func (e *engine) keepalive(c *derpclient.Client) {
 	ticker := time.NewTicker(keepAlivePeriod)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -520,7 +520,7 @@ func (e *Engine) keepalive(c *derpclient.Client) {
 // peerGone drops everything to a peer whose DERP connection just closed (the
 // DERP server told us). Subsequent streams rebuild against a fresh session, and
 // opens use a short timeout until the peer is reachable again.
-func (e *Engine) peerGone(peer derpclient.PublicKey) {
+func (e *engine) peerGone(peer derpclient.PublicKey) {
 	e.mu.Lock()
 	e.gone[peer] = true
 	pc := e.peers[peer]
@@ -538,20 +538,20 @@ func (e *Engine) peerGone(peer derpclient.PublicKey) {
 	e.log.Debug("derp peer gone", "peer", keyName(peer))
 }
 
-func (e *Engine) isGone(peer derpclient.PublicKey) bool {
+func (e *engine) isGone(peer derpclient.PublicKey) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.gone[peer]
 }
 
-func (e *Engine) clearGone(peer derpclient.PublicKey) {
+func (e *engine) clearGone(peer derpclient.PublicKey) {
 	e.mu.Lock()
 	delete(e.gone, peer)
 	e.mu.Unlock()
 }
 
 // teardown drops the transport and every session built on it.
-func (e *Engine) teardown(c *derpclient.Client, cause error) {
+func (e *engine) teardown(c *derpclient.Client, cause error) {
 	e.mu.Lock()
 	if e.client != c {
 		e.mu.Unlock()
@@ -572,7 +572,7 @@ func (e *Engine) teardown(c *derpclient.Client, cause error) {
 }
 
 // Close shuts the engine down.
-func (e *Engine) Close() {
+func (e *engine) Close() {
 	e.mu.Lock()
 	select {
 	case <-e.stop:

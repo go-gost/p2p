@@ -67,6 +67,13 @@ func (h *Host) openTunnelStream(ctx context.Context, network, peer string) (net.
 	if err != nil {
 		return nil, err
 	}
+	// Re-check: a Close racing the check above would leave this record out of
+	// server.close()'s teardown, and unlike the gRPC path there is no second
+	// RPC to fail — the serve goroutine would dial the peer after Close.
+	if h.isClosed() {
+		h.server.dropTunnel(t)
+		return nil, net.ErrClosed
+	}
 
 	streamCtx, cancel := context.WithCancel(context.Background())
 	clientSide, serverSide := newPipePair(streamCtx)

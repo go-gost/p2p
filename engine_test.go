@@ -63,7 +63,7 @@ func TestDirectLiveNoSideEffect(t *testing.T) {
 // direct session counts as direct and must not also be counted as derp; peers
 // on the relay alone count as derp.
 func TestTransportCounts(t *testing.T) {
-	e := &Engine{
+	e := &engine{
 		directs: make(map[derpclient.PublicKey]*directConn),
 		peers:   make(map[derpclient.PublicKey]*peerConn),
 	}

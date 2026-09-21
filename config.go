@@ -109,6 +109,11 @@ func (c *Config) TargetList() []string {
 // broken punch. smux timeout must be >= 2x the interval: smux's own
 // VerifyConfig only requires >=, and the failing case hit twice was equality
 // (an idle session kills itself after ~interval).
+//
+// The timings are process-wide, not per-Host: a second New merges its non-zero
+// values into those already applied, so a Host with zero timeouts inherits the
+// first Host's. Embedders running more than one Host in a process must give
+// them identical timeouts (or none).
 func applyTimeouts(t *TimeoutsConfig) error {
 	if t == nil {
 		return nil

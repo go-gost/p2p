@@ -25,7 +25,7 @@ func v6LoopbackAvailable(t *testing.T) bool {
 func loopbackV6() *net.UDPAddr { return &net.UDPAddr{IP: net.IPv6loopback} }
 
 // assertDirectFamily checks the family of a peer's dialed direct endpoint.
-func assertDirectFamily(t *testing.T, e *Engine, peer derpclient.PublicKey, v6 bool) {
+func assertDirectFamily(t *testing.T, e *engine, peer derpclient.PublicKey, v6 bool) {
 	t.Helper()
 	dc := e.getDirect(peer)
 	if dc == nil {

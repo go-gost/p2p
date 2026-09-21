@@ -86,7 +86,7 @@ type candidate struct {
 // directConn is the per-peer hole-punch state, kept in a map separate from the
 // relay peerConn so it survives DERP transport teardown.
 type directConn struct {
-	e    *Engine
+	e    *engine
 	peer derpclient.PublicKey
 
 	cand chan []candidate // peer candidates (buffered)
@@ -101,7 +101,7 @@ type directConn struct {
 	peerCaps uint8          // capability bits the peer advertised via ctrlCaps
 }
 
-func (e *Engine) directConn(peer derpclient.PublicKey) *directConn {
+func (e *engine) directConn(peer derpclient.PublicKey) *directConn {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if dc, ok := e.directs[peer]; ok {
@@ -116,7 +116,7 @@ func (e *Engine) directConn(peer derpclient.PublicKey) *directConn {
 	return dc
 }
 
-func (e *Engine) getDirect(peer derpclient.PublicKey) *directConn {
+func (e *engine) getDirect(peer derpclient.PublicKey) *directConn {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.directs[peer]
@@ -125,7 +125,7 @@ func (e *Engine) getDirect(peer derpclient.PublicKey) *directConn {
 // directEnabled reports whether a punch has any candidate source: a configured
 // STUN server (IPv4), a usable global IPv6 egress, or an explicit v6 override.
 // Side-effect free, so it is safe on the OpenStream/status paths.
-func (e *Engine) directEnabled() bool {
+func (e *engine) directEnabled() bool {
 	if !e.direct {
 		return false
 	}
@@ -135,7 +135,7 @@ func (e *Engine) directEnabled() bool {
 // maybeStartDirect kicks off hole punching when a candidate source exists.
 // Idempotent: it only transitions directNone -> directAttempting, so concurrent
 // triggers from OpenStream and pump converge on a single punch goroutine.
-func (e *Engine) maybeStartDirect(peer derpclient.PublicKey) {
+func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 	if !e.directEnabled() {
 		return
 	}
@@ -147,7 +147,7 @@ func (e *Engine) maybeStartDirect(peer derpclient.PublicKey) {
 // the caller falls back to the relay. Candidate exchange rides the DERP
 // control channel, so it needs only the DERP connection — not a relay mux
 // session — and completes well under the timeout.
-func (e *Engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
+func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 	if !e.directEnabled() {
 		return nil
 	}
@@ -688,7 +688,7 @@ func bindAddrFor(addr string) *net.UDPAddr {
 // collectV4 binds an IPv4 punch socket to the egress IP toward the STUN server
 // (so the local address we advertise is concrete and the NAT mapping is
 // identical) and learns our public endpoint from STUN over that same socket.
-func (e *Engine) collectV4() (*net.UDPConn, []candidate, error) {
+func (e *engine) collectV4() (*net.UDPConn, []candidate, error) {
 	sock, err := net.ListenUDP("udp4", bindAddrFor(e.stunAddr))
 	if err != nil {
 		return nil, nil, err
@@ -713,7 +713,7 @@ func (e *Engine) collectV4() (*net.UDPConn, []candidate, error) {
 // endpoint: binding it (rather than the wildcard) makes the send source
 // deterministic, so kcp's strict source filter accepts the peer's replies even
 // on a multi-homed host.
-func (e *Engine) collectV6(src *net.UDPAddr) (*net.UDPConn, []candidate, error) {
+func (e *engine) collectV6(src *net.UDPAddr) (*net.UDPConn, []candidate, error) {
 	sock, err := net.ListenUDP("udp6", &net.UDPAddr{IP: src.IP})
 	if err != nil {
 		return nil, nil, err
@@ -759,26 +759,26 @@ func detectV6Egress() *net.UDPAddr {
 
 // sendCandidates seals our candidate list to the peer and ships it over the
 // relay control channel.
-func (e *Engine) sendCandidates(peer derpclient.PublicKey, cands []candidate) error {
+func (e *engine) sendCandidates(peer derpclient.PublicKey, cands []candidate) error {
 	return e.sendControl(peer, ctrlPunchCandidates, e.priv.SealTo(peer, encodeCandidates(cands)))
 }
 
 // sendCaps advertises our capability bits to the peer. Re-sent with every
 // candidate broadcast (idempotent) so a lost frame or a late-joining peer
 // cannot permanently degrade negotiation; the peer ORs the bits.
-func (e *Engine) sendCaps(peer derpclient.PublicKey, caps uint8) error {
+func (e *engine) sendCaps(peer derpclient.PublicKey, caps uint8) error {
 	return e.sendControl(peer, ctrlCaps, e.priv.SealTo(peer, []byte{caps}))
 }
 
 // sendDialUDP tells peer that this host has dialled a udp tunnel toward it, so
 // a peer holding a udp target knows a datagram channel is wanted. Sealed so a
 // malicious relay cannot forge the notice on a peer's behalf.
-func (e *Engine) sendDialUDP(peer derpclient.PublicKey) error {
+func (e *engine) sendDialUDP(peer derpclient.PublicKey) error {
 	return e.sendControl(peer, ctrlDialUDP, e.priv.SealTo(peer, nil))
 }
 
 // sendControl sends a control frame ([frameControl][kind][payload]) to peer.
-func (e *Engine) sendControl(peer derpclient.PublicKey, kind byte, payload []byte) error {
+func (e *engine) sendControl(peer derpclient.PublicKey, kind byte, payload []byte) error {
 	e.mu.Lock()
 	c := e.client
 	e.mu.Unlock()
@@ -857,7 +857,7 @@ func decodeCandidates(b []byte) ([]candidate, error) {
 // direct sessions; transport names the path the stream arrived over ("derp"
 // relay or "direct" hole punch), peerAddr is the peer's dialed endpoint
 // (direct only).
-func (e *Engine) acceptLoop(sess *smux.Session, transport string, peer derpclient.PublicKey, peerAddr string) {
+func (e *engine) acceptLoop(sess *smux.Session, transport string, peer derpclient.PublicKey, peerAddr string) {
 	start := time.Now()
 	for {
 		stream, err := sess.AcceptStream()
@@ -882,7 +882,7 @@ func (e *Engine) acceptLoop(sess *smux.Session, transport string, peer derpclien
 // serveInbound routes one inbound stream: a stream tagged with the datagram
 // channel magic carries the peer's udp channel, anything else is a normal
 // tunnel stream bridged to --target.
-func (e *Engine) serveInbound(stream net.Conn, transport string, peer derpclient.PublicKey, peerAddr string) {
+func (e *engine) serveInbound(stream net.Conn, transport string, peer derpclient.PublicKey, peerAddr string) {
 	if tagged, c := peekTag(stream); tagged {
 		// Two kinds of datagram end, resolved here:
 		//   - the channel side (this host has a local gost udp tunnel for peer):

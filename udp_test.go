@@ -13,7 +13,7 @@ import (
 
 // newTestEngine builds an engine with no relay: enough for the channel-level
 // tests, which attach streams by hand instead of dialling a peer.
-func newTestEngine(t *testing.T) *Engine {
+func newTestEngine(t *testing.T) *engine {
 	t.Helper()
 	priv, _, err := derpclient.Generate()
 	if err != nil {
@@ -26,7 +26,7 @@ func newTestEngine(t *testing.T) *Engine {
 
 // newTestChannel creates a channel without starting the opener loop; the
 // caller attaches the edges.
-func newTestChannel(t *testing.T, e *Engine, peer derpclient.PublicKey) *channel {
+func newTestChannel(t *testing.T, e *engine, peer derpclient.PublicKey) *channel {
 	t.Helper()
 	ch := &channel{
 		e:    e,

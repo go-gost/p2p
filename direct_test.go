@@ -92,7 +92,7 @@ func mappedResponse(req []byte, addr *net.UDPAddr, mapped string) []byte {
 }
 
 // hasDirect reports whether an engine has an established direct session to peer.
-func hasDirect(e *Engine, peer derpclient.PublicKey) bool {
+func hasDirect(e *engine, peer derpclient.PublicKey) bool {
 	dc := e.getDirect(peer)
 	return dc != nil && dc.session() != nil
 }
@@ -502,7 +502,7 @@ func TestDirectRepunchAfterSessionDeath(t *testing.T) {
 
 	// Simulate the idle-keepalive death: close the smux session on both sides.
 	// Each side's accept loop ends and markDead must reset the state.
-	for _, e := range []*Engine{engineA, engineB} {
+	for _, e := range []*engine{engineA, engineB} {
 		peer := pubB
 		if e == engineB {
 			peer = engineA.pub

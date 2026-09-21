@@ -427,3 +427,39 @@ func TestStreamTokenCheck(t *testing.T) {
 		t.Fatalf("echo = %q, want ping", buf)
 	}
 }
+
+// TestPipeSendCopiesCallerBuffer pins the net.Conn write contract on the
+// in-process path: a caller may reuse its buffer once Write returns (io.Copy
+// does exactly that), so the pipe must copy the payload instead of retaining
+// the caller's slice in its queue.
+func TestPipeSendCopiesCallerBuffer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientSide, serverSide := newPipePair(ctx)
+	w := newStreamConn(clientSide, cancel)
+	r := newStreamConn(serverSide, nil)
+
+	buf := []byte("AAAA")
+	if _, err := w.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+	copy(buf, "BBBB") // legal: Write has returned
+
+	got := make([]byte, 4)
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(r, got)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("read timed out")
+	}
+	if string(got) != "AAAA" {
+		t.Fatalf("read %q after the caller reused its buffer, want %q", got, "AAAA")
+	}
+}

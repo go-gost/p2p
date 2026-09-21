@@ -158,7 +158,7 @@ func main() {
 			"pubkey", host.PublicKey(), "targets", cfg.Targets)
 	}
 	if _, err := host.Start(); err != nil {
-		slog.Error("listen", "error", err)
+		slog.Error("start", "error", err)
 		host.Close()
 		os.Exit(1)
 	}

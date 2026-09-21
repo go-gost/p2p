@@ -38,12 +38,12 @@ func selfSignedPEM(t *testing.T) []byte {
 // skip-verify, and trusting a self-signed cert via a CA file.
 func TestBuildTLSConfig(t *testing.T) {
 	// defaults (secure, no CA) → nil so derpclient uses Go's normal verification
-	if cfg := buildTLSConfig(true, ""); cfg != nil {
+	if cfg := buildTLSConfig(true, "", nil); cfg != nil {
 		t.Fatalf("secure + no CA = %v, want nil", cfg)
 	}
 
 	// insecure → skip verification
-	if cfg := buildTLSConfig(false, ""); cfg == nil || !cfg.InsecureSkipVerify {
+	if cfg := buildTLSConfig(false, "", nil); cfg == nil || !cfg.InsecureSkipVerify {
 		t.Fatalf("insecure config = %v, want InsecureSkipVerify=true", cfg)
 	}
 
@@ -53,7 +53,7 @@ func TestBuildTLSConfig(t *testing.T) {
 	if err := os.WriteFile(caFile, selfSignedPEM(t), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := buildTLSConfig(true, caFile)
+	cfg := buildTLSConfig(true, caFile, nil)
 	if cfg == nil || cfg.RootCAs == nil {
 		t.Fatalf("secure + CA = %v, want RootCAs set", cfg)
 	}
@@ -62,7 +62,7 @@ func TestBuildTLSConfig(t *testing.T) {
 	}
 
 	// missing CA file → fall back to default roots, still no skip
-	cfg = buildTLSConfig(true, filepath.Join(dir, "missing.pem"))
+	cfg = buildTLSConfig(true, filepath.Join(dir, "missing.pem"), nil)
 	if cfg == nil || cfg.RootCAs != nil {
 		t.Fatalf("missing CA = %v, want RootCAs nil", cfg)
 	}
