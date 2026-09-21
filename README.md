@@ -35,7 +35,7 @@ It provides **reachability, not policy** — the same layering as IP/TCP:
 ## Quick start
 
 ```bash
-go build -o p2p .
+go build -o p2p ./cmd/p2p
 ./p2p --addr 127.0.0.1:8003
 ```
 

@@ -23,7 +23,7 @@ An integrator supplies: a relay, peer public keys, and (if needed) its own encry
 ## Build & Run
 
 ```bash
-go build -o p2p .          # or: go run . (go.work resolves deps too)
+go build -o p2p ./cmd/p2p  # or: go run ./cmd/p2p (go.work resolves deps too)
 GOWORK=off go build ./...  # standalone build must also pass
 
 # Run the stub (loopback bridge)

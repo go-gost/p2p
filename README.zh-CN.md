@@ -35,7 +35,7 @@ GOST client ══Tunnel 流（"id" metadata）══▶ p2p host ──bridge�
 ## 快速开始
 
 ```bash
-go build -o p2p .
+go build -o p2p ./cmd/p2p
 ./p2p --addr 127.0.0.1:8003
 ```
 

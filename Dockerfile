@@ -14,7 +14,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-      go build -ldflags="-s -w" -o /p2p .
+      go build -ldflags="-s -w" -o /p2p ./cmd/p2p
 
 # Runtime environment. Non-root (uid 10001) by default.
 #

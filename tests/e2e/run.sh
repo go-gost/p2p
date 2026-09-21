@@ -116,7 +116,7 @@ build_binaries() {
 	fi
 	mkdir -p "$WORK/bin"
 	say "building p2p..."
-	(cd "$P2P_DIR" && "$GO" build -o "$P2P_BIN" .) || { echo "p2p build failed" >&2; exit 1; }
+	(cd "$P2P_DIR" && "$GO" build -o "$P2P_BIN" ./cmd/p2p) || { echo "p2p build failed" >&2; exit 1; }
 	say "building helper..."
 	(cd "$P2P_DIR" && "$GO" build -o "$HELPER_BIN" ./tests/e2e/helper) || { echo "helper build failed" >&2; exit 1; }
 	say "building gost..."

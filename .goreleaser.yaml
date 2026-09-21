@@ -9,7 +9,7 @@ builds:
   - env:
       - CGO_ENABLED=0
       - GOWORK=off # 本地在 go.work 里，独立构建必须关掉
-    main: .
+    main: ./cmd/p2p
     targets:
       - linux_386
       - linux_amd64
