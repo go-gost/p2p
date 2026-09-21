@@ -1,4 +1,4 @@
-package main
+package p2p
 
 import (
 	"errors"
@@ -17,6 +17,7 @@ type Config struct {
 	Token    string          `yaml:"token,omitempty"`
 	Derp     string          `yaml:"derp,omitempty"`
 	Key      string          `yaml:"key,omitempty"`
+	KeyHex   string          `yaml:"keyHex,omitempty"`
 	Target   string          `yaml:"target,omitempty"`
 	Targets  []string        `yaml:"targets,omitempty"`
 	Stun     string          `yaml:"stun,omitempty"`
@@ -78,8 +79,8 @@ type ForwardConfig struct {
 	Peer   string `yaml:"peer,omitempty"`
 }
 
-// loadConfig reads and parses a YAML config file.
-func loadConfig(path string) (*Config, error) {
+// LoadConfig reads and parses a YAML config file.
+func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -91,9 +92,9 @@ func loadConfig(path string) (*Config, error) {
 	return &c, nil
 }
 
-// targetList merges the legacy scalar `target` with the `targets` list, scalar
+// TargetList merges the legacy scalar `target` with the `targets` list, scalar
 // first, into the raw spec list the engine parses.
-func (c *Config) targetList() []string {
+func (c *Config) TargetList() []string {
 	specs := make([]string, 0, len(c.Targets)+1)
 	if c.Target != "" {
 		specs = append(specs, c.Target)

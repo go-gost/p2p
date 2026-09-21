@@ -1,12 +1,10 @@
-package main
+package p2p
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // TestLoadConfig covers parsing the full YAML schema, including the *bool
@@ -53,7 +51,7 @@ timeouts:
     interval: 5s
     timeout: 10s
 `)
-	c, err := loadConfig(path)
+	c, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +83,7 @@ timeouts:
 
 	// omitted secure -> nil pointer (so the merge keeps the default true)
 	write("tls:\n  caFile: /ca.pem\n")
-	c, err = loadConfig(path)
+	c, err = LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,18 +93,18 @@ timeouts:
 
 	// malformed YAML -> error
 	write("addr: [unclosed\n")
-	if _, err := loadConfig(path); err == nil {
+	if _, err := LoadConfig(path); err == nil {
 		t.Fatal("malformed yaml = nil error")
 	}
 
 	// missing file -> error
-	if _, err := loadConfig(filepath.Join(dir, "missing.yaml")); err == nil {
+	if _, err := LoadConfig(filepath.Join(dir, "missing.yaml")); err == nil {
 		t.Fatal("missing file = nil error")
 	}
 
 	// empty file -> zero-value config
 	write("")
-	c, err = loadConfig(path)
+	c, err = LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,64 +126,28 @@ func TestConfigTargetsMerge(t *testing.T) {
 	}
 
 	write("target: 127.0.0.1:18080\ntargets:\n  - udp://127.0.0.1:8421\n  - 127.0.0.1:18081\n")
-	c, err := loadConfig(path)
+	c, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"127.0.0.1:18080", "udp://127.0.0.1:8421", "127.0.0.1:18081"}
-	if got := c.targetList(); !equalStrings(got, want) {
+	if got := c.TargetList(); !equalStrings(got, want) {
 		t.Fatalf("merged targets = %q, want %q", got, want)
 	}
 
 	write("targets:\n  - udp://127.0.0.1:8421\n")
-	if c, _ = loadConfig(path); !equalStrings(c.targetList(), []string{"udp://127.0.0.1:8421"}) {
-		t.Fatalf("list only = %q", c.targetList())
+	if c, _ = LoadConfig(path); !equalStrings(c.TargetList(), []string{"udp://127.0.0.1:8421"}) {
+		t.Fatalf("list only = %q", c.TargetList())
 	}
 
 	write("target: 127.0.0.1:18080\n")
-	if c, _ = loadConfig(path); !equalStrings(c.targetList(), []string{"127.0.0.1:18080"}) {
-		t.Fatalf("scalar only = %q", c.targetList())
+	if c, _ = LoadConfig(path); !equalStrings(c.TargetList(), []string{"127.0.0.1:18080"}) {
+		t.Fatalf("scalar only = %q", c.TargetList())
 	}
 
 	write("")
-	if c, _ = loadConfig(path); len(c.targetList()) != 0 {
-		t.Fatalf("empty = %q, want none", c.targetList())
-	}
-}
-
-// TestLogOutputRotation verifies the log.rotation config reaches lumberjack's
-// fields, and that a nil rotation falls back to lumberjack defaults.
-func TestLogOutputRotation(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sub", "app.log")
-
-	w, err := logOutput(path, &LogRotationConfig{
-		MaxSize: 25, MaxAge: 3, MaxBackups: 2, LocalTime: true, Compress: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lj, ok := w.(*lumberjack.Logger)
-	if !ok {
-		t.Fatalf("logOutput = %T, want *lumberjack.Logger", w)
-	}
-	if lj.Filename != path || lj.MaxSize != 25 || lj.MaxAge != 3 ||
-		lj.MaxBackups != 2 || !lj.LocalTime || !lj.Compress {
-		t.Fatalf("lumberjack = %+v", lj)
-	}
-
-	// nil rotation -> lumberjack defaults (zero MaxSize = default 100 MB)
-	w2, err := logOutput(filepath.Join(dir, "def.log"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lj2 := w2.(*lumberjack.Logger); lj2.MaxSize != 0 || lj2.MaxBackups != 0 || lj2.Compress {
-		t.Fatalf("nil rotation lumberjack = %+v", lj2)
-	}
-
-	// non-file output is not a lumberjack logger
-	if _, err := logOutput("stderr", &LogRotationConfig{MaxSize: 1}); err != nil {
-		t.Fatal(err)
+	if c, _ = LoadConfig(path); len(c.TargetList()) != 0 {
+		t.Fatalf("empty = %q, want none", c.TargetList())
 	}
 }
 

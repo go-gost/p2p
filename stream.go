@@ -1,8 +1,6 @@
-package main
+package p2p
 
 import (
-	"log/slog"
-
 	"github.com/go-gost/plugin/p2p/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -25,7 +23,19 @@ func (s *server) Tunnel(stream proto.P2P_TunnelServer) error {
 	if v := md.Get("id"); len(v) > 0 {
 		id = v[0]
 	}
+	t, err := s.claimTunnel(id)
+	if err != nil {
+		return err
+	}
+	defer s.dropTunnel(t)
+	// No abort: a server stream is aborted by this handler returning.
+	return s.serveTunnel(t, stream, nil)
+}
 
+// claimTunnel resolves the id issued by OpenTunnel and marks the record
+// attached. The id is single-use: a second stream must not attach to a live
+// tunnel (the two would fight over the record's teardown).
+func (s *server) claimTunnel(id string) (*tunnel, error) {
 	s.mu.Lock()
 	t, ok := s.tunnels[id]
 	attached := ok && t.attached
@@ -34,20 +44,26 @@ func (s *server) Tunnel(stream proto.P2P_TunnelServer) error {
 	}
 	s.mu.Unlock()
 	if !ok {
-		return status.Errorf(codes.NotFound, "unknown tunnel %q", shortID(id))
+		return nil, status.Errorf(codes.NotFound, "unknown tunnel %q", shortID(id))
 	}
 	if attached {
-		// The id is single-use: a second stream must not attach to a live
-		// tunnel (the two would fight over the record's teardown).
-		return status.Error(codes.AlreadyExists, "tunnel already attached")
+		return nil, status.Error(codes.AlreadyExists, "tunnel already attached")
 	}
-	defer s.dropTunnel(t)
+	return t, nil
+}
 
-	// The host side of the stream stays a raw byte pipe in every network
-	// mode: for udp the framing travels through as bytes (GOST side frames,
-	// the peer's GOST side parses), so the host never touches it.
-	// No abort: a server stream is aborted by this handler returning.
-	conn := newStreamConn(stream, nil)
+// serveTunnel runs one tunnel over stream, whichever transport carries it: the
+// gRPC Tunnel RPC or an in-process pipe (see pipeStream). It is the single
+// shared data-plane body, so both carriers behave identically.
+//
+// abort ends the stream on teardown: nil on the gRPC path (the handler
+// returning ends the RPC) and the pipe's cancel for in-process tunnels.
+//
+// The host side of the stream stays a raw byte pipe in every network mode: for
+// udp the framing travels through as bytes (GOST side frames, the peer's GOST
+// side parses), so the host never touches it.
+func (s *server) serveTunnel(t *tunnel, stream tunnelStream, abort func()) error {
+	conn := newStreamConn(stream, abort)
 
 	if t.network == "udp" {
 		// A udp tunnel's stream is the datagram channel's local edge: the
@@ -61,7 +77,7 @@ func (s *server) Tunnel(stream proto.P2P_TunnelServer) error {
 
 	up, err := t.openPeer()
 	if err != nil {
-		slog.Debug("tunnel open peer failed", "tunnel", shortID(t.id), "target", t.target, "error", err)
+		t.log.Debug("tunnel open peer failed", "tunnel", shortID(t.id), "target", t.target, "error", err)
 		return status.Errorf(codes.Unavailable, "open peer: %v", err)
 	}
 	t.pipe(conn, up, "stream:"+shortID(t.id), t.target)
