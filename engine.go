@@ -53,6 +53,7 @@ type engine struct {
 
 	mu      sync.Mutex
 	client  *derpclient.Client
+	dialErr error // the last dial failure, surfaced by Connect
 	peers   map[derpclient.PublicKey]*peerConn
 	directs map[derpclient.PublicKey]*directConn
 	chans   map[derpclient.PublicKey]*channel
@@ -241,6 +242,11 @@ func (e *engine) Connect() error {
 	defer e.mu.Unlock()
 	e.ensureClientLocked()
 	if e.client == nil {
+		if e.dialErr != nil {
+			// The caller gets the cause, not just "failed": a TLS or DNS
+			// failure is actionable, a bare "connect failed" is not.
+			return fmt.Errorf("derp engine: connect: %w", e.dialErr)
+		}
 		return errors.New("derp engine: connect failed")
 	}
 	return nil
@@ -398,8 +404,10 @@ func (e *engine) ensureClientLocked() {
 	c, err := derpclient.Dial(ctx, e.url, e.priv, e.tlsCfg)
 	if err != nil {
 		e.log.Error("derp dial", "url", e.url, "error", err)
+		e.dialErr = err
 		return
 	}
+	e.dialErr = nil
 	e.client = c
 	e.log.Debug("derp connected", "url", e.url, "server", keyName(c.ServerPublicKey()))
 	go e.pump(c)

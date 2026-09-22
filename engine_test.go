@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -402,5 +403,26 @@ func TestParsePeerKey(t *testing.T) {
 	}
 	if _, err := parsePeerKey("AAAA"); err == nil {
 		t.Fatal("short key accepted")
+	}
+}
+
+// TestConnectErrorKeepsDialCause: a failed dial must surface its cause. A bare
+// "connect failed" hides TLS/DNS problems the caller can act on (a self-signed
+// relay, a bad CA file, a typo in the URL), which the log line alone does not
+// fix for an API caller.
+func TestConnectErrorKeepsDialCause(t *testing.T) {
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("wss://127.0.0.1:1/derp", "", priv, slog.Default())
+	defer e.Close()
+
+	err = e.Connect()
+	if err == nil {
+		t.Fatal("Connect to a refused relay = nil error")
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("Connect error = %v, want the dial cause (connection refused)", err)
 	}
 }
