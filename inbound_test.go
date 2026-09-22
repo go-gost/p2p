@@ -97,6 +97,59 @@ func TestListenWithTargetsErrors(t *testing.T) {
 	}
 }
 
+// TestListenBacklogOverflow: a stream arriving with the backlog full is dropped
+// and closed instead of queued forever. The first dial's stream carries bytes,
+// so its tag peek (udp.go peekTag) returns at once and the stream is queued
+// well before the second stream reaches deliver: the second one is idle, so it
+// is only classified when the peek times out — always later than the first
+// delivery. The drop order is therefore deterministic.
+func TestListenBacklogOverflow(t *testing.T) {
+	old := inboundBacklog
+	inboundBacklog = 1
+	t.Cleanup(func() { inboundBacklog = old })
+
+	rs := &relayServer{}
+	url := rs.start(t)
+	a := newListenTestHost(t, url, strings.Repeat("aa", 32))
+	b := newListenTestHost(t, url, strings.Repeat("bb", 32))
+
+	ln, err := b.Tunnel().Listen()
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	// First stream: sent with bytes so it is classified (and queued) at once;
+	// nobody accepts, so it holds the single backlog slot.
+	c1, err := a.Tunnel().Dial(context.Background(), "tcp", b.PublicKey())
+	if err != nil {
+		t.Fatalf("dial 1: %v", err)
+	}
+	defer c1.Close()
+	if _, err := c1.Write([]byte("fill")); err != nil {
+		t.Fatalf("write on stream 1: %v", err)
+	}
+
+	// Second stream, idle: it is dropped when its delivery finds the queue
+	// full.
+	c2, err := a.Tunnel().Dial(context.Background(), "tcp", b.PublicKey())
+	if err != nil {
+		t.Fatalf("dial 2: %v", err)
+	}
+	defer c2.Close()
+
+	// The write may be swallowed locally (smux buffers it), but nothing can
+	// ever come back: the read fails once B closes the dropped stream. The
+	// deadline must cover the tag peek's timeout, which delays the drop.
+	if _, err := c2.Write([]byte("x")); err != nil {
+		return // the drop was already visible on the write
+	}
+	c2.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := c2.Read(make([]byte, 1)); err == nil {
+		t.Fatal("second stream survived a full backlog, want it dropped and closed")
+	}
+}
+
 // newListenTestHost builds a connected in-process host for the Listen tests.
 func newListenTestHost(t *testing.T, url, keyHex string) *Host {
 	t.Helper()
