@@ -2,6 +2,9 @@ package p2p
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
 	"testing"
 )
 
@@ -113,4 +116,85 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestFrameConnWriteWire pins the in-process provider's udp wire format: the
+// carrier's conn must emit the same 2-byte big-endian length-prefixed frames
+// as x/p2p/streamconn (and the outlet's dgramEdge), and report the payload
+// length from Write, not the frame length.
+func TestFrameConnWriteWire(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientRaw, serverRaw := newPipePair(ctx)
+	w := newFrameConn(newStreamConn(clientRaw, nil))
+	raw := newStreamConn(serverRaw, nil)
+
+	if _, err := w.Write([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 7)
+	if _, err := io.ReadFull(raw, buf); err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte{0x00, 0x05, 'f', 'i', 'r', 's', 't'}; !bytes.Equal(buf, want) {
+		t.Fatalf("frame = %v, want %v", buf, want)
+	}
+
+	n, err := w.Write([]byte("abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 6 {
+		t.Fatalf("Write = %d, want 6 (the payload length, not the frame length)", n)
+	}
+	if _, err := io.ReadFull(raw, make([]byte, 8)); err != nil {
+		t.Fatal(err) // drain the second frame
+	}
+
+	if _, err := w.Write(make([]byte, maxFrame+1)); !errors.Is(err, errDatagramTooLarge) {
+		t.Fatalf("oversized write err = %v, want errDatagramTooLarge", err)
+	}
+}
+
+// TestFrameConnReadDatagrams pins the read side: one datagram per Read with
+// boundaries preserved, and bytes beyond a short read buffer discarded as on a
+// UDP socket — the following Read must return the next datagram, not the tail.
+func TestFrameConnReadDatagrams(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientRaw, serverRaw := newPipePair(ctx)
+	w := newFrameConn(newStreamConn(clientRaw, nil))
+	r := newFrameConn(newStreamConn(serverRaw, nil))
+
+	for _, m := range []string{"first", "second", "0123456"} {
+		if _, err := w.Write([]byte(m)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	buf := make([]byte, 64)
+	n, err := r.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "first" {
+		t.Fatalf("Read = %q, want %q", got, "first")
+	}
+
+	small := make([]byte, 3)
+	n, err = r.Read(small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(small[:n]); got != "sec" {
+		t.Fatalf("short Read = %q, want %q", got, "sec")
+	}
+
+	n, err = r.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "0123456" {
+		t.Fatalf("Read after truncation = %q, want %q (the discarded tail must not reappear)", got, "0123456")
+	}
 }

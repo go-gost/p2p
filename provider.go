@@ -87,6 +87,13 @@ func (h *Host) openTunnelStream(ctx context.Context, network, peer string) (net.
 	// LocalAddr/RemoteAddr and call String on them.
 	conn.local = streamAddr{network: network, addr: "p2p"}
 	conn.remote = streamAddr{network: network, addr: peer}
+	if network == "udp" {
+		// A udp tunnel carries datagrams, so the GOST-side conn owns the
+		// 2-byte framing (frame.go) exactly as x/p2p/streamconn's conn does on
+		// the gRPC carrier: both carriers then hand the inner dialer the same
+		// conn shape. Without it the outlet's frame parser never sees a frame.
+		return newFrameConn(conn), nil
+	}
 	return conn, nil
 }
 
