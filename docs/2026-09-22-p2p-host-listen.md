@@ -1,10 +1,10 @@
-# p2p Host.Listen（入站流交付 embedder）Implementation Plan
+# p2p Provider.Listen / Dial（入站流交付 embedder）Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** p2p host 支持把**入站 peer 流以 conn 交给 embedder**（`Host.Listen()`），host 不再自己桥 target；为 wisper 的进程级 host + peer 路由铺路。
+**Goal:** p2p 的 `Provider` 成为完整的对外传输接口（`Dial` / `Listen` / `Close`，与 net 包一致）：入站 peer 流以 conn 交给 embedder，host 不再自己桥 target。
 
-**Architecture:** engine 侧新增"入站队列"（`Host.Listen()` 创建并独占消费）；`serveInbound` 的未打标签路径在队列存在时改为投递而非桥接；合成地址携带 peer key。
+**Architecture:** engine 侧新增"入站队列"（`Provider.Listen()` 创建并独占消费）；`serveInbound` 的未打标签路径在队列存在时改为投递而非桥接；合成地址携带 peer key。**同时**把 `Provider.Dial` 改名 `Dial`——x 侧接口 `xp2p.TunnelProvider` 必须同步改名（见 `../../x/docs/plans/2026-09-22-p2p-provider-dial-rename.md`），故本计划顺序：先 x 改名发版 → 再 p2p。
 
 **Tech Stack:** Go（本仓 `github.com/go-gost/p2p`）、`engine_test.go` 的进程内测试 relay。
 
@@ -14,7 +14,7 @@
 
 ---
 
-### Task 1: `Host.Listen()` + 入站队列
+### Task 1: `Provider.Listen()` + `Provider.Dial` 改名 + 入站队列
 
 **Files:**
 - Modify: `engine.go`（队列字段 + 投递）、`direct.go`（`serveInbound` 分支）、`host.go`（`Listen()` + Close 联动）
@@ -44,14 +44,14 @@ func TestHostListen(t *testing.T) {
 	a := newListenTestHost(t, url, strings.Repeat("aa", 32))
 	b := newListenTestHost(t, url, strings.Repeat("bb", 32))
 
-	ln, err := b.Listen()
+	ln, err := b.Provider().Listen()
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
 	// A opens a tunnel to B; B accepts it and both ends exchange bytes.
-	client, err := a.Provider().OpenTunnelStream(context.Background(), "tcp", b.PublicKey())
+	client, err := a.Provider().Dial(context.Background(), "tcp", b.PublicKey())
 	if err != nil {
 		t.Fatalf("open tunnel: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestListenWithTargetsErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = h.Close() })
-	if _, err := h.Listen(); err == nil {
+	if _, err := h.Provider().Listen(); err == nil {
 		t.Fatal("Listen with configured targets = nil error, want a failure")
 	}
 }
@@ -217,7 +217,7 @@ func (q *inboundQueue) close() {
 	})
 }
 
-// inboundListener is the net.Listener returned by Host.Listen.
+// inboundListener is the net.Listener returned by Provider.Listen.
 type inboundListener struct {
 	q    *inboundQueue
 	host string // the host's own base64 key, for LocalAddr
@@ -250,7 +250,7 @@ func (c *inboundConn) RemoteAddr() net.Addr { return c.remote }
 
 `engine.go`：`engine` 结构加字段 `inbound *inboundQueue`（nil = 未启用）。
 
-`host.go`：
+`provider.go`：
 
 ```go
 // Listen returns a listener over inbound peer tunnel streams. Each accepted
@@ -260,21 +260,22 @@ func (c *inboundConn) RemoteAddr() net.Addr { return c.remote }
 // and dropped. It is mutually exclusive with Config.Targets: with targets
 // configured the host bridges inbound tunnels internally (the CLI behaviour).
 // Single consumer: calling it twice returns the same listener.
-func (h *Host) Listen() (net.Listener, error) {
-	if h.engine == nil {
+func (p *Provider) Listen() (net.Listener, error) {
+	if p.h.engine == nil {
 		return nil, errors.New("p2p: Listen requires derp mode")
 	}
-	if len(h.cfg.TargetList()) > 0 {
+	if len(p.h.cfg.TargetList()) > 0 {
 		return nil, errors.New("p2p: Listen and Config.Targets are mutually exclusive")
 	}
-	h.listenOnce.Do(func() {
-		h.engine.inbound = newInboundQueue()
-		h.listener = &inboundListener{q: h.engine.inbound, host: h.PublicKey()}
+	p.h.listenOnce.Do(func() {
+		p.h.engine.inbound = newInboundQueue()
+		p.h.listener = &inboundListener{q: p.h.engine.inbound, host: p.h.PublicKey()}
 	})
-	return h.listener, nil
+	return p.h.listener, nil
 }
 ```
-（`Host` 加 `listenOnce sync.Once`、`listener net.Listener` 字段；`Close()` 里若 `h.listener != nil` 调 `h.listener.Close()`。）
+（`Host` 加未导出的 `listenOnce sync.Once`、`listener net.Listener` 字段与 `listen()` 内部逻辑；`Provider.Listen` 是唯一导出入口。`Provider.Close()` 同时关闭 listener（`Accept` 返回 `net.ErrClosed`），host 本身不动。`Host.Close()` 里若 `h.listener != nil` 也要关。）
+同名改名：`Provider.Dial` → `Provider.Dial`（`provider.go` + `doc.go` 示例 + `host_test.go` 调用；接口注释同步）。x 的接口改名见上面的 x 计划，**必须先做**。
 
 `direct.go` 的 `serveInbound` 未打标签路径改为：
 
@@ -302,7 +303,7 @@ Expected: PASS；build/vet 干净。
 
 ```bash
 git add inbound.go inbound_test.go engine.go direct.go host.go
-git commit -m "p2p: hand inbound peer streams to the embedder (Host.Listen)"
+git commit -m "p2p: Provider.Dial rename + Listen hands inbound streams to the embedder"
 ```
 
 ---
@@ -350,7 +351,7 @@ git commit -m "p2p: test the Listen backlog overflow"
 在 `CLAUDE.md` 的「Architecture (two planes)」数据面段落补一段（英文，与全文一致）：
 
 ```markdown
-**Embedder mode** (`Host.Listen`): an in-process embedder can take inbound peer
+**Embedder mode** (`Provider.Listen`): an in-process embedder can take inbound peer
 streams as conns instead of letting the host bridge them to `--target` (mutually
 exclusive with `Config.Targets`). Each accepted conn's `RemoteAddr()` carries the
 peer's base64 key, so the embedder can route by peer, own the service stack
@@ -376,7 +377,7 @@ git push && git tag v0.4.2 && git push origin v0.4.2
 
 ## Self-Review 记录
 
-- **Spec 覆盖**：`Listen()` 契约（互斥、合成地址、backlog、单消费者）→ Task 1；溢出行为 → Task 2；文档/发布 → Task 3。spec 里"不需要计数 API"→ 计划里确实没有计数改动 ✓。
+- **Spec 覆盖**：`Provider.Listen()`/`Provider.Dial` 契约（互斥、合成地址、backlog、单消费者）→ Task 1；溢出行为 → Task 2；文档/发布 → Task 3。spec 里"不需要计数 API"→ 计划里确实没有计数改动 ✓。
 - **占位符**：溢出测试（Task 2）给了断言方式而非完整代码（复用 Task 1 的辅助），实现者按样板补齐。
 - **类型一致性**：`inboundQueue`/`inboundStream`/`inboundListener`/`inboundConn`/`peerAddr`/`inboundBacklog` 命名一致；`engine.inbound`、`Host.listener`/`listenOnce` 在 Task 1 内自洽。
-- **风险**：`Host.Listen()` 需在 `Connect()` 之前调用才能保证不漏流入流（文档写明）；smux 流的 `CloseWrite` 语义由 `inboundConn` 透传（`net.Conn` 无该方法，embedder 侧如需要半关需类型断言——wisper 侧用 gost 的 pipe，无需半关）。
+- **风险**：`Provider.Listen()` 需在 `Connect()` 之前调用才能保证不漏流入流（文档写明）；smux 流的 `CloseWrite` 语义由 `inboundConn` 透传（`net.Conn` 无该方法，embedder 侧如需要半关需类型断言——wisper 侧用 gost 的 pipe，无需半关）。
