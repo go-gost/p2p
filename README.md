@@ -1,8 +1,10 @@
 # p2p
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-gost/p2p.svg)](https://pkg.go.dev/github.com/go-gost/p2p)
+
 **English** · [简体中文](README.zh-CN.md)
 
-Tunnel host process for [GOST](https://github.com/go-gost/gost)'s [p2p plugin](https://github.com/go-gost/plugin) protocol. It lets GOST establish the network path to a chain node through a tunnel opened by this process — the traversal strategy (rendezvous, relay, hole punching) is entirely up to the plugin, and GOST only ever sees a plain byte stream (the `Tunnel` gRPC stream) to carry its protocol over.
+Peer-to-peer tunnel host for [GOST](https://github.com/go-gost/gost)'s [p2p plugin](https://github.com/go-gost/plugin) protocol, usable either as a standalone binary or as a **Go library embedded in another process** (see [In-process embedding](#in-process-embedding)). It lets GOST establish the network path to a chain node through a tunnel opened by this host — the traversal strategy (rendezvous, relay, hole punching) is entirely up to the plugin, and GOST only ever sees a plain byte stream (the `Tunnel` gRPC stream) to carry its protocol over.
 
 **Status: stub + mux + DERP relay + STUN/UDP hole punching + datagram channels.** The host bridges tunnels with a local TCP forward, either directly (stub mode, loopback) or through a **DERP relay** (engine mode, cross-machine/NAT). In engine mode, after a relay session is up, both peers probe their NAT via STUN and punch a UDP hole; once the direct path (KCP + smux) is established, new tunnels flow over it while the relay stays up as fallback. Inner dialers `tcp/tls/ws/mtcp/mtls/mws/udp` are supported — the mux family reuses one tunnel as a multiplexed session, and `udp` asks for a **datagram stream** instead of a byte stream (this is what carries a tun link: GOST owns the device, this host is only the pipe).
 
@@ -115,6 +117,66 @@ chains:
             metadata:
               p2p: p2p-1              # this node's base path goes through the plugin
 ```
+
+## In-process embedding
+
+`p2p` is a plain Go library — the CLI is only a flag/config front end over `p2p.New`. An
+application can embed a host in its own process instead of running this binary next to it: no
+subprocess, no loopback gRPC control plane, no auth token. The data plane is the same one the
+gRPC carrier uses (both run the same `serveTunnel`; only the stream carrier differs — an
+in-memory pipe), and every tunnel is handed back to the caller as a `net.Conn`.
+
+```go
+import "github.com/go-gost/p2p"
+
+host, err := p2p.New(&p2p.Config{
+	Derp:   "wss://derp.example.com/derp", // empty = stub mode (peer is a plain host:port)
+	Key:    "peer.key",                    // curve25519 key file; created if missing
+	Target: "127.0.0.1:18080",             // inbound tunnels bridge here (DERP mode)
+})
+if err != nil {
+	return err
+}
+defer host.Close()
+
+// Connect brings up the DERP engine and the configured forwards — what the
+// CLI's Start does, minus the listener. Not needed in stub mode. A connect
+// failure is not fatal here: the engine retries in the background.
+_ = host.Connect()
+log.Printf("my public key: %s", host.PublicKey()) // peers address the host by this
+
+// peer: a base64 public key in DERP mode, a host:port in stub mode.
+conn, err := host.Tunnel().Dial(ctx, "tcp", peer)
+if err != nil {
+	return err
+}
+defer conn.Close() // the conn IS the tunnel — closing it tears the tunnel down
+```
+
+- **What you get.** `Dial` returns a `net.Conn`: read and write it like a socket, and
+  whatever your application already carries over TCP (its own protocol, TLS, a request/response
+  loop) rides inside it unchanged. `network` picks the stream's semantics — `udp` (also
+  `udp4`/`udp6`) returns a conn that preserves datagram boundaries, anything else a byte stream.
+- **Lifetime.** `ctx` bounds only the call; the tunnel outlives it. The returned conn is the
+  cancellation handle — close it and the tunnel, its peer dial, and its bookkeeping all go away.
+  There is nothing else to track and no close RPC.
+- **Inbound.** In DERP mode the same host also *accepts* tunnels from its peers. With a
+  `Target`/`Targets` configured, each inbound stream is bridged to one of them for that stream's
+  lifetime. With none configured, `Tunnel().Listen()` hands the inbound streams to the embedder
+  instead: a `net.Listener` whose accepted conns carry the peer's base64 key as `RemoteAddr()`,
+  so the embedder can route by peer and own the service stack (stats, auth, recording). The two
+  are mutually exclusive.
+- **Shutdown.** `host.Close()` shuts down the engine, the forwards and the tunnel bookkeeping
+  (idempotent). `Tunnel.Close()` is narrower — it refuses new tunnels and closes a `Listen` listener; open
+  conns and the host keep running.
+- **No control plane.** `Start`/`Serve` bind the gRPC listener, which only out-of-process clients
+  need; an embedder calls `Connect` (or nothing at all, in stub mode) and never starts a server.
+  Every field under [Configuration file](#configuration-file) is a `Config` field you can set in
+  code.
+
+The tunnel endpoint is deliberately structural — `Dial(ctx, network, peer)` + `Listen()` +
+`Close()`, net-style — so an application that already defines its own transport interface can let
+`*p2p.Tunnel` satisfy it directly instead of writing an adapter.
 
 ## DERP mode (cross-machine)
 

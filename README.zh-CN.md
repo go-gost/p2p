@@ -1,8 +1,10 @@
 # p2p
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-gost/p2p.svg)](https://pkg.go.dev/github.com/go-gost/p2p)
+
 [English](README.md) · **简体中文**
 
-为 [GOST](https://github.com/go-gost/gost) 的 [p2p 插件](https://github.com/go-gost/plugin) 协议服务的隧道宿主进程。它让 GOST 通过本进程打开的隧道，建立到链节点的网络通路——穿越策略（rendezvous、relay、打洞）完全由插件决定，GOST 侧永远只看到一条普通的字节流（`Tunnel` gRPC 流）来承载它的协议。
+为 [GOST](https://github.com/go-gost/gost) 的 [p2p 插件](https://github.com/go-gost/plugin) 协议服务的 P2P 隧道宿主，既可以作为独立二进制运行，也可以作为 **Go 库嵌入到其他进程**（见[进程内嵌入](#进程内嵌入in-process)）。它让 GOST 通过本宿主打开的隧道，建立到链节点的网络通路——穿越策略（rendezvous、relay、打洞）完全由插件决定，GOST 侧永远只看到一条普通的字节流（`Tunnel` gRPC 流）来承载它的协议。
 
 **当前状态：stub + mux + DERP relay + STUN/UDP 打洞 + 数据报通道。** 宿主用本地 TCP 转发桥接隧道：stub 模式（回环）直接转发，**DERP relay** 模式（engine）跨机/NAT。engine 模式下，relay 会话建立后，两端各自用 STUN 探测 NAT 并打 UDP 洞；直连路径（KCP + smux）建立后，新隧道走直连、relay 保持为回退。支持内层 dialer `tcp/tls/ws/mtcp/mtls/mws/udp`——mux 一族把一条隧道复用成多路会话，`udp` 则要求一条**数据报流**而不是字节流（tun 链路靠它：设备归 GOST 管，本进程只是管道）。
 
@@ -114,6 +116,55 @@ chains:
             metadata:
               p2p: p2p-1              # 该节点的基础路径走插件
 ```
+
+## 进程内嵌入（in-process）
+
+`p2p` 就是一个普通 Go 库——CLI 只是 `p2p.New` 之上的 flag/config 前端。应用可以把宿主嵌进自己的
+进程，而不必在旁边跑这个二进制：无子进程、无 loopback gRPC 控制面、无认证 token。数据面与 gRPC
+载体完全一致（两者跑同一个 `serveTunnel`，只是流的载体不同——内存管道），每条隧道都以 `net.Conn`
+的形式交回给调用方。
+
+```go
+import "github.com/go-gost/p2p"
+
+host, err := p2p.New(&p2p.Config{
+	Derp:   "wss://derp.example.com/derp", // 留空 = stub 模式（peer 即普通 host:port）
+	Key:    "peer.key",                    // curve25519 密钥文件；缺失时自动创建
+	Target: "127.0.0.1:18080",             // 入站隧道桥接到此处（DERP 模式）
+})
+if err != nil {
+	return err
+}
+defer host.Close()
+
+// Connect 启动 DERP engine 与配置的 forward —— CLI 的 Start 所做的工作减去监听器。
+// stub 模式无需调用。连接失败不致命：engine 会在后台重试。
+_ = host.Connect()
+log.Printf("my public key: %s", host.PublicKey()) // peer 用这个公钥寻址本宿主
+
+// peer：DERP 模式下是 base64 公钥，stub 模式下是 host:port。
+conn, err := host.Tunnel().Dial(ctx, "tcp", peer)
+if err != nil {
+	return err
+}
+defer conn.Close() // conn 本身就是隧道——关闭它即拆除隧道
+```
+
+- **拿到什么。** `Dial` 返回一个 `net.Conn`：像 socket 一样读写，应用原本跑在 TCP 上
+  的任何东西（自有协议、TLS、请求/响应循环）原样在其中穿行。`network` 决定流的语义——`udp`
+  （含 `udp4`/`udp6`）返回保留数据报边界的 conn，其余为字节流。
+- **生命周期。** `ctx` 只约束这次调用；隧道比它活得更久。返回的 conn 就是取消句柄——关闭它，隧道、
+  它的 peer 拨号与记账一起消失。没有别的东西需要跟踪，也没有 close RPC。
+- **入站。** DERP 模式下同一个宿主**也**接受 peer 发来的隧道：每条入站流在其存续期内桥接到配置的
+  `Target`/`Targets`，因此一个嵌入宿主可同时服务两个方向。未配置 target 时它只对外拨号。
+- **关闭。** `host.Close()` 关停 engine、forward 与隧道记账（幂等）。`Tunnel.Close()` 范围更窄
+  ——只拒绝新隧道；已开的 conn 与宿主继续运行。
+- **不需要控制面。** `Start`/`Serve` 绑定 gRPC 监听器，只有进程外客户端才需要；嵌入方调用
+  `Connect`（stub 模式下什么都不用调），永不启动 server。
+  [配置文件](#配置文件) 下的每个字段都是可在代码里直接设置的 `Config` 字段。
+
+provider 的形态是刻意结构化（structural）的——`Dial(ctx, network, peer)` + `Listen()` + `Close()`
+——因此已经定义了自己 tunnel-provider 接口的应用，可以让 `*p2p.Tunnel` 直接满足它，而不必写适配器。
 
 ## DERP 模式（跨机）
 

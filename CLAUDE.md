@@ -65,6 +65,13 @@ fully replace the command line.
 
 There is no `CloseTunnel`: the stream ending is the close.
 
+**Embedder mode** (`Tunnel.Listen`): an in-process embedder can take inbound peer streams as
+conns instead of letting the host bridge them to `--target` (mutually exclusive with
+`Config.Targets`). Each accepted conn's `RemoteAddr()` carries the peer's base64 key, so the
+embedder can route by peer, own the service stack (stats, auth, recording) and skip the target
+pool entirely. `Tunnel.Dial` is the outbound counterpart; both are the same data plane the gRPC
+carrier uses, only the stream carrier differs.
+
 **Data plane** — the `Tunnel` stream per tunnel (see control plane). `--forward` listeners keep the old shape ([server.go](server.go) `bridge` → `pipe`): every accepted connection is bridged to the peer end and copied in both directions. Half-close semantics: when one direction EOFs, the destination gets `CloseWrite()` so the other side can drain — conn types without `CloseWrite` (mux and stream-backed conns) fall back to a full close; both ends close only after both directions finish. In DERP mode the peer end is an `engine.OpenStream(peer)` mux stream instead of a dialed TCP conn.
 
 **DERP engine** ([engine.go](engine.go)): one long-lived WebSocket-DERP connection per host (client package `internal/derpclient`, a minimal DERP subset over the standard WS path — see its package doc for the wire reference @v1.102.3). A packet pump routes inbound packets to per-peer adapters; each peer pair has exactly one `smux` session (role chosen by public-key ordering) over which each tunnel is one stream. Both sides run an accept loop bridging inbound streams to `--target`. The host connects eagerly at startup (it is a rendezvous node) and redials every 5s on disconnect; `--key` is generated on first run and its public key printed — that base64 string is what peers put in their GOST node `addr`.
