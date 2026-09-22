@@ -63,6 +63,9 @@ go build -o p2p ./cmd/p2p
 所有 flag 都可以写进 YAML 配置文件（gost 风格 `-C`）：配置值作为默认，显式传入的 flag 覆盖；
 `--forward` flag 与配置里的 `forwards` 列表叠加生效。
 
+配置文件由 CLI（`cmd/p2p`）读取；库本身不带文件读取器，`addr`、`token`、`log` 是 CLI 自己的
+键——`p2p.Config` 里没有这些字段（它们属于部署设置，不属于 endpoint）。
+
 ```bash
 ./p2p -C p2p.yaml
 ```
@@ -123,6 +126,18 @@ chains:
 进程，而不必在旁边跑这个二进制：无子进程、无 loopback gRPC 控制面、无认证 token。数据面与 gRPC
 transport 完全一致（两者跑同一个 `serveTunnel`，只是流的载体不同——内存管道），每条隧道都以
 `net.Conn` 的形式交回给调用方。
+
+库是四个包、单一依赖方向：
+[`github.com/go-gost/p2p`](https://pkg.go.dev/github.com/go-gost/p2p)（契约——`Config`、
+`Status`、sentinel error；只依赖标准库）、
+[`…/p2p/endpoint`](https://pkg.go.dev/github.com/go-gost/p2p/endpoint)（endpoint：身份、relay
+engine、forward、`Dial`/`Listen`）、
+[`…/p2p/grpc`](https://pkg.go.dev/github.com/go-gost/p2p/grpc)（transport：把 endpoint 按插件协议
+对外提供）、以及 `internal/host`（endpoint 背后的 engine，模块外不可导入）。身份处理、timing
+参数与信任边界见[嵌入指南](docs/embedding.md)。
+
+从 v0.4.x 升级：`p2p.New`/`p2p.Host` 变成 `endpoint.New`/`endpoint.Endpoint`，`Host.Tunnel()`
+facade 已删除——`Dial`/`Listen` 直接在 endpoint 上。
 
 ```go
 import (

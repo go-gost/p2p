@@ -64,6 +64,10 @@ Every flag can live in a YAML config file instead (gost-style `-C`): a config
 value is the default, and an explicitly-set flag overrides it. `--forward`
 flags and the config `forwards` list are additive.
 
+The file is read by the CLI (`cmd/p2p`); the library has no file reader, and
+`addr`, `token` and `log` are the CLI's own keys — a `p2p.Config` has no such
+fields (they are deployment settings, not endpoint settings).
+
 ```bash
 ./p2p -C p2p.yaml
 ```
@@ -125,6 +129,19 @@ embed an endpoint in its own process instead of running this binary next to it: 
 loopback gRPC control plane, no auth token. The data plane is the same one the gRPC transport uses
 (both run the same `serveTunnel`; only the stream carrier differs — an in-memory pipe), and every
 tunnel is handed back to the caller as a `net.Conn`.
+
+The library is four packages, one direction of dependency:
+[`github.com/go-gost/p2p`](https://pkg.go.dev/github.com/go-gost/p2p) (the contracts — `Config`,
+`Status`, the sentinel errors; standard library only),
+[`…/p2p/endpoint`](https://pkg.go.dev/github.com/go-gost/p2p/endpoint) (the endpoint: identity,
+relay engine, forwards, `Dial`/`Listen`),
+[`…/p2p/grpc`](https://pkg.go.dev/github.com/go-gost/p2p/grpc) (the transport that serves an
+endpoint over the plugin protocol), and `internal/host` (the engine behind the endpoint,
+unimportable). Identity handling, the timing knobs and the trust boundary are covered in the
+[embedding guide](docs/embedding.md).
+
+Upgrading from v0.4.x: `p2p.New`/`p2p.Host` are now `endpoint.New`/`endpoint.Endpoint`, and the
+`Host.Tunnel()` facade is gone — `Dial`/`Listen` live on the endpoint itself.
 
 ```go
 import (
