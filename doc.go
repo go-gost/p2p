@@ -1,27 +1,21 @@
-// Package p2p implements a peer-to-peer tunnel host: it exposes gRPC tunnels
-// to a peer and bridges each one to a local target, using a DERP relay for
-// rendezvous and, optionally, a hole-punched direct path.
+// Package p2p is the contract layer of the p2p library: the configuration an
+// endpoint reads, the status it reports, and the sentinel errors callers match
+// on. It holds no implementation and no dependency outside the standard
+// library, so importing it never pulls an engine, a transport, or a parser.
 //
-// It runs in two modes. With Config.Derp set, peers are addressed by base64
-// curve25519 public key and the relay/hole-punch engine carries the tunnel;
-// with it empty ("stub" mode) the peer is a plain host:port dialled directly.
+// An endpoint is built from a Config and used in one of two shapes:
 //
-// The package is a library. The standalone binary lives in cmd/p2p and is only
-// a flag/config front end over New. An embedder that wants tunnels without a
-// separate process uses:
+//   - in-process (github.com/go-gost/p2p/endpoint): the caller dials tunnels
+//     and takes inbound ones directly, with no wire protocol in between;
+//   - over a wire protocol (github.com/go-gost/p2p/grpc): a transport serves
+//     the same endpoint so a remote client — GOST's p2p plugin client — can
+//     open tunnels to it.
 //
-//	host, err := p2p.New(&p2p.Config{Derp: url, KeyHex: hexKey})
-//	if err != nil {
-//		return err
-//	}
-//	defer host.Close()
-//	if err := host.Connect(); err != nil { // engine + configured forwards
-//		return err
-//	}
-//	conn, err := host.Tunnel().Dial(ctx, "tcp", peerKey)
+// Both shapes share one endpoint, so a process that does both uses one
+// identity and one relay connection.
 //
-// Tunnel opens (and listens for) tunnels in-process over an in-memory stream;
-// the gRPC control plane (Start/Serve) is only needed by out-of-process
-// clients. Both paths run the same data-plane code, so tunnel semantics do not
-// depend on the carrier.
+// Trust boundary: the data plane is plaintext and the control plane is
+// unauthenticated by default — the loopback default listen address is the
+// security boundary. Confidentiality is the inner protocol's job; see the
+// package documentation of endpoint and grpc for the specifics.
 package p2p

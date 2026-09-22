@@ -1,20 +1,12 @@
 package p2p
 
-import (
-	"errors"
-	"fmt"
-	"os"
-	"time"
+import "time"
 
-	"github.com/goccy/go-yaml"
-)
-
-// Config is the optional YAML configuration file. Every field mirrors a
-// command-line flag (the flag name without the leading "--"); a config value
-// supplies the default and an explicitly-set flag overrides it.
+// Config is the endpoint configuration: everything the host reads to build its
+// identity, its relay engine and its data planes. The yaml tags are the
+// config-file schema, but the file itself is read by the binary that deploys
+// the library (cmd/p2p), not by this package.
 type Config struct {
-	Addr     string          `yaml:"addr,omitempty"`
-	Token    string          `yaml:"token,omitempty"`
 	Derp     string          `yaml:"derp,omitempty"`
 	Key      string          `yaml:"key,omitempty"`
 	KeyHex   string          `yaml:"keyHex,omitempty"`
@@ -23,13 +15,17 @@ type Config struct {
 	Stun     string          `yaml:"stun,omitempty"`
 	Direct   *bool           `yaml:"direct,omitempty"`
 	TLS      *TLSConfig      `yaml:"tls,omitempty"`
-	Log      *LogConfig      `yaml:"log,omitempty"`
 	Timeouts *TimeoutsConfig `yaml:"timeouts,omitempty"`
 	Forwards []ForwardConfig `yaml:"forwards,omitempty"`
 }
 
 // TimeoutsConfig tunes deployment-dependent timings. Zero values keep the
 // built-in defaults; internal mechanism timeouts stay hardcoded.
+//
+// The timings are process-wide: they are applied when an endpoint is created
+// and a later endpoint inherits the values already applied. One endpoint per
+// process is the model; a process that builds two must give them identical
+// timeouts (or none).
 type TimeoutsConfig struct {
 	PunchWait     time.Duration `yaml:"punchWait,omitempty"`
 	Punch         time.Duration `yaml:"punch,omitempty"`
@@ -40,7 +36,8 @@ type TimeoutsConfig struct {
 }
 
 // SmuxTimeouts tunes the smux keepalive shared by the relay and direct
-// sessions. Timeout must be >= 2x Interval (validated in applyTimeouts).
+// sessions. Timeout must be >= 2x Interval (validated when the endpoint is
+// created).
 type SmuxTimeouts struct {
 	Interval time.Duration `yaml:"interval,omitempty"`
 	Timeout  time.Duration `yaml:"timeout,omitempty"`
@@ -53,43 +50,11 @@ type TLSConfig struct {
 	CAFile string `yaml:"caFile,omitempty"`
 }
 
-// LogConfig mirrors the --log.* flags plus file rotation.
-type LogConfig struct {
-	Level    string             `yaml:"level,omitempty"`
-	Format   string             `yaml:"format,omitempty"`
-	Output   string             `yaml:"output,omitempty"`
-	Rotation *LogRotationConfig `yaml:"rotation,omitempty"`
-}
-
-// LogRotationConfig configures lumberjack file rotation for a file output.
-// Zero values fall back to lumberjack's defaults (100 MB, keep all, UTC, no
-// compression).
-type LogRotationConfig struct {
-	MaxSize    int  `yaml:"maxSize,omitempty"`
-	MaxAge     int  `yaml:"maxAge,omitempty"`
-	MaxBackups int  `yaml:"maxBackups,omitempty"`
-	LocalTime  bool `yaml:"localTime,omitempty"`
-	Compress   bool `yaml:"compress,omitempty"`
-}
-
 // ForwardConfig is a pre-configured static port forward: bind Listen and bridge
 // accepted connections to the peer's public key.
 type ForwardConfig struct {
 	Listen string `yaml:"listen,omitempty"`
 	Peer   string `yaml:"peer,omitempty"`
-}
-
-// LoadConfig reads and parses a YAML config file.
-func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var c Config
-	if err := yaml.Unmarshal(data, &c); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
-	}
-	return &c, nil
 }
 
 // TargetList merges the legacy scalar `target` with the `targets` list, scalar
@@ -101,79 +66,4 @@ func (c *Config) TargetList() []string {
 	}
 	specs = append(specs, c.Targets...)
 	return specs
-}
-
-// applyTimeouts validates and applies the timeouts config to the package-level
-// timing vars. Zero values keep defaults; invalid values are rejected at
-// startup so a misconfiguration fails loudly instead of producing a silently
-// broken punch. smux timeout must be >= 2x the interval: smux's own
-// VerifyConfig only requires >=, and the failing case hit twice was equality
-// (an idle session kills itself after ~interval).
-//
-// The timings are process-wide, not per-Host: a second New merges its non-zero
-// values into those already applied, so a Host with zero timeouts inherits the
-// first Host's. Embedders running more than one Host in a process must give
-// them identical timeouts (or none).
-func applyTimeouts(t *TimeoutsConfig) error {
-	if t == nil {
-		return nil
-	}
-	for _, v := range []struct {
-		name string
-		val  time.Duration
-	}{
-		{"punchWait", t.PunchWait},
-		{"punch", t.Punch},
-		{"seed", t.Seed},
-		{"backoff", t.Backoff},
-		{"derpKeepAlive", t.DerpKeepAlive},
-	} {
-		if v.val < 0 {
-			return fmt.Errorf("timeouts.%s must be positive", v.name)
-		}
-	}
-	if t.Smux != nil && (t.Smux.Interval < 0 || t.Smux.Timeout < 0) {
-		return errors.New("timeouts.smux values must be positive")
-	}
-
-	// Validate the smux pair before applying anything, so a rejected value
-	// never leaves half-applied state behind.
-	if t.Smux != nil {
-		interval, timeout := smuxKeepAliveInterval, smuxKeepAliveTimeout
-		if t.Smux.Interval != 0 {
-			interval = t.Smux.Interval
-		}
-		if t.Smux.Timeout != 0 {
-			timeout = t.Smux.Timeout
-		}
-		if timeout < 2*interval {
-			return fmt.Errorf("timeouts.smux.timeout (%s) must be >= 2x interval (%s)", timeout, interval)
-		}
-	}
-
-	// Validation passed: apply.
-	if t.PunchWait != 0 {
-		punchWaitTimeout = t.PunchWait
-	}
-	if t.Punch != 0 {
-		punchTimeout = t.Punch
-	}
-	if t.Seed != 0 {
-		seedTimeout = t.Seed
-	}
-	if t.Backoff != 0 {
-		backoffPeriod = t.Backoff
-	}
-	if t.DerpKeepAlive != 0 {
-		keepAlivePeriod = t.DerpKeepAlive
-	}
-	if t.Smux != nil {
-		if t.Smux.Interval != 0 {
-			smuxKeepAliveInterval = t.Smux.Interval
-		}
-		if t.Smux.Timeout != 0 {
-			smuxKeepAliveTimeout = t.Smux.Timeout
-		}
-	}
-	return nil
 }

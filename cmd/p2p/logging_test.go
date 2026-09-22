@@ -4,7 +4,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/go-gost/p2p"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -14,7 +13,7 @@ func TestLogOutputRotation(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sub", "app.log")
 
-	w, err := logOutput(path, &p2p.LogRotationConfig{
+	w, err := logOutput(path, &logRotationConfig{
 		MaxSize: 25, MaxAge: 3, MaxBackups: 2, LocalTime: true, Compress: true,
 	})
 	if err != nil {
@@ -39,7 +38,7 @@ func TestLogOutputRotation(t *testing.T) {
 	}
 
 	// non-file output is not a lumberjack logger
-	if _, err := logOutput("stderr", &p2p.LogRotationConfig{MaxSize: 1}); err != nil {
+	if _, err := logOutput("stderr", &logRotationConfig{MaxSize: 1}); err != nil {
 		t.Fatal(err)
 	}
 }

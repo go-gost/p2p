@@ -120,16 +120,19 @@ chains:
 
 ## In-process embedding
 
-`p2p` is a plain Go library — the CLI is only a flag/config front end over `p2p.New`. An
-application can embed a host in its own process instead of running this binary next to it: no
-subprocess, no loopback gRPC control plane, no auth token. The data plane is the same one the
-gRPC carrier uses (both run the same `serveTunnel`; only the stream carrier differs — an
-in-memory pipe), and every tunnel is handed back to the caller as a `net.Conn`.
+`p2p` is a plain Go library — the CLI is only a flag/config front end over it. An application can
+embed an endpoint in its own process instead of running this binary next to it: no subprocess, no
+loopback gRPC control plane, no auth token. The data plane is the same one the gRPC transport uses
+(both run the same `serveTunnel`; only the stream carrier differs — an in-memory pipe), and every
+tunnel is handed back to the caller as a `net.Conn`.
 
 ```go
-import "github.com/go-gost/p2p"
+import (
+	"github.com/go-gost/p2p"
+	"github.com/go-gost/p2p/endpoint"
+)
 
-host, err := p2p.New(&p2p.Config{
+ep, err := endpoint.New(&p2p.Config{
 	Derp:   "wss://derp.example.com/derp", // empty = stub mode (peer is a plain host:port)
 	Key:    "peer.key",                    // curve25519 key file; created if missing
 	Target: "127.0.0.1:18080",             // inbound tunnels bridge here (DERP mode)
@@ -137,16 +140,16 @@ host, err := p2p.New(&p2p.Config{
 if err != nil {
 	return err
 }
-defer host.Close()
+defer ep.Close() // the endpoint owns the engine, the forwards and the inbound listener
 
-// Connect brings up the DERP engine and the configured forwards — what the
-// CLI's Start does, minus the listener. Not needed in stub mode. A connect
-// failure is not fatal here: the engine retries in the background.
-_ = host.Connect()
-log.Printf("my public key: %s", host.PublicKey()) // peers address the host by this
+// Connect brings up the DERP engine and the configured forwards. Not needed in
+// stub mode. A connect failure is not fatal here: the engine retries in the
+// background. A failed forward registration is returned — that one is fatal.
+_ = ep.Connect()
+log.Printf("my public key: %s", ep.PublicKey()) // peers address the endpoint by this
 
 // peer: a base64 public key in DERP mode, a host:port in stub mode.
-conn, err := host.Tunnel().Dial(ctx, "tcp", peer)
+conn, err := ep.Dial(ctx, "tcp", peer)
 if err != nil {
 	return err
 }
@@ -160,23 +163,43 @@ defer conn.Close() // the conn IS the tunnel — closing it tears the tunnel dow
 - **Lifetime.** `ctx` bounds only the call; the tunnel outlives it. The returned conn is the
   cancellation handle — close it and the tunnel, its peer dial, and its bookkeeping all go away.
   There is nothing else to track and no close RPC.
-- **Inbound.** In DERP mode the same host also *accepts* tunnels from its peers. With a
+- **Inbound.** In DERP mode the same endpoint also *accepts* tunnels from its peers. With a
   `Target`/`Targets` configured, each inbound stream is bridged to one of them for that stream's
-  lifetime. With none configured, `Tunnel().Listen()` hands the inbound streams to the embedder
+  lifetime. With none configured, `Listen()` hands the inbound streams to the embedder
   instead: a `net.Listener` whose accepted conns carry the peer's base64 key as `RemoteAddr()`,
   so the embedder can route by peer and own the service stack (stats, auth, recording). The two
   are mutually exclusive.
-- **Shutdown.** `host.Close()` shuts down the engine, the forwards and the tunnel bookkeeping
-  (idempotent). `Tunnel.Close()` is narrower — it refuses new tunnels and closes a `Listen` listener; open
-  conns and the host keep running.
+- **Shutdown.** `ep.Close()` shuts the endpoint down: the engine, the forwards, the inbound
+  listener and the tunnel bookkeeping (idempotent). A transport attached to the endpoint ends with
+  it; closing a transport only stops its own listener.
 - **No control plane.** `Start`/`Serve` bind the gRPC listener, which only out-of-process clients
   need; an embedder calls `Connect` (or nothing at all, in stub mode) and never starts a server.
   Every field under [Configuration file](#configuration-file) is a `Config` field you can set in
   code.
 
-The tunnel endpoint is deliberately structural — `Dial(ctx, network, peer)` + `Listen()` +
-`Close()`, net-style — so an application that already defines its own transport interface can let
-`*p2p.Tunnel` satisfy it directly instead of writing an adapter.
+### Serving the plugin protocol from the same process
+
+An endpoint is shared: attach the gRPC transport to serve GOST's plugin client while the same
+process dials in-process — one identity, one relay connection, one channel per peer.
+
+```go
+import (
+	"github.com/go-gost/p2p"
+	"github.com/go-gost/p2p/endpoint"
+	"github.com/go-gost/p2p/grpc"
+)
+
+ep, _ := endpoint.New(&p2p.Config{Derp: "wss://derp.example.com/derp", Key: "peer.key"})
+srv, _ := grpc.New(ep, grpc.WithAddr("127.0.0.1:8003"), grpc.WithToken(token))
+addr, err := srv.Start() // binds the control plane and connects the endpoint
+
+srv.Close() // stops the control plane; the endpoint keeps running
+ep.Close()  // tears the endpoint (and every transport on it) down
+```
+
+The endpoint is deliberately structural — `Dial(ctx, network, peer)` + `Close()`, net-style — so an
+application that already defines its own transport interface can let `*endpoint.Endpoint` satisfy
+it directly instead of writing an adapter.
 
 ## DERP mode (cross-machine)
 

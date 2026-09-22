@@ -1,7 +1,8 @@
-// Command p2p runs the p2p host standalone: a gRPC control plane that opens
-// tunnels to peer hosts over a DERP relay (or, in stub mode, bridges to a
-// direct host:port). The host itself is the importable "github.com/go-gost/p2p"
-// package; this command is only the flag/config front end around it.
+// Command p2p runs a p2p endpoint standalone: it builds the endpoint from a
+// config file and flags, and serves it over the gRPC control plane so a GOST
+// plugin client can open tunnels to it. The library is the importable
+// "github.com/go-gost/p2p" module; this command is only the flag/config front
+// end around it.
 package main
 
 import (
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/go-gost/p2p"
+	"github.com/go-gost/p2p/endpoint"
+	"github.com/go-gost/p2p/grpc"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -52,9 +55,9 @@ func main() {
 	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
 
 	// The config is the single source of truth; flags only override it.
-	cfg := &p2p.Config{}
+	cfg := &config{}
 	if *configFile != "" {
-		c, err := p2p.LoadConfig(*configFile)
+		c, err := loadConfig(*configFile)
 		if err != nil {
 			slog.Error("load config", "file", *configFile, "error", err)
 			os.Exit(1)
@@ -62,17 +65,13 @@ func main() {
 		cfg = c
 	}
 
-	// Defaults for anything the config didn't set. New also applies these; they
-	// are set here too so the flag overrides below never dereference a nil.
+	// Defaults for anything the config didn't set, so the flag overrides below
+	// never dereference a nil. The endpoint applies its own TLS/Direct defaults.
 	if cfg.TLS == nil {
 		cfg.TLS = &p2p.TLSConfig{}
 	}
-	if cfg.TLS.Secure == nil {
-		def := true
-		cfg.TLS.Secure = &def
-	}
 	if cfg.Log == nil {
-		cfg.Log = &p2p.LogConfig{}
+		cfg.Log = &logConfig{}
 	}
 	if cfg.Log.Level == "" {
 		cfg.Log.Level = "info"
@@ -82,10 +81,6 @@ func main() {
 	}
 	if cfg.Log.Output == "" {
 		cfg.Log.Output = "stderr"
-	}
-	if cfg.Direct == nil {
-		def := true
-		cfg.Direct = &def
 	}
 	if cfg.Addr == "" {
 		cfg.Addr = "127.0.0.1:8003"
@@ -142,31 +137,39 @@ func main() {
 		cfg.Forwards = append(cfg.Forwards, p2p.ForwardConfig{Listen: listen, Peer: peer})
 	}
 
-	// Set up the logger from the resolved config before creating the host.
+	// Set up the logger from the resolved config before creating the endpoint.
 	if err := setupLogger(cfg.Log.Output, cfg.Log.Format, cfg.Log.Level, cfg.Log.Rotation); err != nil {
 		slog.Error("setup logger", "error", err)
 		os.Exit(1)
 	}
 
-	host, err := p2p.New(cfg, p2p.WithLogger(slog.Default()))
+	ep, err := endpoint.New(&cfg.Config, endpoint.WithLogger(slog.Default()))
 	if err != nil {
 		slog.Error("init", "error", err)
 		os.Exit(1)
 	}
 	if cfg.Derp != "" {
 		slog.Info("p2p derp engine", "url", cfg.Derp,
-			"pubkey", host.PublicKey(), "targets", cfg.Targets)
+			"pubkey", ep.PublicKey(), "targets", cfg.Targets)
 	}
-	if _, err := host.Start(); err != nil {
+	srv, err := grpc.New(ep, grpc.WithAddr(cfg.Addr), grpc.WithToken(cfg.Token))
+	if err != nil {
+		slog.Error("init", "error", err)
+		ep.Close()
+		os.Exit(1)
+	}
+	if _, err := srv.Start(); err != nil {
 		slog.Error("start", "error", err)
-		host.Close()
+		srv.Close()
+		ep.Close()
 		os.Exit(1)
 	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	host.Close()
+	srv.Close()
+	ep.Close()
 }
 
 // Custom slog levels to cover gost's logrus-compatible range (slog built-in:
@@ -180,7 +183,7 @@ const (
 // config: output (stderr/stdout/none/file), level (trace…fatal), and format
 // (json/text, JSON by default). File output is rotation-backed via lumberjack,
 // the same writer gost uses.
-func setupLogger(output, format, level string, rot *p2p.LogRotationConfig) error {
+func setupLogger(output, format, level string, rot *logRotationConfig) error {
 	lvl, err := parseLogLevel(level)
 	if err != nil {
 		return err
@@ -234,7 +237,7 @@ func parseLogLevel(s string) (slog.Level, error) {
 // logOutput resolves an output destination to a writer. A file path returns a
 // lumberjack writer for size-based rotation; rot (the log.rotation config)
 // overrides lumberjack's defaults.
-func logOutput(output string, rot *p2p.LogRotationConfig) (io.Writer, error) {
+func logOutput(output string, rot *logRotationConfig) (io.Writer, error) {
 	switch output {
 	case "", "stderr":
 		return os.Stderr, nil

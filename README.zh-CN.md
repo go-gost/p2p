@@ -119,15 +119,18 @@ chains:
 
 ## 进程内嵌入（in-process）
 
-`p2p` 就是一个普通 Go 库——CLI 只是 `p2p.New` 之上的 flag/config 前端。应用可以把宿主嵌进自己的
+`p2p` 就是一个普通 Go 库——CLI 只是它之上的 flag/config 前端。应用可以把 endpoint 嵌进自己的
 进程，而不必在旁边跑这个二进制：无子进程、无 loopback gRPC 控制面、无认证 token。数据面与 gRPC
-载体完全一致（两者跑同一个 `serveTunnel`，只是流的载体不同——内存管道），每条隧道都以 `net.Conn`
-的形式交回给调用方。
+transport 完全一致（两者跑同一个 `serveTunnel`，只是流的载体不同——内存管道），每条隧道都以
+`net.Conn` 的形式交回给调用方。
 
 ```go
-import "github.com/go-gost/p2p"
+import (
+	"github.com/go-gost/p2p"
+	"github.com/go-gost/p2p/endpoint"
+)
 
-host, err := p2p.New(&p2p.Config{
+ep, err := endpoint.New(&p2p.Config{
 	Derp:   "wss://derp.example.com/derp", // 留空 = stub 模式（peer 即普通 host:port）
 	Key:    "peer.key",                    // curve25519 密钥文件；缺失时自动创建
 	Target: "127.0.0.1:18080",             // 入站隧道桥接到此处（DERP 模式）
@@ -135,15 +138,15 @@ host, err := p2p.New(&p2p.Config{
 if err != nil {
 	return err
 }
-defer host.Close()
+defer ep.Close() // endpoint 拥有 engine、forward 与入站监听器
 
-// Connect 启动 DERP engine 与配置的 forward —— CLI 的 Start 所做的工作减去监听器。
-// stub 模式无需调用。连接失败不致命：engine 会在后台重试。
-_ = host.Connect()
-log.Printf("my public key: %s", host.PublicKey()) // peer 用这个公钥寻址本宿主
+// Connect 启动 DERP engine 与配置的 forward。stub 模式无需调用。连接失败不致命：
+// engine 会在后台重试；forward 注册失败会返回——那个是致命的。
+_ = ep.Connect()
+log.Printf("my public key: %s", ep.PublicKey()) // peer 用这个公钥寻址本 endpoint
 
 // peer：DERP 模式下是 base64 公钥，stub 模式下是 host:port。
-conn, err := host.Tunnel().Dial(ctx, "tcp", peer)
+conn, err := ep.Dial(ctx, "tcp", peer)
 if err != nil {
 	return err
 }
@@ -155,16 +158,38 @@ defer conn.Close() // conn 本身就是隧道——关闭它即拆除隧道
   （含 `udp4`/`udp6`）返回保留数据报边界的 conn，其余为字节流。
 - **生命周期。** `ctx` 只约束这次调用；隧道比它活得更久。返回的 conn 就是取消句柄——关闭它，隧道、
   它的 peer 拨号与记账一起消失。没有别的东西需要跟踪，也没有 close RPC。
-- **入站。** DERP 模式下同一个宿主**也**接受 peer 发来的隧道：每条入站流在其存续期内桥接到配置的
-  `Target`/`Targets`，因此一个嵌入宿主可同时服务两个方向。未配置 target 时它只对外拨号。
-- **关闭。** `host.Close()` 关停 engine、forward 与隧道记账（幂等）。`Tunnel.Close()` 范围更窄
-  ——只拒绝新隧道；已开的 conn 与宿主继续运行。
+- **入站。** DERP 模式下同一个 endpoint **也**接受 peer 发来的隧道：每条入站流在其存续期内桥接到
+  配置的 `Target`/`Targets`。未配置 target 时，`Listen()` 把入站流交给嵌入方：一个
+  `net.Listener`，其 Accept 出的 conn 以 peer 的 base64 公钥作为 `RemoteAddr()`，嵌入方据此按
+  peer 路由并自持服务栈（统计、认证、录制）。两者互斥。
+- **关闭。** `ep.Close()` 关停 endpoint：engine、forward、入站监听器与隧道记账（幂等）。挂在
+  endpoint 上的 transport 随之结束；关闭 transport 只停它自己的监听器。
 - **不需要控制面。** `Start`/`Serve` 绑定 gRPC 监听器，只有进程外客户端才需要；嵌入方调用
   `Connect`（stub 模式下什么都不用调），永不启动 server。
   [配置文件](#配置文件) 下的每个字段都是可在代码里直接设置的 `Config` 字段。
 
-provider 的形态是刻意结构化（structural）的——`Dial(ctx, network, peer)` + `Listen()` + `Close()`
-——因此已经定义了自己 tunnel-provider 接口的应用，可以让 `*p2p.Tunnel` 直接满足它，而不必写适配器。
+### 同进程提供插件协议
+
+endpoint 是共享的：挂上 gRPC transport，就能在服务 GOST 插件客户端的同时让本进程内拨号——
+一个身份、一条 relay 连接、每个 peer 一条 channel。
+
+```go
+import (
+	"github.com/go-gost/p2p"
+	"github.com/go-gost/p2p/endpoint"
+	"github.com/go-gost/p2p/grpc"
+)
+
+ep, _ := endpoint.New(&p2p.Config{Derp: "wss://derp.example.com/derp", Key: "peer.key"})
+srv, _ := grpc.New(ep, grpc.WithAddr("127.0.0.1:8003"), grpc.WithToken(token))
+addr, err := srv.Start() // 绑定控制面并连接 endpoint
+
+srv.Close() // 只停控制面；endpoint 继续运行
+ep.Close()  // 拆除 endpoint（及其上的所有 transport）
+```
+
+endpoint 的形态是刻意结构化（structural）的——`Dial(ctx, network, peer)` + `Close()`——因此已经
+定义了自己 tunnel-provider 接口的应用，可以让 `*endpoint.Endpoint` 直接满足它，而不必写适配器。
 
 ## DERP 模式（跨机）
 
