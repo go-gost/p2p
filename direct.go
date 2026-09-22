@@ -910,6 +910,11 @@ func (e *engine) serveInbound(stream net.Conn, transport string, peer derpclient
 		stream = c // untagged: replay the bytes consumed by the partial peek
 	}
 
+	// Listen mode: the embedder owns the stream (and its target).
+	if q := e.inbound.Load(); q != nil {
+		q.deliver(stream, keyName(peer), transport, peerAddr, e.log)
+		return
+	}
 	target, ok := e.targets.pick("tcp")
 	if !ok {
 		e.log.Warn("inbound tunnel refused", "transport", transport, "peer", keyName(peer))

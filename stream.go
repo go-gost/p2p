@@ -35,7 +35,7 @@ func (s *server) Tunnel(stream proto.P2P_TunnelServer) error {
 // claimTunnel resolves the id issued by OpenTunnel and marks the record
 // attached. The id is single-use: a second stream must not attach to a live
 // tunnel (the two would fight over the record's teardown).
-func (s *server) claimTunnel(id string) (*tunnel, error) {
+func (s *server) claimTunnel(id string) (*tunnelRecord, error) {
 	s.mu.Lock()
 	t, ok := s.tunnels[id]
 	attached := ok && t.attached
@@ -62,7 +62,7 @@ func (s *server) claimTunnel(id string) (*tunnel, error) {
 // The host side of the stream stays a raw byte pipe in every network mode: for
 // udp the framing travels through as bytes (GOST side frames, the peer's GOST
 // side parses), so the host never touches it.
-func (s *server) serveTunnel(t *tunnel, stream tunnelStream, abort func()) error {
+func (s *server) serveTunnel(t *tunnelRecord, stream tunnelStream, abort func()) error {
 	conn := newStreamConn(stream, abort)
 
 	if t.network == "udp" {

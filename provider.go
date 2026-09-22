@@ -2,34 +2,36 @@ package p2p
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync/atomic"
 )
 
-// Provider implements the in-process tunnel provider contract
-// (OpenTunnelStream + Close). p2p does not import the consumer that defines
-// that contract, so the match is structural; the embedding caller asserts it
-// against the real interface.
-var _ io.Closer = (*Provider)(nil)
+// Tunnel implements the in-process tunnel endpoint contract (Dial + Listen +
+// Close). p2p does not import the consumer that defines that contract, so the
+// match is structural; the embedding caller asserts it against the real
+// interface.
+var _ io.Closer = (*Tunnel)(nil)
 
-// Provider exposes a Host as a tunnel provider for in-process use: it opens
-// tunnels without a loopback gRPC control plane.
+// Tunnel exposes a Host as a tunnel endpoint for in-process use: it dials
+// tunnels and takes inbound ones without a loopback gRPC control plane.
 //
-// Close stops the provider from accepting new tunnels; it does not tear down
-// the Host or any already-open tunnel. Those end with their own connections,
-// exactly as the gRPC path's streams do.
-type Provider struct {
+// Close stops the endpoint from accepting new tunnels and closes an inbound
+// listener opened by Listen; it does not tear down the Host or any already-open
+// tunnel. Those end with their own connections, exactly as the gRPC path's
+// streams do.
+type Tunnel struct {
 	h      *Host
 	closed atomic.Bool
 }
 
-// Provider returns an in-process tunnel provider backed by h.
-func (h *Host) Provider() *Provider {
-	return &Provider{h: h}
+// Tunnel returns an in-process tunnel endpoint backed by h.
+func (h *Host) Tunnel() *Tunnel {
+	return &Tunnel{h: h}
 }
 
-// OpenTunnelStream opens a tunnel to peer and returns its local end. network is
+// Dial opens a tunnel to peer and returns its local end. network is
 // normalized here (udp/udp4/udp6 -> udp), so callers may pass any dialer
 // network. peer carries the same meaning as on the gRPC path: a base64 public
 // key in DERP mode, a host:port in stub mode.
@@ -37,16 +39,44 @@ func (h *Host) Provider() *Provider {
 // ctx only bounds the call itself (allocation); the tunnel outlives it. The
 // peer dial runs in the tunnel's serve goroutine, so the returned conn — not
 // ctx — is the cancellation handle: closing it tears the tunnel down.
-func (p *Provider) OpenTunnelStream(ctx context.Context, network, peer string) (net.Conn, error) {
-	if p.closed.Load() {
+func (t *Tunnel) Dial(ctx context.Context, network, peer string) (net.Conn, error) {
+	if t.closed.Load() {
 		return nil, net.ErrClosed
 	}
-	return p.h.openTunnelStream(ctx, normalizeNetwork(network), peer)
+	return t.h.openTunnelStream(ctx, normalizeNetwork(network), peer)
 }
 
-// Close stops accepting new tunnels. It is safe to call more than once.
-func (p *Provider) Close() error {
-	p.closed.Store(true)
+// Listen returns a listener over inbound peer tunnel streams. Each accepted
+// conn's RemoteAddr() carries the peer's base64 public key; the conn's bytes
+// are the peer's tunnel exactly as they arrived (no framing on tcp). Streams
+// arriving before Listen is called, or while the backlog is full, are closed
+// and dropped. It is mutually exclusive with Config.Targets: with targets
+// configured the host bridges inbound tunnels internally (the CLI behaviour).
+// Single consumer: calling it twice returns the same listener. Call it before
+// Connect so no inbound stream is missed.
+func (t *Tunnel) Listen() (net.Listener, error) {
+	if t.h.engine == nil {
+		return nil, errors.New("p2p: Listen requires derp mode")
+	}
+	if len(t.h.cfg.TargetList()) > 0 {
+		return nil, errors.New("p2p: Listen and Config.Targets are mutually exclusive")
+	}
+	t.h.listenOnce.Do(func() {
+		q := newInboundQueue()
+		t.h.engine.inbound.Store(q)
+		t.h.listener = &inboundListener{q: q, host: t.h.PublicKey()}
+	})
+	return t.h.listener, nil
+}
+
+// Close stops the endpoint from accepting new tunnels and closes the inbound
+// listener (Accept then returns net.ErrClosed). It is safe to call more than
+// once.
+func (t *Tunnel) Close() error {
+	t.closed.Store(true)
+	if t.h.listener != nil {
+		t.h.listener.Close()
+	}
 	return nil
 }
 

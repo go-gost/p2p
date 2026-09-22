@@ -42,7 +42,7 @@ func (p *pipeStream) Context() context.Context { return p.ctx }
 
 // newPipePair returns the two ends of an in-memory tunnel stream. client's Send
 // feeds server's Recv and vice versa; the names reflect which end the in-process
-// Provider hands to the caller (client) and which the host serves (server).
+// Tunnel hands to the caller (client) and which the host serves (server).
 func newPipePair(ctx context.Context) (client, server *pipeStream) {
 	up := make(chan *proto.Chunk, 8)
 	down := make(chan *proto.Chunk, 8)

@@ -45,6 +45,12 @@ type engine struct {
 	pub         derpclient.PublicKey
 	log         *slog.Logger
 
+	// inbound is the embedder's inbound-stream queue, set once by
+	// Tunnel.Listen (nil = no listener; inbound tunnel streams are bridged to
+	// a target instead). An atomic because Listen is callable at any time
+	// while the pump goroutines run.
+	inbound atomic.Pointer[inboundQueue]
+
 	mu      sync.Mutex
 	client  *derpclient.Client
 	peers   map[derpclient.PublicKey]*peerConn

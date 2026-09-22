@@ -10,12 +10,12 @@ import (
 	"time"
 )
 
-// TestProviderStubEcho exercises the in-process path end to end: a Host with no
+// TestTunnelStubEcho exercises the in-process path end to end: a Host with no
 // DERP and no gRPC control plane serves a tunnel straight to a stub peer over
-// an in-memory stream. This is the embedding path — OpenTunnelStream reaches the
+// an in-memory stream. This is the embedding path — Dial reaches the
 // same allocateTunnel/serveTunnel as the gRPC Tunnel RPC, only the carrier
 // differs.
-func TestProviderStubEcho(t *testing.T) {
+func TestTunnelStubEcho(t *testing.T) {
 	echo, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -39,8 +39,8 @@ func TestProviderStubEcho(t *testing.T) {
 		t.Fatalf("PublicKey = %q, want empty in stub mode", host.PublicKey())
 	}
 
-	p := host.Provider()
-	conn, err := p.OpenTunnelStream(context.Background(), "tcp4", echo.Addr().String())
+	p := host.Tunnel()
+	conn, err := p.Dial(context.Background(), "tcp4", echo.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestProviderStubEcho(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.OpenTunnelStream(context.Background(), "tcp", echo.Addr().String()); !errors.Is(err, net.ErrClosed) {
+	if _, err := p.Dial(context.Background(), "tcp", echo.Addr().String()); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("after Close: err = %v, want net.ErrClosed", err)
 	}
 }
@@ -140,14 +140,14 @@ func (r *patternReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestProviderStreamIntegrityUnderBackpressure drives the in-process path with
+// TestTunnelStreamIntegrityUnderBackpressure drives the in-process path with
 // io.Copy's reusable buffer while the peer drains slower than the writer, so
 // the tunnel queue fills and every queued chunk's payload must survive intact
 // until the peer reads it. The window is small and the peer pauses
 // periodically: without the pause the kernel's send buffer absorbs the whole
 // transfer and the queue never fills, which is what made this corruption
 // invisible to the round-trip tests.
-func TestProviderStreamIntegrityUnderBackpressure(t *testing.T) {
+func TestTunnelStreamIntegrityUnderBackpressure(t *testing.T) {
 	const total = 8 << 20
 
 	peer, err := net.Listen("tcp", "127.0.0.1:0")
@@ -190,7 +190,7 @@ func TestProviderStreamIntegrityUnderBackpressure(t *testing.T) {
 	}
 	defer host.Close()
 
-	conn, err := host.Provider().OpenTunnelStream(context.Background(), "tcp", peer.Addr().String())
+	conn, err := host.Tunnel().Dial(context.Background(), "tcp", peer.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

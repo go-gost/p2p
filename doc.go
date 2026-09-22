@@ -18,9 +18,10 @@
 //	if err := host.Connect(); err != nil { // engine + configured forwards
 //		return err
 //	}
-//	conn, err := host.Provider().OpenTunnelStream(ctx, "tcp", peerKey)
+//	conn, err := host.Tunnel().Dial(ctx, "tcp", peerKey)
 //
-// Provider opens tunnels in-process over an in-memory stream; the gRPC control
-// plane (Start/Serve) is only needed by out-of-process clients. Both paths run
-// the same data-plane code, so tunnel semantics do not depend on the carrier.
+// Tunnel opens (and listens for) tunnels in-process over an in-memory stream;
+// the gRPC control plane (Start/Serve) is only needed by out-of-process
+// clients. Both paths run the same data-plane code, so tunnel semantics do not
+// depend on the carrier.
 package p2p

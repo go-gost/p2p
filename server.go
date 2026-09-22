@@ -45,7 +45,7 @@ type server struct {
 	log     *slog.Logger
 	mu      sync.Mutex
 	seq     atomic.Int64
-	tunnels map[string]*tunnel
+	tunnels map[string]*tunnelRecord
 	stop    chan struct{} // closed by close(); stops the pending GC
 }
 
@@ -62,7 +62,7 @@ func newServer(engine *engine) *server {
 	s := &server{
 		engine:  engine,
 		log:     slog.Default(),
-		tunnels: make(map[string]*tunnel),
+		tunnels: make(map[string]*tunnelRecord),
 		stop:    make(chan struct{}),
 	}
 	go s.gcPending(gcInterval)
@@ -80,7 +80,7 @@ func (s *server) close() {
 	default:
 		close(s.stop)
 	}
-	tunnels := make([]*tunnel, 0, len(s.tunnels))
+	tunnels := make([]*tunnelRecord, 0, len(s.tunnels))
 	for _, t := range s.tunnels {
 		tunnels = append(tunnels, t)
 	}
@@ -91,13 +91,13 @@ func (s *server) close() {
 }
 
 // registerTunnel records a freshly allocated tunnel.
-func (s *server) registerTunnel(t *tunnel) {
+func (s *server) registerTunnel(t *tunnelRecord) {
 	s.mu.Lock()
 	s.tunnels[t.id] = t
 	s.mu.Unlock()
 }
 
-type tunnel struct {
+type tunnelRecord struct {
 	id     string
 	target string   // far end as passed to OpenTunnel: peer host:port (stub) or public key (DERP)
 	engine *engine  // derp mode: stream source
@@ -151,12 +151,12 @@ func (s *server) OpenTunnel(ctx context.Context, req *proto.OpenTunnelRequest) (
 }
 
 // allocateTunnel validates a request and creates the tunnel record. It is shared
-// by the gRPC OpenTunnel path and the in-process provider. attached records the
+// by the gRPC OpenTunnel path and the in-process Tunnel. attached records the
 // stream claim up front: false on the gRPC path (the Tunnel stream claims it
 // later, and the pending GC may reclaim it if no stream arrives), true for the
-// in-process provider, which serves the stream immediately (see
+// in-process Tunnel, which serves the stream immediately (see
 // Host.openTunnelStream).
-func (s *server) allocateTunnel(network, peer string, attached bool) (*tunnel, error) {
+func (s *server) allocateTunnel(network, peer string, attached bool) (*tunnelRecord, error) {
 	if network == "" {
 		network = "tcp"
 	}
@@ -185,7 +185,7 @@ func (s *server) allocateTunnel(network, peer string, attached bool) (*tunnel, e
 			if err := s.engine.sendDialUDP(key); err != nil {
 				s.log.Debug("udp dial notice", "peer", peer, "error", err)
 			}
-			t := &tunnel{
+			t := &tunnelRecord{
 				id:        newTunnelID(),
 				target:    peer,
 				peer:      peer,
@@ -207,7 +207,7 @@ func (s *server) allocateTunnel(network, peer string, attached bool) (*tunnel, e
 		}
 	}
 
-	t := &tunnel{
+	t := &tunnelRecord{
 		id:        newTunnelID(),
 		target:    peer,
 		network:   network,
@@ -237,7 +237,7 @@ func (s *server) gcPending(interval time.Duration) {
 		case <-t.C:
 		}
 		now := time.Now()
-		var stale []*tunnel
+		var stale []*tunnelRecord
 		s.mu.Lock()
 		for id, tn := range s.tunnels {
 			// Only stream-backed records are GC candidates: a --forward tunnel
@@ -263,7 +263,7 @@ func (s *server) gcPending(interval time.Duration) {
 //
 // dropTunnel replaces CloseTunnel: it runs when a Tunnel handler returns
 // (stream end IS the teardown) and from the pending GC.
-func (s *server) dropTunnel(t *tunnel) {
+func (s *server) dropTunnel(t *tunnelRecord) {
 	s.mu.Lock()
 	if s.tunnels[t.id] == t {
 		delete(s.tunnels, t.id)
@@ -280,12 +280,12 @@ func (s *server) dropTunnel(t *tunnel) {
 // startTunnel binds a listener on addr and registers a tunnel bridging to
 // peer (a host:port in stub mode, a base64 public key in DERP mode). The
 // returned tunnel is already serving. Only --forward uses this path.
-func (s *server) startTunnel(addr, peer string) (*tunnel, error) {
+func (s *server) startTunnel(addr, peer string) (*tunnelRecord, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	t := &tunnel{
+	t := &tunnelRecord{
 		id:        fmt.Sprintf("tunnel-%d", s.seq.Add(1)),
 		target:    peer,
 		network:   "tcp",
@@ -355,7 +355,7 @@ func (s *server) Status(ctx context.Context, req *proto.StatusRequest) (*proto.S
 
 // serve accepts connections until the tunnel is closed, bridging each one
 // to the peer target.
-func (t *tunnel) serve() {
+func (t *tunnelRecord) serve() {
 	for {
 		conn, err := t.ln.Accept()
 		if err != nil {
@@ -369,7 +369,7 @@ func (t *tunnel) serve() {
 // openPeer connects the tunnel's far end: a mux stream to the peer through
 // the relay (DERP engine mode) or a direct dial of the peer host:port (stub
 // mode).
-func (t *tunnel) openPeer() (net.Conn, error) {
+func (t *tunnelRecord) openPeer() (net.Conn, error) {
 	if t.engine != nil {
 		return t.engine.OpenStream(t.peer)
 	}
@@ -378,7 +378,7 @@ func (t *tunnel) openPeer() (net.Conn, error) {
 
 // bridge copies bytes in both directions between an accepted --forward
 // connection and the tunnel's peer end.
-func (t *tunnel) bridge(conn net.Conn) {
+func (t *tunnelRecord) bridge(conn net.Conn) {
 	up, err := t.openPeer()
 	if err != nil {
 		t.log.Debug("bridge dial failed", "tunnel", t.id, "target", t.target, "error", err)
@@ -397,7 +397,7 @@ func (t *tunnel) bridge(conn net.Conn) {
 // does today. Both ends are closed only after both directions are done.
 // pipe logs each tunnel in gost style: "<src> <-> <dst>" on connect and
 // ">-<" with the duration on disconnect.
-func (t *tunnel) pipe(conn, up net.Conn, endpoint, target string) {
+func (t *tunnelRecord) pipe(conn, up net.Conn, endpoint, target string) {
 	defer t.untrackConn(conn)
 	t.trackConn(up)
 	defer func() {
@@ -454,13 +454,13 @@ func halfCloseWrite(dst net.Conn) {
 	}
 }
 
-func (t *tunnel) trackConn(conn net.Conn) {
+func (t *tunnelRecord) trackConn(conn net.Conn) {
 	t.mu.Lock()
 	t.conns[conn] = struct{}{}
 	t.mu.Unlock()
 }
 
-func (t *tunnel) untrackConn(conn net.Conn) {
+func (t *tunnelRecord) untrackConn(conn net.Conn) {
 	t.mu.Lock()
 	delete(t.conns, conn)
 	t.mu.Unlock()
@@ -468,7 +468,7 @@ func (t *tunnel) untrackConn(conn net.Conn) {
 
 // close stops the tunnel: the listener (--forward only; nil for stream
 // records), then every tracked connection.
-func (t *tunnel) close() {
+func (t *tunnelRecord) close() {
 	if t.ln != nil {
 		t.ln.Close() // stops accept; no new conns
 	}

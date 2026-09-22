@@ -20,7 +20,7 @@ const defaultAddr = "127.0.0.1:8003"
 // Host is a p2p endpoint. It owns the DERP engine (when a relay URL is
 // configured), the gRPC control plane, and the tunnel bookkeeping. It can run
 // standalone as the CLI does (Start + Close) or be embedded in-process
-// (Connect + Provider).
+// (Connect + Tunnel).
 type Host struct {
 	cfg *Config
 	log *slog.Logger
@@ -33,6 +33,11 @@ type Host struct {
 	grpc   *grpc.Server
 	addr   string
 	closed bool
+
+	// listenOnce/listener hold the inbound listener Tunnel.Listen hands the
+	// embedder (nil until Listen runs).
+	listenOnce sync.Once
+	listener   net.Listener
 
 	prepareOnce sync.Once
 	prepareErr  error
@@ -252,6 +257,9 @@ func (h *Host) Close() error {
 		}
 		if ln != nil {
 			ln.Close()
+		}
+		if h.listener != nil {
+			h.listener.Close() // the embedder's inbound listener: Accept -> net.ErrClosed
 		}
 		h.server.close()
 		if h.engine != nil {
