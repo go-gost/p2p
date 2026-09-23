@@ -717,6 +717,43 @@ func TestPunchAndWaitDoesNotStallWhenPunchCannotStart(t *testing.T) {
 	}
 }
 
+// TestWarmConnectsWithoutStream: warming a peer brings up its relay session and
+// starts the punch with no tunnel stream at all — the entrypoint case, where
+// the path has to be arranged (and be visible in the status) before the first
+// client arrives.
+func TestWarmConnectsWithoutStream(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, "", privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	if err := engineA.warm(pubB); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+
+	// The peer counts as connected before any traffic: it has a path in the
+	// per-peer transports, which is what a caller renders.
+	if got := engineA.peerTransports()[keyName(pubB)]; got == "" {
+		t.Fatalf("peerTransports = %v, want an entry for the warmed peer", engineA.peerTransports())
+	}
+
+	// The punch it started is mutual: the peer answers the candidates and both
+	// sides come up, with no stream ever opened.
+	waitFor(t, 5*time.Second, func() bool {
+		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
+	})
+}
+
 // TestRelaySessionRecoversAfterAdapterClosed reproduces the stuck state where a
 // peer's relay adapter is closed (the peer process died) but stays cached: the
 // next OpenStream must drop it and rebuild a fresh session instead of failing

@@ -142,6 +142,14 @@ func (e *Endpoint) Listen() (net.Listener, error) {
 	return e.h.Listen()
 }
 
+// Warm connects to the peer's relay session and starts a hole punch for it,
+// without opening a tunnel stream — for a caller that already knows which peer
+// it will talk to, so the path is being arranged before the first stream needs
+// it. Idempotent; the punch runs in the background.
+func (e *Endpoint) Warm(peer string) error {
+	return e.h.Warm(peer)
+}
+
 // Status reports the endpoint's tunnel count and transport stats.
 func (e *Endpoint) Status() p2p.Status {
 	return e.h.Status()

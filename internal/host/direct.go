@@ -16,6 +16,7 @@ import (
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 
+	"github.com/go-gost/p2p"
 	"github.com/go-gost/p2p/internal/derpclient"
 	"github.com/go-gost/p2p/internal/stun"
 )
@@ -156,6 +157,22 @@ func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 		return
 	}
 	e.directConn(peer).start()
+}
+
+// warm brings up the peer's relay session (a smux session over the DERP
+// adapter, no stream on it) so the peer counts as connected, and lets
+// ensureSessionLocked start the punch. The caller gets the peer's path in
+// Status before any traffic exists, which is what an entrypoint with a known
+// peer wants.
+func (e *engine) warm(peer derpclient.PublicKey) error {
+	pc := e.peerConn(peer)
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if pc.closed {
+		return p2p.ErrPeerUnreachable
+	}
+	_, err := pc.ensureSessionLocked()
+	return err
 }
 
 // punchAndWait triggers hole punching when a candidate source exists and blocks

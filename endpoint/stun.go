@@ -17,7 +17,20 @@ import (
 // candidates from the socket it punches with). It is a reachability and
 // address check, not a preview of the punch's endpoint.
 func StunLookup(ctx context.Context, addr string) (netip.AddrPort, error) {
-	conn, err := net.ListenUDP("udp", nil)
+	// Bind the family the server resolves to, rather than a dual-stack socket:
+	// the client accepts a reply only from the exact address it dialed, and a
+	// v4-mapped source reported by a dual-stack socket (which Windows and some
+	// stacks do) would not match it.
+	raddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	network := "udp6"
+	if raddr.IP.To4() != nil {
+		network = "udp4"
+	}
+
+	conn, err := net.ListenUDP(network, nil)
 	if err != nil {
 		return netip.AddrPort{}, err
 	}
