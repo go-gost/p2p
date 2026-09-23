@@ -90,10 +90,10 @@ func (s *server) registerTunnel(t *tunnelRecord) {
 
 type tunnelRecord struct {
 	id     string
-	target string   // far end as passed to OpenTunnel: peer host:port (stub) or public key (DERP)
-	engine *engine  // derp mode: stream source
-	peer   string   // derp mode: peer public key (base64)
-	ch     *channel // udp tunnels: the peer channel this tunnel holds a reference on
+	target string  // far end as passed to OpenTunnel: peer host:port (stub) or public key (DERP)
+	engine *engine // derp mode: stream source
+	peer   string  // derp mode: peer public key (base64)
+	link   *link   // udp tunnels: this dial's datagram link (one per dial)
 	ln     net.Listener
 	log    *slog.Logger
 
@@ -154,24 +154,22 @@ func (s *server) allocateTunnel(network, peer string, attached bool) (*tunnelRec
 			return nil, fmt.Errorf("%w %q: %v", p2p.ErrInvalidPeer, peer, err)
 		}
 		if network == "udp" {
-			// A datagram tunnel is one channel per peer, shared by every gost
-			// dial to it: the channel pairs the peer edge with the latest
-			// tunnel's local edge and outlives individual dials; the record's
-			// release is what drops its reference.
-			// A dial is the intent to connect: start the punch now instead of only
-			// once a stream is opened (which never happens for the responder half
-			// of the key orders), and tell the peer a datagram channel is wanted.
+			// A datagram link is per dial: this record owns one, and the dialing
+			// side always presents an edge (see link), so a one-sided link works
+			// whatever the key order and concurrent dials never share an edge.
+			// A dial is the intent to connect: start the punch now instead of
+			// only once a stream is opened (which never happens for the
+			// responder half of the key orders).
 			s.engine.maybeStartDirect(key)
-			if err := s.engine.sendDialUDP(key); err != nil {
-				s.log.Debug("udp dial notice", "peer", peer, "error", err)
-			}
+			lnk := newLink(s.engine, key)
+			s.engine.addLink(lnk)
 			t := &tunnelRecord{
 				id:        newTunnelID(),
 				target:    peer,
 				peer:      peer,
 				engine:    s.engine,
 				network:   "udp",
-				ch:        s.engine.openChannel(key),
+				link:      lnk,
 				createdAt: time.Now(),
 				conns:     make(map[net.Conn]struct{}),
 				log:       s.log,
@@ -235,11 +233,10 @@ func (s *server) gcPending(interval time.Duration) {
 	}
 }
 
-// dropTunnel removes t from the registry and tears it down. A channel-holding
-// record releases its channel reference — release is refcounted, so a channel
-// shared with another live tunnel to the same peer survives; never teardown()
-// a channel here. Everything else closes its listener (--forward only) and
-// tracked connections.
+// dropTunnel removes t from the registry and tears it down. A udp record owns
+// its datagram link: it is unregistered and closed here, which ends the
+// carrier parked in serveTunnel. Everything else closes its listener (--forward
+// only) and tracked connections.
 //
 // dropTunnel replaces CloseTunnel: it runs when a Tunnel handler returns
 // (stream end IS the teardown) and from the pending GC.
@@ -250,8 +247,11 @@ func (s *server) dropTunnel(t *tunnelRecord) {
 	}
 	s.mu.Unlock()
 
-	if t.ch != nil {
-		t.ch.release()
+	if t.link != nil {
+		// The link is per record: drop it and its registry entry. close() is
+		// idempotent, so a link whose local pump already ended is fine.
+		t.engine.removeLink(t.link)
+		t.link.close()
 		return
 	}
 	t.close()

@@ -27,7 +27,7 @@ type Stream interface {
 
 // streamConn adapts a Stream to the net.Conn the tunnel pipe needs. The host
 // side is a raw byte pipe: no framing (a udp tunnel's frames travel through as
-// bytes — the peer datagram channel parses them), no write deadline (a server
+// bytes — the peer's datagram link parses them), no write deadline (a server
 // handler cannot abort its stream; its return is the abort). It is deliberately
 // a small standalone implementation rather than the GOST side's richer conn
 // (x/p2p/streamconn): the two sides couple through the wire, not through code.

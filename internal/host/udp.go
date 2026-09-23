@@ -10,345 +10,59 @@ import (
 	"github.com/go-gost/p2p/internal/derpclient"
 )
 
-// Datagram channel: the per-peer UDP tunnel. It has two byte-stream edges and
-// pumps bytes between them:
+// A udp tunnel is a datagram link: one per dial, pairing the dial's tunnel
+// stream (the local edge) with one peer edge — a tagged stream to the peer over
+// the relay or the hole-punched path. The host never parses the data: the
+// GOST-side conns frame the datagrams into 2-byte-prefixed frames and the
+// peer's GOST-side conn parses them, so frame bytes travel through verbatim.
 //
-//   - the peer edge — a persistent stream to the other host through the relay
-//     or the hole-punched path (opener: the smaller key; responder: the
-//     acceptLoop's tagged stream);
-//   - the local edge — the Tunnel gRPC stream of the latest gost tunnel to
-//     this peer (one per dial; last dial wins, as the endpoint's
-//     last-client-wins did).
+// The dialing side always presents: a link opens its own tagged edge as soon as
+// it is allocated, so a one-sided link — the peer holds no dial of its own —
+// works whatever the key order, and N concurrent dials to one peer never share
+// an edge.
 //
-// The host never parses the data: the GOST-side conn frames datagrams into
-// 2-byte-prefixed frames and the peer's GOST-side conn parses them, so the
-// frames travel through verbatim. Bytes are dropped while the opposite edge
-// is absent or down — IP tolerates loss, exactly like the endpoint model.
+// Two dials, one on each side of the same pair, are a rendezvous on one edge,
+// not two links: the larger key adopts the smaller key's presentation (its own
+// presentation is provisional and is dropped at adoption). A link that holds an
+// adopted edge is never displaced — an extra inbound edge from the peer is
+// served per stream (embedder or udp target) instead of stealing it.
 //
-// Role by public-key ordering, the same rule as the mux session: the smaller
-// key opens the stream (loop), the larger is served by acceptLoop.
-type channel struct {
+// Bytes are dropped while the opposite edge is absent or down, exactly like the
+// endpoint model, with one exception: a link with no live peer edge buffers the
+// local bytes it reads (bounded), so the datagram that triggered the dial is not
+// lost while the presentation opens.
+type link struct {
 	e    *engine
 	peer derpclient.PublicKey
 
-	stop chan struct{} // closed by teardown; ends loop
+	stop     chan struct{} // closed by close(); ends the presenter and the pumps
+	stopOnce sync.Once
+	done     chan struct{} // closed when the link is torn down; the carrier parks here
+	doneOnce sync.Once
+	edgeGone chan struct{} // buffered(1): a peer edge died, the presenter re-presents
 
-	mu     sync.Mutex
-	stream net.Conn // peer edge: current upstream stream; nil while the channel is down
-	local  net.Conn // local edge: the latest tunnel's stream; nil until a gost dials
-	refs   int      // gost tunnels holding this channel open
-	closed bool
+	// wmu serializes everything written to the peer edge — payloads and the
+	// first-datagram buffer drain — so the buffer can be flushed by the edge's
+	// publisher without reordering bytes behind a payload in flight. It is
+	// never held while taking mu.
+	wmu  sync.Mutex
+	wbuf []byte // local bytes held while no peer edge is live; capped
+
+	mu       sync.Mutex
+	local    net.Conn // this dial's tunnel stream; nil until the carrier attaches
+	peerEdge net.Conn // current peer edge: our presentation or an adopted one
+	own      net.Conn // our presentation edge; nil once adopted or when it dies
+	closed   bool
 }
 
-// channelChunkSize bounds one pump read; frame bytes from the GOST side
-// arrive in chunks at most this size.
-const channelChunkSize = 32 * 1024
+// linkBufLimit caps the first-datagram buffer: it exists to keep the datagram
+// that triggered a dial (and its first replies) while the presentation opens,
+// not to become an unbounded queue. Beyond it, new bytes are dropped.
+const linkBufLimit = 32 * 1024
 
-// channelRetryMin is the peer-edge reconnect floor. A peer that just came
-// back (restarted, or its path dropped) is picked up within seconds instead of
-// waiting out the punch backoff; a stream the responder refused means the peer
-// is there but its gost has not opened a udp tunnel yet, so that retries fast
-// too. Only an outright open failure (peer unreachable) backs off.
-const channelRetryMin = 2 * time.Second
-
-// channelRetryDelay returns the next peer-edge reconnect delay: open failures
-// grow towards the punch backoff, everything else resets to the floor.
-func channelRetryDelay(prev time.Duration, openFailed bool) time.Duration {
-	if openFailed {
-		return min(2*prev, backoffPeriod)
-	}
-	return channelRetryMin
-}
-
-// openChannel returns the peer's channel, creating and starting it on first
-// use, and takes a reference on it. The channel outlives individual gost
-// tunnels: it is torn down when the last one closes.
-func (e *engine) openChannel(peer derpclient.PublicKey) *channel {
-	// A channel takes over the peer edge: stop any target-side opener loop so it
-	// does not fight ch.loop over setStream (last-wins). The stop is only
-	// observed at the dialer's next round -- a serveTargetStream already in
-	// flight runs to its current stream's end -- so takeover converges within a
-	// backoff round, not instantly, when the same host is both a udp outlet and
-	// a local udp dialer for the peer.
-	e.stopDatagramDialer(peer)
-	e.mu.Lock()
-	if ch, ok := e.chans[peer]; ok {
-		ch.mu.Lock()
-		if !ch.closed {
-			ch.refs++
-			ch.mu.Unlock()
-			e.mu.Unlock()
-			return ch
-		}
-		ch.mu.Unlock()
-		delete(e.chans, peer) // drop the dead channel
-	}
-
-	ch := &channel{
-		e:    e,
-		peer: peer,
-		stop: make(chan struct{}),
-		refs: 1,
-	}
-	e.chans[peer] = ch
-	e.mu.Unlock()
-
-	if bytes.Compare(e.pub[:], peer[:]) < 0 {
-		e.log.Info("channel role", "peer", keyName(peer), "role", "opener")
-		go ch.loop()
-	} else {
-		e.log.Info("channel role", "peer", keyName(peer), "role", "responder")
-	}
-	return ch
-}
-
-// channel returns the peer's live channel, or nil when it has none (or its
-// gost has already closed it).
-func (e *engine) channel(peer derpclient.PublicKey) *channel {
-	e.mu.Lock()
-	ch := e.chans[peer]
-	e.mu.Unlock()
-	if ch == nil {
-		return nil
-	}
-	ch.mu.Lock()
-	closed := ch.closed
-	ch.mu.Unlock()
-	if closed {
-		return nil
-	}
-	return ch
-}
-
-// attachLocal publishes c as the channel's local edge and starts its pump.
-// The returned channel is closed when this edge's tunnel ends: the gost
-// closed its stream (the read fails and the pump exits), a newer dial
-// replaced it, or the channel was torn down. Only the edge's own pump closes
-// it, so it cannot double-close.
-func (ch *channel) attachLocal(c net.Conn) <-chan struct{} {
-	done := make(chan struct{})
-	ch.mu.Lock()
-	if ch.closed {
-		ch.mu.Unlock()
-		c.Close()
-		close(done)
-		return done
-	}
-	// Last dial wins: the previous edge is closed, which ends its pump.
-	old := ch.local
-	ch.local = c
-	ch.mu.Unlock()
-	if old != nil {
-		old.Close()
-	}
-	go ch.pumpLocal(c, done)
-	return done
-}
-
-// release drops one reference; the last one tears the channel down and removes
-// it, so the next openChannel rebuilds it with a fresh peer edge. Reference
-// count and map entry are updated under the engine lock, so an open racing a
-// close sees either the live channel or a fresh one — never a torn-down one.
-func (ch *channel) release() {
-	ch.e.mu.Lock()
-	ch.mu.Lock()
-	ch.refs--
-	if ch.refs > 0 || ch.closed {
-		ch.mu.Unlock()
-		ch.e.mu.Unlock()
-		return
-	}
-	ch.closed = true
-	stream := ch.stream
-	ch.stream = nil
-	local := ch.local
-	ch.local = nil
-	if ch.e.chans[ch.peer] == ch {
-		delete(ch.e.chans, ch.peer)
-	}
-	ch.mu.Unlock()
-	ch.e.mu.Unlock()
-
-	ch.stopLoop(stream)
-	if local != nil {
-		local.Close() // its pump exits and closes the edge's done
-	}
-}
-
-// teardown closes the channel regardless of references (engine shutdown).
-// It runs once; false means the channel was already down.
-func (ch *channel) teardown() bool {
-	ch.mu.Lock()
-	if ch.closed {
-		ch.mu.Unlock()
-		return false
-	}
-	ch.closed = true
-	stream := ch.stream
-	ch.stream = nil
-	local := ch.local
-	ch.local = nil
-	ch.mu.Unlock()
-
-	ch.stopLoop(stream)
-	if local != nil {
-		local.Close()
-	}
-	return true
-}
-
-// stopLoop stops the opener loop and unblocks the peer-edge reader.
-func (ch *channel) stopLoop(stream net.Conn) {
-	close(ch.stop)
-	if stream != nil {
-		stream.Close()
-	}
-}
-
-// stopped reports whether the channel has been torn down.
-func (ch *channel) stopped() bool {
-	ch.mu.Lock()
-	defer ch.mu.Unlock()
-	return ch.closed
-}
-
-// loop keeps exactly one channel stream to the peer alive: open, serve until
-// it dies, back off, repeat. It exits when the channel is torn down — a rebuilt
-// channel gets a fresh loop, so a stale one can never feed the new channel.
-func (ch *channel) loop() {
-	pname := keyName(ch.peer)
-	delay := channelRetryMin
-	for {
-		openFailed := false
-		c, err := ch.e.openTaggedStream(pname)
-		if err == nil {
-			// The channel may have been torn down while the stream was opening:
-			// serving it would feed a dead channel.
-			if ch.stopped() {
-				c.Close()
-				return
-			}
-		}
-		if err != nil {
-			openFailed = true
-			if c != nil {
-				c.Close()
-			}
-			ch.e.log.Debug("channel: open stream", "peer", pname, "error", err)
-		} else {
-			transport := ""
-			if tw, ok := c.(interface{ Transport() string }); ok {
-				transport = tw.Transport()
-			}
-			ch.serveStream(c, transport)
-		}
-
-		select {
-		case <-ch.stop:
-			return
-		case <-time.After(delay):
-		}
-		delay = channelRetryDelay(delay, openFailed)
-	}
-}
-
-// serveStream publishes c as the channel's peer edge and pumps bytes from it
-// to the local edge until it dies. Bytes read while no local is attached are
-// dropped: IP tolerates loss (the GOST-side frames are carried verbatim; the
-// host never parses them). The up/down logs live here (not in the opener's
-// loop) so the responder, which attaches streams through serveInbound, logs
-// them identically. transport is passed in rather than sniffed off the conn:
-// the responder's accepted stream is a bare mux stream with no Transport().
-func (ch *channel) serveStream(c net.Conn, transport string) {
-	ch.setStream(c)
-	ch.e.log.Info("channel up", "peer", keyName(ch.peer), "transport", transport)
-	defer func() {
-		ch.clearStream(c)
-		c.Close()
-		ch.e.log.Info("channel down", "peer", keyName(ch.peer))
-	}()
-
-	buf := make([]byte, channelChunkSize)
-	for {
-		n, err := c.Read(buf)
-		if n > 0 {
-			ch.mu.Lock()
-			local := ch.local
-			ch.mu.Unlock()
-			if local != nil {
-				if _, werr := local.Write(buf[:n]); werr != nil {
-					// Drop and keep serving: a write error (e.g. the gost edge
-					// just died) must not cost the whole channel a reconnect.
-					ch.e.log.Debug("channel: write local", "peer", keyName(ch.peer), "error", werr)
-				}
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
-}
-
-// pumpLocal moves bytes from the local edge onto the peer edge; done is closed
-// when the edge ends (gost closed the stream, or the edge was replaced/torn
-// down). Bytes are dropped while the peer edge is down.
-func (ch *channel) pumpLocal(c net.Conn, done chan struct{}) {
-	defer func() {
-		ch.clearLocal(c)
-		c.Close()
-		close(done)
-	}()
-
-	buf := make([]byte, channelChunkSize)
-	for {
-		n, err := c.Read(buf)
-		if n > 0 {
-			ch.mu.Lock()
-			s := ch.stream
-			ch.mu.Unlock()
-			if s != nil {
-				if _, werr := s.Write(buf[:n]); werr != nil {
-					ch.e.log.Debug("channel: write stream", "peer", keyName(ch.peer), "error", werr)
-				}
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
-}
-
-// setStream publishes c as the current peer edge, replacing (and closing) a
-// predecessor.
-func (ch *channel) setStream(c net.Conn) {
-	ch.mu.Lock()
-	old := ch.stream
-	ch.stream = c
-	ch.mu.Unlock()
-	if old != nil && old != c {
-		old.Close()
-	}
-}
-
-// clearStream drops c if it is still the current peer edge (a reconnect may
-// already have replaced it).
-func (ch *channel) clearStream(c net.Conn) {
-	ch.mu.Lock()
-	if ch.stream == c {
-		ch.stream = nil
-	}
-	ch.mu.Unlock()
-}
-
-// clearLocal drops c if it is still the current local edge (a newer dial may
-// already have replaced it).
-func (ch *channel) clearLocal(c net.Conn) {
-	ch.mu.Lock()
-	if ch.local == c {
-		ch.local = nil
-	}
-	ch.mu.Unlock()
-}
+// linkChunkSize bounds one pump read; frame bytes from the GOST side arrive in
+// chunks at most this size.
+const linkChunkSize = 32 * 1024
 
 // channelTag marks a stream as carrying a datagram channel. An ordinary tunnel
 // stream's payload is arbitrary bytes, so the responder needs an explicit
@@ -360,6 +74,384 @@ const channelTag = "P2PU"
 // first), so waiting for its first bytes would deadlock that bridge.
 // A var so tests can shorten it.
 var channelTagTimeout = 2 * time.Second
+
+// channelRetryMin is the presentation reconnect floor. A peer that just came
+// back (restarted, or its path dropped) is picked up within seconds instead of
+// waiting out the punch backoff; a stream the peer refused means the peer is
+// there but its side is not serving datagrams yet, so that retries fast too.
+// Only an outright open failure (peer unreachable) backs off.
+const channelRetryMin = 2 * time.Second
+
+// channelRetryDelay returns the next presentation reconnect delay: open
+// failures grow towards the punch backoff, everything else resets to the floor.
+func channelRetryDelay(prev time.Duration, openFailed bool) time.Duration {
+	if openFailed {
+		return min(2*prev, backoffPeriod)
+	}
+	return channelRetryMin
+}
+
+// newLink creates the datagram link of one udp dial and starts its presenter.
+// The caller registers it on the engine so inbound edges can find it.
+func newLink(e *engine, peer derpclient.PublicKey) *link {
+	l := &link{
+		e:        e,
+		peer:     peer,
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+		edgeGone: make(chan struct{}, 1),
+	}
+	go l.presentLoop()
+	return l
+}
+
+// attach publishes conn as the link's local edge (this dial's tunnel stream)
+// and starts the local->peer pump. The gRPC carrier calls it when its stream
+// arrives, the in-process carrier immediately. The returned channel is closed
+// when the link is torn down, so the carrier can park for the tunnel's
+// lifetime; the pump's exit closes the link, so a carrier that ends its stream
+// ends the tunnel.
+func (l *link) attach(conn net.Conn) <-chan struct{} {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		conn.Close()
+		return l.done
+	}
+	l.local = conn
+	l.mu.Unlock()
+	go l.pumpLocal(conn)
+	return l.done
+}
+
+// adoptable reports whether an inbound edge may replace this link's peer edge:
+// only when the edge is absent or still our own presentation. An adopted edge is
+// never displaced — a second inbound edge from the same peer is served per
+// stream instead of stealing the link. The key-order half of the rule lives in
+// engine.adoptableLink.
+func (l *link) adoptable() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return false
+	}
+	return l.peerEdge == nil || l.peerEdge == l.own
+}
+
+// hasEdge reports whether a peer edge is live.
+func (l *link) hasEdge() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.peerEdge != nil
+}
+
+// currentEdge returns the peer edge to write to, if any.
+func (l *link) currentEdge() net.Conn {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.peerEdge
+}
+
+// presentLoop keeps a presentation edge up while the link has none: open a
+// tagged stream, publish it, wait for it to end (or be adopted), repeat. A link
+// that holds an adopted edge presents nothing — the pair is already on one
+// shared edge, and a second presenter would fight it.
+func (l *link) presentLoop() {
+	pname := keyName(l.peer)
+	delay := channelRetryMin
+	for {
+		if l.hasEdge() {
+			select {
+			case <-l.stop:
+				return
+			case <-l.edgeGone:
+			}
+			continue
+		}
+
+		openFailed := false
+		c, err := l.e.openTaggedStream(pname)
+		if err == nil {
+			if !l.publishOwn(c) {
+				c.Close()
+				if l.isClosed() {
+					return
+				}
+				// An adopt raced the open and won: there is nothing to present,
+				// and the loop's hasEdge check parks it on the adopted edge.
+				continue
+			}
+			l.e.log.Info("datagram link up", "peer", pname)
+			// Wait for this presentation to end before deciding the next delay:
+			// a stream that lived (peer restart, path drop) resets the cadence
+			// to the fast floor, an outright open failure backs off.
+			select {
+			case <-l.stop:
+				return
+			case <-l.edgeGone:
+			}
+		} else {
+			openFailed = true
+			if c != nil {
+				c.Close()
+			}
+			l.e.log.Debug("link: open presentation", "peer", pname, "error", err)
+		}
+
+		select {
+		case <-l.stop:
+			return
+		case <-time.After(delay):
+		}
+		delay = channelRetryDelay(delay, openFailed)
+	}
+}
+
+// publishOwn makes c the link's presentation edge and starts its reader. It
+// returns false when the link is closed or already holds an adopted edge (an
+// adopt raced the open) — the caller still owns c and must close it.
+func (l *link) publishOwn(c net.Conn) bool {
+	l.mu.Lock()
+	if l.closed || (l.peerEdge != nil && l.peerEdge != l.own) {
+		l.mu.Unlock()
+		return false
+	}
+	l.own, l.peerEdge = c, c
+	l.mu.Unlock()
+	go l.serveEdge(c)
+	// Asynchronous: a flush can block on a peer that is not reading yet, and
+	// the presenter must stay free to react to the edge dying. wmu keeps the
+	// buffered bytes ahead of anything written later.
+	go l.flush()
+	return true
+}
+
+// adopt makes c the link's peer edge, replacing (and closing) the current one.
+// It is the rendezvous half of the model: the larger key adopts the smaller
+// key's presentation so the pair rides one shared edge. false means the link is
+// closed or already holds an adopted edge — an adopted edge is never displaced,
+// so the caller serves c per stream instead (and still owns c). The key-order
+// half of the rule lives in engine.adoptableLink; this is the re-check that
+// closes the window between that lookup and here.
+func (l *link) adopt(c net.Conn, transport string) bool {
+	l.mu.Lock()
+	if l.closed || (l.peerEdge != nil && l.peerEdge != l.own) {
+		l.mu.Unlock()
+		return false
+	}
+	old, own := l.peerEdge, l.own
+	l.peerEdge, l.own = c, nil
+	l.mu.Unlock()
+	// Our presentation is superseded; its reader retires it.
+	if own != nil && own != c {
+		own.Close()
+	}
+	if old != nil && old != c && old != own {
+		old.Close()
+	}
+	l.e.log.Info("datagram link up", "peer", keyName(l.peer), "transport", transport)
+	go l.serveEdge(c)
+	go l.flush() // as in publishOwn: never block the adopter on a slow reader
+	return true
+}
+
+// isClosed reports whether the link has been torn down.
+func (l *link) isClosed() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.closed
+}
+
+// serveEdge moves bytes from one peer edge to the local edge until it ends,
+// then retires it. It is the edge's only reader, so the cleanup cannot race a
+// second reader of the same conn.
+func (l *link) serveEdge(c net.Conn) {
+	defer func() {
+		l.retireEdge(c)
+		c.Close()
+	}()
+
+	buf := make([]byte, linkChunkSize)
+	for {
+		n, err := c.Read(buf)
+		if n > 0 {
+			l.mu.Lock()
+			local := l.local
+			l.mu.Unlock()
+			if local != nil {
+				if _, werr := local.Write(buf[:n]); werr != nil {
+					// Keep serving: a write error (e.g. the gost edge just died)
+					// must not cost the link its peer edge.
+					l.e.log.Debug("link: write local", "peer", keyName(l.peer), "error", werr)
+				}
+			}
+			// No local yet: the carrier has not attached, so there is nobody to
+			// deliver to — dropped, like any datagram loss.
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// retireEdge clears c if it is still the link's edge and wakes the presenter.
+// An adopted edge that dies is replaced by a fresh presentation; our own edge
+// dying is the presenter's cue to reopen it.
+func (l *link) retireEdge(c net.Conn) {
+	l.mu.Lock()
+	current := l.peerEdge == c
+	if current {
+		l.peerEdge = nil
+		l.e.log.Info("datagram link down", "peer", keyName(l.peer))
+	}
+	if l.own == c {
+		l.own = nil
+	}
+	closed := l.closed
+	l.mu.Unlock()
+	if closed {
+		return
+	}
+	select {
+	case l.edgeGone <- struct{}{}:
+	default:
+	}
+}
+
+// pumpLocal moves the dial's bytes onto the current peer edge. Bytes read while
+// no edge is live are buffered (bounded); bytes that do not fit are dropped.
+// The pump's exit ends the link: the dial's stream ending IS the dial ending.
+func (l *link) pumpLocal(c net.Conn) {
+	defer l.close()
+
+	buf := make([]byte, linkChunkSize)
+	for {
+		n, err := c.Read(buf)
+		if n > 0 {
+			l.writeEdge(buf[:n])
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// writeEdge appends p to the peer edge, draining the buffer first so bytes keep
+// their order. With no live edge, p goes to the buffer instead.
+func (l *link) writeEdge(p []byte) {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+
+	l.flushLocked()
+	if e := l.currentEdge(); e != nil {
+		if _, err := e.Write(p); err != nil {
+			l.e.log.Debug("link: write peer edge", "peer", keyName(l.peer), "error", err)
+		}
+		return
+	}
+	if len(l.wbuf)+len(p) > linkBufLimit {
+		l.e.log.Debug("link: first-datagram buffer full, dropping", "peer", keyName(l.peer))
+		return
+	}
+	l.wbuf = append(l.wbuf, p...)
+}
+
+// flush drains the first-datagram buffer onto the current edge. It runs when an
+// edge is published: the pump may be parked in Read and would otherwise hold
+// the buffered bytes until the next datagram arrives.
+func (l *link) flush() {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	l.flushLocked()
+}
+
+// flushLocked must be called with wmu held. Without a live edge the buffer is
+// left for the next call.
+func (l *link) flushLocked() {
+	if len(l.wbuf) == 0 {
+		return
+	}
+	e := l.currentEdge()
+	if e == nil {
+		return
+	}
+	if _, err := e.Write(l.wbuf); err != nil {
+		l.e.log.Debug("link: flush buffer", "peer", keyName(l.peer), "error", err)
+	}
+	l.wbuf = nil
+}
+
+// close tears the link down: the presenter stops, the edges and the local
+// stream are closed (their pumps exit), and done is closed so the carrier can
+// return. Idempotent; the record's drop and the local pump's exit are the
+// callers.
+func (l *link) close() {
+	l.stopOnce.Do(func() {
+		l.mu.Lock()
+		l.closed = true
+		local, edge, own := l.local, l.peerEdge, l.own
+		l.local, l.peerEdge, l.own = nil, nil, nil
+		l.mu.Unlock()
+
+		close(l.stop)
+		if local != nil {
+			local.Close()
+		}
+		if own != nil && own != edge {
+			own.Close()
+		}
+		if edge != nil {
+			edge.Close()
+		}
+		l.doneOnce.Do(func() { close(l.done) })
+	})
+}
+
+// addLink registers l for its peer so inbound datagram edges can find it. A
+// host may hold several links to one peer (concurrent dials); the rendezvous
+// shape has exactly one.
+func (e *engine) addLink(l *link) {
+	e.mu.Lock()
+	e.links[l.peer] = append(e.links[l.peer], l)
+	e.mu.Unlock()
+}
+
+// removeLink drops l from its peer's list by identity, so a concurrent add of
+// another link is never clobbered.
+func (e *engine) removeLink(l *link) {
+	e.mu.Lock()
+	ls := e.links[l.peer]
+	for i, x := range ls {
+		if x == l {
+			ls = append(ls[:i], ls[i+1:]...)
+			break
+		}
+	}
+	if len(ls) == 0 {
+		delete(e.links, l.peer)
+	} else {
+		e.links[l.peer] = ls
+	}
+	e.mu.Unlock()
+}
+
+// adoptableLink returns the link that may adopt an inbound edge from peer, or
+// nil: only the larger key adopts (the smaller keeps its own presentation, so
+// the pair converges on one edge), and only a link that is waiting for one.
+func (e *engine) adoptableLink(peer derpclient.PublicKey) *link {
+	if bytes.Compare(e.pub[:], peer[:]) <= 0 {
+		return nil
+	}
+	e.mu.Lock()
+	ls := append([]*link(nil), e.links[peer]...)
+	e.mu.Unlock()
+	for _, l := range ls {
+		if l.adoptable() {
+			return l
+		}
+	}
+	return nil
+}
 
 // peekTag classifies an inbound stream by its leading bytes. Bytes consumed by
 // a partial read are replayed through the returned conn, so an untagged stream
@@ -389,8 +481,8 @@ func (c *prefixConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 // serveTargetStream bridges one inbound datagram stream to a udp target from
 // the pool: frame bytes from the stream become datagrams at the target, and
-// each datagram comes back as a frame. It is the receive half of a datagram
-// channel; nothing outlives the stream, so there is no per-peer state.
+// each datagram comes back as a frame. It is the target half of a datagram
+// link; nothing outlives the stream, so there is no per-peer state.
 // Either direction ending tears the pair down.
 func (e *engine) serveTargetStream(stream net.Conn, target string) {
 	defer stream.Close()
@@ -410,7 +502,7 @@ func (e *engine) serveTargetStream(stream net.Conn, target string) {
 
 	done := make(chan struct{}, 2)
 	go func() { // stream frames -> target datagrams
-		buf := make([]byte, channelChunkSize)
+		buf := make([]byte, linkChunkSize)
 		for {
 			n, err := stream.Read(buf)
 			if n > 0 {
@@ -425,7 +517,7 @@ func (e *engine) serveTargetStream(stream net.Conn, target string) {
 		}
 	}()
 	go func() { // target datagrams -> stream frames
-		buf := make([]byte, channelChunkSize)
+		buf := make([]byte, linkChunkSize)
 		for {
 			n, err := edge.Read(buf)
 			if n > 0 {
@@ -442,70 +534,16 @@ func (e *engine) serveTargetStream(stream net.Conn, target string) {
 	<-done
 }
 
-// maxDatagramDialers bounds the per-peer opener loops, so an unbounded stream of
-// announcing peers cannot exhaust fds/goroutines.
-const maxDatagramDialers = 256
-
-// startDatagramDialer keeps a datagram peer edge to peer alive: open a tagged
-// stream, bridge it to a udp target for the stream's lifetime, back off, repeat.
-// It runs only on the pure target side, only when it owns the smaller key and a
-// udp target exists, and only after the peer announces a udp dial. Idempotent
-// per peer.
-func (e *engine) startDatagramDialer(peer derpclient.PublicKey) {
-	// The channel side already owns the peer edge (ch.loop); a second opener
-	// would fight it over setStream. This dialer is for the pure target side.
-	if e.channel(peer) != nil {
-		return
-	}
-	e.mu.Lock()
-	if _, ok := e.dialers[peer]; ok {
-		e.mu.Unlock()
-		return
-	}
-	if len(e.dialers) >= maxDatagramDialers {
-		e.mu.Unlock()
-		e.log.Warn("datagram dialer limit reached", "peer", keyName(peer))
-		return
-	}
-	stop := make(chan struct{})
-	e.dialers[peer] = stop
-	e.mu.Unlock()
-	go e.datagramDialerLoop(peer, stop)
-}
-
-// stopDatagramDialer ends peer's opener loop (peer gone / engine shutdown).
-func (e *engine) stopDatagramDialer(peer derpclient.PublicKey) {
-	e.mu.Lock()
-	stop := e.dialers[peer]
-	delete(e.dialers, peer)
-	e.mu.Unlock()
-	if stop != nil {
-		close(stop)
-	}
-}
-
-// stopDatagramDialerOwned is a loop's own cleanup: it drops and closes the entry
-// only while it is still this loop's stop channel, so an exiting loop cannot
-// delete a successor's entry that handleControl registered in the meantime
-// (clearStream / clearLocal / the chans identity check are the same pattern).
-// Closing stop is safe: the loop is its only receiver and is exiting.
-func (e *engine) stopDatagramDialerOwned(peer derpclient.PublicKey, stop chan struct{}) {
-	e.mu.Lock()
-	if e.dialers[peer] != stop {
-		e.mu.Unlock()
-		return
-	}
-	delete(e.dialers, peer)
-	e.mu.Unlock()
-	close(stop)
-}
-
 // openTaggedStream opens a stream to peer and writes the datagram-channel tag
 // before returning it: the tag must precede any frame byte, or the responder
 // would read payload as the tag. The stream is closed on a tag-write failure,
 // so a non-nil error never leaves the caller owning a stream.
 func (e *engine) openTaggedStream(pname string) (net.Conn, error) {
-	c, err := e.OpenStream(pname)
+	open := e.OpenStream
+	if e.openStream != nil {
+		open = e.openStream // test seam
+	}
+	c, err := open(pname)
 	if err != nil {
 		return nil, err
 	}
@@ -514,52 +552,4 @@ func (e *engine) openTaggedStream(pname string) (net.Conn, error) {
 		return nil, werr
 	}
 	return c, nil
-}
-
-// datagramDialerLoop is the target side's peer-edge loop. It re-checks for a
-// channel each round: a channel that appears after the notice owns the peer
-// edge, and a second opener would fight ch.loop over setStream (last-wins), so
-// the dialer hands over deterministically.
-func (e *engine) datagramDialerLoop(peer derpclient.PublicKey, stop chan struct{}) {
-	pname := keyName(peer)
-	// Every exit path must drop this peer's dialer entry: a stale entry would
-	// consume one of the 256 slots AND make startDatagramDialer early-return
-	// forever, so the target side could never re-arm after the channel goes
-	// away. The owned form no-ops when a `<-stop` exit already removed the
-	// entry, and never clobbers a successor's.
-	defer e.stopDatagramDialerOwned(peer, stop)
-	delay := channelRetryMin
-	for {
-		if e.channel(peer) != nil {
-			return
-		}
-		openFailed := false
-		c, err := e.openTaggedStream(pname)
-		if err != nil {
-			openFailed = true
-			if c != nil {
-				c.Close()
-			}
-			e.log.Debug("datagram dial: open stream", "peer", pname, "error", err)
-		} else if target, ok := e.targets.pick("udp"); ok {
-			e.log.Info("datagram channel up", "peer", pname)
-			e.serveTargetStream(c, target)
-			e.log.Info("datagram channel down", "peer", pname)
-		} else {
-			// Unreachable today: startDatagramDialer only runs with a udp target
-			// and the pool is fixed after startup. Retrying would spin, so stop
-			// instead.
-			e.log.Debug("datagram dial: no udp target", "peer", pname)
-			c.Close()
-			return
-		}
-		select {
-		case <-e.stop:
-			return
-		case <-stop:
-			return
-		case <-time.After(delay):
-		}
-		delay = channelRetryDelay(delay, openFailed)
-	}
 }

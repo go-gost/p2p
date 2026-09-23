@@ -2,6 +2,7 @@ package host
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -11,8 +12,8 @@ import (
 	"github.com/go-gost/p2p/internal/derpclient"
 )
 
-// newTestEngine builds an engine with no relay: enough for the channel-level
-// tests, which attach streams by hand instead of dialling a peer.
+// newTestEngine builds an engine with no relay: enough for the link-level
+// tests, which drive the edges by hand instead of dialling a peer.
 func newTestEngine(t *testing.T) *engine {
 	t.Helper()
 	priv, _, err := derpclient.Generate()
@@ -24,45 +25,53 @@ func newTestEngine(t *testing.T) *engine {
 	return e
 }
 
-// newTestChannel creates a channel without starting the opener loop; the
-// caller attaches the edges.
-func newTestChannel(t *testing.T, e *engine, peer derpclient.PublicKey) *channel {
+// failOpen is the injected opener for tests that drive the edges themselves:
+// the presenter's attempts fail, so it never publishes one behind the test.
+func failOpen(string) (net.Conn, error) { return nil, errors.New("test: no opener") }
+
+// newTestLink creates a registered link whose presentation is driven by open.
+func newTestLink(t *testing.T, e *engine, peer derpclient.PublicKey, open func(string) (net.Conn, error)) *link {
 	t.Helper()
-	ch := &channel{
-		e:    e,
-		peer: peer,
-		stop: make(chan struct{}),
-	}
-	t.Cleanup(func() { ch.teardown() })
-	return ch
+	e.openStream = open
+	l := newLink(e, peer)
+	e.addLink(l)
+	t.Cleanup(func() {
+		e.removeLink(l)
+		l.close()
+	})
+	return l
 }
 
-// attachStream serves c as the channel's peer edge (the real pump) and waits
-// until the channel sees it.
-func attachStream(t *testing.T, ch *channel, c net.Conn) {
-	t.Helper()
-	go ch.serveStream(c, "test")
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		ch.mu.Lock()
-		up := ch.stream != nil
-		ch.mu.Unlock()
-		if up {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("channel peer edge was not published")
-}
-
-// attachLocal attaches a pipe end as the channel's local edge (standing in
-// for a gost tunnel's stream) and returns the test's end.
-func attachLocal(t *testing.T, ch *channel) net.Conn {
+// attachLocal attaches a pipe end as the link's local edge (standing in for a
+// gost tunnel's stream) and returns the test's end.
+func attachLocal(t *testing.T, l *link) net.Conn {
 	t.Helper()
 	local, side := net.Pipe()
 	t.Cleanup(func() { side.Close() })
-	ch.attachLocal(local)
+	l.attach(local)
 	return side
+}
+
+// publishEdge publishes a pipe end as the link's presentation edge and returns
+// the test's end.
+func publishEdge(t *testing.T, l *link) net.Conn {
+	t.Helper()
+	edge, side := net.Pipe()
+	t.Cleanup(func() { side.Close() })
+	if !l.publishOwn(edge) {
+		t.Fatal("link refused the presentation")
+	}
+	return side
+}
+
+// waitBuffered waits until the link holds n buffered bytes.
+func waitBuffered(t *testing.T, l *link, n int) {
+	t.Helper()
+	waitFor(t, 3*time.Second, func() bool {
+		l.wmu.Lock()
+		defer l.wmu.Unlock()
+		return len(l.wbuf) == n
+	})
 }
 
 func readN(t *testing.T, c net.Conn, n int) []byte {
@@ -75,18 +84,15 @@ func readN(t *testing.T, c net.Conn, n int) []byte {
 	return buf
 }
 
-// TestChannelBytePipe drives the channel in both directions: bytes written on
-// the local edge come out of the peer edge verbatim, and vice versa. The host
+// TestLinkBytePipe drives the link in both directions: bytes written on the
+// local edge come out of the peer edge verbatim, and vice versa. The host
 // never parses them (framing is the GOST side's job).
-func TestChannelBytePipe(t *testing.T) {
+func TestLinkBytePipe(t *testing.T) {
 	e := newTestEngine(t)
 	_, peerKey, _ := derpclient.Generate()
-	ch := newTestChannel(t, e, peerKey)
-	local := attachLocal(t, ch)
-
-	upstream, peerSide := net.Pipe()
-	t.Cleanup(func() { upstream.Close() })
-	attachStream(t, ch, upstream)
+	l := newTestLink(t, e, peerKey, failOpen)
+	local := attachLocal(t, l)
+	peerSide := publishEdge(t, l)
 
 	go local.Write([]byte("first"))
 	if got := string(readN(t, peerSide, 5)); got != "first" {
@@ -98,70 +104,169 @@ func TestChannelBytePipe(t *testing.T) {
 	}
 }
 
-// TestChannelLastLocalWins proves a newer gost dial takes over the channel's
-// local edge: the previous edge is closed, and data follows the newest one.
-func TestChannelLastLocalWins(t *testing.T) {
+// TestLinkBuffersFirstDatagram is the R2 regression: the datagram that triggers
+// a dial arrives before the presentation is up, and must not be lost. The link
+// holds it until an edge is published, then flushes it in order.
+func TestLinkBuffersFirstDatagram(t *testing.T) {
 	e := newTestEngine(t)
 	_, peerKey, _ := derpclient.Generate()
-	ch := newTestChannel(t, e, peerKey)
+	l := newTestLink(t, e, peerKey, failOpen)
+	local := attachLocal(t, l)
 
-	first := attachLocal(t, ch)
-	upstream, peerSide := net.Pipe()
-	t.Cleanup(func() { upstream.Close() })
-	attachStream(t, ch, upstream)
+	go local.Write([]byte("first")) // no peer edge yet
+	waitBuffered(t, l, 5)
 
-	second := attachLocal(t, ch) // takes over; the previous edge ends
-
-	first.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-	if _, err := first.Read(make([]byte, 8)); err == nil {
-		t.Fatal("replaced local edge is still readable, want it closed")
+	peerSide := publishEdge(t, l)
+	if got := string(readN(t, peerSide, 5)); got != "first" {
+		t.Fatalf("peer received %q, want first (the buffered datagram was dropped)", got)
 	}
 
-	go peerSide.Write([]byte("hello"))
-	if got := string(readN(t, second, 5)); got != "hello" {
-		t.Fatalf("new local received %q, want hello", got)
-	}
-	go second.Write([]byte("back"))
-	if got := string(readN(t, peerSide, 4)); got != "back" {
-		t.Fatalf("peer received %q, want back", got)
+	// The buffer is drained: later datagrams ride the edge directly.
+	go local.Write([]byte("second"))
+	if got := string(readN(t, peerSide, 6)); got != "second" {
+		t.Fatalf("peer received %q, want second", got)
 	}
 }
 
-// TestChannelDrops covers the lossy edges: bytes with no local are dropped
-// (not buffered), bytes with the peer edge down are dropped, and flow resumes
-// when the edge returns — IP tolerates loss.
-func TestChannelDrops(t *testing.T) {
+// TestLinkBufferCapDrops: the first-datagram buffer is bounded. Beyond the cap
+// new bytes are dropped — the buffer keeps a dial's opening datagrams, it is
+// not an unbounded queue.
+func TestLinkBufferCapDrops(t *testing.T) {
 	e := newTestEngine(t)
 	_, peerKey, _ := derpclient.Generate()
-	ch := newTestChannel(t, e, peerKey)
+	l := newTestLink(t, e, peerKey, failOpen)
+	local := attachLocal(t, l)
 
-	upstream, peerSide := net.Pipe()
-	t.Cleanup(func() { upstream.Close() })
-	attachStream(t, ch, upstream)
+	big := bytes.Repeat([]byte{'x'}, linkBufLimit+100)
+	go local.Write(big)
+	waitBuffered(t, l, linkBufLimit) // the tail is dropped, not queued
 
-	// No local yet: peer bytes are dropped.
-	go peerSide.Write([]byte("early"))
-	time.Sleep(50 * time.Millisecond)
+	peerSide := publishEdge(t, l)
+	if got := readN(t, peerSide, linkBufLimit); !bytes.Equal(got, big[:linkBufLimit]) {
+		t.Fatal("buffered payload mismatch")
+	}
+	peerSide.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, err := peerSide.Read(make([]byte, 8)); err == nil {
+		t.Fatalf("read %d bytes past the cap, want nothing", n)
+	}
+}
 
-	local := attachLocal(t, ch)
-	go peerSide.Write([]byte("late"))
-	if got := string(readN(t, local, 4)); got != "late" {
-		t.Fatalf("local received %q, want late (channel stopped serving)", got)
+// TestLinkAdoptReplacesPresentation: adopting an inbound edge supersedes the
+// link's own presentation — the presentation is closed and the adopted edge
+// carries both directions. An adopted edge is never displaced afterwards (see
+// TestEngineAdoptableLink).
+func TestLinkAdoptReplacesPresentation(t *testing.T) {
+	e := newTestEngine(t)
+	_, peerKey, _ := derpclient.Generate()
+	l := newTestLink(t, e, peerKey, failOpen)
+	local := attachLocal(t, l)
+	own := publishEdge(t, l)
+
+	adopted, adoptedSide := net.Pipe()
+	t.Cleanup(func() { adoptedSide.Close() })
+	if !l.adopt(adopted, "test") {
+		t.Fatal("the link refused to adopt an inbound edge")
 	}
 
-	// Peer edge down: local bytes are dropped.
-	upstream.Close()
-	time.Sleep(50 * time.Millisecond) // let serveStream retire the edge
-	go local.Write([]byte("void"))
-	time.Sleep(50 * time.Millisecond)
+	own.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, err := own.Read(make([]byte, 8)); err == nil {
+		t.Fatal("the superseded presentation is still readable, want it closed")
+	}
 
-	// Reconnected: flow resumes on the same local edge.
-	upstream2, peerSide2 := net.Pipe()
-	t.Cleanup(func() { upstream2.Close() })
-	attachStream(t, ch, upstream2)
-	go local.Write([]byte("again"))
-	if got := string(readN(t, peerSide2, 5)); got != "again" {
-		t.Fatalf("peer received %q, want again (flow did not resume)", got)
+	go local.Write([]byte("out"))
+	if got := string(readN(t, adoptedSide, 3)); got != "out" {
+		t.Fatalf("adopted edge received %q, want out", got)
+	}
+	go adoptedSide.Write([]byte("in"))
+	if got := string(readN(t, local, 2)); got != "in" {
+		t.Fatalf("local received %q, want in", got)
+	}
+	if l.adoptable() {
+		t.Fatal("a link holding an adopted edge is still adoptable")
+	}
+}
+
+// TestEngineAdoptableLink covers the rendezvous rule: only the larger key
+// adopts, and only a link that is waiting for an edge (none, or its own
+// presentation). An adopted edge is never displaced, so a second inbound edge
+// is served per stream instead of stealing the link.
+func TestEngineAdoptableLink(t *testing.T) {
+	e := newTestEngine(t)
+
+	// e owns the larger key.
+	var peer derpclient.PublicKey
+	for {
+		_, peer, _ = derpclient.Generate()
+		if bytes.Compare(e.pub[:], peer[:]) > 0 {
+			break
+		}
+	}
+	l := newTestLink(t, e, peer, failOpen)
+	if e.adoptableLink(peer) != l {
+		t.Fatal("the larger key must adopt a link that is waiting for an edge")
+	}
+
+	publishEdge(t, l) // our own presentation: still adoptable
+	if e.adoptableLink(peer) != l {
+		t.Fatal("a link on its own presentation must still be adoptable")
+	}
+
+	adopted, adoptedSide := net.Pipe()
+	t.Cleanup(func() { adoptedSide.Close() })
+	if !l.adopt(adopted, "test") {
+		t.Fatal("the link refused to adopt")
+	}
+	if got := e.adoptableLink(peer); got != nil {
+		t.Fatal("a link holding an adopted edge must not be adoptable")
+	}
+
+	// The smaller key never adopts: it keeps its own presentation, and the
+	// larger side adopts that one.
+	e2 := newTestEngine(t)
+	var peer2 derpclient.PublicKey
+	for {
+		_, peer2, _ = derpclient.Generate()
+		if bytes.Compare(e2.pub[:], peer2[:]) < 0 {
+			break
+		}
+	}
+	newTestLink(t, e2, peer2, failOpen)
+	if got := e2.adoptableLink(peer2); got != nil {
+		t.Fatal("the smaller key must not adopt")
+	}
+}
+
+// TestLinkRepresentsAfterEdgeDeath: when the presentation dies the link opens a
+// new one (the peer restart / path-drop case), and it keeps presenting while it
+// has no edge.
+func TestLinkRepresentsAfterEdgeDeath(t *testing.T) {
+	e := newTestEngine(t)
+	_, peerKey, _ := derpclient.Generate()
+
+	peerSides := make(chan net.Conn, 4)
+	open := func(string) (net.Conn, error) {
+		edge, side := net.Pipe()
+		// The presenter writes the channel tag before handing the stream over
+		// (openTaggedStream); on an unbuffered pipe that needs a reader.
+		go func() {
+			io.ReadFull(side, make([]byte, len(channelTag)))
+		}()
+		peerSides <- side
+		return edge, nil
+	}
+	l := newTestLink(t, e, peerKey, open)
+
+	first := <-peerSides
+	waitFor(t, 3*time.Second, l.hasEdge) // the opener hands the edge out before publishing it
+
+	first.Close() // the path drops
+	select {
+	case second := <-peerSides:
+		if second == first {
+			t.Fatal("the presenter re-published the dead edge")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the presenter did not re-present after the edge died")
 	}
 }
 
@@ -244,68 +349,6 @@ func startGreeter(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-func waitStream(t *testing.T, ch *channel) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		ch.mu.Lock()
-		up := ch.stream != nil
-		ch.mu.Unlock()
-		if up {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("channel stream did not come up")
-}
-
-// TestEngineChannelRoundTrip is the happy path through two engines and the
-// test relay: what one gost-side edge sends comes out of the other, bytes
-// intact, in both directions.
-func TestEngineChannelRoundTrip(t *testing.T) {
-	rs := &relayServer{}
-	url := rs.start(t)
-
-	privA, pubA, _ := derpclient.Generate()
-	privB, pubB, _ := derpclient.Generate()
-	engineA := newEngine(url, "", privA, slog.Default())
-	engineB := newEngine(url, "", privB, slog.Default())
-	defer engineA.Close()
-	defer engineB.Close()
-	if err := engineA.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	if err := engineB.Connect(); err != nil {
-		t.Fatal(err)
-	}
-
-	chA := engineA.openChannel(pubB)
-	defer chA.release()
-	chB := engineB.openChannel(pubA)
-	defer chB.release()
-
-	// The gost side: a pipe end per channel standing in for the tunnel stream.
-	localA := attachLocal(t, chA)
-	localB := attachLocal(t, chB)
-
-	waitStream(t, chA)
-	waitStream(t, chB)
-
-	go localA.Write([]byte("one"))
-	if got := string(readN(t, localB, 3)); got != "one" {
-		t.Fatalf("A->B = %q, want one", got)
-	}
-	payload := bytes.Repeat([]byte{0x5a}, 3000)
-	go localA.Write(payload)
-	if got := readN(t, localB, len(payload)); !bytes.Equal(got, payload) {
-		t.Fatal("A->B payload mismatch")
-	}
-	go localB.Write([]byte("back"))
-	if got := string(readN(t, localA, 4)); got != "back" {
-		t.Fatalf("B->A = %q, want back", got)
-	}
-}
-
 // TestEngineIdleStreamBridged proves an ordinary tunnel stream that stays
 // silent is still bridged: the tag peek is bounded, so a target that speaks
 // first is reached instead of waiting forever for client bytes.
@@ -347,12 +390,12 @@ func TestEngineIdleStreamBridged(t *testing.T) {
 	}
 }
 
-// TestChannelRetryDelay pins the peer-edge reconnect cadence: a stream that
+// TestLinkRetryDelay pins the presentation reconnect cadence: a stream that
 // lived (peer restart / path drop) resets to the fast floor — that was the
 // "tun-to-tun takes ~80s to reconnect" complaint — while an outright open
 // failure doubles towards the punch backoff and never exceeds it. Assertions
 // derive from the ambient backoffPeriod (TestMain shortens it for the package).
-func TestChannelRetryDelay(t *testing.T) {
+func TestLinkRetryDelay(t *testing.T) {
 	if got := channelRetryDelay(backoffPeriod, false); got != channelRetryMin {
 		t.Fatalf("after a live stream: delay = %v, want %v (fast reconnect)", got, channelRetryMin)
 	}
@@ -367,232 +410,25 @@ func TestChannelRetryDelay(t *testing.T) {
 	}
 }
 
-// TestChannelFastRetryAfterRefusal: while the responder's gost has not opened
-// a udp tunnel, the opener's peer-edge stream is refused at once; once the
-// responder's channel appears the opener must recover quickly (the fast
-// retry), not wait out the 30s punch backoff.
-func TestChannelFastRetryAfterRefusal(t *testing.T) {
-	rs := &relayServer{}
-	url := rs.start(t)
-
-	// Force the opener role on A: the smaller public key opens the stream.
-	var privA, privB derpclient.PrivateKey
-	var pubA, pubB derpclient.PublicKey
-	for {
-		privA, pubA, _ = derpclient.Generate()
-		privB, pubB, _ = derpclient.Generate()
-		if bytes.Compare(pubA[:], pubB[:]) < 0 {
-			break
-		}
-	}
-	engineA := newEngine(url, "", privA, slog.Default())
-	engineB := newEngine(url, "", privB, slog.Default())
-	defer engineA.Close()
-	defer engineB.Close()
-	if err := engineA.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	if err := engineB.Connect(); err != nil {
-		t.Fatal(err)
-	}
-
-	chA := engineA.openChannel(pubB) // the opener starts its loop at once
-	defer chA.release()
-
-	// B's channel (and so A's first attempt) is absent now: the attempt is
-	// refused; B appears shortly after.
-	time.Sleep(500 * time.Millisecond)
-	chB := engineB.openChannel(pubA)
-	defer chB.release()
-	attachLocal(t, chB)
-
-	deadline := time.Now().Add(8 * time.Second) // << backoffPeriod: guards the fast retry
-	for time.Now().Before(deadline) {
-		chA.mu.Lock()
-		up := chA.stream != nil
-		chA.mu.Unlock()
-		if up {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatal("opener did not recover after the refusal (fast retry missing)")
-}
-
-// TestChannelRefcount covers the channel lifecycle: tunnels to the same peer
-// share one channel, it survives until the last one closes, and the next open
-// rebuilds it (with a fresh loop, so a stale one cannot feed it).
-func TestChannelRefcount(t *testing.T) {
+// TestLinkCloseIdempotent: close is called by the record's drop and by the
+// local pump's exit, so it must be safe twice and must end the carrier's park.
+func TestLinkCloseIdempotent(t *testing.T) {
 	e := newTestEngine(t)
 	_, peerKey, _ := derpclient.Generate()
+	l := newTestLink(t, e, peerKey, failOpen)
+	local := attachLocal(t, l)
 
-	ch := e.openChannel(peerKey)
-	again := e.openChannel(peerKey)
-	if again != ch {
-		t.Fatal("second open created a new channel instead of sharing the peer's")
-	}
-	if e.channel(peerKey) != ch {
-		t.Fatal("channel not registered for its peer")
-	}
+	l.close()
+	l.close()
 
-	ch.release()
-	if e.channel(peerKey) == nil {
-		t.Fatal("channel torn down while a reference was still held")
-	}
-
-	ch.release()
-	if e.channel(peerKey) != nil {
-		t.Fatal("channel still registered after its last reference")
-	}
-
-	rebuilt := e.openChannel(peerKey)
-	defer rebuilt.release()
-	if rebuilt == ch {
-		t.Fatal("reused the torn-down channel")
-	}
-	if rebuilt.stop == ch.stop {
-		t.Fatal("rebuilt channel shares the stale stop channel (a stale loop could feed it)")
-	}
-}
-
-// TestDatagramDialerHandsOverToChannel: when a channel appears after the dial
-// notice (the interleave startDatagramDialer's guard targets), the dialer
-// loop's first iteration returns on the channel -- but it must still drop its
-// e.dialers entry. A stale entry burns one of the 256 slots and makes
-// startDatagramDialer early-return forever, so the target side could never
-// re-arm once that channel goes away.
-func TestDatagramDialerHandsOverToChannel(t *testing.T) {
-	e := newTestEngine(t)
-	// A responder-role peer: openChannel starts no loop, so the setup is
-	// deterministic.
-	var peer derpclient.PublicKey
-	for {
-		_, peer, _ = derpclient.Generate()
-		if bytes.Compare(e.pub[:], peer[:]) < 0 {
-			break
-		}
-	}
-
-	ch := e.openChannel(peer) // the channel that races in after the notice
-
-	// Reconstruct the interleave's outcome: the channel is already up, yet the
-	// dialer entry got registered anyway (startDatagramDialer's pre-lock check
-	// raced past openChannel). Run the loop exactly as startDatagramDialer
-	// would.
-	e.mu.Lock()
-	stop := make(chan struct{})
-	e.dialers[peer] = stop
-	e.mu.Unlock()
-	go e.datagramDialerLoop(peer, stop)
-
-	waitFor(t, 3*time.Second, func() bool {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		return len(e.dialers) == 0
-	})
-
-	// The channel later ends: the target side must be able to re-arm.
-	ch.release()
-	e.startDatagramDialer(peer)
-	e.mu.Lock()
-	n := len(e.dialers)
-	e.mu.Unlock()
-	if n != 1 {
-		t.Fatalf("dialer did not re-arm after the channel went away: %d entries", n)
-	}
-	e.stopDatagramDialer(peer)
-}
-
-// TestStopDatagramDialerOwnedIgnoresSuccessor: a loop's owned cleanup must only
-// drop its own entry. A successor registered under the same peer (re-armed
-// after a re-announce, while the stale loop is still exiting) must survive, or
-// the new opener would be deleted and closed silently.
-func TestStopDatagramDialerOwnedIgnoresSuccessor(t *testing.T) {
-	e := newTestEngine(t)
-	_, peer, _ := derpclient.Generate()
-
-	mine := make(chan struct{})
-	successor := make(chan struct{})
-	e.mu.Lock()
-	e.dialers[peer] = successor // the successor owns the slot
-	e.mu.Unlock()
-
-	e.stopDatagramDialerOwned(peer, mine) // the stale loop exiting
-
-	e.mu.Lock()
-	got := e.dialers[peer]
-	e.mu.Unlock()
-	if got != successor {
-		t.Fatal("owned cleanup clobbered the successor's dialer entry")
-	}
 	select {
-	case <-successor:
-		t.Fatal("owned cleanup closed the successor's stop channel")
+	case <-l.done:
 	default:
+		t.Fatal("close did not end the link")
 	}
-
-	// Owning cleanup does drop its own entry.
-	e.stopDatagramDialerOwned(peer, successor)
-	e.mu.Lock()
-	n := len(e.dialers)
-	e.mu.Unlock()
-	if n != 0 {
-		t.Fatalf("owned cleanup left %d entries, want 0", n)
+	// The local edge is closed with the link: a write fails.
+	local.SetWriteDeadline(time.Now().Add(time.Second))
+	if _, err := local.Write([]byte("x")); err == nil {
+		t.Fatal("the local edge survived the link")
 	}
-}
-
-// TestMaxDatagramDialersCap: the opener count is bounded so a flood of
-// announcing peers cannot exhaust fds/goroutines. At the cap startDatagramDialer
-// must refuse; once a slot frees it must register exactly one entry. Map-level
-// setup: no 256 goroutines are spun up.
-func TestMaxDatagramDialersCap(t *testing.T) {
-	e := newTestEngine(t)
-	_, newPeer, _ := derpclient.Generate()
-
-	// Pre-fill to the cap with distinct dummy keys, each with its own stop.
-	e.mu.Lock()
-	dummies := make([]derpclient.PublicKey, 0, maxDatagramDialers)
-	for i := 0; i < maxDatagramDialers; i++ {
-		k := derpclient.PublicKey{byte(i), byte(i >> 8)}
-		e.dialers[k] = make(chan struct{})
-		dummies = append(dummies, k)
-	}
-	e.mu.Unlock()
-
-	// At the cap: refused, count unchanged.
-	e.startDatagramDialer(newPeer)
-	e.mu.Lock()
-	_, present := e.dialers[newPeer]
-	n := len(e.dialers)
-	e.mu.Unlock()
-	if present {
-		t.Fatal("startDatagramDialer registered past the cap")
-	}
-	if n != maxDatagramDialers {
-		t.Fatalf("dialer count = %d, want %d (cap unchanged)", n, maxDatagramDialers)
-	}
-
-	// Free one slot: the next start registers exactly one entry.
-	e.mu.Lock()
-	delete(e.dialers, dummies[0])
-	e.mu.Unlock()
-	e.startDatagramDialer(newPeer)
-	e.mu.Lock()
-	_, present = e.dialers[newPeer]
-	n = len(e.dialers)
-	e.mu.Unlock()
-	if !present {
-		t.Fatal("startDatagramDialer did not register after a slot freed")
-	}
-	if n != maxDatagramDialers {
-		t.Fatalf("dialer count = %d, want %d after re-register", n, maxDatagramDialers)
-	}
-
-	// Stop the real loop we started and clear the dummies.
-	e.stopDatagramDialer(newPeer)
-	e.mu.Lock()
-	for _, k := range dummies[1:] {
-		delete(e.dialers, k)
-	}
-	e.mu.Unlock()
 }

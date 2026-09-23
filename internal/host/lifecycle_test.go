@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -146,13 +147,8 @@ func TestUDPTunnelEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create both channels up front (the dials below reuse them), so the
-	// opener's very first peer-edge attempt finds the responder's channel.
-	chA := engineA.openChannel(pubB)
-	defer chA.release()
-	chB := engineB.openChannel(pubA)
-	defer chB.release()
-
+	// Both sides dial, so the pair is a rendezvous: the larger key adopts the
+	// smaller's presentation (see waitRendezvous).
 	hA := &Host{cfg: &p2p.Config{}, log: slog.Default(), engine: engineA, server: newServer(engineA)}
 	hB := &Host{cfg: &p2p.Config{}, log: slog.Default(), engine: engineB, server: newServer(engineB)}
 	defer hA.Close()
@@ -172,10 +168,13 @@ func TestUDPTunnelEndToEnd(t *testing.T) {
 	}
 	defer connB.Close()
 
-	// Both channels must have their peer edge up before data flows: bytes are
-	// dropped while the opposite edge is down.
-	waitStream(t, engineA.channel(pubB))
-	waitStream(t, engineB.channel(pubA))
+	// Both sides dial, so the pair is a rendezvous: wait for the larger key to
+	// adopt the smaller's presentation (one shared edge) before asserting.
+	if bytes.Compare(pubA[:], pubB[:]) < 0 {
+		waitRendezvous(t, engineLink(t, engineB, pubA))
+	} else {
+		waitRendezvous(t, engineLink(t, engineA, pubB))
+	}
 
 	connA.SetDeadline(time.Now().Add(5 * time.Second))
 	connB.SetDeadline(time.Now().Add(5 * time.Second))
@@ -200,7 +199,194 @@ func TestUDPTunnelEndToEnd(t *testing.T) {
 		t.Fatalf("B->A = %q, want back", buf2)
 	}
 
-	// Closing one side tears its record (and channel reference) down.
+	// Closing one side tears its record (and link) down.
 	connA.Close()
 	waitTunnelCount(t, hA, 0)
+}
+
+// startUDPEcho returns a udp echo server plus its "udp://" target spec: every
+// datagram is sent back to its sender, so a test can tell which stream a reply
+// arrived on.
+func startUDPEcho(t *testing.T) string {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	go func() {
+		buf := make([]byte, maxFrame)
+		for {
+			n, addr, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if _, err := conn.WriteToUDP(buf[:n], addr); err != nil {
+				return
+			}
+		}
+	}()
+	return "udp://" + conn.LocalAddr().String()
+}
+
+// readDatagram reads one datagram (the frameConn's Read returns exactly one).
+func readDatagram(t *testing.T, c net.Conn) string {
+	t.Helper()
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, maxFrame)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("read datagram: %v", err)
+	}
+	return string(buf[:n])
+}
+
+// TestUDPTwoDialsIsolated is the R3 regression: one host dials the same peer
+// twice (concurrent clients) and each dial's reply comes back on its own dial.
+// The old per-peer channel replaced its local edge on the second dial, so the
+// first client starved and the second received the first one's replies.
+func TestUDPTwoDialsIsolated(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, startUDPEcho(t), privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+	if err := engineA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	hA := &Host{cfg: &p2p.Config{}, log: slog.Default(), engine: engineA, server: newServer(engineA)}
+	defer hA.Close()
+	keyB := base64.RawURLEncoding.EncodeToString(pubB[:])
+
+	c1, err := hA.Dial(context.Background(), "udp", keyB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c2, err := hA.Dial(context.Background(), "udp", keyB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	// Both clients write before either edge is up (the first datagram is
+	// buffered) and each must read back its own echo.
+	for i, c := range []net.Conn{c1, c2} {
+		payload := []string{"one", "two"}[i]
+		if _, err := c.Write([]byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := readDatagram(t, c1); got != "one" {
+		t.Fatalf("dial 1 read %q, want one (cross-talk between dials)", got)
+	}
+	if got := readDatagram(t, c2); got != "two" {
+		t.Fatalf("dial 2 read %q, want two (cross-talk between dials)", got)
+	}
+
+	// A second round proves both links stay independent, not just the first
+	// datagram's buffering.
+	if _, err := c1.Write([]byte("three")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c2.Write([]byte("four")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readDatagram(t, c1); got != "three" {
+		t.Fatalf("dial 1 read %q, want three", got)
+	}
+	if got := readDatagram(t, c2); got != "four" {
+		t.Fatalf("dial 2 read %q, want four", got)
+	}
+}
+
+// TestListenDeliversDatagramConn: a udp tunnel stream handed to the embedder is
+// a datagram conn — net.PacketConn, frames parsed — stamped with the peer's
+// key. That is the shape a consumer (x's local handler) tells udp by, and the
+// contract wisper's reverse side builds on.
+func TestListenDeliversDatagramConn(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+
+	privA, pubA, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, "", privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+	if err := engineA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	hA := &Host{cfg: &p2p.Config{}, log: slog.Default(), engine: engineA, server: newServer(engineA)}
+	hB := &Host{cfg: &p2p.Config{}, log: slog.Default(), engine: engineB, server: newServer(engineB)}
+	defer hA.Close()
+	defer hB.Close()
+
+	ln, err := hB.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	keyB := base64.RawURLEncoding.EncodeToString(pubB[:])
+	connA, err := hA.Dial(context.Background(), "udp", keyB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connA.Close()
+
+	type accepted struct {
+		conn net.Conn
+		err  error
+	}
+	acc := make(chan accepted, 1)
+	go func() {
+		c, err := ln.Accept()
+		acc <- accepted{c, err}
+	}()
+
+	var c net.Conn
+	select {
+	case a := <-acc:
+		if a.err != nil {
+			t.Fatal(a.err)
+		}
+		c = a.conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("the udp tunnel was not delivered to the listener")
+	}
+	defer c.Close()
+
+	if _, ok := c.(net.PacketConn); !ok {
+		t.Fatal("a udp tunnel stream must be delivered as a datagram conn (net.PacketConn)")
+	}
+	keyA := base64.RawURLEncoding.EncodeToString(pubA[:])
+	if got := c.RemoteAddr().String(); got != keyA {
+		t.Fatalf("remote addr = %q, want the peer key %q", got, keyA)
+	}
+
+	if _, err := connA.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readDatagram(t, c); got != "ping" {
+		t.Fatalf("listener read %q, want ping", got)
+	}
+	if _, err := c.Write([]byte("pong")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readDatagram(t, connA); got != "pong" {
+		t.Fatalf("dialer read %q, want pong", got)
+	}
 }

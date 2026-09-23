@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
 )
@@ -21,105 +22,87 @@ func startHubStub(t *testing.T) (*net.UDPConn, string) {
 	return conn, "udp://" + conn.LocalAddr().String()
 }
 
-// TestDatagramDialNoticeOpensWhenOpener: the dial notice makes a udp-target
-// holder open a datagram stream to the notifier, but only when it owns the
-// smaller key (the key-order opener). No allowlist is consulted.
-func TestDatagramDialNoticeOpensWhenOpener(t *testing.T) {
-	rs := &relayServer{}
-	url := rs.start(t)
-
-	var privH, privS derpclient.PrivateKey
-	var pubH, pubS derpclient.PublicKey
-	for { // hub owns the smaller key, so the hub is the opener
-		privH, pubH, _ = derpclient.Generate()
-		privS, pubS, _ = derpclient.Generate()
-		if bytes.Compare(pubH[:], pubS[:]) < 0 {
-			break
+// TestSpokeReachesTargetOutlet: a spoke's udp dial reaches a peer holding a udp
+// target, whatever the key order — the dialing side presents its own edge, so
+// no notice and no key-order opener is involved. This is the shape a wisper
+// entrypoint uses against a host with --target.
+func TestSpokeReachesTargetOutlet(t *testing.T) {
+	for _, spokeSmaller := range []bool{true, false} {
+		name := "spoke-larger"
+		if spokeSmaller {
+			name = "spoke-smaller"
 		}
-	}
+		t.Run(name, func(t *testing.T) {
+			rs := &relayServer{}
+			url := rs.start(t)
 
-	hub := newEngine(url, "", privH, slog.Default())
-	spoke := newEngine(url, "", privS, slog.Default())
-	defer hub.Close()
-	defer spoke.Close()
-	if err := hub.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	if err := spoke.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	stub, spec := startHubStub(t)
-	if err := hub.addTargets([]string{spec}); err != nil {
-		t.Fatal(err)
-	}
+			var privH, privS derpclient.PrivateKey
+			var pubH, pubS derpclient.PublicKey
+			for {
+				privH, pubH, _ = derpclient.Generate()
+				privS, pubS, _ = derpclient.Generate()
+				if (bytes.Compare(pubS[:], pubH[:]) < 0) == spokeSmaller {
+					break
+				}
+			}
 
-	chS := spoke.openChannel(pubH)
-	defer chS.release()
-	spokeLocal := attachLocal(t, chS) // the GOST-side edge (test's end of the pipe)
+			hub := newEngine(url, "", privH, slog.Default())
+			spoke := newEngine(url, "", privS, slog.Default())
+			defer hub.Close()
+			defer spoke.Close()
+			if err := hub.Connect(); err != nil {
+				t.Fatal(err)
+			}
+			if err := spoke.Connect(); err != nil {
+				t.Fatal(err)
+			}
+			stub, spec := startHubStub(t)
+			if err := hub.addTargets([]string{spec}); err != nil {
+				t.Fatal(err)
+			}
 
-	if err := spoke.sendDialUDP(pubH); err != nil {
-		t.Fatal(err)
-	}
-	waitStream(t, chS) // the hub opened the peer edge
+			l := newLink(spoke, pubH)
+			spoke.addLink(l)
+			defer func() {
+				spoke.removeLink(l)
+				l.close()
+			}()
+			local := attachLocal(t, l)
 
-	go spokeLocal.Write(appendFrame(nil, []byte("hello")))
-	got, err := recvDatagram(t, stub)
-	if err != nil || string(got) != "hello" {
-		t.Fatalf("target got %q, %v; want hello", got, err)
+			go local.Write(appendFrame(nil, []byte("hello")))
+			got, err := recvDatagram(t, stub)
+			if err != nil || string(got) != "hello" {
+				t.Fatalf("target got %q, %v; want hello", got, err)
+			}
+		})
 	}
 }
 
-// TestDatagramDialNoticeIgnoredWhenResponder: with the target holder owning the
-// larger key it is the responder, so the notice must not make it open; the
-// notifier (the opener) opens and the holder serves it per stream.
-func TestDatagramDialNoticeIgnoredWhenResponder(t *testing.T) {
-	rs := &relayServer{}
-	url := rs.start(t)
-
-	var privH, privS derpclient.PrivateKey
-	var pubH, pubS derpclient.PublicKey
-	for { // spoke owns the smaller key, so the spoke is the opener
-		privH, pubH, _ = derpclient.Generate()
-		privS, pubS, _ = derpclient.Generate()
-		if bytes.Compare(pubS[:], pubH[:]) < 0 {
-			break
-		}
+// engineLink returns e's first link to peer; the tests that use it dial once.
+func engineLink(t *testing.T, e *engine, peer derpclient.PublicKey) *link {
+	t.Helper()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ls := e.links[peer]
+	if len(ls) == 0 {
+		t.Fatalf("engine has no link to %s", keyName(peer))
 	}
-
-	hub := newEngine(url, "", privH, slog.Default())
-	spoke := newEngine(url, "", privS, slog.Default())
-	defer hub.Close()
-	defer spoke.Close()
-	if err := hub.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	if err := spoke.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	stub, spec := startHubStub(t)
-	if err := hub.addTargets([]string{spec}); err != nil {
-		t.Fatal(err)
-	}
-
-	chS := spoke.openChannel(pubH) // the spoke is the opener: its loop opens
-	defer chS.release()
-	local := attachLocal(t, chS)
-	if err := spoke.sendDialUDP(pubH); err != nil {
-		t.Fatal(err)
-	}
-	waitStream(t, chS)
-
-	go local.Write(appendFrame(nil, []byte("hello")))
-	if got, err := recvDatagram(t, stub); err != nil || string(got) != "hello" {
-		t.Fatalf("target got %q, %v; want hello", got, err)
-	}
+	return ls[0]
 }
 
-// tunToTunRoundTrip models tun-to-tun: both sides hold a GOST udp dial (a
-// channel with a local edge) and neither holds a udp --target. The opener's
-// ch.loop stream must be served by the responder through the channel branch --
-// the absent --target must NOT refuse it -- and the gost edges must pass bytes
-// both ways. smallerA forces which public key wins, so both key orders run.
+// waitRendezvous waits until the larger key has adopted the smaller key's
+// presentation, so both links ride one shared edge. Until it settles, a datagram
+// written on the larger side may ride its own provisional edge — which the
+// smaller side discards — exactly like the old model's build window.
+func waitRendezvous(t *testing.T, larger *link) {
+	t.Helper()
+	waitFor(t, 10*time.Second, func() bool { return !larger.adoptable() })
+}
+
+// tunToTunRoundTrip models tun-to-tun: both sides hold a GOST udp dial (a link
+// with a local edge) and neither holds a udp --target. The larger key adopts the
+// smaller's presentation — one shared edge — and the gost edges pass bytes both
+// ways. smallerA forces which public key wins, so both key orders run.
 func tunToTunRoundTrip(t *testing.T, smallerA bool) {
 	t.Helper()
 	rs := &relayServer{}
@@ -146,18 +129,26 @@ func tunToTunRoundTrip(t *testing.T, smallerA bool) {
 		t.Fatal(err)
 	}
 
-	chA := engineA.openChannel(pubB)
-	defer chA.release()
-	chB := engineB.openChannel(pubA)
-	defer chB.release()
-	localA := attachLocal(t, chA)
-	localB := attachLocal(t, chB)
+	la := newLink(engineA, pubB)
+	engineA.addLink(la)
+	defer func() {
+		engineA.removeLink(la)
+		la.close()
+	}()
+	lb := newLink(engineB, pubA)
+	engineB.addLink(lb)
+	defer func() {
+		engineB.removeLink(lb)
+		lb.close()
+	}()
+	localA := attachLocal(t, la)
+	localB := attachLocal(t, lb)
 
-	// Only the smaller key's loop opens; the larger side serves it. If the
-	// responder refused tagged streams when it has no udp target, the stream
-	// would never come up and this would time out.
-	waitStream(t, chA)
-	waitStream(t, chB)
+	larger := lb
+	if !smallerA {
+		larger = la
+	}
+	waitRendezvous(t, larger)
 
 	go localA.Write([]byte("one"))
 	if got := string(readN(t, localB, 3)); got != "one" {
@@ -170,8 +161,8 @@ func tunToTunRoundTrip(t *testing.T, smallerA bool) {
 }
 
 // TestTunToTunBothKeyOrders: tun-to-tun with no udp target on either side must
-// still work through the channel branch, for both public-key orders (running
-// only one order would miss a broken "channel present -> no dialer" guard).
+// still work through the rendezvous (the larger key adopts the smaller's
+// presentation), for both public-key orders.
 func TestTunToTunBothKeyOrders(t *testing.T) {
 	t.Run("a-opener", func(t *testing.T) { tunToTunRoundTrip(t, true) })
 	t.Run("b-opener", func(t *testing.T) { tunToTunRoundTrip(t, false) })

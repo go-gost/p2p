@@ -7,7 +7,7 @@ import (
 )
 
 // dgramEdge adapts a UDP socket already dialed to the tun server into the
-// byte-stream shape the datagram channel pumps: frame bytes from the peer edge
+// byte-stream shape a datagram link pumps: frame bytes from the peer edge
 // are parsed and each frame's payload sent as one datagram; each datagram read
 // from the socket is emitted as one 2-byte-prefixed frame. It is the local edge
 // of a udp target outlet: the socket dialed to the tun server, paired with the

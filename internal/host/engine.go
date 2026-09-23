@@ -34,13 +34,14 @@ import (
 // regardless of who dials first. smux allows either side to open streams.
 type engine struct {
 	url         string
-	targets     *targetPool    // inbound bridge targets; an empty tcp pool refuses inbound tunnels
-	direct      bool           // master direct switch (--direct); false = relay-only
-	stunAddr    string         // STUN server (host:port); "" disables the IPv4 direct path
-	v6Addr      *net.UDPAddr   // explicit IPv6 egress override (tests); nil = probe each round
-	v6Available bool           // host had a global IPv6 egress at startup (gates direct)
-	v6Announce  v6AnnounceFunc // test seam: overrides the advertised IPv6 endpoint
-	tlsCfg      *tls.Config    // relay TLS options; nil = default verification
+	targets     *targetPool                            // inbound bridge targets; an empty tcp pool refuses inbound tunnels
+	direct      bool                                   // master direct switch (--direct); false = relay-only
+	stunAddr    string                                 // STUN server (host:port); "" disables the IPv4 direct path
+	v6Addr      *net.UDPAddr                           // explicit IPv6 egress override (tests); nil = probe each round
+	v6Available bool                                   // host had a global IPv6 egress at startup (gates direct)
+	v6Announce  v6AnnounceFunc                         // test seam: overrides the advertised IPv6 endpoint
+	openStream  func(peerB64 string) (net.Conn, error) // test seam: overrides OpenStream for link presentation
+	tlsCfg      *tls.Config                            // relay TLS options; nil = default verification
 	priv        derpclient.PrivateKey
 	pub         derpclient.PublicKey
 	log         *slog.Logger
@@ -56,9 +57,8 @@ type engine struct {
 	dialErr error // the last dial failure, surfaced by Connect
 	peers   map[derpclient.PublicKey]*peerConn
 	directs map[derpclient.PublicKey]*directConn
-	chans   map[derpclient.PublicKey]*channel
-	dialers map[derpclient.PublicKey]chan struct{} // pure target side: per-peer datagram opener loops
-	gone    map[derpclient.PublicKey]bool          // peers reported gone (DERP connection dropped)
+	links   map[derpclient.PublicKey][]*link // per-peer datagram links (one per udp dial)
+	gone    map[derpclient.PublicKey]bool    // peers reported gone (DERP connection dropped)
 	stop    chan struct{}
 
 	stats engineStats
@@ -182,8 +182,7 @@ func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger)
 		pub:     priv.Public(),
 		peers:   make(map[derpclient.PublicKey]*peerConn),
 		directs: make(map[derpclient.PublicKey]*directConn),
-		chans:   make(map[derpclient.PublicKey]*channel),
-		dialers: make(map[derpclient.PublicKey]chan struct{}),
+		links:   make(map[derpclient.PublicKey][]*link),
 		gone:    make(map[derpclient.PublicKey]bool),
 		log:     log,
 		stop:    make(chan struct{}),
@@ -496,19 +495,6 @@ func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
 			return
 		}
 		e.directConn(src).onCandidates(cands)
-	case ctrlDialUDP:
-		if _, ok := e.priv.OpenFrom(src, body[1:]); !ok {
-			e.log.Debug("udp dial notice: bad box", "peer", keyName(src))
-			return
-		}
-		// Only the pure target side runs an opener loop: it has no channel, so
-		// without this notice (and only in the half of the key orders where it
-		// owns the smaller key) nothing would ever open. The channel side has
-		// its own ch.loop; starting a second opener here would fight it over
-		// setStream (last-wins) and livelock.
-		if e.targets.has("udp") && e.channel(src) == nil && bytes.Compare(e.pub[:], src[:]) < 0 {
-			e.startDatagramDialer(src)
-		}
 	case ctrlCaps:
 		clear, ok := e.priv.OpenFrom(src, body[1:])
 		if !ok || len(clear) < 1 {
@@ -548,7 +534,6 @@ func (e *engine) peerGone(peer derpclient.PublicKey) {
 	if dc != nil {
 		dc.teardown()
 	}
-	e.stopDatagramDialer(peer)
 	e.log.Debug("derp peer gone", "peer", keyName(peer))
 }
 
@@ -605,16 +590,11 @@ func (e *engine) Close() {
 		directs = append(directs, dc)
 	}
 	e.directs = make(map[derpclient.PublicKey]*directConn)
-	chans := make([]*channel, 0, len(e.chans))
-	for _, ch := range e.chans {
-		chans = append(chans, ch)
+	links := make([]*link, 0, len(e.links))
+	for _, ls := range e.links {
+		links = append(links, ls...)
 	}
-	e.chans = make(map[derpclient.PublicKey]*channel)
-	dialers := make([]chan struct{}, 0, len(e.dialers))
-	for _, stop := range e.dialers {
-		dialers = append(dialers, stop)
-	}
-	e.dialers = make(map[derpclient.PublicKey]chan struct{})
+	e.links = make(map[derpclient.PublicKey][]*link)
 	e.mu.Unlock()
 	for _, pc := range peers {
 		pc.kill(errors.New("engine closed"))
@@ -622,11 +602,8 @@ func (e *engine) Close() {
 	for _, dc := range directs {
 		dc.teardown()
 	}
-	for _, ch := range chans {
-		ch.teardown()
-	}
-	for _, stop := range dialers {
-		close(stop)
+	for _, l := range links {
+		l.close()
 	}
 	if c != nil {
 		c.Close()

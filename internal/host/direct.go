@@ -37,8 +37,9 @@ const (
 	frameData    = 0x01 // [0x01][smux byte stream]
 
 	ctrlPunchCandidates = 0x02 // sealed candidate list
-	ctrlDialUDP         = 0x03 // sealed udp-tunnel dial notice
 	ctrlCaps            = 0x04 // sealed capability bitfield (forward-looking seam)
+	// 0x03 was the udp dial notice: a datagram link now always presents its own
+	// edge, so no notice is sent and none is acted on. The kind stays unused.
 )
 
 // Capability bits exchanged via ctrlCaps. Bit 0 marks IPv6 awareness. The frame
@@ -770,13 +771,6 @@ func (e *engine) sendCaps(peer derpclient.PublicKey, caps uint8) error {
 	return e.sendControl(peer, ctrlCaps, e.priv.SealTo(peer, []byte{caps}))
 }
 
-// sendDialUDP tells peer that this host has dialled a udp tunnel toward it, so
-// a peer holding a udp target knows a datagram channel is wanted. Sealed so a
-// malicious relay cannot forge the notice on a peer's behalf.
-func (e *engine) sendDialUDP(peer derpclient.PublicKey) error {
-	return e.sendControl(peer, ctrlDialUDP, e.priv.SealTo(peer, nil))
-}
-
 // sendControl sends a control frame ([frameControl][kind][payload]) to peer.
 func (e *engine) sendControl(peer derpclient.PublicKey, kind byte, payload []byte) error {
 	e.mu.Lock()
@@ -884,21 +878,29 @@ func (e *engine) acceptLoop(sess *smux.Session, transport string, peer derpclien
 // tunnel stream bridged to --target.
 func (e *engine) serveInbound(stream net.Conn, transport string, peer derpclient.PublicKey, peerAddr string) {
 	if tagged, c := peekTag(stream); tagged {
-		// Two kinds of datagram end, resolved here:
-		//   - the channel side (this host has a local gost udp tunnel for peer):
-		//     the peer edge pairs with that gost stream -- the generic path, used
-		//     by tun-to-tun and wherever this host holds a local udp dial;
-		//   - the target side (no local gost udp tunnel): serve straight from the
-		//     udp target pool for the stream's lifetime, zero per-peer state.
-		//     Whether this peer may use the target is the caller's business
-		//     (tun auther / firewall), not the transport's.
-		if ch := e.channel(peer); ch != nil {
-			ch.serveStream(c, transport)
+		// Three kinds of datagram end, resolved here:
+		//   - the rendezvous (this host holds a local udp dial for peer and owns
+		//     the larger key): the peer's edge pairs with that link, so the pair
+		//     rides one shared edge -- the tun-to-tun shape. A link that already
+		//     holds an adopted edge is not adoptable, so a second concurrent dial
+		//     is served per stream instead of stealing the first one's edge;
+		//   - the embedder (Listen mode): delivered as a datagram conn, the
+		//     embedder's service owns it;
+		//   - the target outlet (no local dial, no listener): served straight
+		//     from the udp target pool for the stream's lifetime, zero per-peer
+		//     state. Whether this peer may use the target is the caller's
+		//     business (tun auther / firewall), not the transport's.
+		if lnk := e.adoptableLink(peer); lnk != nil && lnk.adopt(c, transport) {
+			return
+		}
+		if q := e.inbound.Load(); q != nil {
+			q.deliverDatagram(c, keyName(peer), transport, peerAddr, e.log)
 			return
 		}
 		target, ok := e.targets.pick("udp")
 		if !ok {
-			e.log.Debug("datagram stream refused (no udp target)", "transport", transport, "peer", keyName(peer))
+			e.log.Debug("datagram stream refused (no link, no listener, no udp target)",
+				"transport", transport, "peer", keyName(peer))
 			c.Close()
 			return
 		}
