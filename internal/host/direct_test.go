@@ -690,6 +690,7 @@ func TestPunchAndWaitDoesNotStallWhenPunchCannotStart(t *testing.T) {
 	// An idle connection still owns the wait: that is the case the wait is for.
 	dc.mu.Lock()
 	dc.state = directNone
+	dc.failed = false
 	dc.mu.Unlock()
 	if sess := engineA.punchAndWait(pubB); sess != nil {
 		t.Fatal("punchAndWait returned a session for an unreachable peer")
@@ -699,6 +700,20 @@ func TestPunchAndWaitDoesNotStallWhenPunchCannotStart(t *testing.T) {
 	dc.mu.Unlock()
 	if state == directNone {
 		t.Fatal("punchAndWait did not start a punch from directNone")
+	}
+
+	// A peer whose punch already failed does not make a later caller wait:
+	// the round is started again for the background, and the caller goes on.
+	dc.mu.Lock()
+	dc.state = directNone
+	dc.failed = true
+	dc.mu.Unlock()
+	start := time.Now()
+	if sess := engineA.punchAndWait(pubB); sess != nil {
+		t.Fatal("punchAndWait returned a session after a failed round")
+	}
+	if d := time.Since(start); d > punchWaitTimeout/4 {
+		t.Fatalf("punchAndWait waited %v after a failed round; want an immediate nil", d)
 	}
 }
 

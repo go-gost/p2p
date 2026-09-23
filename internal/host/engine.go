@@ -130,14 +130,23 @@ func (e *engine) peerTransports() map[string]string {
 		switch {
 		case dc.live():
 			out[name] = transportDirect
+		case reason != "":
+			// A host-wide cause outranks this peer's own round: when STUN does
+			// not answer, "this peer's punch failed" is the symptom, and the
+			// reason is what a user would fix.
+			out[name] = reason
+		case dc.hasFailed():
+			// A round failed for this peer. Reported even while a retry is in
+			// flight: re-announcements restart rounds often enough that the
+			// live state alone would show "punching" forever, which is exactly
+			// the state a user cannot act on.
+			out[name] = transportFailed
 		case dc.stateOf() == directAttempting:
 			out[name] = transportPunching
-		case dc.stateOf() == directBackoff:
-			out[name] = transportFailed
 		default:
-			// Nothing in flight for this peer: the host-wide reason (if any)
-			// is the whole story, and it is already the fallback.
-			out[name] = fallback
+			// Nothing in flight for this peer and nothing wrong with the host:
+			// a punch has simply not been needed yet.
+			out[name] = transportRelay
 		}
 	}
 	return out

@@ -108,6 +108,7 @@ type directConn struct {
 
 	mu       sync.Mutex
 	state    directState
+	failed   bool           // a punch round has failed at least once (sticky)
 	sess     *smux.Session  // direct smux session when up
 	socket   *net.UDPConn   // punch socket; kcp closes it with the session (ownConn=true)
 	peerAddr netip.AddrPort // peer's dialed endpoint (public cross-NAT, local same-NAT)
@@ -167,7 +168,9 @@ func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 // is unaffected by blocking here, and one that failed and is backing off cannot
 // come up within the wait at all — so waiting would charge every stream the
 // full timeout on a peer that cannot punch (symmetric NAT, STUN blocked),
-// turning a relay-only path into a per-connection stall.
+// turning a relay-only path into a per-connection stall. For the same reason
+// the wait ends as soon as the round it started has failed, rather than
+// running out the clock on a session that is no longer coming.
 func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 	if !e.directEnabled() {
 		return nil
@@ -180,6 +183,9 @@ func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 	for time.Now().Before(deadline) {
 		if sess := dc.session(); sess != nil {
 			return sess
+		}
+		if dc.hasFailed() {
+			return nil // a round already failed for this peer: the relay is the answer
 		}
 		select {
 		case <-e.stop:
@@ -233,6 +239,17 @@ func (dc *directConn) stateOf() directState {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	return dc.state
+}
+
+// hasFailed reports whether any punch round for this peer has failed. It
+// outlives the round: a retry in flight after a failure is still a peer whose
+// direct path does not work, and reporting "punching" for it would hide that
+// (the peer's own re-announcements restart rounds often enough that the state
+// alone is no guide).
+func (dc *directConn) hasFailed() bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.failed
 }
 
 // live reports whether a usable direct session exists, without side effects.
@@ -379,6 +396,7 @@ func (dc *directConn) peerAddrString() string {
 func (dc *directConn) backoff() {
 	dc.mu.Lock()
 	dc.state = directBackoff
+	dc.failed = true
 	dc.mu.Unlock()
 	dc.e.log.Debug("direct punch: backoff", "peer", keyName(dc.peer), "retryIn", backoffPeriod.String())
 	go func() {

@@ -139,7 +139,10 @@ func TestPeerTransportReasons(t *testing.T) {
 			e.directs[peer] = &directConn{e: e, peer: peer, state: directAttempting}
 		}, transportPunching},
 		{"punch failed", func(e *engine) {
-			e.directs[peer] = &directConn{e: e, peer: peer, state: directBackoff}
+			e.directs[peer] = &directConn{e: e, peer: peer, state: directBackoff, failed: true}
+		}, transportFailed},
+		{"failed, retry in flight", func(e *engine) {
+			e.directs[peer] = &directConn{e: e, peer: peer, state: directAttempting, failed: true}
 		}, transportFailed},
 		{"direct switched off", func(e *engine) {
 			e.direct = false
@@ -169,6 +172,16 @@ func TestPeerTransportReasons(t *testing.T) {
 	e.directs[peer] = &directConn{e: e, peer: peer, sess: newTestSess(t), state: directUp}
 	if got := e.peerTransports()[keyName(peer)]; got != transportDirect {
 		t.Errorf("live session: transport = %q, want direct", got)
+	}
+
+	// A host-wide cause outranks a peer's own failed round: with STUN silent
+	// and no IPv6, that is the thing to fix, not the symptom.
+	e = newEngine()
+	e.peers[peer] = &peerConn{}
+	e.stunFailed.Store(true)
+	e.directs[peer] = &directConn{e: e, peer: peer, state: directBackoff, failed: true}
+	if got := e.peerTransports()[keyName(peer)]; got != transportStunUnreachable {
+		t.Errorf("stun silent + failed round: transport = %q, want %q", got, transportStunUnreachable)
 	}
 }
 
