@@ -79,6 +79,20 @@ const (
 	directBackoff
 )
 
+// The values p2p.Status.PeerTransports reports, one per peer: a peer is
+// connected through the relay, and these say whether it rides a hole-punched
+// session instead — and, when it does not, why not. Keep the set and the doc
+// on that field in sync.
+const (
+	transportDirect          = "direct"           // live hole-punched session
+	transportPunching        = "punching"         // a punch for this peer is in flight
+	transportFailed          = "failed"           // this peer's punch failed (usually a symmetric NAT)
+	transportRelay           = "derp"             // on the relay, nothing in the way of a punch
+	transportDisabled        = "disabled"         // the direct path is off (Config.Direct)
+	transportNoCandidates    = "no-candidates"    // no STUN server and no IPv6 egress: nothing to punch with
+	transportStunUnreachable = "stun-unreachable" // STUN configured but not answering, and no IPv6 fallback
+)
+
 // candidate is a single UDP endpoint offered by a peer.
 type candidate struct {
 	addr netip.AddrPort
@@ -212,6 +226,13 @@ func (dc *directConn) session() *smux.Session {
 	}
 	go dc.start() // schedule re-punch
 	return nil
+}
+
+// stateOf reports the punch state machine's current state, a plain read.
+func (dc *directConn) stateOf() directState {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.state
 }
 
 // live reports whether a usable direct session exists, without side effects.
@@ -410,8 +431,13 @@ func (dc *directConn) punch() {
 	var fams []family
 	if e.stunAddr != "" {
 		if sock, mine, err := e.collectV4(); err != nil {
+			// Remember it for Status: a STUN server that does not answer is the
+			// usual reason a peer is stuck on the relay, and it is not visible
+			// per peer.
+			e.stunFailed.Store(true)
 			e.log.Debug("direct punch: v4 unavailable", "peer", pname, "error", err)
 		} else {
+			e.stunFailed.Store(false)
 			fams = append(fams, family{name: "v4", sock: sock, mine: mine})
 		}
 	}

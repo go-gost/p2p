@@ -65,8 +65,10 @@ func TestDirectLiveNoSideEffect(t *testing.T) {
 // on the relay alone count as derp.
 func TestTransportCounts(t *testing.T) {
 	e := &engine{
-		directs: make(map[derpclient.PublicKey]*directConn),
-		peers:   make(map[derpclient.PublicKey]*peerConn),
+		direct:   true,
+		stunAddr: "127.0.0.1:3478",
+		directs:  make(map[derpclient.PublicKey]*directConn),
+		peers:    make(map[derpclient.PublicKey]*peerConn),
 	}
 
 	peerDirect := derpclient.PublicKey{1}
@@ -110,6 +112,63 @@ func TestTransportCounts(t *testing.T) {
 	}
 	if got := e.peerTransports()[keyName(peerDirect)]; got != "derp" {
 		t.Errorf("after session death: peer transport = %q, want derp", got)
+	}
+}
+
+// TestPeerTransportReasons: a relayed peer reports the most specific reason
+// available — its own punch state first, then the host-wide one — which is what
+// a caller turns into an icon and a tooltip. Being able to tell "STUN does not
+// answer" from "punching cannot work here at all" is the point.
+func TestPeerTransportReasons(t *testing.T) {
+	newEngine := func() *engine {
+		return &engine{
+			direct:   true,
+			stunAddr: "127.0.0.1:3478",
+			directs:  make(map[derpclient.PublicKey]*directConn),
+			peers:    make(map[derpclient.PublicKey]*peerConn),
+		}
+	}
+	peer := derpclient.PublicKey{3}
+
+	cases := []struct {
+		name string
+		mut  func(e *engine)
+		want string
+	}{
+		{"punch in flight", func(e *engine) {
+			e.directs[peer] = &directConn{e: e, peer: peer, state: directAttempting}
+		}, transportPunching},
+		{"punch failed", func(e *engine) {
+			e.directs[peer] = &directConn{e: e, peer: peer, state: directBackoff}
+		}, transportFailed},
+		{"direct switched off", func(e *engine) {
+			e.direct = false
+			e.directs[peer] = &directConn{e: e, peer: peer}
+		}, transportDisabled},
+		{"no STUN, no IPv6", func(e *engine) { e.stunAddr = "" }, transportNoCandidates},
+		{"STUN silent", func(e *engine) { e.stunFailed.Store(true) }, transportStunUnreachable},
+		{"STUN silent but IPv6 exists", func(e *engine) {
+			e.stunFailed.Store(true)
+			e.v6Available = true
+		}, transportRelay},
+		{"plain relay", func(e *engine) {}, transportRelay},
+	}
+	for _, tc := range cases {
+		e := newEngine()
+		e.peers[peer] = &peerConn{}
+		tc.mut(e)
+		if got := e.peerTransports()[keyName(peer)]; got != tc.want {
+			t.Errorf("%s: transport = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+
+	// A live punch wins over every reason.
+	e := newEngine()
+	e.peers[peer] = &peerConn{}
+	e.stunFailed.Store(true)
+	e.directs[peer] = &directConn{e: e, peer: peer, sess: newTestSess(t), state: directUp}
+	if got := e.peerTransports()[keyName(peer)]; got != transportDirect {
+		t.Errorf("live session: transport = %q, want direct", got)
 	}
 }
 

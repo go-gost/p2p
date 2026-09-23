@@ -12,10 +12,21 @@ type Status struct {
 	StreamsDirect int64 // counter
 	StreamsDerp   int64 // counter
 	// PeerTransports names each connected peer's current path, keyed by base64
-	// public key: "direct" when the peer has a live direct session, "derp"
-	// otherwise. A peer with no session at all is absent. It says where the
-	// next stream would go, which is what a caller showing per-peer state
-	// wants — one of DirectPeers/DerpPeers counts, per key.
+	// public key. A peer with no session at all is absent: every value
+	// describes a peer that is reachable, and says whether it rides a
+	// hole-punched session or, if not, the most specific reason available —
+	// so DirectPeers/DerpPeers are its counts.
+	//
+	// One of:
+	//
+	//	"direct"           a live hole-punched session
+	//	"punching"         a punch for this peer is in flight
+	//	"failed"           this peer's punch failed (usually a symmetric NAT)
+	//	"derp"             on the relay, with nothing in the way of a punch
+	//	"disabled"         the direct path is off (Config.Direct)
+	//	"no-candidates"    no STUN server and no IPv6 egress: nothing to punch with
+	//	"stun-unreachable" STUN is configured but not answering, and there is no
+	//	                   IPv6 egress to fall back on
 	//
 	// The gRPC transport does not carry it: its proto is frozen, so plugin
 	// clients see the counts only.

@@ -52,6 +52,12 @@ type engine struct {
 	// while the pump goroutines run.
 	inbound atomic.Pointer[inboundQueue]
 
+	// stunFailed records whether the last IPv4 candidate collection failed
+	// (an unreachable STUN server, or no socket to ask from). It is only
+	// meaningful when STUN is configured; Status turns it into the
+	// "stun-unreachable" transport reason.
+	stunFailed atomic.Bool
+
 	mu      sync.Mutex
 	client  *derpclient.Client
 	dialErr error // the last dial failure, surfaced by Connect
@@ -88,12 +94,15 @@ func (s *engineStats) countStream(transport string) {
 	s.streamsDerp.Add(1)
 }
 
-// peerTransports names each peer's current path: "direct" when it has a live
-// direct session, "derp" otherwise (the relay adapter is what makes a peer
-// connected at all). It probes each directConn with the side-effect-free live()
-// rather than session(): session() tears down a dead session and schedules a
-// re-punch, which a status query must never do. The engine lock is released
-// before probing, so directConn.mu is never taken while holding it.
+// peerTransports names each peer's current path — the value set documented on
+// p2p.Status.PeerTransports. A peer is connected through the relay (that is
+// what makes it connected); the value says whether it rides a hole-punched
+// session instead, and when it does not, the most specific reason available:
+// this peer's own punch state first, then the host-wide reason (which is the
+// same for every peer). It probes each directConn with the side-effect-free
+// live() rather than session(): session() tears down a dead session and
+// schedules a re-punch, which a status query must never do. The engine lock is
+// released before probing, so directConn.mu is never taken while holding it.
 func (e *engine) peerTransports() map[string]string {
 	e.mu.Lock()
 	directs := make([]*directConn, 0, len(e.directs))
@@ -106,23 +115,58 @@ func (e *engine) peerTransports() map[string]string {
 	}
 	e.mu.Unlock()
 
+	reason := e.directReason()
+	fallback := transportRelay
+	if reason != "" {
+		fallback = reason
+	}
+
 	out := make(map[string]string, len(peers)+len(directs))
 	for _, p := range peers {
-		out[keyName(p)] = "derp"
+		out[keyName(p)] = fallback
 	}
 	for _, dc := range directs {
-		if dc.live() {
-			out[keyName(dc.peer)] = "direct"
+		name := keyName(dc.peer)
+		switch {
+		case dc.live():
+			out[name] = transportDirect
+		case dc.stateOf() == directAttempting:
+			out[name] = transportPunching
+		case dc.stateOf() == directBackoff:
+			out[name] = transportFailed
+		default:
+			// Nothing in flight for this peer: the host-wide reason (if any)
+			// is the whole story, and it is already the fallback.
+			out[name] = fallback
 		}
 	}
 	return out
+}
+
+// directReason names what stands between this host and a direct path when
+// nothing peer-specific does: "" while punching is possible, else "disabled"
+// (the master switch), "no-candidates" (no STUN server and no IPv6 egress) or
+// "stun-unreachable" (STUN configured but its last query failed, with no IPv6
+// to fall back on). Each is a distinct thing for a user to fix.
+func (e *engine) directReason() string {
+	if !e.direct {
+		return transportDisabled
+	}
+	hasV6 := e.v6Addr != nil || e.v6Available
+	switch {
+	case e.stunAddr == "" && !hasV6:
+		return transportNoCandidates
+	case !hasV6 && e.stunFailed.Load():
+		return transportStunUnreachable
+	}
+	return ""
 }
 
 // transportCounts returns how many peers currently ride a direct session and
 // how many are on the relay only.
 func (e *engine) transportCounts() (direct, derp int) {
 	for _, transport := range e.peerTransports() {
-		if transport == "direct" {
+		if transport == transportDirect {
 			direct++
 			continue
 		}
