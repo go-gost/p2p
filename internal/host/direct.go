@@ -160,18 +160,17 @@ func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 }
 
 // warm brings up the peer's relay session (a smux session over the DERP
-// adapter, no stream on it) so the peer counts as connected, and lets
-// ensureSessionLocked start the punch. The caller gets the peer's path in
-// Status before any traffic exists, which is what an entrypoint with a known
-// peer wants.
-func (e *engine) warm(peer derpclient.PublicKey) error {
+// adapter, no stream on it) so the peer counts as connected and has a path in
+// Status before any traffic — and, when punch is set, starts a hole punch for
+// it too. See sessionLocked for why the two are separable.
+func (e *engine) warm(peer derpclient.PublicKey, punch bool) error {
 	pc := e.peerConn(peer)
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	if pc.closed {
 		return p2p.ErrPeerUnreachable
 	}
-	_, err := pc.ensureSessionLocked()
+	_, err := pc.sessionLocked(punch)
 	return err
 }
 

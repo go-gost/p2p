@@ -717,10 +717,10 @@ func TestPunchAndWaitDoesNotStallWhenPunchCannotStart(t *testing.T) {
 	}
 }
 
-// TestWarmConnectsWithoutStream: warming a peer brings up its relay session and
-// starts the punch with no tunnel stream at all — the entrypoint case, where
-// the path has to be arranged (and be visible in the status) before the first
-// client arrives.
+// TestWarmConnectsWithoutStream: warming a peer brings up its relay session
+// with no tunnel stream and no punch — the answering side's case, where the
+// peer must be visible in the status but nothing should be attempted on its
+// behalf yet.
 func TestWarmConnectsWithoutStream(t *testing.T) {
 	rs := &relayServer{}
 	url := rs.start(t)
@@ -737,7 +737,7 @@ func TestWarmConnectsWithoutStream(t *testing.T) {
 	engineA.Connect()
 	engineB.Connect()
 
-	if err := engineA.warm(pubB); err != nil {
+	if err := engineA.warm(pubB, false); err != nil {
 		t.Fatalf("warm: %v", err)
 	}
 
@@ -746,9 +746,36 @@ func TestWarmConnectsWithoutStream(t *testing.T) {
 	if got := engineA.peerTransports()[keyName(pubB)]; got == "" {
 		t.Fatalf("peerTransports = %v, want an entry for the warmed peer", engineA.peerTransports())
 	}
+	// Nothing was attempted for it.
+	time.Sleep(200 * time.Millisecond)
+	if attempts, _, _, _ := engineA.stats.snapshot(); attempts != 0 {
+		t.Fatalf("punch attempts after a presence-only warm = %d, want 0", attempts)
+	}
+}
 
-	// The punch it started is mutual: the peer answers the candidates and both
-	// sides come up, with no stream ever opened.
+// TestPunchStartsWithoutStream: Punch is the dialing side's warm-up — the
+// punch starts (and is mutual) with no stream ever opened.
+func TestPunchStartsWithoutStream(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, "", privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	if err := engineA.warm(pubB, true); err != nil {
+		t.Fatalf("punch: %v", err)
+	}
+
+	// The peer answers our candidates: both sides come up, no stream opened.
 	waitFor(t, 5*time.Second, func() bool {
 		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
 	})

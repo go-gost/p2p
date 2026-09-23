@@ -128,16 +128,26 @@ func (h *Host) AddForward(listen, peerKey string) error {
 	return h.server.addForwardAddr(listen, peerKey)
 }
 
-// Warm connects to the peer's relay session and starts a hole punch for it,
-// without opening a tunnel stream. It is for a caller that knows which peer it
-// will talk to (an entrypoint's configured peer): the path is then being
-// arranged — and visible in Status' PeerTransports — before the first stream
-// needs it, instead of the punch starting only when traffic arrives.
+// Warm brings up the peer's relay session, without opening a tunnel stream and
+// without starting a punch. It is how a caller that only answers its peers — a
+// reverse tunnel — gets them into Status' PeerTransports before any traffic,
+// with no speculative punch round that would fail for a peer that has not
+// engaged yet.
 //
-// It returns as soon as the session and the punch are launched: the punch runs
-// in the background and retries on its own. Warming a peer is idempotent, and
-// in stub mode (no relay) it is a no-op.
+// Idempotent, and a no-op in stub mode (no relay).
 func (h *Host) Warm(peerB64 string) error {
+	return h.warm(peerB64, false)
+}
+
+// Punch is Warm plus a hole punch for the peer: for a caller that dials out
+// (an entrypoint's configured peer), the direct path is then being arranged
+// before the first stream needs it. The punch runs in the background and
+// retries on its own.
+func (h *Host) Punch(peerB64 string) error {
+	return h.warm(peerB64, true)
+}
+
+func (h *Host) warm(peerB64 string, punch bool) error {
 	if h.engine == nil {
 		return nil // stub mode: peers are host:port, there is no relay session to warm
 	}
@@ -145,7 +155,7 @@ func (h *Host) Warm(peerB64 string) error {
 	if err != nil {
 		return err
 	}
-	return h.engine.warm(peer)
+	return h.engine.warm(peer, punch)
 }
 
 // Status reports transport stats and the live tunnel count.
