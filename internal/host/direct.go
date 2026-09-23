@@ -432,16 +432,26 @@ func (dc *directConn) markDead(sess *smux.Session) {
 }
 
 // addCaps ORs the capability bits the peer advertised. Capabilities are
-// cumulative: a re-announcement never clears a bit already set.
+// cumulative: a re-announcement never clears a bit already set. The frame rides
+// every candidate broadcast, so it logs only when the set changes — which is
+// the line that says whether this peer's direct sessions get the tighter
+// keepalive (capsTightKeepalive) or the relay's pair.
 func (dc *directConn) addCaps(bits uint8) {
 	dc.mu.Lock()
+	before := dc.peerCaps
 	dc.peerCaps |= bits
+	after := dc.peerCaps
 	dc.mu.Unlock()
+	if after != before {
+		dc.e.log.Debug("direct punch: peer caps", "peer", keyName(dc.peer),
+			"ipv6", after&capsIPv6 != 0,
+			"tightKeepalive", after&capsTightKeepalive != 0)
+	}
 }
 
 // supports reports whether the peer has advertised all of the given capability
-// bits. Kept for the negotiation seam; IPv6 selection does not depend on it
-// (the candidate list is the in-band signal).
+// bits. IPv6 selection does not depend on it (the candidate list is the in-band
+// signal there); the direct session's keepalive pair does.
 func (dc *directConn) supports(bits uint8) bool {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -688,7 +698,8 @@ func (dc *directConn) punch() {
 		dc.mu.Unlock()
 		dc.markUp(sess, sock, dial)
 		e.log.Debug("direct established", "peer", pname, "family", f.name,
-			"mine", candAddrs(f.mine), "peerAddr", dial.String())
+			"mine", candAddrs(f.mine), "peerAddr", dial.String(),
+			"keepalive", cfg.KeepAliveInterval.String()+"/"+cfg.KeepAliveTimeout.String())
 		go func() {
 			e.acceptLoop(sess, "direct", dc.peer, dial.String())
 			dc.markDead(sess)
