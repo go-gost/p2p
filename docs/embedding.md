@@ -69,6 +69,12 @@ ln, err := ep.Listen()      // call before Connect
 c, err := ln.Accept()       // c.RemoteAddr() is the peer's base64 key
 ```
 
+A `tcp` tunnel arrives as a byte stream. A udp tunnel arrives as a **datagram
+conn**: it satisfies `net.PacketConn` (which is how a service stack tells udp
+from tcp), every Read returns one datagram and every Write sends one, and the
+2-byte framing on the wire is parsed for you. Datagrams larger than the read
+buffer are truncated, as on a UDP socket.
+
 **Bridge to local services** — `Config.Target`/`Targets` make the endpoint
 bridge each inbound tunnel to a local target for that tunnel's lifetime
 (`tcp://host:port`, `udp://host:port`). With targets configured the endpoint
