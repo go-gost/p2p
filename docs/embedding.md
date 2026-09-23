@@ -92,6 +92,16 @@ endpoint is created, and a later endpoint inherits the values already applied.
 One endpoint per process is the model — a process that builds two must give them
 identical timeouts (or none). Internal mechanism timeouts are not configurable.
 
+The two smux keepalives are separate: `smux` is the relay session's, `directSmux`
+the hole-punched session's. The direct one defaults much tighter (2s/6s against
+10s/30s) because it is the only detector that always runs: the relay's PeerGone
+is best-effort — it is not sent for every peer that leaves — and the relay
+session's own keepalive is a minute out, so a peer that dies while a direct
+session was carrying it would read as live for that long. smux notices a silent
+session after roughly 2x the timeout, so the direct default gives ~12s. Widening
+it costs latency in that window; narrowing it risks giving up a path that a
+burst of loss merely stalled, at the price of a relay fallback and a re-punch.
+
 ## Direct path
 
 `Config.Direct` (nil = on) attempts a hole-punched path and falls back to the

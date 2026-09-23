@@ -32,6 +32,10 @@ import (
 // The direct session is independent of the DERP transport: once established it
 // keeps serving even if the relay drops (the control plane is gone, so a
 // re-punch must wait for the relay to return, but existing traffic continues).
+// A relay-reported PeerGone for the peer does not tear it down either — that
+// notice is best-effort and says nothing about a path that does not run through
+// the relay. The session answers for itself through its own keepalive
+// (directSmuxKeepAliveTimeout), and dropIfGone reclaims its entry once it ends.
 
 const (
 	frameControl = 0x00 // [0x00][kind 1B][payload]
@@ -252,6 +256,9 @@ func (dc *directConn) session() *smux.Session {
 	if sock != nil {
 		sock.Close()
 	}
+	if dc.e.dropIfGone(dc.peer, dc) {
+		return nil // the peer is gone from the relay: nothing to re-punch with
+	}
 	go dc.start() // schedule re-punch
 	return nil
 }
@@ -412,6 +419,7 @@ func (dc *directConn) markDead(sess *smux.Session) {
 	if sock != nil {
 		sock.Close()
 	}
+	dc.e.dropIfGone(dc.peer, dc)
 }
 
 // addCaps ORs the capability bits the peer advertised. Capabilities are
@@ -649,8 +657,8 @@ func (dc *directConn) punch() {
 
 		// 5. smux over KCP; role by key order (external to who dialed).
 		cfg := smux.DefaultConfig()
-		cfg.KeepAliveInterval = smuxKeepAliveInterval
-		cfg.KeepAliveTimeout = smuxKeepAliveTimeout
+		cfg.KeepAliveInterval = directSmuxKeepAliveInterval
+		cfg.KeepAliveTimeout = directSmuxKeepAliveTimeout
 		var sess *smux.Session
 		if roleIsClient {
 			sess, err = smux.Client(kcpConn, cfg)

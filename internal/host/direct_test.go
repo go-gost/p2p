@@ -28,6 +28,10 @@ func TestMain(m *testing.M) {
 	punchWaitTimeout = 2 * time.Second
 	backoffPeriod = 500 * time.Millisecond
 	stunTimeout = 500 * time.Millisecond
+	// The direct session's keepalive is the thing TestDirectSilentPeerIsNoticed
+	// measures, so it runs at test speed here (production is 2s/6s).
+	directSmuxKeepAliveInterval = 500 * time.Millisecond
+	directSmuxKeepAliveTimeout = 2 * time.Second
 	os.Exit(m.Run())
 }
 
@@ -580,6 +584,143 @@ func TestDirectRepunchAfterMissedPeerGone(t *testing.T) {
 	}
 	defer s2.Close()
 	roundTrip(t, s2, "re-punched after missed peer gone")
+}
+
+// TestDirectSilentPeerIsNoticed: a direct session whose path goes silent must
+// be given up on its own keepalive, not left looking live. The relay only
+// reports a peer gone when the peer leaves the relay, which is not what a dead
+// direct path is — a NAT rebinding or a route change leaves the peer present
+// and the path black. Until the session is closed the peer reads as "direct"
+// and a new stream is handed to the dead path instead of the relay, so the
+// window is the whole point of the direct session's own (tighter) keepalive.
+func TestDirectSilentPeerIsNoticed(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+
+	waitFor(t, 5*time.Second, func() bool {
+		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
+	})
+
+	dcA := engineA.directConn(pubB)
+	dcA.mu.Lock()
+	sessA := dcA.sess
+	dcA.mu.Unlock()
+	if sessA == nil {
+		t.Fatal("A has no direct session to watch")
+	}
+
+	// B's punch socket goes away without the relay being told: from A's side
+	// this is a black path, which is the case the keepalive has to cover.
+	dcB := engineB.directConn(engineA.pub)
+	dcB.mu.Lock()
+	sockB := dcB.socket
+	dcB.mu.Unlock()
+	if sockB == nil {
+		t.Fatal("B has no punch socket to close")
+	}
+	sockB.Close()
+
+	// 1-2x the direct timeout (2s in TestMain). The relay keepalive this
+	// replaced would take 30-60s, so the bound proves which one is in play.
+	closed := time.Now()
+	waitFor(t, 8*time.Second, func() bool { return sessA.IsClosed() })
+	t.Logf("silent direct path noticed after %v (keepalive %v/%v)",
+		time.Since(closed).Round(time.Millisecond), directSmuxKeepAliveInterval, directSmuxKeepAliveTimeout)
+}
+
+// TestPeerGoneKeepsLiveDirectSession: a PeerGone is a notice about the peer's
+// *relay* connection, and it says nothing about the hole-punched path, which
+// does not run through the relay at all. It used to tear the direct session
+// down, so every blip on the peer's relay link cost a working path and a
+// re-punch. The direct session answers for itself through its own keepalive.
+func TestPeerGoneKeepsLiveDirectSession(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+
+	waitFor(t, 5*time.Second, func() bool {
+		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
+	})
+
+	dcA := engineA.directConn(pubB)
+	dcA.mu.Lock()
+	sessA := dcA.sess
+	dcA.mu.Unlock()
+	if sessA == nil {
+		t.Fatal("A has no direct session to watch")
+	}
+
+	// B's relay connection goes away, so the relay reports it gone to A. B's
+	// process — and with it the punch socket — stays up, which is the case the
+	// direct session must survive.
+	engineB.mu.Lock()
+	clientB := engineB.client
+	engineB.mu.Unlock()
+	if clientB == nil {
+		t.Fatal("B has no relay connection to drop")
+	}
+	clientB.Close()
+
+	waitFor(t, 5*time.Second, func() bool { return engineA.isGone(pubB) })
+
+	// Longer than the direct keepalive's own detection window (2x the 2s
+	// timeout here): a session that survives this is genuinely alive, not just
+	// unexamined.
+	time.Sleep(3 * directSmuxKeepAliveTimeout)
+	if sessA.IsClosed() {
+		t.Fatal("a PeerGone tore down the live direct session")
+	}
+	if !hasDirect(engineA, pubB) {
+		t.Fatal("A no longer holds the direct session")
+	}
+
+	// And it still carries traffic, with the relay out of the picture.
+	rs.setDropData(true)
+	s2, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatalf("open after PeerGone: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "still direct")
 }
 
 // TestDirectLocalCandidateSameNetwork proves that peers on the same network

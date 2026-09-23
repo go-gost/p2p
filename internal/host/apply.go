@@ -1,7 +1,6 @@
 package host
 
 import (
-	"errors"
 	"fmt"
 	"time"
 
@@ -53,23 +52,16 @@ func applyTimeouts(t *p2p.TimeoutsConfig) error {
 			return fmt.Errorf("timeouts.%s must be positive", v.name)
 		}
 	}
-	if t.Smux != nil && (t.Smux.Interval < 0 || t.Smux.Timeout < 0) {
-		return errors.New("timeouts.smux values must be positive")
-	}
 
-	// Validate the smux pair before applying anything, so a rejected value
-	// never leaves half-applied state behind.
-	if t.Smux != nil {
-		interval, timeout := smuxKeepAliveInterval, smuxKeepAliveTimeout
-		if t.Smux.Interval != 0 {
-			interval = t.Smux.Interval
-		}
-		if t.Smux.Timeout != 0 {
-			timeout = t.Smux.Timeout
-		}
-		if timeout < 2*interval {
-			return fmt.Errorf("timeouts.smux.timeout (%s) must be >= 2x interval (%s)", timeout, interval)
-		}
+	// Resolve and validate both keepalive pairs before applying anything, so a
+	// rejected value never leaves half-applied state behind.
+	relayInterval, relayTimeout, err := resolveSmuxTimeouts(t.Smux, "smux", smuxKeepAliveInterval, smuxKeepAliveTimeout)
+	if err != nil {
+		return err
+	}
+	directInterval, directTimeout, err := resolveSmuxTimeouts(t.DirectSmux, "directSmux", directSmuxKeepAliveInterval, directSmuxKeepAliveTimeout)
+	if err != nil {
+		return err
 	}
 
 	// Validation passed: apply.
@@ -88,13 +80,29 @@ func applyTimeouts(t *p2p.TimeoutsConfig) error {
 	if t.DerpKeepAlive != 0 {
 		keepAlivePeriod = t.DerpKeepAlive
 	}
-	if t.Smux != nil {
-		if t.Smux.Interval != 0 {
-			smuxKeepAliveInterval = t.Smux.Interval
-		}
-		if t.Smux.Timeout != 0 {
-			smuxKeepAliveTimeout = t.Smux.Timeout
-		}
-	}
+	smuxKeepAliveInterval, smuxKeepAliveTimeout = relayInterval, relayTimeout
+	directSmuxKeepAliveInterval, directSmuxKeepAliveTimeout = directInterval, directTimeout
 	return nil
+}
+
+// resolveSmuxTimeouts merges a smux timeouts block over the current values and
+// checks the pair, naming the block in any error. A nil block or a zero field
+// keeps what is already there.
+func resolveSmuxTimeouts(s *p2p.SmuxTimeouts, name string, interval, timeout time.Duration) (time.Duration, time.Duration, error) {
+	if s == nil {
+		return interval, timeout, nil
+	}
+	if s.Interval < 0 || s.Timeout < 0 {
+		return 0, 0, fmt.Errorf("timeouts.%s values must be positive", name)
+	}
+	if s.Interval != 0 {
+		interval = s.Interval
+	}
+	if s.Timeout != 0 {
+		timeout = s.Timeout
+	}
+	if timeout < 2*interval {
+		return 0, 0, fmt.Errorf("timeouts.%s.timeout (%s) must be >= 2x interval (%s)", name, timeout, interval)
+	}
+	return interval, timeout, nil
 }

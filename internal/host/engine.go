@@ -227,13 +227,34 @@ var (
 	// keepAlivePeriod pings the DERP server well below typical proxy idle
 	// timeouts (e.g. Cloudflare's ~100s).
 	keepAlivePeriod = 30 * time.Second
-	// smux keepalive, shared by the relay and direct sessions. KeepAliveTimeout
-	// must stay well above the interval (>= 2x): with them equal, smux's idle
-	// check races the first NOP round-trip and closes an idle session after
-	// ~interval (see docs/2026-09-09-p2p-mutual-punch-design.md, kcp-go deep
-	// dive R1/R2).
+	// smux keepalive for the relay session. KeepAliveTimeout must stay well
+	// above the interval (>= 2x): with them equal, smux's idle check races the
+	// first NOP round-trip and closes an idle session after ~interval (see
+	// docs/2026-09-09-p2p-mutual-punch-design.md, kcp-go deep dive R1/R2).
 	smuxKeepAliveInterval = 10 * time.Second
 	smuxKeepAliveTimeout  = 30 * time.Second
+
+	// The direct session's own keepalive, deliberately tighter than the relay's.
+	// smux clears its activity flag on one timeout tick and closes on the next,
+	// so a path that goes silent is noticed after ~2x the timeout (measured:
+	// 3.97s at a 2s timeout; this pair gives ~12s against the relay pair's ~60s).
+	//
+	// It is also the only detector that always runs. The relay's PeerGone is
+	// best-effort — it is not sent for every peer that leaves — and the relay
+	// session's own keepalive is a minute out, so a peer that dies while the
+	// direct path was carrying it would otherwise read as live for that long.
+	// Until the session closes it is served as live: status calls the peer
+	// "direct" and a new stream is handed to the dead path instead of the relay.
+	//
+	// The direct path is peer-to-peer and its frames ride KCP, so a lost NOP is
+	// retransmitted rather than dropped: silence for seconds means the path
+	// carries nothing at all, not that it is lossy. That is what makes a window
+	// this much tighter than the relay's safe; a false positive costs a fallback
+	// to the relay and a re-punch, so deployments with slow or lossy direct
+	// paths should widen it through timeouts.directSmux rather than live with
+	// the churn.
+	directSmuxKeepAliveInterval = 2 * time.Second
+	directSmuxKeepAliveTimeout  = 6 * time.Second
 )
 
 func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger) *engine {
@@ -583,21 +604,38 @@ func (e *engine) keepalive(c *derpclient.Client) {
 // peerGone drops everything to a peer whose DERP connection just closed (the
 // DERP server told us). Subsequent streams rebuild against a fresh session, and
 // opens use a short timeout until the peer is reachable again.
+//
+// The peer's *direct* session is deliberately left alone. PeerGone is a
+// best-effort notice about the peer's relay connection, and it says nothing
+// about the hole-punched path, which does not run through the relay at all —
+// tearing it down here destroyed a working path every time a peer's relay link
+// blipped. The direct session answers for itself through its own keepalive
+// (see directSmuxKeepAliveTimeout); dropIfGone reclaims the entry once that
+// session ends.
 func (e *engine) peerGone(peer derpclient.PublicKey) {
 	e.mu.Lock()
 	e.gone[peer] = true
 	pc := e.peers[peer]
 	delete(e.peers, peer)
-	dc := e.directs[peer]
-	delete(e.directs, peer)
 	e.mu.Unlock()
 	if pc != nil {
 		pc.kill(errors.New("derp engine: peer gone"))
 	}
-	if dc != nil {
-		dc.teardown()
-	}
 	e.log.Debug("derp peer gone", "peer", keyName(peer))
+}
+
+// dropIfGone reclaims a peer's punch state when the relay has reported it gone
+// and the session that was keeping the entry alive has ended. It reports
+// whether it dropped the entry: a peer that is gone has nothing to re-punch
+// with, so the caller can skip scheduling one.
+func (e *engine) dropIfGone(peer derpclient.PublicKey, dc *directConn) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.gone[peer] || e.directs[peer] != dc {
+		return false
+	}
+	delete(e.directs, peer)
+	return true
 }
 
 func (e *engine) isGone(peer derpclient.PublicKey) bool {
