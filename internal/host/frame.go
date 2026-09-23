@@ -101,3 +101,14 @@ func (c *frameConn) Read(b []byte) (int, error) {
 		}
 	}
 }
+
+// ReadFrom and WriteTo make frameConn a net.PacketConn, the shape a consumer
+// tells a datagram stream by (x's local handler classifies udp that way). A
+// tunnel has exactly one peer, so the address is the conn's own: reported on
+// read, ignored on write.
+func (c *frameConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, err := c.Read(b)
+	return n, c.RemoteAddr(), err
+}
+
+func (c *frameConn) WriteTo(b []byte, _ net.Addr) (int, error) { return c.Write(b) }

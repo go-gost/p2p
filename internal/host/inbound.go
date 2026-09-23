@@ -30,6 +30,7 @@ type inboundStream struct {
 	peer      string
 	transport string
 	peerAddr  string
+	datagram  bool // a udp tunnel: the conn is a net.PacketConn (frames parsed)
 }
 
 // inboundQueue carries inbound streams from the engine to Listen's listener.
@@ -49,13 +50,31 @@ func newInboundQueue() *inboundQueue {
 // deliver hands one inbound stream to the embedder; when the backlog is full
 // the stream is closed and dropped (lossy, documented).
 func (q *inboundQueue) deliver(conn net.Conn, peer, transport, peerAddr string, log *slog.Logger) {
+	q.enqueue(inboundStream{conn: conn, peer: peer, transport: transport, peerAddr: peerAddr}, log)
+}
+
+// deliverDatagram hands one inbound datagram stream to the embedder: the conn is
+// wrapped so Read returns one datagram (the 2-byte framing is parsed here, by
+// its owner) and the conn satisfies net.PacketConn, the shape a consumer tells
+// a udp tunnel by. The embedder never sees the framing.
+func (q *inboundQueue) deliverDatagram(conn net.Conn, peer, transport, peerAddr string, log *slog.Logger) {
+	q.enqueue(inboundStream{
+		conn:      newFrameConn(conn),
+		peer:      peer,
+		transport: transport,
+		peerAddr:  peerAddr,
+		datagram:  true,
+	}, log)
+}
+
+func (q *inboundQueue) enqueue(s inboundStream, log *slog.Logger) {
 	select {
-	case q.ch <- inboundStream{conn: conn, peer: peer, transport: transport, peerAddr: peerAddr}:
+	case q.ch <- s:
 	case <-q.closed:
-		conn.Close()
+		s.conn.Close()
 	default:
-		log.Warn("inbound stream dropped (backlog full)", "peer", peer)
-		conn.Close()
+		log.Warn("inbound stream dropped (backlog full)", "peer", s.peer)
+		s.conn.Close()
 	}
 }
 
@@ -82,7 +101,11 @@ type inboundListener struct {
 func (l *inboundListener) Accept() (net.Conn, error) {
 	select {
 	case s := <-l.q.ch:
-		return &inboundConn{Conn: s.conn, local: peerAddr{key: l.host}, remote: peerAddr{key: s.peer}}, nil
+		conn := &inboundConn{Conn: s.conn, local: peerAddr{key: l.host}, remote: peerAddr{key: s.peer}}
+		if s.datagram {
+			return &inboundDatagramConn{inboundConn: conn}, nil
+		}
+		return conn, nil
 	case <-l.q.closed:
 		return nil, net.ErrClosed
 	}
@@ -102,3 +125,17 @@ type inboundConn struct {
 
 func (c *inboundConn) LocalAddr() net.Addr  { return c.local }
 func (c *inboundConn) RemoteAddr() net.Addr { return c.remote }
+
+// inboundDatagramConn is inboundConn's datagram twin: it satisfies
+// net.PacketConn, which is how a consumer (x's local handler) tells a udp
+// tunnel stream from a tcp one. Read returns one datagram, Write emits one.
+type inboundDatagramConn struct {
+	*inboundConn
+}
+
+func (c *inboundDatagramConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, err := c.Read(b)
+	return n, c.remote, err
+}
+
+func (c *inboundDatagramConn) WriteTo(b []byte, _ net.Addr) (int, error) { return c.Write(b) }
