@@ -148,12 +148,20 @@ func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 // the caller falls back to the relay. Candidate exchange rides the DERP
 // control channel, so it needs only the DERP connection — not a relay mux
 // session — and completes well under the timeout.
+//
+// Only the call that starts the punch waits for it. A punch already in flight
+// is unaffected by blocking here, and one that failed and is backing off cannot
+// come up within the wait at all — so waiting would charge every stream the
+// full timeout on a peer that cannot punch (symmetric NAT, STUN blocked),
+// turning a relay-only path into a per-connection stall.
 func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 	if !e.directEnabled() {
 		return nil
 	}
 	dc := e.directConn(peer)
-	dc.start()
+	if !dc.start() {
+		return nil
+	}
 	deadline := time.Now().Add(punchWaitTimeout)
 	for time.Now().Before(deadline) {
 		if sess := dc.session(); sess != nil {
@@ -168,15 +176,17 @@ func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 	return nil
 }
 
-func (dc *directConn) start() {
+// start kicks off a punch when none is running, and reports whether this call
+// started one: false when a punch is already in flight or backing off.
+func (dc *directConn) start() bool {
 	dc.mu.Lock()
+	defer dc.mu.Unlock()
 	if dc.state != directNone {
-		dc.mu.Unlock()
-		return
+		return false
 	}
 	dc.state = directAttempting
-	dc.mu.Unlock()
 	go dc.punch()
+	return true
 }
 
 // session returns the live direct smux session, or nil. If the session was

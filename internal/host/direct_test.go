@@ -655,6 +655,53 @@ func TestDirectStunUnreachableStaysOnRelay(t *testing.T) {
 	roundTrip(t, s2, "relay only")
 }
 
+// TestPunchAndWaitDoesNotStallWhenPunchCannotStart: the punch wait is charged
+// to the call that starts the punch. A peer that already failed to punch (in
+// backoff) or has one in flight is not affected by a blocking wait, so waiting
+// there would stall every stream open by the full punchWaitTimeout — on a
+// symmetric-NAT peer, every connection over a permanent relay path.
+func TestPunchAndWaitDoesNotStallWhenPunchCannotStart(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+
+	privA, _, _ := derpclient.Generate()
+	_, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineA.stunAddr = "192.0.2.1:9" // candidate source exists; the punch itself fails
+	defer engineA.Close()
+
+	engineA.Connect()
+
+	dc := engineA.directConn(pubB)
+	for _, state := range []directState{directBackoff, directUp} {
+		dc.mu.Lock()
+		dc.state = state
+		dc.mu.Unlock()
+
+		start := time.Now()
+		if sess := engineA.punchAndWait(pubB); sess != nil {
+			t.Fatalf("punchAndWait returned a session in state %d", state)
+		}
+		if d := time.Since(start); d > punchWaitTimeout/4 {
+			t.Fatalf("punchAndWait waited %v in state %d; want an immediate nil", d, state)
+		}
+	}
+
+	// An idle connection still owns the wait: that is the case the wait is for.
+	dc.mu.Lock()
+	dc.state = directNone
+	dc.mu.Unlock()
+	if sess := engineA.punchAndWait(pubB); sess != nil {
+		t.Fatal("punchAndWait returned a session for an unreachable peer")
+	}
+	dc.mu.Lock()
+	state := dc.state
+	dc.mu.Unlock()
+	if state == directNone {
+		t.Fatal("punchAndWait did not start a punch from directNone")
+	}
+}
+
 // TestRelaySessionRecoversAfterAdapterClosed reproduces the stuck state where a
 // peer's relay adapter is closed (the peer process died) but stays cached: the
 // next OpenStream must drop it and rebuild a fresh session instead of failing
