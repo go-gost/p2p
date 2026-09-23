@@ -781,6 +781,56 @@ func TestPunchStartsWithoutStream(t *testing.T) {
 	})
 }
 
+// TestCandidatesKeepLiveSession: an announcement from a peer whose rounds keep
+// failing must not tear down the session that is already carrying traffic.
+// Tearing it down is what makes a pair that can punch look like a pair that
+// cannot: every retry announcement kills the working path, and the round that
+// replaces it fails. A round may still start — that is how a genuinely stale
+// session gets repaired — but the live one keeps serving until a new punch
+// succeeds and markUp replaces it.
+func TestCandidatesKeepLiveSession(t *testing.T) {
+	newEngine := func(state directState) (*engine, *directConn, *smux.Session) {
+		e := &engine{
+			direct:   true,
+			stunAddr: "127.0.0.1:3478",
+			log:      slog.Default(),
+			stop:     make(chan struct{}),
+			directs:  make(map[derpclient.PublicKey]*directConn),
+			peers:    make(map[derpclient.PublicKey]*peerConn),
+		}
+		peer := derpclient.PublicKey{9}
+		sess := newTestSess(t)
+		dc := &directConn{e: e, peer: peer, sess: sess, state: state, cand: make(chan []candidate, 1)}
+		e.directs[peer] = dc
+		return e, dc, sess
+	}
+	cands := []candidate{{addr: netip.MustParseAddrPort("203.0.113.7:1234")}}
+
+	// A live session stays live, and is still what a stream would use.
+	for _, state := range []directState{directUp, directBackoff} {
+		_, dc, sess := newEngine(state)
+		dc.onCandidates(cands)
+		if !dc.live() {
+			t.Errorf("state %v: after candidates live = false, want the session untouched", state)
+		}
+		if sess.IsClosed() {
+			t.Errorf("state %v: the live direct session was closed by an announcement", state)
+		}
+		if got := dc.session(); got == nil {
+			t.Errorf("state %v: session() = nil, want the live session served whatever the punch state", state)
+		}
+	}
+
+	// Either way a round runs: the peer is punching now, and a round is what
+	// repairs a session that really is stale.
+	_, dc, _ := newEngine(directBackoff)
+	dc.failed = true
+	dc.onCandidates(cands)
+	if got := dc.stateOf(); got != directAttempting {
+		t.Errorf("after candidates while backing off: state = %v, want a round started", got)
+	}
+}
+
 // TestRelaySessionRecoversAfterAdapterClosed reproduces the stuck state where a
 // peer's relay adapter is closed (the peer process died) but stays cached: the
 // next OpenStream must drop it and rebuild a fresh session instead of failing

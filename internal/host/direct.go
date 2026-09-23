@@ -229,7 +229,7 @@ func (dc *directConn) start() bool {
 // found dead it is torn down and a re-punch is scheduled.
 func (dc *directConn) session() *smux.Session {
 	dc.mu.Lock()
-	if dc.state != directUp || dc.sess == nil {
+	if dc.sess == nil {
 		dc.mu.Unlock()
 		return nil
 	}
@@ -241,7 +241,9 @@ func (dc *directConn) session() *smux.Session {
 	dc.sess = nil
 	sock := dc.socket
 	dc.socket = nil
-	dc.state = directNone
+	if dc.state == directUp {
+		dc.state = directNone
+	}
 	dc.mu.Unlock()
 	if sock != nil {
 		sock.Close()
@@ -274,7 +276,7 @@ func (dc *directConn) hasFailed() bool {
 func (dc *directConn) live() bool {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	return dc.state == directUp && dc.sess != nil && !dc.sess.IsClosed()
+	return dc.sess != nil && !dc.sess.IsClosed()
 }
 
 func (dc *directConn) onCandidates(cands []candidate) {
@@ -306,31 +308,29 @@ func (dc *directConn) onCandidates(cands []candidate) {
 	case dc.cand <- cands:
 	default:
 	}
-	// The peer is punching now: answer immediately instead of waiting out our
-	// backoff, or the two sides' punch windows miss each other and every retry
-	// fails. start() only runs from directNone, so reset a backoff first.
+	// A live session is not disturbed by an announcement. The peer only
+	// announces when it (re)started a round, which once meant "our session is
+	// stale, tear it down" — but a peer whose rounds keep failing re-announces
+	// with a new port every round, and tearing down a *working* session each
+	// time is how both sides end up with nothing: the session that came up is
+	// killed by the next announcement, and the round that replaces it fails.
+	// A session that really is stale (the peer restarted and we missed its
+	// PeerGone) dies on its own within a keepalive, and the re-punch below
+	// happens then.
 	//
-	// A peer only sends candidates when it has (re)started a punch. If we still
-	// hold a directUp session, it is stale — the peer restarted and we missed
-	// its PeerGone — so tear it down before re-punching, or we'd never answer
-	// the re-punch candidates.
-	var staleSess *smux.Session
-	var staleSock *net.UDPConn
+	// A backoff, on the other hand, should be cut short: the peer is punching
+	// now, and waiting it out means the two sides' windows miss each other.
+	// start() only runs from directNone, so reset a backoff first.
 	dc.mu.Lock()
-	if dc.state == directUp {
-		staleSess, staleSock = dc.sess, dc.socket
-		dc.sess, dc.socket = nil, nil
-		dc.state = directNone
-	} else if dc.state == directBackoff {
+	if dc.state == directUp || dc.state == directBackoff {
+		// Let a round run. A live session is not torn down for it: session()
+		// serves it whatever the punch state is, and markUp replaces it only
+		// once a new punch actually succeeds. If this peer's session really is
+		// stale (it restarted and we missed its PeerGone), the round is what
+		// repairs it.
 		dc.state = directNone
 	}
 	dc.mu.Unlock()
-	if staleSess != nil {
-		staleSess.Close()
-	}
-	if staleSock != nil {
-		staleSock.Close()
-	}
 	dc.start()
 }
 
@@ -355,11 +355,22 @@ func (dc *directConn) teardown() {
 // markUp stores the freshly-built session+token and marks the state up.
 func (dc *directConn) markUp(sess *smux.Session, socket *net.UDPConn, peerAddr netip.AddrPort) {
 	dc.mu.Lock()
+	// A punch can succeed while an older session is still serving (it is
+	// re-run on the peer's announcements): the new session replaces it, and
+	// the old one and its socket are done.
+	prevSess, prevSock := dc.sess, dc.socket
 	dc.sess = sess
 	dc.socket = socket
 	dc.peerAddr = peerAddr
 	dc.state = directUp
+	dc.failed = false
 	dc.mu.Unlock()
+	if prevSess != nil && prevSess != sess {
+		prevSess.Close()
+	}
+	if prevSock != nil && prevSock != socket {
+		prevSock.Close()
+	}
 	dc.e.stats.punchSuccess.Add(1)
 }
 
