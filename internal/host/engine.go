@@ -235,24 +235,27 @@ var (
 	smuxKeepAliveTimeout  = 30 * time.Second
 
 	// The direct session's own keepalive, deliberately tighter than the relay's.
-	// smux clears its activity flag on one timeout tick and closes on the next,
-	// so a path that goes silent is noticed after ~2x the timeout (measured:
-	// 3.97s at a 2s timeout; this pair gives ~12s against the relay pair's ~60s).
+	// It is negotiated (capsTightKeepalive) and only used when the peer
+	// advertises the same pair: smux answers a NOP with nothing, so a session's
+	// liveness is fed by the frames the *peer* sends — a peer pinging every 10s
+	// cannot keep a 6s timeout alive, and would have its direct sessions torn
+	// down and re-punched every 6s. A peer that does not advertise it gets
+	// smuxKeepAliveInterval/Timeout below, which is what every peer had before
+	// this pair existed.
 	//
-	// It is also the only detector that always runs. The relay's PeerGone is
-	// best-effort — it is not sent for every peer that leaves — and the relay
-	// session's own keepalive is a minute out, so a peer that dies while the
-	// direct path was carrying it would otherwise read as live for that long.
-	// Until the session closes it is served as live: status calls the peer
-	// "direct" and a new stream is handed to the dead path instead of the relay.
+	// With both ends on it: smux clears its activity flag on one timeout tick
+	// and closes on the next, so a path that goes silent is noticed after ~2x
+	// the timeout (measured: 3.97s at a 2s timeout; this pair gives ~12s against
+	// the relay pair's ~60s). Until then the session is served as live: status
+	// calls the peer "direct" and a new stream is handed to a dead path instead
+	// of the relay. The relay's PeerGone is not a substitute — it is best-effort
+	// and says nothing about a path that does not run through the relay.
 	//
 	// The direct path is peer-to-peer and its frames ride KCP, so a lost NOP is
 	// retransmitted rather than dropped: silence for seconds means the path
-	// carries nothing at all, not that it is lossy. That is what makes a window
-	// this much tighter than the relay's safe; a false positive costs a fallback
-	// to the relay and a re-punch, so deployments with slow or lossy direct
-	// paths should widen it through timeouts.directSmux rather than live with
-	// the churn.
+	// carries nothing at all, not that it is lossy. A false positive costs a
+	// fallback to the relay and a re-punch, so deployments with slow or lossy
+	// direct paths widen it through timeouts.directSmux.
 	directSmuxKeepAliveInterval = 2 * time.Second
 	directSmuxKeepAliveTimeout  = 6 * time.Second
 )

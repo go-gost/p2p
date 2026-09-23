@@ -33,12 +33,15 @@ type TimeoutsConfig struct {
 	Backoff       time.Duration `yaml:"backoff,omitempty"`
 	DerpKeepAlive time.Duration `yaml:"derpKeepAlive,omitempty"`
 	Smux          *SmuxTimeouts `yaml:"smux,omitempty"`
-	// DirectSmux tunes the direct (hole-punched) session's keepalive, which
-	// runs tighter than the relay's by default. It is the only liveness
-	// detector that always runs — the relay's PeerGone is best-effort — and a
-	// direct session that is dead but not yet noticed is still served as live,
-	// so the window costs the peer its status and costs a new stream the relay
-	// fallback. Widen it for slow or lossy direct paths.
+	// DirectSmux tunes the direct (hole-punched) session's keepalive, which runs
+	// tighter than the relay's by default. It is negotiated: smux answers a NOP
+	// with nothing, so a session is kept alive by the frames the peer sends, and
+	// a timeout shorter than the peer's ping interval would tear the session
+	// down on a loop. Both ends advertise the pair (ctrlCaps) and a peer that
+	// does not gets the relay's, so the tighter values apply only when both
+	// sides run this version. Until a dead session is noticed it is served as
+	// live — the peer reads as "direct" and a new stream goes to the dead path
+	// instead of the relay. Widen it for slow or lossy direct paths.
 	DirectSmux *SmuxTimeouts `yaml:"directSmux,omitempty"`
 }
 

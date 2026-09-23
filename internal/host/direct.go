@@ -48,12 +48,21 @@ const (
 )
 
 // Capability bits exchanged via ctrlCaps. Bit 0 marks IPv6 awareness. The frame
-// is a forward-looking negotiation seam: IPv6 selection does NOT depend on it —
-// the candidate list is the in-band signal (a peer that offers a v6 candidate
-// supports v6) — so an unset bit changes no behavior today. It is re-sent with
-// every candidate broadcast so a lost frame or a late-joining peer cannot
-// permanently degrade negotiation; the receiver ORs the bits.
+// is a negotiation seam: IPv6 selection does NOT depend on it — the candidate
+// list is the in-band signal (a peer that offers a v6 candidate supports v6) —
+// so an unset bit changes no behavior there. It is re-sent with every candidate
+// broadcast so a lost frame or a late-joining peer cannot permanently degrade
+// negotiation; the receiver ORs the bits.
 const capsIPv6 uint8 = 1 << 0
+
+// capsTightKeepalive marks a peer that runs the direct session's own, tighter
+// keepalive (timeouts.directSmux). It has to be negotiated, not assumed: smux
+// answers a NOP with nothing, so a session's liveness is fed only by the frames
+// the *peer* sends — a peer pinging every 10s cannot keep a 6s timeout alive,
+// and would see its direct sessions torn down and re-punched every 6s. A peer
+// that does not set this bit gets the relay's pair instead, which is what every
+// peer got before the tighter one existed.
+const capsTightKeepalive uint8 = 1 << 1
 
 // v6AnnounceFunc maps the bound IPv6 punch socket's port to the endpoint to
 // advertise. Production advertises the socket's own local address; tests
@@ -558,7 +567,7 @@ func (dc *directConn) punch() {
 	dc.mu.Lock()
 	dc.mine = mine
 	dc.mu.Unlock()
-	if err := e.sendCaps(dc.peer, capsIPv6); err != nil {
+	if err := e.sendCaps(dc.peer, capsIPv6|capsTightKeepalive); err != nil {
 		e.log.Debug("direct punch: send caps failed", "peer", pname, "error", err)
 	}
 	if err := e.sendCandidates(dc.peer, mine); err != nil {
@@ -656,9 +665,7 @@ func (dc *directConn) punch() {
 		}
 
 		// 5. smux over KCP; role by key order (external to who dialed).
-		cfg := smux.DefaultConfig()
-		cfg.KeepAliveInterval = directSmuxKeepAliveInterval
-		cfg.KeepAliveTimeout = directSmuxKeepAliveTimeout
+		cfg := directSmuxConfig(dc.supports(capsTightKeepalive))
 		var sess *smux.Session
 		if roleIsClient {
 			sess, err = smux.Client(kcpConn, cfg)
@@ -911,6 +918,24 @@ func detectV6Egress() *net.UDPAddr {
 // relay control channel.
 func (e *engine) sendCandidates(peer derpclient.PublicKey, cands []candidate) error {
 	return e.sendControl(peer, ctrlPunchCandidates, e.priv.SealTo(peer, encodeCandidates(cands)))
+}
+
+// directSmuxConfig is the smux configuration for a direct session. The tighter
+// pair applies only when the peer advertised it (capsTightKeepalive): a session
+// is kept alive by the frames the peer sends, so a timeout shorter than the
+// peer's ping interval would tear the session down and re-punch it on a loop.
+// A peer that did not advertise the bit gets the relay's pair — the behavior
+// every peer had before the tighter one existed.
+func directSmuxConfig(peerTight bool) *smux.Config {
+	cfg := smux.DefaultConfig()
+	if peerTight {
+		cfg.KeepAliveInterval = directSmuxKeepAliveInterval
+		cfg.KeepAliveTimeout = directSmuxKeepAliveTimeout
+		return cfg
+	}
+	cfg.KeepAliveInterval = smuxKeepAliveInterval
+	cfg.KeepAliveTimeout = smuxKeepAliveTimeout
+	return cfg
 }
 
 // sendCaps advertises our capability bits to the peer. Re-sent with every

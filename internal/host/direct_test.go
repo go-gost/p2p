@@ -369,6 +369,20 @@ func TestDirectPunchRoundTrip(t *testing.T) {
 		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
 	})
 
+	// The direct session's tighter keepalive is negotiated, and both ends of a
+	// punch run this version, so each must have seen the other's bit. The caps
+	// frame rides the control channel, so it can land just after the session.
+	for _, e := range []*engine{engineA, engineB} {
+		peer := pubB
+		if e == engineB {
+			peer = engineA.pub
+		}
+		waitFor(t, 5*time.Second, func() bool {
+			dc := e.getDirect(peer)
+			return dc != nil && dc.supports(capsTightKeepalive)
+		})
+	}
+
 	// Cut relay data frames; control frames still flow. The direct path must
 	// now carry the traffic.
 	rs.setDropData(true)
@@ -584,6 +598,27 @@ func TestDirectRepunchAfterMissedPeerGone(t *testing.T) {
 	}
 	defer s2.Close()
 	roundTrip(t, s2, "re-punched after missed peer gone")
+}
+
+// TestDirectSmuxConfig: the tighter direct keepalive applies only to a peer
+// that advertised it. smux answers a NOP with nothing, so a session is kept
+// alive by the frames the peer sends — a peer pinging every 10s cannot keep a
+// 6s timeout alive, and every direct session to it would be torn down and
+// re-punched on a loop. A peer that does not set the bit gets the relay's pair,
+// which is what every peer had before the tighter one existed.
+func TestDirectSmuxConfig(t *testing.T) {
+	tight := directSmuxConfig(true)
+	if tight.KeepAliveInterval != directSmuxKeepAliveInterval || tight.KeepAliveTimeout != directSmuxKeepAliveTimeout {
+		t.Fatalf("an advertising peer got %v/%v, want the direct pair %v/%v",
+			tight.KeepAliveInterval, tight.KeepAliveTimeout,
+			directSmuxKeepAliveInterval, directSmuxKeepAliveTimeout)
+	}
+	loose := directSmuxConfig(false)
+	if loose.KeepAliveInterval != smuxKeepAliveInterval || loose.KeepAliveTimeout != smuxKeepAliveTimeout {
+		t.Fatalf("a peer that did not advertise got %v/%v, want the relay pair %v/%v",
+			loose.KeepAliveInterval, loose.KeepAliveTimeout,
+			smuxKeepAliveInterval, smuxKeepAliveTimeout)
+	}
 }
 
 // TestDirectSilentPeerIsNoticed: a direct session whose path goes silent must
