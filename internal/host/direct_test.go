@@ -978,6 +978,91 @@ func TestSameCandidates(t *testing.T) {
 	}
 }
 
+// newSlotConn builds a bare directConn with an engine whose punch cannot start
+// (no STUN answers), for tests that only exercise the candidate exchange.
+func newSlotConn(t *testing.T) *directConn {
+	t.Helper()
+	peer := derpclient.PublicKey{7}
+	e := &engine{
+		direct:   true,
+		stunAddr: "127.0.0.1:3478",
+		log:      slog.Default(),
+		stop:     make(chan struct{}),
+		directs:  make(map[derpclient.PublicKey]*directConn),
+		peers:    make(map[derpclient.PublicKey]*peerConn),
+	}
+	dc := &directConn{e: e, peer: peer, cand: make(chan []candidate, 1)}
+	e.directs[peer] = dc
+	return dc
+}
+
+// TestCandidateSlotLatestWins: the slot holds one list and a round takes
+// whatever is in it, so a newer announcement must displace an older one the
+// round has not picked up yet. The older list names a port the peer has already
+// left, and dialing it is what burns a round.
+func TestCandidateSlotLatestWins(t *testing.T) {
+	dc := newSlotConn(t)
+	older := []candidate{{addr: netip.MustParseAddrPort("203.0.113.7:1111")}}
+	newer := []candidate{{addr: netip.MustParseAddrPort("203.0.113.7:2222")}}
+
+	dc.onCandidates(older)
+	dc.onCandidates(newer)
+
+	select {
+	case got := <-dc.cand:
+		if got[0].addr != newer[0].addr {
+			t.Fatalf("slot holds %v, want the newest %v", candAddrs(got), candAddrs(newer))
+		}
+	default:
+		t.Fatal("slot is empty, want the newest list in it")
+	}
+}
+
+// TestFresherCandidates: a round holds briefly for a list that supersedes the
+// one it took, and does not report one when the grace passes without any.
+func TestFresherCandidates(t *testing.T) {
+	dc := newSlotConn(t)
+	newer := []candidate{{addr: netip.MustParseAddrPort("203.0.113.7:2222")}}
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		dc.onCandidates(newer)
+	}()
+	if got, ok := dc.fresherCandidates(500 * time.Millisecond); !ok {
+		t.Fatal("a list arriving inside the grace was not reported")
+	} else if got[0].addr != newer[0].addr {
+		t.Fatalf("superseding list = %v, want %v", candAddrs(got), candAddrs(newer))
+	}
+
+	start := time.Now()
+	if _, ok := dc.fresherCandidates(50 * time.Millisecond); ok {
+		t.Fatal("a list was reported when none arrived")
+	}
+	if d := time.Since(start); d < 40*time.Millisecond {
+		t.Fatalf("returned after %v, want the grace to be waited out", d)
+	}
+}
+
+// TestBackoffDropsOwnCandidates: onCandidates answers a peer's announcement with
+// dc.mine, so a failed round must not leave its own list behind — those sockets
+// are closed, and an echo of them races the peer's fresh list into its slot.
+func TestBackoffDropsOwnCandidates(t *testing.T) {
+	dc := newSlotConn(t)
+	dc.mu.Lock()
+	dc.mine = []candidate{{addr: netip.MustParseAddrPort("203.0.113.7:1111")}}
+	dc.state = directAttempting
+	dc.mu.Unlock()
+
+	dc.backoff()
+
+	dc.mu.Lock()
+	mine := dc.mine
+	dc.mu.Unlock()
+	if mine != nil {
+		t.Fatalf("mine = %v after a failed round, want it cleared", candAddrs(mine))
+	}
+}
+
 // TestDirectPunchStaggeredStart covers the late-start case: A punches while B
 // is down, then B starts and punches. A must end up with B's candidates and B
 // with A's so both dial. The in-process relay sends A a PeerGone when it first

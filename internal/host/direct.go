@@ -66,6 +66,9 @@ var (
 	punchWaitTimeout = 5 * time.Second
 	backoffPeriod    = 30 * time.Second
 	stunTimeout      = 3 * time.Second
+	// candidateGrace is how long a round holds after taking a peer's candidate
+	// list, for a fresher one to supersede it. See the call site in punch.
+	candidateGrace = 200 * time.Millisecond
 	// seedTimeout bounds the symmetric echo handshake (both peers must see
 	// their own token round-trip before streams ride the session).
 	seedTimeout = 5 * time.Second
@@ -241,6 +244,7 @@ func (dc *directConn) session() *smux.Session {
 	dc.sess = nil
 	sock := dc.socket
 	dc.socket = nil
+	dc.mine = nil // the socket backing them is closing
 	if dc.state == directUp {
 		dc.state = directNone
 	}
@@ -304,6 +308,19 @@ func (dc *directConn) onCandidates(cands []candidate) {
 		}
 	}
 
+	// Latest wins: the slot holds one list and a round takes whatever is in it,
+	// so an older list the round has not picked up yet must not shadow this
+	// one. The superseded list is the more dangerous of the two — a peer
+	// announces a new port every round, so the stale entry names a socket that
+	// is already closed.
+drain:
+	for {
+		select {
+		case <-dc.cand:
+		default:
+			break drain
+		}
+	}
 	select {
 	case dc.cand <- cands:
 	default:
@@ -342,6 +359,7 @@ func (dc *directConn) teardown() {
 	sock := dc.socket
 	dc.sess = nil
 	dc.socket = nil
+	dc.mine = nil
 	dc.state = directNone
 	dc.mu.Unlock()
 	if sess != nil {
@@ -388,6 +406,7 @@ func (dc *directConn) markDead(sess *smux.Session) {
 	dc.sess = nil
 	sock := dc.socket
 	dc.socket = nil
+	dc.mine = nil
 	dc.state = directNone
 	dc.mu.Unlock()
 	if sock != nil {
@@ -424,6 +443,10 @@ func (dc *directConn) backoff() {
 	dc.mu.Lock()
 	dc.state = directBackoff
 	dc.failed = true
+	// The round's sockets are gone, so its candidate list is not ours to offer
+	// any more: onCandidates answers a peer's announcement with dc.mine, and
+	// echoing a dead endpoint races the peer's own fresh list into its slot.
+	dc.mine = nil
 	dc.mu.Unlock()
 	dc.e.log.Debug("direct punch: backoff", "peer", keyName(dc.peer), "retryIn", backoffPeriod.String())
 	go func() {
@@ -547,6 +570,16 @@ func (dc *directConn) punch() {
 		dc.backoff()
 		return
 	}
+	// The list just taken can already be superseded: a peer that (re)connected
+	// announces into our slot the moment it starts its round, and its own
+	// exchange with us completes a few milliseconds later, so the round that
+	// follows is the current one and the one we hold is a socket it has left.
+	// Dialing it burns the round — and behind a symmetric NAT it also binds our
+	// mapping to a port the peer is not listening on, so the packets that would
+	// have converged go nowhere. Hold briefly for the fresher list.
+	if newer, ok := dc.fresherCandidates(candidateGrace); ok {
+		cands = newer
+	}
 	peerV4 := ipv4Addrs(cands)
 	peerV6 := v6Addrs(cands)
 	e.log.Debug("direct punch: peer candidates", "peer", pname, "candidates", candAddrs(cands))
@@ -633,6 +666,11 @@ func (dc *directConn) punch() {
 		sock := f.sock
 		f.sock = nil // owned by the session
 		closeFams()  // drop the unused family's socket
+		// Only the winner's socket is still bound, so only its candidates are
+		// ours to answer a peer's announcement with.
+		dc.mu.Lock()
+		dc.mine = f.mine
+		dc.mu.Unlock()
 		dc.markUp(sess, sock, dial)
 		e.log.Debug("direct established", "peer", pname, "family", f.name,
 			"mine", candAddrs(f.mine), "peerAddr", dial.String())
@@ -682,6 +720,28 @@ func seedHandshake(c net.Conn, timeout time.Duration) error {
 		return errors.New("derp engine: seed echo mismatch")
 	}
 	return nil
+}
+
+// fresherCandidates returns the newest candidate list to arrive within grace,
+// or false when none did. It lets a round trade a fixed delay for the peer's
+// current port: the lists are exchanged within milliseconds of each other
+// (16-24 ms observed on a real relay), and the earlier of the two names a
+// socket the peer has already replaced.
+func (dc *directConn) fresherCandidates(grace time.Duration) ([]candidate, bool) {
+	t := time.NewTimer(grace)
+	defer t.Stop()
+	var (
+		latest []candidate
+		ok     bool
+	)
+	for {
+		select {
+		case c := <-dc.cand:
+			latest, ok = c, true
+		case <-t.C:
+			return latest, ok
+		}
+	}
 }
 
 func (dc *directConn) waitCandidates(ctx context.Context) ([]candidate, bool) {
