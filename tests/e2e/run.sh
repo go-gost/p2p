@@ -509,7 +509,7 @@ scenario_inner_matrix() {
 }
 
 scenario_udp_tun() {
-	step "datagram channel: point-to-point tun link (udp inner)"
+	step "datagram link: point-to-point tun link (udp inner)"
 	local dir="$RUNDIR/tun"
 	start_derp_pair tun off false "" || return
 	local akey bkey
@@ -551,8 +551,8 @@ scenario_udp_tun() {
 	local p
 	if p=$(ns_run A ping -c1 -W4 10.10.0.2 2>&1); then ok "tun link: A pings B (10.10.0.2)"; else fail "tun link ping failed: $p"; fi
 	if p=$(ns_run B ping -c1 -W4 10.10.0.1 2>&1); then ok "tun link: B pings A (10.10.0.1)"; else fail "tun link ping failed: $p"; fi
-	check_grep "datagram channel is live on A" 'channel up|channel role' "$LOGDIR/p2p-tun-a.log"
-	check_grep "datagram channel is live on B" 'channel up|channel role' "$LOGDIR/p2p-tun-b.log"
+	check_grep "datagram link is live on A" 'datagram link up' "$LOGDIR/p2p-tun-a.log"
+	check_grep "datagram link is live on B" 'datagram link up' "$LOGDIR/p2p-tun-b.log"
 }
 
 scenario_udp_outlet() {

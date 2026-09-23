@@ -52,7 +52,7 @@ colliding with a previous run). The last five runs are kept.
 | `derp-direct` | STUN + UDP hole punch establishes a direct session (`status.direct_peers`), and traffic survives killing the relay (the session is genuinely direct). |
 | `forward` | `--forward listen=peerkey` exposes a raw TCP port bound to a peer key; a plain TCP client reaches a service on the peer. |
 | `inner-matrix` | The `tcp`, `tls`, `ws`, `mtcp`, `mtls`, and `mws` inner dialers each carry HTTP to peer gost listeners over one relay pair. |
-| `udp-tun` | The datagram channel backs a point-to-point tun link (both ends tun clients, `udp` inner dialer): bidirectional ICMP across the link, and the channel comes up on both sides. |
+| `udp-tun` | The datagram link backs a point-to-point tun link (both ends tun clients, `udp` inner dialer): bidirectional ICMP across the link, and the link comes up on both sides. |
 | `udp-outlet` | A `udp://` target outlet: a tun **server** behind the tunnel with a shared passphrase; a remote spoke registers a keepalive route and reaches both the server address and a LAN address behind it. |
 | `ipv6-direct` | With no STUN server, a global IPv6 egress is enough to select a direct path (`direct_peers`); the peer's announced candidate is an `fd00::` address, proving the dial was IPv6 and not a v4 fallback. |
 
