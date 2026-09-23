@@ -88,13 +88,13 @@ func (s *engineStats) countStream(transport string) {
 	s.streamsDerp.Add(1)
 }
 
-// transportCounts returns how many peers currently ride a direct session and
-// how many are on the relay only. It probes each directConn with the
-// side-effect-free live() rather than session(): session() tears down a dead
-// session and schedules a re-punch, which a status query must never do. The
-// engine lock is released before probing, so directConn.mu is never taken
-// while holding it.
-func (e *engine) transportCounts() (direct, derp int) {
+// peerTransports names each peer's current path: "direct" when it has a live
+// direct session, "derp" otherwise (the relay adapter is what makes a peer
+// connected at all). It probes each directConn with the side-effect-free live()
+// rather than session(): session() tears down a dead session and schedules a
+// re-punch, which a status query must never do. The engine lock is released
+// before probing, so directConn.mu is never taken while holding it.
+func (e *engine) peerTransports() map[string]string {
 	e.mu.Lock()
 	directs := make([]*directConn, 0, len(e.directs))
 	for _, dc := range e.directs {
@@ -106,17 +106,27 @@ func (e *engine) transportCounts() (direct, derp int) {
 	}
 	e.mu.Unlock()
 
-	liveDirect := make(map[derpclient.PublicKey]struct{}, len(directs))
+	out := make(map[string]string, len(peers)+len(directs))
+	for _, p := range peers {
+		out[keyName(p)] = "derp"
+	}
 	for _, dc := range directs {
 		if dc.live() {
-			liveDirect[dc.peer] = struct{}{}
-			direct++
+			out[keyName(dc.peer)] = "direct"
 		}
 	}
-	for _, p := range peers {
-		if _, ok := liveDirect[p]; !ok {
-			derp++
+	return out
+}
+
+// transportCounts returns how many peers currently ride a direct session and
+// how many are on the relay only.
+func (e *engine) transportCounts() (direct, derp int) {
+	for _, transport := range e.peerTransports() {
+		if transport == "direct" {
+			direct++
+			continue
 		}
+		derp++
 	}
 	return
 }

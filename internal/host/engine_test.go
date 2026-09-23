@@ -85,6 +85,19 @@ func TestTransportCounts(t *testing.T) {
 		t.Fatalf("derp = %d, want 1 (the direct peer must not double-count)", derp)
 	}
 
+	// The same classification is available per peer, which is what a caller
+	// listing peers uses.
+	transports := e.peerTransports()
+	if len(transports) != 2 {
+		t.Fatalf("peerTransports = %v, want both peers", transports)
+	}
+	if got := transports[keyName(peerDirect)]; got != "direct" {
+		t.Errorf("peer %s transport = %q, want direct", keyName(peerDirect), got)
+	}
+	if got := transports[keyName(peerRelay)]; got != "derp" {
+		t.Errorf("peer %s transport = %q, want derp", keyName(peerRelay), got)
+	}
+
 	// Losing the direct session moves that peer into the relay column.
 	dc.mu.Lock()
 	sess := dc.sess
@@ -94,6 +107,9 @@ func TestTransportCounts(t *testing.T) {
 	direct, derp = e.transportCounts()
 	if direct != 0 || derp != 2 {
 		t.Fatalf("after session death: direct = %d, derp = %d, want 0, 2", direct, derp)
+	}
+	if got := e.peerTransports()[keyName(peerDirect)]; got != "derp" {
+		t.Errorf("after session death: peer transport = %q, want derp", got)
 	}
 }
 

@@ -322,8 +322,14 @@ func (s *server) addForwardAddr(addr, key string) error {
 func (s *server) status() p2p.Status {
 	var st p2p.Status
 	if s.engine != nil {
-		direct, derp := s.engine.transportCounts()
-		st.DirectPeers, st.DerpPeers = direct, derp
+		st.PeerTransports = s.engine.peerTransports()
+		for _, transport := range st.PeerTransports {
+			if transport == "direct" {
+				st.DirectPeers++
+				continue
+			}
+			st.DerpPeers++
+		}
 		st.PunchAttempts, st.PunchSuccess,
 			st.StreamsDirect, st.StreamsDerp = s.engine.stats.snapshot()
 	}
