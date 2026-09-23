@@ -9,7 +9,7 @@ and the boundaries the library deliberately does not cross.
 | Package | What it is | Dependencies |
 |---|---|---|
 | `github.com/go-gost/p2p` | the contracts: `Config`, `Status`, the sentinel errors | standard library only |
-| `github.com/go-gost/p2p/endpoint` | the endpoint: identity, relay engine, forwards, `Dial`/`Listen` | engine (kcp, smux, websocket) |
+| `github.com/go-gost/p2p/endpoint` | the endpoint: identity, relay engine, forwards, `Dial`/`Listen`, a STUN probe | engine (kcp, smux, websocket) |
 | `github.com/go-gost/p2p/grpc` | the gRPC transport: serves an endpoint over the GOST plugin protocol | grpc-go, the plugin proto |
 | `github.com/go-gost/p2p/internal/…` | implementation detail | not importable, not supported |
 
@@ -91,6 +91,21 @@ relay keepalive, smux keepalive). They are **process-wide**: applied when an
 endpoint is created, and a later endpoint inherits the values already applied.
 One endpoint per process is the model — a process that builds two must give them
 identical timeouts (or none). Internal mechanism timeouts are not configurable.
+
+## Direct path
+
+`Config.Direct` (nil = on) attempts a hole-punched path and falls back to the
+relay; `Config.Stun` (host:port) is the IPv4 candidate source, and the IPv6 path
+needs no STUN. `endpoint.StunLookup(ctx, addr)` probes a STUN server the way the
+engine does — it returns the public address the server sees, which is what a
+punch needs — so an embedder can validate a `Stun` value before starting:
+
+```go
+mapped, err := endpoint.StunLookup(ctx, "derp.example:3478")
+```
+
+The probe dials its own socket: the address it reports is that socket's mapping,
+not the one a later punch will use.
 
 ## Trust boundary
 

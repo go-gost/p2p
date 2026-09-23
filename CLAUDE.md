@@ -13,7 +13,7 @@ Current implementation: **stub + mux + token + DERP relay + STUN/UDP hole punchi
 | Package | Role |
 |---|---|
 | `p2p` (root) | **contracts only**: `Config` + `TLSConfig`/`ForwardConfig`/`TimeoutsConfig`, `Status`, the sentinel errors. **Standard library only** — a test (`deps_test.go`) fails if anything else creeps in. |
-| `p2p/endpoint` | the public endpoint: identity, engine, forwards, `Dial`/`Listen`/`Status`. Owns the host; an embedder never holds it. |
+| `p2p/endpoint` | the public endpoint: identity, engine, forwards, `Dial`/`Listen`/`Status`, and `StunLookup` (a STUN reachability/address probe). Owns the host; an embedder never holds it. |
 | `p2p/grpc` | the gRPC transport: serves an endpoint over the plugin protocol (`OpenTunnel`, `Tunnel`, `Status`) and owns its listener + token check. Named after its protocol, so it aliases grpc-go as `ggrpc` inside itself. |
 | `p2p/internal/host` | the host: engine, registry, data planes, and the **seam** (`OpenTunnel`/`AttachTunnel`/`Dial`/`Listen`). The package is unimportable outside the module, so third-party transports are not supported — a value obtained from `Endpoint.Host()` still has callable methods, but the seam is not a stable contract and changes without notice. |
 | `cmd/p2p` | the CLI: flags, its own config-file format (`addr`/`token`/`log` + the inlined `p2p.Config`), and the assembly of endpoint + gRPC transport. |
