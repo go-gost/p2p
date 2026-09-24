@@ -517,7 +517,10 @@ func TestDirectRepunchAfterSessionDeath(t *testing.T) {
 	})
 
 	// Simulate the idle-keepalive death: close the smux session on both sides.
-	// Each side's accept loop ends and markDead must reset the state.
+	// Nothing dials afterwards — the death itself must bring the path back.
+	// That is the phone's Wi-Fi ↔ cellular switch: the session dies with the
+	// old interface, and without the re-punch the pair sits on the relay until
+	// something dials.
 	for _, e := range []*engine{engineA, engineB} {
 		peer := pubB
 		if e == engineB {
@@ -531,16 +534,8 @@ func TestDirectRepunchAfterSessionDeath(t *testing.T) {
 			sess.Close()
 		}
 	}
-	waitFor(t, 5*time.Second, func() bool {
-		dcA := engineA.directConn(pubB)
-		dcA.mu.Lock()
-		a := dcA.state
-		dcA.mu.Unlock()
-		dcB := engineB.directConn(engineA.pub)
-		dcB.mu.Lock()
-		b := dcB.state
-		dcB.mu.Unlock()
-		return a == directNone && b == directNone
+	waitFor(t, 10*time.Second, func() bool {
+		return directUpNow(engineA, pubB) && directUpNow(engineB, engineA.pub)
 	})
 
 	// Cut relay data; only a re-punched direct path can carry this.
@@ -1312,4 +1307,17 @@ func TestUDPDialStartsPunch(t *testing.T) {
 	if state == directNone {
 		t.Fatal("udp dial left the punch unstarted")
 	}
+}
+
+// directUpNow reports the punch state without going through session(): that
+// call is itself a re-punch trigger, and the point of the test below is the
+// death being one.
+func directUpNow(e *engine, peer derpclient.PublicKey) bool {
+	dc := e.directConn(peer)
+	if dc == nil {
+		return false
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.state == directUp
 }

@@ -413,6 +413,10 @@ func (dc *directConn) markUp(sess *smux.Session, socket *net.UDPConn, peerAddr n
 // accepting side otherwise stays stuck in directUp and never answers the
 // re-punch candidates, so the pair can never re-establish. The guard ignores a
 // stale session so a concurrent re-punch (markUp) is not clobbered.
+// markDead tears down the direct session after its accept loop ends and punches
+// again: the path died (a network change, a NAT rebind, an idle keepalive
+// timeout), and a new network is a new chance — nothing else would retry while
+// the pair is idle on the relay.
 func (dc *directConn) markDead(sess *smux.Session) {
 	dc.mu.Lock()
 	if dc.sess != sess {
@@ -428,7 +432,11 @@ func (dc *directConn) markDead(sess *smux.Session) {
 	if sock != nil {
 		sock.Close()
 	}
-	dc.e.dropIfGone(dc.peer, dc)
+	if dc.e.dropIfGone(dc.peer, dc) {
+		return // the peer is gone from the relay: nothing to punch with
+	}
+	dc.e.log.Debug("direct punch: session died, punching again", "peer", keyName(dc.peer))
+	go dc.start()
 }
 
 // addCaps ORs the capability bits the peer advertised. Capabilities are
