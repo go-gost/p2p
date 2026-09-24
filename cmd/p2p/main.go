@@ -26,7 +26,7 @@ import (
 func main() {
 	// Flags are overrides on top of the config file; their defaults are only
 	// used as a fallback when neither the config nor the flag sets the value.
-	addr := flag.String("addr", "127.0.0.1:8003", "gRPC listen address (control plane)")
+	addr := flag.String("addr", "", "gRPC listen address (control plane); empty runs none — a --target/--forward node has no GOST client to serve")
 	token := flag.String("token", "", "control-plane auth token; empty disables checking (loopback default)")
 	derpURL := flag.String("derp", "", "DERP relay server URL (wss://host/derp); enables DERP engine mode")
 	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
@@ -81,9 +81,6 @@ func main() {
 	}
 	if cfg.Log.Output == "" {
 		cfg.Log.Output = "stderr"
-	}
-	if cfg.Addr == "" {
-		cfg.Addr = "127.0.0.1:8003"
 	}
 
 	// Explicitly-set flags override the config.
@@ -152,24 +149,47 @@ func main() {
 		slog.Info("p2p derp engine", "url", cfg.Derp,
 			"pubkey", ep.PublicKey(), "targets", cfg.Targets)
 	}
-	srv, err := grpc.New(ep, grpc.WithAddr(cfg.Addr), grpc.WithToken(cfg.Token))
-	if err != nil {
-		slog.Error("init", "error", err)
-		ep.Close()
-		os.Exit(1)
-	}
-	if _, err := srv.Start(); err != nil {
-		slog.Error("start", "error", err)
-		srv.Close()
-		ep.Close()
-		os.Exit(1)
+	// The control plane exists for a GOST client (a p2ps plugin) to open tunnels
+	// through this node. A node that only bridges inbound traffic (--target) or
+	// forwards static ports has no such client, and an address nothing dials is
+	// just a local port: it stays closed unless one is asked for.
+	var srv *grpc.Server
+	if controlPlaneOff(cfg.Addr) {
+		slog.Info("p2p control plane off",
+			"hint", "pass --addr to serve a GOST client's OpenTunnel()")
+	} else {
+		var err error
+		srv, err = grpc.New(ep, grpc.WithAddr(cfg.Addr), grpc.WithToken(cfg.Token))
+		if err != nil {
+			slog.Error("init", "error", err)
+			ep.Close()
+			os.Exit(1)
+		}
+		if _, err := srv.Start(); err != nil {
+			slog.Error("start", "error", err)
+			srv.Close()
+			ep.Close()
+			os.Exit(1)
+		}
 	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	srv.Close()
+	if srv != nil {
+		srv.Close()
+	}
 	ep.Close()
+}
+
+// controlPlaneOff reports whether no control plane is wanted: an unset address,
+// or an explicit "off"/"none" (so a config file can say it in a word).
+func controlPlaneOff(addr string) bool {
+	switch strings.ToLower(strings.TrimSpace(addr)) {
+	case "", "off", "none":
+		return true
+	}
+	return false
 }
 
 // Custom slog levels to cover gost's logrus-compatible range (slog built-in:

@@ -52,7 +52,7 @@ GOWORK=off go build ./...   # standalone build must also pass
 | Flag | Default | Meaning |
 |---|---|---|
 | `-C` | *(empty)* | config file (YAML); config values are defaults, explicitly-set flags override |
-| `--addr` | `127.0.0.1:8003` | gRPC control-plane listen address |
+| `--addr` | *(empty: no control plane)* | gRPC control-plane listen address; only a node a GOST `p2ps:` client dials needs one |
 | `--token` | *(empty)* | control-plane auth token; empty disables checking (loopback default) |
 | `--derp` | *(empty)* | DERP relay URL (`wss://host/derp`); enables engine mode |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |

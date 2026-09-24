@@ -44,7 +44,7 @@ go build -o p2p ./cmd/p2p
 | Flag | Default | Meaning |
 |---|---|---|
 | `-C` | *(empty)* | config file (YAML); config values are defaults, explicitly-set flags override |
-| `--addr` | `127.0.0.1:8003` | gRPC control-plane listen address |
+| `--addr` | *(empty: no control plane)* | gRPC control-plane listen address; set it only when a GOST client will dial this node (`p2ps:` plugin). A `--target`/`--forward` node has no such client |
 | `--token` | *(empty)* | control-plane auth token; empty disables checking |
 | `--derp` | *(empty)* | DERP relay URL (`wss://host/derp`); enables engine mode |
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
@@ -67,6 +67,13 @@ flags and the config `forwards` list are additive.
 The file is read by the CLI (`cmd/p2p`); the library has no file reader, and
 `addr`, `token` and `log` are the CLI's own keys — a `p2p.Config` has no such
 fields (they are deployment settings, not endpoint settings).
+
+The control plane is **opt-in**: without `addr` (or with `addr: off`) the node
+runs no gRPC listener at all, which is what a node that only bridges inbound
+traffic needs — its `--target` (a hub for spokes) or its `--forward` list is
+served from inside the endpoint, with no client to talk to. Only a node a GOST
+`p2ps:` plugin dials needs one; without `--token` it is unauthenticated, so keep
+it on loopback (or give it a token) when you do run it.
 
 ```bash
 ./p2p -C p2p.yaml
