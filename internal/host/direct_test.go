@@ -1321,3 +1321,46 @@ func directUpNow(e *engine, peer derpclient.PublicKey) bool {
 	defer dc.mu.Unlock()
 	return dc.state == directUp
 }
+
+// TestPunchWaitsForRelay: with the relay down a punch round must wait, not
+// fail. Candidates are exchanged over the relay, so there is nothing to do
+// until it is back — and counting the round as a failure backs the peer off for
+// 30s over what is usually a few seconds of network change (a phone switching
+// Wi-Fi ↔ cellular, which is when this happens).
+func TestPunchWaitsForRelay(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, "", privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+	engineA.Connect()
+	engineB.Connect()
+
+	// Take the relay away, the way a network change does.
+	engineA.mu.Lock()
+	c := engineA.client
+	engineA.client = nil
+	engineA.mu.Unlock()
+	if c != nil {
+		c.Close()
+	}
+
+	dc := engineA.directConn(pubB)
+	if !dc.start() {
+		t.Fatal("punch did not start")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		dc.mu.Lock()
+		defer dc.mu.Unlock()
+		return dc.state == directBackoff
+	})
+	if dc.hasFailed() {
+		t.Fatal("a round without the relay marked the peer as failed; it should wait instead")
+	}
+}

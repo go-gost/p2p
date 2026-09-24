@@ -313,10 +313,28 @@ func (e *engine) reconnect() {
 			return
 		case <-ticker.C:
 			e.mu.Lock()
-			if e.client == nil {
+			wasDown := e.client == nil
+			if wasDown {
 				e.ensureClientLocked()
 			}
+			var punch []*directConn
+			if wasDown && e.client != nil {
+				for _, dc := range e.directs {
+					punch = append(punch, dc)
+				}
+			}
 			e.mu.Unlock()
+
+			// The relay just came back, which on a phone means the network
+			// changed (Wi-Fi ↔ cellular): the candidates exchanged over it are
+			// stale, and a round that ran while it was down gave up. Punch
+			// again — nothing else would, while the pair is idle.
+			if len(punch) > 0 {
+				e.log.Debug("relay reconnected, punching again", "peers", len(punch))
+				for _, dc := range punch {
+					go dc.start()
+				}
+			}
 		}
 	}
 }

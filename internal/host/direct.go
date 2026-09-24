@@ -78,7 +78,11 @@ var (
 	// the relay.
 	punchWaitTimeout = 5 * time.Second
 	backoffPeriod    = 30 * time.Second
-	stunTimeout      = 3 * time.Second
+	// relayWaitRetry is how long a punch waits for the relay to come back
+	// before trying again; it is short because the relay is usually back
+	// within the reconnect ticker's period.
+	relayWaitRetry = 2 * time.Second
+	stunTimeout    = 3 * time.Second
 	// candidateGrace is how long a round holds after taking a peer's candidate
 	// list, for a fresher one to supersede it. See the call site in punch.
 	candidateGrace = 200 * time.Millisecond
@@ -163,6 +167,14 @@ func (e *engine) directEnabled() bool {
 		return false
 	}
 	return e.stunAddr != "" || e.v6Addr != nil || e.v6Available
+}
+
+// relayConnected reports whether the relay connection is up: the punch's
+// candidate exchange runs over it.
+func (e *engine) relayConnected() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.client != nil
 }
 
 // maybeStartDirect kicks off hole punching when a candidate source exists.
@@ -474,21 +486,27 @@ func (dc *directConn) peerAddrString() string {
 }
 
 // backoff marks a failed punch and schedules a retry.
-func (dc *directConn) backoff() {
+func (dc *directConn) backoff() { dc.retry(backoffPeriod, true) }
+
+// retry reschedules the punch after d. failed says a *round* failed — the relay
+// being away is not a failure, it is a reason to wait: nothing can be exchanged
+// without it, and the round would otherwise back off for 30s over a network
+// blip (the phone's Wi-Fi ↔ cellular switch).
+func (dc *directConn) retry(d time.Duration, failed bool) {
 	dc.mu.Lock()
 	dc.state = directBackoff
-	dc.failed = true
+	dc.failed = dc.failed || failed
 	// The round's sockets are gone, so its candidate list is not ours to offer
 	// any more: onCandidates answers a peer's announcement with dc.mine, and
 	// echoing a dead endpoint races the peer's own fresh list into its slot.
 	dc.mine = nil
 	dc.mu.Unlock()
-	dc.e.log.Debug("direct punch: backoff", "peer", keyName(dc.peer), "retryIn", backoffPeriod.String())
+	dc.e.log.Debug("direct punch: backoff", "peer", keyName(dc.peer), "retryIn", d.String())
 	go func() {
 		select {
 		case <-dc.e.stop:
 			return
-		case <-time.After(backoffPeriod):
+		case <-time.After(d):
 		}
 		dc.mu.Lock()
 		// Only reset if we're still backing off: onCandidates may have already
@@ -520,6 +538,16 @@ func (dc *directConn) punch() {
 	// dials: both peers dial. See docs/2026-09-09-p2p-mutual-punch-design.md.
 	roleIsClient := bytes.Compare(e.pub[:], dc.peer[:]) < 0
 	pname := keyName(dc.peer)
+
+	// Candidates are exchanged over the relay: with no connection there is
+	// nothing to announce and nothing to answer with, so wait for it rather
+	// than failing the round.
+	if !e.relayConnected() {
+		e.log.Debug("direct punch: no relay connection, waiting", "peer", pname)
+		dc.retry(relayWaitRetry, false)
+		return
+	}
+
 	e.stats.punchAttempts.Add(1)
 
 	// 1. Collect one socket + candidate set per available family. A family that
