@@ -231,8 +231,22 @@ var (
 	// above the interval (>= 2x): with them equal, smux's idle check races the
 	// first NOP round-trip and closes an idle session after ~interval (see
 	// docs/2026-09-09-p2p-mutual-punch-design.md, kcp-go deep dive R1/R2).
-	smuxKeepAliveInterval = 10 * time.Second
-	smuxKeepAliveTimeout  = 30 * time.Second
+	//
+	// The pair is what bounds how long a peer that restarted — or moved
+	// networks — stays "connected" while carrying nothing: only the frames the
+	// *peer* sends feed a session's liveness, and the relay's PeerGone is
+	// best-effort (derper sends it to mesh watchers, not to open-relay clients),
+	// so a session whose far end vanished is noticed only here. Measured on a
+	// phone whose tun entrypoint was restarted: ~33s of blackhole at 10s/30s,
+	// which is one timeout plus the re-establishment.
+	//
+	// The timeout must stay above the ping interval of a peer that has not
+	// adopted this pair — 10s, what this pair used to be — or a peer pinging
+	// every 10s would have its healthy session torn down on a tick. 15s is that
+	// floor for a mixed fleet; 3s pings leave room for a tighter timeout once
+	// both ends negotiate one (see capsTightKeepalive's shape).
+	smuxKeepAliveInterval = 3 * time.Second
+	smuxKeepAliveTimeout  = 15 * time.Second
 
 	// The direct session's own keepalive, deliberately tighter than the relay's.
 	// It is negotiated (capsTightKeepalive) and only used when the peer
@@ -240,16 +254,16 @@ var (
 	// liveness is fed by the frames the *peer* sends — a peer pinging every 10s
 	// cannot keep a 6s timeout alive, and would have its direct sessions torn
 	// down and re-punched every 6s. A peer that does not advertise it gets
-	// smuxKeepAliveInterval/Timeout below, which is what every peer had before
-	// this pair existed.
+	// smuxKeepAliveInterval/Timeout above instead.
 	//
 	// With both ends on it: smux clears its activity flag on one timeout tick
 	// and closes on the next, so a path that goes silent is noticed after ~2x
 	// the timeout (measured: 3.97s at a 2s timeout; this pair gives ~12s against
-	// the relay pair's ~60s). Until then the session is served as live: status
-	// calls the peer "direct" and a new stream is handed to a dead path instead
-	// of the relay. The relay's PeerGone is not a substitute — it is best-effort
-	// and says nothing about a path that does not run through the relay.
+	// the relay pair's whole timeout). Until then the session is served as live:
+	// status calls the peer "direct" and a new stream is handed to a dead path
+	// instead of the relay. The relay's PeerGone is not a substitute — it is
+	// best-effort and says nothing about a path that does not run through the
+	// relay.
 	//
 	// The direct path is peer-to-peer and its frames ride KCP, so a lost NOP is
 	// retransmitted rather than dropped: silence for seconds means the path
