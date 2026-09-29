@@ -651,32 +651,32 @@ func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
 	}
 }
 
-// relayDeadPeriod is how long the relay connection may deliver no frame at all
-// before the engine treats the path as dead and reconnects. A healthy
-// connection hears from the derper every second or two (its keepalives and
-// ping/pong), so the ceiling is deliberately generous: it exists to catch a path
-// gone silent while TCP still looks open — writes buffered, reads parked — not
-// to police a merely quiet one. A var so tests can shorten it.
-var relayDeadPeriod = 60 * time.Second
+// relayDeadPeriod is how long an unanswered probe may stand before the engine
+// treats the relay path as dead and reconnects. Probes go out every
+// keepAlivePeriod (30s), so the ceiling sits between one and two ticks: long
+// enough that a round trip in flight is never mistaken for a dead path, short
+// enough that a stale registration is cleared within a minute. A var so tests
+// can shorten it.
+var relayDeadPeriod = 45 * time.Second
 
-// relaySilent reports whether the relay connection looks dead: it once carried
-// a frame and has been quiet ever since. A zero last means no frame has been
-// stamped yet, so there is no verdict.
-func relaySilent(last, now time.Time) bool {
-	return !last.IsZero() && now.Sub(last) > relayDeadPeriod
+// relaySilent reports whether the relay connection has stopped answering: a
+// ping went out at pingedAt and no pong has come back within relayDeadPeriod.
+// Inbound frames alone cannot answer this — a quiet relay carries none at all,
+// healthy or not (measured: a hub with an idle peer set sees frames=0 on a
+// perfectly good connection) — which is why the engine probes instead.
+func relaySilent(pingedAt, pongAt, now time.Time) bool {
+	if pingedAt.IsZero() {
+		return false // nothing probed yet: no verdict
+	}
+	last := pongAt
+	if last.IsZero() || last.Before(pingedAt) {
+		// The ping that is outstanding is the newest evidence there is: an
+		// older pong (or none) says nothing about this round trip.
+		last = pingedAt
+	}
+	return now.Sub(last) > relayDeadPeriod
 }
 
-// keepalive keeps the DERP connection alive through proxy/CDN idle timeouts.
-func (e *engine) keepalive(c *derpclient.Client) {
-	ticker := time.NewTicker(keepAlivePeriod)
-	defer ticker.Stop()
-	for range ticker.C {
-		if err := c.KeepAlive(); err != nil {
-			e.teardown(c, err)
-			return
-		}
-		// A relay path can die without the WebSocket noticing: writes buffer and
-		// nothing errors, so every peer's streams keep being handed to a dead
 // relayChurnWindow and relayChurnMax bound how often one peer's relay session
 // may be rebuilt before the engine treats that *pair* — not the transport — as
 // wedged. A session dies on its own keepalive timeout when its packets stop
@@ -698,25 +698,46 @@ var (
 // p2p.ErrPeerUnreachable.
 var errPeerSessionClosed = errors.New("derp engine: peer session closed")
 
-		// path and nothing recovers until the host is restarted (a stale relay
-		// registration keeps serving as live). The age of the newest inbound
-		// frame is the only local evidence — a healthy connection hears from the
-		// derper every second or two — so it is both reported here and acted on:
-		// a silent path is torn down, and the engine's redial loop then registers
-		// the relay afresh, which is what clears the stale state.
-		last, now := c.LastRecv(), time.Now()
-		age := now.Sub(last)
-		if last.IsZero() {
-			e.log.Debug("derp: keepalive, no inbound frame yet", "frames", c.RecvFrames())
-		} else {
-			e.log.Debug("derp: keepalive", "inboundFrameAge", age.Round(time.Millisecond).String(),
-				"frames", c.RecvFrames())
+// keepalive keeps the DERP connection alive through proxy/CDN idle timeouts.
+func (e *engine) keepalive(c *derpclient.Client) {
+	ticker := time.NewTicker(keepAlivePeriod)
+	defer ticker.Stop()
+
+	// pingedAt is this loop's own: the probe and its verdict are the keepalive
+	// goroutine's business, and a new connection starts a new loop.
+	var pingedAt time.Time
+	for range ticker.C {
+		if err := c.KeepAlive(); err != nil {
+			e.teardown(c, err)
+			return
 		}
-		if relaySilent(last, now) {
-			e.log.Error("derp: relay path dead, reconnecting", "silentFor", age.Round(time.Second).String(),
-				"frames", c.RecvFrames())
-			e.teardown(c, fmt.Errorf("relay path silent for %v (%d frames in)",
-				age.Round(time.Second), c.RecvFrames()))
+		// A relay path can die without the WebSocket noticing: writes buffer and
+		// nothing errors, so every peer's streams keep being handed to a dead
+		// path and nothing recovers until the host is restarted (a stale relay
+		// registration keeps serving as live). Inbound frames cannot say whether
+		// that happened — a quiet relay carries none either way — so a ping goes
+		// out and the pong, or its absence, is the verdict: an unanswered probe
+		// tears the connection down, and the redial registers the relay afresh,
+		// which is what clears the stale state.
+		if err := c.Ping(); err != nil {
+			e.teardown(c, err)
+			return
+		}
+		pingedAt = time.Now()
+		// The reported age is the last pong's, which is the number that says
+		// whether the path is answering; the ping just sent is only in flight.
+		pongAge := "never"
+		if last := c.LastPong(); !last.IsZero() {
+			pongAge = time.Since(last).Round(time.Millisecond).String()
+		}
+		e.log.Debug("derp: keepalive", "pongAge", pongAge, "pongs", c.Pongs(),
+			"inboundFrameAge", time.Since(c.LastRecv()).Round(time.Second).String(),
+			"frames", c.RecvFrames())
+		if relaySilent(pingedAt, c.LastPong(), time.Now()) {
+			e.log.Error("derp: relay path dead, reconnecting", "pongAge", pongAge,
+				"pongs", c.Pongs(), "frames", c.RecvFrames())
+			e.teardown(c, fmt.Errorf("relay path unresponsive for %v (%d pongs, %d frames in)",
+				relayDeadPeriod, c.Pongs(), c.RecvFrames()))
 			return
 		}
 	}
@@ -855,10 +876,34 @@ func (pc *peerConn) ensureSession(punch bool) (*smux.Session, error) {
 	}
 	sess, err := pc.sessionLocked()
 	pc.mu.Unlock()
+	if pc.takeChurnTripped() {
+		// This pair is rebuilding sessions far faster than a working one ever
+		// does: its packets are not getting through a relay that still looks
+		// healthy for every other peer, and each rebuild rides the same path.
+		// A fresh registration is the cure, so the transport goes down and the
+		// redial brings it back.
+		pc.e.log.Error("derp: peer relay session churn, reconnecting the relay",
+			"peer", keyName(pc.peer), "builds", relayChurnMax+1, "window", relayChurnWindow.String())
+		pc.e.reconnectRelay(fmt.Errorf("peer %s rebuilt its relay session more than %d times in %v",
+			keyName(pc.peer), relayChurnMax, relayChurnWindow))
+	}
 	if err == nil && punch {
 		pc.e.maybeStartDirect(pc.peer)
 	}
 	return sess, err
+}
+
+// reconnectRelay tears the shared relay connection down, so the redial loop
+// registers with it afresh. Nothing smaller cures a stale registration: the
+// relay's routing table is per connection, and it is the registration that has
+// gone stale.
+func (e *engine) reconnectRelay(cause error) {
+	e.mu.Lock()
+	c := e.client
+	e.mu.Unlock()
+	if c != nil {
+		e.teardown(c, cause)
+	}
 }
 
 // sessionLocked brings up the peer's relay mux session if it is not already
@@ -876,65 +921,20 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	cfg.KeepAliveTimeout = smuxKeepAliveTimeout
 	roleIsClient := bytes.Compare(pc.e.pub[:], pc.peer[:]) < 0
 	if roleIsClient {
-	if pc.takeChurnTripped() {
-		// This pair is rebuilding sessions far faster than a working one ever
-		// does: its packets are not getting through a relay that still looks
-		// healthy for every other peer, and each rebuild rides the same path.
-		// A fresh registration is the cure, so the transport goes down and the
-		// redial brings it back.
-		pc.e.log.Error("derp: peer relay session churn, reconnecting the relay",
-			"peer", keyName(pc.peer), "builds", relayChurnMax+1, "window", relayChurnWindow.String())
-		pc.e.reconnectRelay(fmt.Errorf("peer %s rebuilt its relay session more than %d times in %v",
-			keyName(pc.peer), relayChurnMax, relayChurnWindow))
-	}
 		pc.sess, _ = smux.Client(pc, cfg)
 	} else {
 		pc.sess, _ = smux.Server(pc, cfg)
 	}
 	if pc.sess == nil {
 		return nil, errors.New("derp engine: cannot establish mux session")
-// reconnectRelay tears the shared relay connection down, so the redial loop
-// registers with it afresh. Nothing smaller cures a stale registration: the
-// relay's routing table is per connection, and it is the registration that has
-// gone stale.
-func (e *engine) reconnectRelay(cause error) {
-	e.mu.Lock()
-	c := e.client
-	e.mu.Unlock()
-	if c != nil {
-		e.teardown(c, cause)
-	}
-}
-
 	}
 	pc.sessAt = time.Now()
+	pc.noteBuildLocked(pc.sessAt)
 	pc.e.log.Debug("peer relay session up", "peer", keyName(pc.peer), "client", roleIsClient)
 	pc.startAccept()
 	return pc.sess, nil
 }
 
-// startAccept launches the inbound stream loop for the adapter's current
-// session, if that session has none yet. Caller must hold pc.mu.
-//
-// The session is captured here, not read inside the goroutine: a rebuild would
-// otherwise hand the loop whatever pc.sess had become — nil (a crash in
-// AcceptStream) or a different, newer session. The flag names the session the
-// loop serves rather than being a plain bool, so a rebuild never has to wait
-// for the previous loop to notice its session died before it can start serving
-// the new one.
-func (pc *peerConn) startAccept() {
-	sess := pc.sess
-	if sess == nil || pc.accepting == sess {
-		return
-	}
-	pc.accepting = sess
-	go func() {
-	pc.noteBuildLocked(pc.sessAt)
-		defer func() {
-			pc.mu.Lock()
-			if pc.accepting == sess {
-				pc.accepting = nil
-			}
 // noteBuildLocked records one relay session built for this peer, opening a new
 // window when the old one has run out, and trips when the window's limit is
 // crossed. Caller must hold pc.mu.
@@ -962,6 +962,27 @@ func (pc *peerConn) takeChurnTripped() bool {
 	return true
 }
 
+// startAccept launches the inbound stream loop for the adapter's current
+// session, if that session has none yet. Caller must hold pc.mu.
+//
+// The session is captured here, not read inside the goroutine: a rebuild would
+// otherwise hand the loop whatever pc.sess had become — nil (a crash in
+// AcceptStream) or a different, newer session. The flag names the session the
+// loop serves rather than being a plain bool, so a rebuild never has to wait
+// for the previous loop to notice its session died before it can start serving
+// the new one.
+func (pc *peerConn) startAccept() {
+	sess := pc.sess
+	if sess == nil || pc.accepting == sess {
+		return
+	}
+	pc.accepting = sess
+	go func() {
+		defer func() {
+			pc.mu.Lock()
+			if pc.accepting == sess {
+				pc.accepting = nil
+			}
 			pc.mu.Unlock()
 		}()
 		pc.e.acceptLoop(sess, "derp", pc.peer, "")

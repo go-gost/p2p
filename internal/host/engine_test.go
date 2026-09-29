@@ -515,22 +515,34 @@ func TestConnectErrorKeepsDialCause(t *testing.T) {
 	}
 }
 
-// TestRelaySilent: the watchdog's verdict. It must not fire before any frame has
-// been stamped (the connection simply has not been read yet), must tolerate a
-// fresh frame, and must fire once the path has been quiet past the ceiling.
+// TestRelaySilent: the watchdog's verdict, which is about a ping going
+// unanswered — not about frames arriving, since a quiet relay carries none
+// either way. It must not judge before the first probe, must tolerate a round
+// trip that is merely in flight, and must fire once the outstanding probe is
+// older than the ceiling.
 func TestRelaySilent(t *testing.T) {
 	now := time.Now()
 
-	if relaySilent(time.Time{}, now) {
-		t.Error("no verdict before the first frame")
+	if relaySilent(time.Time{}, time.Time{}, now) {
+		t.Error("no verdict before the first probe")
 	}
-	if relaySilent(now.Add(-time.Second), now) {
-		t.Error("a one-second-old frame is not silence")
+	if relaySilent(now.Add(-time.Second), time.Time{}, now) {
+		t.Error("a one-second-old unanswered ping is not silence")
 	}
-	if relaySilent(now.Add(-relayDeadPeriod), now) {
+	if relaySilent(now.Add(-relayDeadPeriod), time.Time{}, now) {
 		t.Error("exactly at the ceiling is not yet silence")
 	}
-	if !relaySilent(now.Add(-relayDeadPeriod-time.Second), now) {
-		t.Error("a frame older than the ceiling is silence")
+	if !relaySilent(now.Add(-relayDeadPeriod-time.Second), time.Time{}, now) {
+		t.Error("an unanswered ping older than the ceiling is silence")
+	}
+
+	// An answered probe is never silence, however quiet the connection is: the
+	// pong is newer than the ping that asked for it.
+	if relaySilent(now.Add(-time.Minute), now.Add(-time.Second), now) {
+		t.Error("a fresh pong is not silence, however old the ping")
+	}
+	// A pong older than the ceiling, with a ping older still, is silence.
+	if !relaySilent(now.Add(-2*relayDeadPeriod), now.Add(-relayDeadPeriod-time.Second), now) {
+		t.Error("a pong older than the ceiling is silence")
 	}
 }

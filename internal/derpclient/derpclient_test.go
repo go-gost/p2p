@@ -419,3 +419,48 @@ func TestOversizedPacketRejected(t *testing.T) {
 	}
 	_ = m
 }
+
+// TestPingIsAnsweredAndStamped: the engine's liveness probe is a round trip, so
+// a pong has to be observable — its arrival time and count — rather than
+// consumed silently. That stamp is the only thing that tells a quiet relay from
+// a dead one, which is why the engine can now reconnect on an unanswered probe
+// instead of on silence.
+func TestPingIsAnsweredAndStamped(t *testing.T) {
+	_, url := startMiniServer(t)
+	priv, _, err := Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, url, priv, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := c.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A reader is what turns the server's reply into a stamped pong: Recv
+	// consumes pongs (and pings and keepalives) internally.
+	go func() {
+		for {
+			if _, _, err := c.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for c.Pongs() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := c.Pongs(); got != 1 {
+		t.Fatalf("Pongs() = %d, want 1 (the server echoes a ping as a pong)", got)
+	}
+	if c.LastPong().IsZero() {
+		t.Error("LastPong() is zero after a stamped pong")
+	}
+}

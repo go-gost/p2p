@@ -180,6 +180,13 @@ type Client struct {
 	// reports the age of the newest one and reconnects when it goes stale.
 	recvAt atomic.Int64
 	recvN  atomic.Int64
+
+	// pongAt (unix nanos) and pongN record the answers to our pings. A relay
+	// path that has gone dead while TCP still looks open carries no frames at
+	// all, healthy or not, so "nothing received" proves nothing on its own —
+	// the round trip is what tells the two apart.
+	pongAt atomic.Int64
+	pongN  atomic.Int64
 }
 
 // LastRecv returns when the most recent frame arrived (zero if none has).
@@ -194,6 +201,18 @@ func (c *Client) LastRecv() time.Time {
 // RecvFrames returns how many frames have arrived, so a caller can tell a
 // fresh arrival from a stale LastRecv.
 func (c *Client) RecvFrames() int64 { return c.recvN.Load() }
+
+// LastPong returns when the most recent pong arrived (zero if none has).
+func (c *Client) LastPong() time.Time {
+	at := c.pongAt.Load()
+	if at == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, at)
+}
+
+// Pongs returns how many pongs have arrived.
+func (c *Client) Pongs() int64 { return c.pongN.Load() }
 
 // Dial connects to the DERP server at rawURL ("wss://host/derp", or ws://
 // for plaintext dev deployments), completes the DERP handshake, and returns
@@ -316,6 +335,19 @@ func (c *Client) pong(payload []byte) error {
 	return c.writeFrame(framePong, payload)
 }
 
+// Ping sends an 8-byte ping, which the server echoes back as a pong. It is the
+// engine's liveness probe: a relay path can die while the WebSocket still looks
+// open (writes buffer, reads park), and a quiet path carries no frames either
+// way, so only a round trip tells a quiet relay from a dead one. The answer is
+// stamped by Recv and reported by LastPong.
+func (c *Client) Ping() error {
+	var payload [8]byte
+	if _, err := rand.Read(payload[:]); err != nil {
+		return err
+	}
+	return c.writeFrame(framePing, payload[:])
+}
+
 // Recv blocks until a packet arrives and returns its source key and bytes.
 // KeepAlive, PeerPresent, unknown frame types, and Pong replies are consumed
 // internally; FramePing is answered with FramePong. A FramePeerGone returns
@@ -347,8 +379,13 @@ func (c *Client) Recv() (src PublicKey, pkt []byte, err error) {
 			}
 			copy(src[:], body[:keyLen])
 			return src, nil, ErrPeerGone
-		case frameKeepAlive, framePeerPresent, framePong, frameServerKey, frameServerInfo:
+		case frameKeepAlive, framePeerPresent, frameServerKey, frameServerInfo:
 			// no-op for us
+		case framePong:
+			// The answer to a Ping: the round trip is the engine's evidence
+			// that the path is alive, so it is stamped rather than ignored.
+			c.pongAt.Store(time.Now().UnixNano())
+			c.pongN.Add(1)
 		default:
 			// Unknown frame type: skip (forward compatibility).
 		}
