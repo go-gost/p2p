@@ -43,7 +43,7 @@ DERPER_BIN="${DERPER_BIN:-}"
 # Scenario registry: --list, --scenario validation and the runner all read this
 # single list, so a new scenario just needs an entry here and a scenario_<name>
 # function below.
-SCENARIOS=(stub derp-relay derp-direct forward inner-matrix udp-tun udp-outlet ipv6-direct)
+SCENARIOS=(stub derp-relay relay-peer-restart derp-direct forward inner-matrix udp-tun udp-outlet ipv6-direct)
 
 usage() {
 	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
@@ -409,6 +409,59 @@ scenario_derp_relay() {
 		save_status A 127.0.0.1:8003 "$dir/status-after.json"
 		fail "tunnel count did not return to zero: $(cat "$dir/status-after.json")"
 	fi
+}
+
+# A peer that restarts — or moves networks — is noticed by smux's own keepalive
+# alone: the relay's PeerGone is best-effort (derper sends it to mesh watchers,
+# not to open-relay clients) and a session whose far end vanished is served as
+# live until that timeout fires, so the tunnel carries nothing meanwhile. This
+# guards the pair the timeout is made of: 3s/15s notices a restart well inside
+# one timeout, where the old 10s/30s took its whole timeout plus the rebuild
+# (measured on a phone: 33s).
+scenario_relay_peer_restart() {
+	step "derp relay: a restarted peer is noticed within one keepalive timeout"
+	local dir="$RUNDIR/restart"
+	start_echo - echo "$NET_GW:18081"
+	start_peer_gost B peer http 127.0.0.1:18080
+	# An open relay, the way the public one runs: a derper that verifies its
+	# clients treats them as one mesh and tells the survivors when a peer
+	# leaves, which would hide exactly the case here — a session whose far end
+	# vanished with nobody to say so. The key is the derper's own node
+	# identity, and the file replaces the one it would write for itself.
+	mkdir -p "$RUNDIR/derper-restart"
+	printf '{"PrivateKey": "privkey:%s", "VerifyClients": false}\n' \
+		"$(openssl rand -hex 32)" >"$RUNDIR/derper-restart/derper.json"
+	start_derp_pair restart off false 127.0.0.1:18080 || return
+	local bkey
+	bkey=$(cat "$dir/b.pub")
+
+	gost_client_cfg "$dir/client.yaml" 127.0.0.1:8003 "$bkey" tcp "" 127.0.0.1:8080
+	start_gost A client -C "$dir/client.yaml"
+	wait_tcp A 127.0.0.1 8080 15 || fail "client proxy did not listen"
+	check "relay tunnel carries HTTP" \
+		test "$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/")" = "hello-p2p"
+
+	# Restart the far peer the way a phone restarts its entrypoint: the same
+	# key file, a fresh process. Nothing tells the client side's session that
+	# the peer it still holds is gone.
+	kill_pid "$(cat "$RUNDIR/pids/p2p-restart-b")"
+	sleep 1
+	start_p2p B "p2p-restart-b" --addr 127.0.0.1:8003 \
+		--derp "wss://$DERP_IP:443/derp" --key "$dir/keys/b" --tls.secure=false \
+		--target 127.0.0.1:18080 --direct=false
+
+	local t0=$SECONDS t1 body
+	while :; do
+		body=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/" 3)
+		[ "$body" = "hello-p2p" ] && break
+		if [ $((SECONDS - t0)) -gt 90 ]; then
+			fail "a restarted peer was not noticed in 90s"
+			return
+		fi
+	done
+	t1=$((SECONDS - t0))
+	ok "tunnel recovered ${t1}s after the peer restarted"
+	check "within one keepalive timeout of the restart" test "$t1" -le 25
 }
 
 scenario_derp_direct() {
