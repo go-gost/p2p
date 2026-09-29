@@ -514,3 +514,23 @@ func TestConnectErrorKeepsDialCause(t *testing.T) {
 		t.Fatalf("Connect error = %v, want the dial cause (connection refused)", err)
 	}
 }
+
+// TestRelaySilent: the watchdog's verdict. It must not fire before any frame has
+// been stamped (the connection simply has not been read yet), must tolerate a
+// fresh frame, and must fire once the path has been quiet past the ceiling.
+func TestRelaySilent(t *testing.T) {
+	now := time.Now()
+
+	if relaySilent(time.Time{}, now) {
+		t.Error("no verdict before the first frame")
+	}
+	if relaySilent(now.Add(-time.Second), now) {
+		t.Error("a one-second-old frame is not silence")
+	}
+	if relaySilent(now.Add(-relayDeadPeriod), now) {
+		t.Error("exactly at the ceiling is not yet silence")
+	}
+	if !relaySilent(now.Add(-relayDeadPeriod-time.Second), now) {
+		t.Error("a frame older than the ceiling is silence")
+	}
+}

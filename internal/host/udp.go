@@ -2,6 +2,7 @@ package host
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -236,7 +237,10 @@ func (l *link) publishOwn(c net.Conn) bool {
 func (l *link) adopt(c net.Conn, transport string) bool {
 	l.mu.Lock()
 	if l.closed || (l.peerEdge != nil && l.peerEdge != l.own) {
+		closed, holdsAdopted := l.closed, l.peerEdge != nil && l.peerEdge != l.own
 		l.mu.Unlock()
+		l.e.log.Debug("link: inbound edge refused", "peer", keyName(l.peer), "transport", transport,
+			"closed", closed, "holdsAdoptedEdge", holdsAdopted)
 		return false
 	}
 	old, own := l.peerEdge, l.own
@@ -331,6 +335,8 @@ func (l *link) pumpLocal(c net.Conn) {
 			l.writeEdge(buf[:n])
 		}
 		if err != nil {
+			// The dial's stream ending IS the dial ending: this closes the link.
+			l.e.log.Debug("link: local edge ended", "peer", keyName(l.peer), "error", err)
 			return
 		}
 	}
@@ -393,6 +399,9 @@ func (l *link) close() {
 		l.local, l.peerEdge, l.own = nil, nil, nil
 		l.mu.Unlock()
 
+		l.e.log.Debug("link closed", "peer", keyName(l.peer), "local", local != nil,
+			"edge", edge != nil, "own", own != nil)
+
 		close(l.stop)
 		if local != nil {
 			local.Close()
@@ -413,7 +422,9 @@ func (l *link) close() {
 func (e *engine) addLink(l *link) {
 	e.mu.Lock()
 	e.links[l.peer] = append(e.links[l.peer], l)
+	n := len(e.links[l.peer])
 	e.mu.Unlock()
+	e.log.Debug("link registered", "peer", keyName(l.peer), "links", n)
 }
 
 // removeLink drops l from its peer's list by identity, so a concurrent add of
@@ -432,7 +443,9 @@ func (e *engine) removeLink(l *link) {
 	} else {
 		e.links[l.peer] = ls
 	}
+	n := len(ls)
 	e.mu.Unlock()
+	e.log.Debug("link unregistered", "peer", keyName(l.peer), "links", n)
 }
 
 // adoptableLink returns the link that may adopt an inbound edge from peer, or
@@ -440,16 +453,24 @@ func (e *engine) removeLink(l *link) {
 // the pair converges on one edge), and only a link that is waiting for one.
 func (e *engine) adoptableLink(peer derpclient.PublicKey) *link {
 	if bytes.Compare(e.pub[:], peer[:]) <= 0 {
+		// Smaller key: it never adopts, it presents. An inbound edge from this
+		// peer is then served by the embedder/target, not paired with a link.
+		e.log.Debug("adoptable link: none, we are the smaller key", "peer", keyName(peer))
 		return nil
 	}
 	e.mu.Lock()
 	ls := append([]*link(nil), e.links[peer]...)
 	e.mu.Unlock()
+	var reasons []string
 	for _, l := range ls {
 		if l.adoptable() {
 			return l
 		}
+		l.mu.Lock()
+		reasons = append(reasons, fmt.Sprintf("closed=%v edge=%v own=%v", l.closed, l.peerEdge != nil, l.own != nil))
+		l.mu.Unlock()
 	}
+	e.log.Debug("adoptable link: none", "peer", keyName(peer), "links", len(ls), "states", reasons)
 	return nil
 }
 

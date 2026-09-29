@@ -194,6 +194,7 @@ type peerConn struct {
 
 	mu        sync.Mutex
 	sess      *smux.Session
+	sessAt    time.Time // when sess was established, for the stream-open log
 	accepting bool
 	closed    bool
 	closeCh   chan struct{}
@@ -428,6 +429,24 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 	if wasGone {
 		to = goneOpenTimeout
 	}
+	// What is carrying this stream, and how stale that carrier looks: a stream
+	// handed to a relay session whose peer has gone silent is the documented
+	// "a dead session is served as live" hole, and these are the numbers that
+	// tell it apart from a healthy open.
+	pc.mu.Lock()
+	sessAge := time.Since(pc.sessAt).Round(time.Second)
+	pc.mu.Unlock()
+	frameAge := "n/a"
+	e.mu.Lock()
+	cl := e.client
+	e.mu.Unlock()
+	if cl != nil {
+		if last := cl.LastRecv(); !last.IsZero() {
+			frameAge = time.Since(last).Round(time.Millisecond).String()
+		}
+	}
+	e.log.Debug("open stream: relay", "peer", peerB64, "sessionAge", sessAge.String(),
+		"derpFrameAge", frameAge, "gone", wasGone)
 	c, err := openStream(sess, to)
 	if err != nil {
 		return nil, fmt.Errorf("derp engine: open stream to %s: %w", peerB64, err)
@@ -624,6 +643,21 @@ func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
 	}
 }
 
+// relayDeadPeriod is how long the relay connection may deliver no frame at all
+// before the engine treats the path as dead and reconnects. A healthy
+// connection hears from the derper every second or two (its keepalives and
+// ping/pong), so the ceiling is deliberately generous: it exists to catch a path
+// gone silent while TCP still looks open — writes buffered, reads parked — not
+// to police a merely quiet one. A var so tests can shorten it.
+var relayDeadPeriod = 60 * time.Second
+
+// relaySilent reports whether the relay connection looks dead: it once carried
+// a frame and has been quiet ever since. A zero last means no frame has been
+// stamped yet, so there is no verdict.
+func relaySilent(last, now time.Time) bool {
+	return !last.IsZero() && now.Sub(last) > relayDeadPeriod
+}
+
 // keepalive keeps the DERP connection alive through proxy/CDN idle timeouts.
 func (e *engine) keepalive(c *derpclient.Client) {
 	ticker := time.NewTicker(keepAlivePeriod)
@@ -631,6 +665,29 @@ func (e *engine) keepalive(c *derpclient.Client) {
 	for range ticker.C {
 		if err := c.KeepAlive(); err != nil {
 			e.teardown(c, err)
+			return
+		}
+		// A relay path can die without the WebSocket noticing: writes buffer and
+		// nothing errors, so every peer's streams keep being handed to a dead
+		// path and nothing recovers until the host is restarted (a stale relay
+		// registration keeps serving as live). The age of the newest inbound
+		// frame is the only local evidence — a healthy connection hears from the
+		// derper every second or two — so it is both reported here and acted on:
+		// a silent path is torn down, and the engine's redial loop then registers
+		// the relay afresh, which is what clears the stale state.
+		last, now := c.LastRecv(), time.Now()
+		age := now.Sub(last)
+		if last.IsZero() {
+			e.log.Debug("derp: keepalive, no inbound frame yet", "frames", c.RecvFrames())
+		} else {
+			e.log.Debug("derp: keepalive", "inboundFrameAge", age.Round(time.Millisecond).String(),
+				"frames", c.RecvFrames())
+		}
+		if relaySilent(last, now) {
+			e.log.Error("derp: relay path dead, reconnecting", "silentFor", age.Round(time.Second).String(),
+				"frames", c.RecvFrames())
+			e.teardown(c, fmt.Errorf("relay path silent for %v (%d frames in)",
+				age.Round(time.Second), c.RecvFrames()))
 			return
 		}
 	}
@@ -784,6 +841,8 @@ func (pc *peerConn) sessionLocked(punch bool) (*smux.Session, error) {
 	if pc.sess == nil {
 		return nil, errors.New("derp engine: cannot establish mux session")
 	}
+	pc.sessAt = time.Now()
+	pc.e.log.Debug("peer relay session up", "peer", keyName(pc.peer), "client", roleIsClient)
 	pc.startAccept()
 	if punch {
 		pc.e.maybeStartDirect(pc.peer)

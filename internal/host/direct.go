@@ -1098,7 +1098,17 @@ func (e *engine) acceptLoop(sess *smux.Session, transport string, peer derpclien
 // channel magic carries the peer's udp channel, anything else is a normal
 // tunnel stream bridged to --target.
 func (e *engine) serveInbound(stream net.Conn, transport string, peer derpclient.PublicKey, peerAddr string) {
-	if tagged, c := peekTag(stream); tagged {
+	start := time.Now()
+	tagged, c := peekTag(stream)
+	// The tag decides everything downstream: a tagged stream is the peer's udp
+	// channel, an untagged one is handed to the embedder as a byte stream (which
+	// a udp target then reaches over tcp). The elapsed time tells a genuinely
+	// untagged stream (bytes arrived at once) from a tag that never arrived
+	// (the peek timed out), so a slow path is visible as such.
+	e.log.Debug("inbound stream: classified", "peer", keyName(peer), "transport", transport,
+		"tagged", tagged, "peek", time.Since(start).Round(time.Millisecond).String(),
+		"tagTimeout", channelTagTimeout.String())
+	if tagged {
 		// Three kinds of datagram end, resolved here:
 		//   - the rendezvous (this host holds a local udp dial for peer and owns
 		//     the larger key): the peer's edge pairs with that link, so the pair
@@ -1112,9 +1122,11 @@ func (e *engine) serveInbound(stream net.Conn, transport string, peer derpclient
 		//     state. Whether this peer may use the target is the caller's
 		//     business (tun auther / firewall), not the transport's.
 		if lnk := e.adoptableLink(peer); lnk != nil && lnk.adopt(c, transport) {
+			e.log.Debug("inbound datagram: adopted by a link", "peer", keyName(peer), "transport", transport)
 			return
 		}
 		if q := e.inbound.Load(); q != nil {
+			e.log.Debug("inbound datagram: delivered to the embedder", "peer", keyName(peer), "transport", transport)
 			q.deliverDatagram(c, keyName(peer), transport, peerAddr, e.log)
 			return
 		}
@@ -1135,6 +1147,11 @@ func (e *engine) serveInbound(stream net.Conn, transport string, peer derpclient
 
 	// Listen mode: the embedder owns the stream (and its target).
 	if q := e.inbound.Load(); q != nil {
+		// The peer's udp channel that arrived untagged lands here, as a byte
+		// stream: the embedder then reaches its udp target over tcp, which is
+		// exactly what a misclassified datagram link looks like in the log.
+		e.log.Debug("inbound stream: delivered to the embedder (untagged)", "peer", keyName(peer),
+			"transport", transport, "peek", time.Since(start).Round(time.Millisecond).String())
 		q.deliver(stream, keyName(peer), transport, peerAddr, e.log)
 		return
 	}

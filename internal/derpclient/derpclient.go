@@ -41,6 +41,8 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
 	"golang.org/x/crypto/curve25519"
@@ -163,7 +165,29 @@ type Client struct {
 	serverKey PublicKey
 
 	wmu sync.Mutex // serializes all frame writes (including pong replies from Recv)
+
+	// recvAt (unix nanos) and recvN are stamped by Recv on every frame read, and
+	// recvAt once more when the handshake completes (a completed handshake is
+	// the first proof the path carries frames). A relay path can die without the
+	// WebSocket noticing — writes are buffered and nothing errors — so the only
+	// local evidence of a live path is inbound frames, and the engine both
+	// reports the age of the newest one and reconnects when it goes stale.
+	recvAt atomic.Int64
+	recvN  atomic.Int64
 }
+
+// LastRecv returns when the most recent frame arrived (zero if none has).
+func (c *Client) LastRecv() time.Time {
+	at := c.recvAt.Load()
+	if at == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, at)
+}
+
+// RecvFrames returns how many frames have arrived, so a caller can tell a
+// fresh arrival from a stale LastRecv.
+func (c *Client) RecvFrames() int64 { return c.recvN.Load() }
 
 // Dial connects to the DERP server at rawURL ("wss://host/derp", or ws://
 // for plaintext dev deployments), completes the DERP handshake, and returns
@@ -205,6 +229,10 @@ func Dial(ctx context.Context, rawURL string, priv PrivateKey, tlsCfg *tls.Confi
 		ws.Close(websocket.StatusInternalError, "handshake failed")
 		return nil, err
 	}
+	// The handshake is the first frame this connection carried, so it starts the
+	// inbound clock: a connection that never hears another thing is measurable
+	// instead of looking like one that has simply not been read yet.
+	c.recvAt.Store(time.Now().UnixNano())
 	return c, nil
 }
 
@@ -292,6 +320,8 @@ func (c *Client) Recv() (src PublicKey, pkt []byte, err error) {
 		if err != nil {
 			return PublicKey{}, nil, err
 		}
+		c.recvAt.Store(time.Now().UnixNano())
+		c.recvN.Add(1)
 		switch t {
 		case frameRecvPacket:
 			if len(body) < keyLen {
