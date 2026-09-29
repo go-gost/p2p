@@ -194,11 +194,18 @@ func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 func (e *engine) warm(peer derpclient.PublicKey, punch bool) error {
 	pc := e.peerConn(peer)
 	pc.mu.Lock()
-	defer pc.mu.Unlock()
 	if pc.closed {
+		pc.mu.Unlock()
 		return p2p.ErrPeerUnreachable
 	}
-	_, err := pc.sessionLocked(punch)
+	_, err := pc.sessionLocked()
+	pc.mu.Unlock()
+	if err == nil && punch {
+		// Started out of pc.mu: maybeStartDirect takes e.mu, and pc.mu is taken
+		// under e.mu elsewhere (peerConn), so doing it locked would invert the
+		// two and deadlock a concurrent open of the same peer.
+		e.maybeStartDirect(peer)
+	}
 	return err
 }
 
@@ -254,7 +261,8 @@ func (dc *directConn) start() bool {
 }
 
 // session returns the live direct smux session, or nil. If the session was
-// found dead it is torn down and a re-punch is scheduled.
+// found dead it is torn down and, when this session owned the state, a re-punch
+// is scheduled.
 func (dc *directConn) session() *smux.Session {
 	dc.mu.Lock()
 	if dc.sess == nil {
@@ -266,22 +274,45 @@ func (dc *directConn) session() *smux.Session {
 		dc.mu.Unlock()
 		return sess
 	}
-	dc.sess = nil
-	sock := dc.socket
-	dc.socket = nil
-	dc.mine = nil // the socket backing them is closing
-	if dc.state == directUp {
-		dc.state = directNone
-	}
+	sock, repunch := dc.detachSessionLocked(sess)
 	dc.mu.Unlock()
 	if sock != nil {
 		sock.Close()
+	}
+	if !repunch {
+		return nil // a round or a backoff is already rebuilding: it decides next
 	}
 	if dc.e.dropIfGone(dc.peer, dc) {
 		return nil // the peer is gone from the relay: nothing to re-punch with
 	}
 	go dc.start() // schedule re-punch
 	return nil
+}
+
+// detachSessionLocked clears the direct state if sess is still the current
+// session, returning the socket to close and whether a re-punch is now this
+// session's to schedule. dc.sess and dc.socket belong to that session; dc.mine
+// is left alone when a punch round is in flight (directAttempting) — that round
+// has already published its own candidate list, and clearing it would stop this
+// side answering the peer's announcements. The state is reset to directNone
+// only when the dead session owned it (directUp); a round already rebuilding,
+// or a backoff with its own pending retry, is left to finish. Caller must hold
+// dc.mu.
+func (dc *directConn) detachSessionLocked(sess *smux.Session) (*net.UDPConn, bool) {
+	if dc.sess != sess {
+		return nil, false
+	}
+	dc.sess = nil
+	sock := dc.socket
+	dc.socket = nil
+	if dc.state != directAttempting {
+		dc.mine = nil // the socket backing the candidates is closing
+	}
+	if dc.state == directUp {
+		dc.state = directNone
+		return sock, true
+	}
+	return sock, false
 }
 
 // stateOf reports the punch state machine's current state, a plain read.
@@ -420,29 +451,28 @@ func (dc *directConn) markUp(sess *smux.Session, socket *net.UDPConn, peerAddr n
 	dc.e.stats.punchSuccess.Add(1)
 }
 
-// markDead clears the direct-session state when the accept loop ends (session
-// dead). The opening side notices death through session() and re-punches; the
-// accepting side otherwise stays stuck in directUp and never answers the
-// re-punch candidates, so the pair can never re-establish. The guard ignores a
-// stale session so a concurrent re-punch (markUp) is not clobbered.
 // markDead tears down the direct session after its accept loop ends and punches
 // again: the path died (a network change, a NAT rebind, an idle keepalive
 // timeout), and a new network is a new chance — nothing else would retry while
-// the pair is idle on the relay.
+// the pair is idle on the relay. The opening side notices death through
+// session() and re-punches; the accepting side otherwise stays stuck in directUp
+// and never answers the re-punch candidates, so the pair can never re-establish.
+//
+// The re-punch is scheduled only when the dead session owned the state
+// (directUp). A round already in flight is left to finish — it is rebuilding
+// anyway, and resetting the state here (as an unguarded clear did) let a second
+// round start on the same candidate channel and mine list. The session-identity
+// guard ignores a stale session so a concurrent re-punch (markUp) is not
+// clobbered.
 func (dc *directConn) markDead(sess *smux.Session) {
 	dc.mu.Lock()
-	if dc.sess != sess {
-		dc.mu.Unlock()
-		return
-	}
-	dc.sess = nil
-	sock := dc.socket
-	dc.socket = nil
-	dc.mine = nil
-	dc.state = directNone
+	sock, repunch := dc.detachSessionLocked(sess)
 	dc.mu.Unlock()
 	if sock != nil {
 		sock.Close()
+	}
+	if !repunch {
+		return
 	}
 	if dc.e.dropIfGone(dc.peer, dc) {
 		return // the peer is gone from the relay: nothing to punch with

@@ -411,13 +411,7 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 	}
 
 	pc := e.peerConn(peer)
-	pc.mu.Lock()
-	if pc.closed {
-		pc.mu.Unlock()
-		return nil, errors.New("derp engine: peer session closed")
-	}
-	sess, err := pc.ensureSessionLocked()
-	pc.mu.Unlock()
+	sess, err := pc.ensureSession(true)
 	if err != nil {
 		return nil, err
 	}
@@ -597,7 +591,7 @@ func (e *engine) pump(c *derpclient.Client) {
 		// Ensure a session exists on this side too: inbound packets must be
 		// consumed by smux (which then accepts streams) even when this host
 		// never opens a tunnel to the peer itself.
-		if _, err := pc.ensureSessionLocked(); err != nil {
+		if _, err := pc.ensureSession(true); err != nil {
 			pc.kill(err)
 			continue
 		}
@@ -803,30 +797,43 @@ func (e *engine) Close() {
 	}
 }
 
-// ensureSessionLocked creates the mux session if needed. The role is fixed
-// by public-key ordering so both ends converge on one session per pair.
-// Caller must hold pc.mu.
-func (pc *peerConn) ensureSessionLocked() (*smux.Session, error) {
-	return pc.sessionLocked(true)
+// ensureSession brings up the peer's relay mux session and, when punch is set,
+// starts a hole punch for it. It takes pc.mu itself: the session state is
+// touched from the pump goroutine as well as OpenStream, and the callers used
+// to disagree on whether that lock was held (pump did not), racing pc.sess and
+// able to build two smux sessions over one packet stream.
+//
+// The punch runs after pc.mu is released: maybeStartDirect takes e.mu, while
+// peerConn takes pc.mu under e.mu, so starting it under pc.mu would invert the
+// two and deadlock two concurrent opens of the same peer.
+//
+// The punch and the session are separable because the roles differ: a host that
+// dials out wants the punch, while one that only answers a peer's dial (a
+// reverse tunnel) should not spend a round on a peer that has not engaged yet —
+// that round fails by construction and its failure is indistinguishable, in the
+// status, from a punch that cannot work.
+func (pc *peerConn) ensureSession(punch bool) (*smux.Session, error) {
+	pc.mu.Lock()
+	if pc.closed {
+		pc.mu.Unlock()
+		return nil, errors.New("derp engine: peer session closed")
+	}
+	sess, err := pc.sessionLocked()
+	pc.mu.Unlock()
+	if err == nil && punch {
+		pc.e.maybeStartDirect(pc.peer)
+	}
+	return sess, err
 }
 
-// sessionLocked brings up the peer's relay mux session; punch also kicks off a
-// hole punch for it. It is a no-op when the session is already live, and
-// punching is idempotent (a no-op when direct is up or already attempting).
-//
-// The two are separable because the roles differ: a host that dials out wants
-// the punch, while one that only answers a peer's dial (a reverse tunnel)
-// should not spend a round on a peer that has not engaged yet — that round
-// fails by construction and its failure is indistinguishable, in the status,
-// from a punch that cannot work.
-func (pc *peerConn) sessionLocked(punch bool) (*smux.Session, error) {
+// sessionLocked brings up the peer's relay mux session if it is not already
+// live. The role is fixed by public-key ordering so both ends converge on one
+// session per pair. Caller must hold pc.mu.
+func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	if pc.sess != nil && pc.sess.IsClosed() {
 		pc.sess = nil
 	}
 	if pc.sess != nil {
-		if punch {
-			pc.e.maybeStartDirect(pc.peer)
-		}
 		return pc.sess, nil
 	}
 	cfg := smux.DefaultConfig()
@@ -844,9 +851,6 @@ func (pc *peerConn) sessionLocked(punch bool) (*smux.Session, error) {
 	pc.sessAt = time.Now()
 	pc.e.log.Debug("peer relay session up", "peer", keyName(pc.peer), "client", roleIsClient)
 	pc.startAccept()
-	if punch {
-		pc.e.maybeStartDirect(pc.peer)
-	}
 	return pc.sess, nil
 }
 
