@@ -194,8 +194,8 @@ type peerConn struct {
 
 	mu        sync.Mutex
 	sess      *smux.Session
-	sessAt    time.Time // when sess was established, for the stream-open log
-	accepting bool
+	sessAt    time.Time     // when sess was established, for the stream-open log
+	accepting *smux.Session // the session whose inbound accept loop is running, if any
 	closed    bool
 	closeCh   chan struct{}
 	remainder []byte // partially consumed packet from inbound
@@ -860,19 +860,30 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	return pc.sess, nil
 }
 
-// startAccept launches the inbound stream loop (once per relay session).
+// startAccept launches the inbound stream loop for the adapter's current
+// session, if that session has none yet. Caller must hold pc.mu.
+//
+// The session is captured here, not read inside the goroutine: a rebuild would
+// otherwise hand the loop whatever pc.sess had become — nil (a crash in
+// AcceptStream) or a different, newer session. The flag names the session the
+// loop serves rather than being a plain bool, so a rebuild never has to wait
+// for the previous loop to notice its session died before it can start serving
+// the new one.
 func (pc *peerConn) startAccept() {
-	if pc.accepting {
+	sess := pc.sess
+	if sess == nil || pc.accepting == sess {
 		return
 	}
-	pc.accepting = true
+	pc.accepting = sess
 	go func() {
 		defer func() {
 			pc.mu.Lock()
-			pc.accepting = false
+			if pc.accepting == sess {
+				pc.accepting = nil
+			}
 			pc.mu.Unlock()
 		}()
-		pc.e.acceptLoop(pc.sess, "derp", pc.peer, "")
+		pc.e.acceptLoop(sess, "derp", pc.peer, "")
 	}()
 }
 
