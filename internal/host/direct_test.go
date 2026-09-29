@@ -19,10 +19,11 @@ import (
 	"github.com/go-gost/p2p/internal/derpclient"
 )
 
-// TestMain shortens the direct punch timing for the whole package. It is set
-// once here, never mutated per-test, so no test writes these globals while a
-// background punch/backoff goroutine reads them. The relay-only tests never
-// trigger punching, so they are unaffected.
+// TestMain shortens the timing globals for the whole package — direct punch and
+// the relay keepalive probe alike. It is set once here, never mutated per-test,
+// so no test writes these globals while a background punch/backoff/keepalive
+// goroutine reads them. The relay-only tests never trigger punching, so they are
+// unaffected.
 func TestMain(m *testing.M) {
 	punchTimeout = 2 * time.Second
 	punchWaitTimeout = 2 * time.Second
@@ -32,6 +33,12 @@ func TestMain(m *testing.M) {
 	// measures, so it runs at test speed here (production is 2s/6s).
 	directSmuxKeepAliveInterval = 500 * time.Millisecond
 	directSmuxKeepAliveTimeout = 2 * time.Second
+	// The relay keepalive probe, shortened together so a relay that stops
+	// answering is noticed at test speed. The ceiling stays several intervals
+	// above the tick, as production has it (30s/45s), so an answering relay is
+	// never mistaken for a silent one.
+	keepAlivePeriod = 100 * time.Millisecond
+	relayDeadPeriod = 400 * time.Millisecond
 	os.Exit(m.Run())
 }
 

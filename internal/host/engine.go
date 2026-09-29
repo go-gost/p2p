@@ -758,17 +758,27 @@ func (e *engine) keepalive(c *derpclient.Client) {
 			e.teardown(c, err)
 			return
 		}
-		pingedAt = time.Now()
+		// The ping just sent becomes the *outstanding* probe only once the
+		// previous one was answered (or when none was outstanding yet). The stamp
+		// must not advance on every tick: the age would then stay at one interval
+		// — below the ceiling — and the verdict below could never fire, leaving a
+		// half-open relay in place forever. Candidate exchange rides the relay, so
+		// that is also a punch that never succeeds again.
+		now := time.Now()
+		pong := c.LastPong()
+		if pingedAt.IsZero() || (!pong.IsZero() && !pong.Before(pingedAt)) {
+			pingedAt = now
+		}
 		// The reported age is the last pong's, which is the number that says
 		// whether the path is answering; the ping just sent is only in flight.
 		pongAge := "never"
-		if last := c.LastPong(); !last.IsZero() {
-			pongAge = time.Since(last).Round(time.Millisecond).String()
+		if !pong.IsZero() {
+			pongAge = now.Sub(pong).Round(time.Millisecond).String()
 		}
 		e.log.Debug("derp: keepalive", "pongAge", pongAge, "pongs", c.Pongs(),
 			"inboundFrameAge", time.Since(c.LastRecv()).Round(time.Second).String(),
 			"frames", c.RecvFrames())
-		if relaySilent(pingedAt, c.LastPong(), time.Now()) {
+		if relaySilent(pingedAt, pong, now) {
 			e.log.Error("derp: relay path dead, reconnecting", "pongAge", pongAge,
 				"pongs", c.Pongs(), "frames", c.RecvFrames())
 			e.teardown(c, fmt.Errorf("relay path unresponsive for %v (%d pongs, %d frames in)",

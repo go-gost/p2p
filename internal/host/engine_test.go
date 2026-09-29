@@ -248,11 +248,18 @@ type relayServer struct {
 	mu       sync.Mutex
 	clients  map[[32]byte]*relayClient
 	dropData bool // when true, drop 0x01 data frames (control still flows)
+	dropPong bool // when true, stop answering pings (a half-open relay path)
 }
 
 func (s *relayServer) setDropData(v bool) {
 	s.mu.Lock()
 	s.dropData = v
+	s.mu.Unlock()
+}
+
+func (s *relayServer) setDropPong(v bool) {
+	s.mu.Lock()
+	s.dropPong = v
 	s.mu.Unlock()
 }
 
@@ -396,6 +403,12 @@ func (s *relayServer) serveClient(ctx context.Context, ws *websocket.Conn) {
 			rc.w.write(0x05, pkt)
 		case 0x06: // keepalive
 		case 0x12: // ping → pong
+			s.mu.Lock()
+			drop := s.dropPong
+			s.mu.Unlock()
+			if drop {
+				continue // a path that carries our bytes but never answers
+			}
 			w.write(0x13, body)
 		}
 	}
@@ -527,8 +540,8 @@ func TestRelaySilent(t *testing.T) {
 	if relaySilent(time.Time{}, time.Time{}, now) {
 		t.Error("no verdict before the first probe")
 	}
-	if relaySilent(now.Add(-time.Second), time.Time{}, now) {
-		t.Error("a one-second-old unanswered ping is not silence")
+	if relaySilent(now.Add(-relayDeadPeriod/4), time.Time{}, now) {
+		t.Error("a fresh unanswered ping is not silence")
 	}
 	if relaySilent(now.Add(-relayDeadPeriod), time.Time{}, now) {
 		t.Error("exactly at the ceiling is not yet silence")
@@ -539,13 +552,48 @@ func TestRelaySilent(t *testing.T) {
 
 	// An answered probe is never silence, however quiet the connection is: the
 	// pong is newer than the ping that asked for it.
-	if relaySilent(now.Add(-time.Minute), now.Add(-time.Second), now) {
+	if relaySilent(now.Add(-2*relayDeadPeriod), now.Add(-relayDeadPeriod/4), now) {
 		t.Error("a fresh pong is not silence, however old the ping")
 	}
 	// A pong older than the ceiling, with a ping older still, is silence.
 	if !relaySilent(now.Add(-2*relayDeadPeriod), now.Add(-relayDeadPeriod-time.Second), now) {
 		t.Error("a pong older than the ceiling is silence")
 	}
+}
+
+// TestRelaySilenceIsReconnected: a relay path can stop answering without the
+// WebSocket noticing — writes sink into the kernel buffer, no frame arrives and
+// nothing errors (measured on a phone switching Wi-Fi/cellular). Candidate
+// exchange rides the relay, so a connection that is never torn down and redialed
+// leaves every punch failing at "no peer candidates", forever. The keepalive's
+// ping probe is the only thing that can see a path like that.
+func TestRelaySilenceIsReconnected(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	priv, _, _ := derpclient.Generate()
+	e := newEngine(url, "", priv, slog.Default())
+	defer e.Close()
+	if err := e.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	// An answering relay is never torn down, however short the tick.
+	time.Sleep(200 * time.Millisecond)
+	if !e.relayConnected() {
+		t.Fatal("an answering relay was torn down")
+	}
+
+	// Stop answering pings. The connection must be declared dead (the redial is
+	// the reconnect loop's business, and it does not run within this window).
+	rs.setDropPong(true)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !e.relayConnected() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("a relay that stopped answering pings was never torn down")
 }
 
 // relayState must report the engine's own relay connection: the three states a
