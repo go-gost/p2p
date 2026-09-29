@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -544,5 +545,32 @@ func TestRelaySilent(t *testing.T) {
 	// A pong older than the ceiling, with a ping older still, is silence.
 	if !relaySilent(now.Add(-2*relayDeadPeriod), now.Add(-relayDeadPeriod-time.Second), now) {
 		t.Error("a pong older than the ceiling is silence")
+	}
+}
+
+// relayState must report the engine's own relay connection: the three states a
+// status consumer has to tell apart.
+func TestRelayState(t *testing.T) {
+	// Never dialed.
+	e := &engine{}
+	if up, msg := e.relayState(); up || msg != "" {
+		t.Errorf("fresh engine: up=%v msg=%q, want false/\"\"", up, msg)
+	}
+
+	// Connected.
+	e.client = &derpclient.Client{}
+	if up, msg := e.relayState(); !up || msg != "" {
+		t.Errorf("connected: up=%v msg=%q, want true/\"\"", up, msg)
+	}
+
+	// Down, with the reason a user can act on.
+	e.client = nil
+	e.dialErr = errors.New("dial tcp 127.0.0.1:443: connect: connection refused")
+	up, msg := e.relayState()
+	if up {
+		t.Error("up = true with no client")
+	}
+	if !strings.Contains(msg, "connection refused") {
+		t.Errorf("msg = %q, want the dial failure", msg)
 	}
 }

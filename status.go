@@ -1,5 +1,14 @@
 package p2p
 
+// PeerPunch is one peer's hole-punch history. The process-wide
+// PunchAttempts/PunchSuccess cannot say which peer is re-punching, which is the
+// question a direct session that keeps dying raises.
+type PeerPunch struct {
+	Attempts int64 // punch rounds started for this peer
+	Ups      int64 // rounds that reached a live direct session
+	Drops    int64 // live direct sessions that ended (and re-punched)
+}
+
 // Status is a point-in-time snapshot of an endpoint: the live tunnel count and
 // the transport counters behind it. A stub-mode endpoint (no relay configured)
 // reports zeros for the transport fields.
@@ -31,4 +40,21 @@ type Status struct {
 	// The gRPC transport does not carry it: its proto is frozen, so plugin
 	// clients see the counts only.
 	PeerTransports map[string]string
+
+	// RelayConnected reports whether the relay transport holds a live
+	// connection, and RelayError the last dial failure (empty while connected).
+	//
+	// None of the fields above can show a relay outage: a live hole-punched
+	// session keeps every gauge and counter healthy while the relay is
+	// unreachable, and the direct session is independent of the DERP transport.
+	//
+	// In-process only, like PeerTransports: the gRPC transport's proto is
+	// frozen, so plugin clients see neither.
+	RelayConnected bool
+	RelayError     string
+
+	// PeerPunches is each connected peer's own punch history, keyed by base64
+	// public key. A peer that has never attempted a direct path is absent.
+	// In-process only, like PeerTransports.
+	PeerPunches map[string]PeerPunch
 }

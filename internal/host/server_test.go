@@ -18,6 +18,9 @@ func TestStatusNoEngine(t *testing.T) {
 		st.StreamsDirect != 0 || st.StreamsDerp != 0 {
 		t.Fatalf("stub-mode Status = %+v, want all zeros", st)
 	}
+	if st.RelayConnected || st.PeerPunches != nil {
+		t.Errorf("stub-mode relay/peer fields = %v/%v, want false/nil", st.RelayConnected, st.PeerPunches)
+	}
 }
 
 // TestStatusReportsTransportStats covers engine mode: the gauges and counters
@@ -35,6 +38,9 @@ func TestStatusReportsTransportStats(t *testing.T) {
 	peerDirect := derpclient.PublicKey{1}
 	peerRelay := derpclient.PublicKey{2}
 	dc := &directConn{e: e, peer: peerDirect, sess: newTestSess(t), state: directUp}
+	dc.attempts.Store(4)
+	dc.ups.Store(2)
+	dc.drops.Store(1)
 	e.directs[peerDirect] = dc
 	e.peers[peerRelay] = &peerConn{}
 
@@ -47,6 +53,16 @@ func TestStatusReportsTransportStats(t *testing.T) {
 		st.StreamsDirect != 11 || st.StreamsDerp != 5 {
 		t.Fatalf("counters = %d/%d/%d/%d, want 7/3/11/5",
 			st.PunchAttempts, st.PunchSuccess, st.StreamsDirect, st.StreamsDerp)
+	}
+
+	// The relay's own state, and the direct peer's punch history.
+	if st.RelayConnected {
+		t.Error("RelayConnected = true, want false for an engine with no client")
+	}
+	if got, ok := st.PeerPunches[base64.RawURLEncoding.EncodeToString(peerDirect[:])]; !ok {
+		t.Errorf("PeerPunches has no entry for the direct peer: %+v", st.PeerPunches)
+	} else if got.Attempts != 4 || got.Ups != 2 || got.Drops != 1 {
+		t.Errorf("PeerPunch = %+v, want attempts=4 ups=2 drops=1", got)
 	}
 }
 

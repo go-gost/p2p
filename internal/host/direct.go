@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtaci/kcp-go/v5"
@@ -144,6 +145,14 @@ type directConn struct {
 	mine     []candidate    // our candidates for the current punch, answered to the peer
 	lastPeer []candidate    // peer candidates already acted on (dedupes re-announcements)
 	peerCaps uint8          // capability bits the peer advertised via ctrlCaps
+
+	// This peer's punch history, reported through Status.PeerPunches. Atomics so
+	// a status query reads them without taking dc.mu and queueing behind a punch
+	// round; drops is also incremented while dc.mu is held, where a second lock
+	// would enter the engine's lock order for no reason.
+	attempts atomic.Int64 // punch rounds started
+	ups      atomic.Int64 // rounds that reached a live direct session
+	drops    atomic.Int64 // live direct sessions that ended
 }
 
 func (e *engine) directConn(peer derpclient.PublicKey) *directConn {
@@ -311,6 +320,7 @@ func (dc *directConn) detachSessionLocked(sess *smux.Session) (*net.UDPConn, boo
 	}
 	if dc.state == directUp {
 		dc.state = directNone
+		dc.drops.Add(1)
 		return sock, true
 	}
 	return sock, false
@@ -341,6 +351,16 @@ func (dc *directConn) live() bool {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	return dc.sess != nil && !dc.sess.IsClosed()
+}
+
+// punchCounts snapshots this peer's punch history. The counters are atomics, so
+// this takes no lock: a status query must not queue behind a punch round.
+func (dc *directConn) punchCounts() p2p.PeerPunch {
+	return p2p.PeerPunch{
+		Attempts: dc.attempts.Load(),
+		Ups:      dc.ups.Load(),
+		Drops:    dc.drops.Load(),
+	}
 }
 
 func (dc *directConn) onCandidates(cands []candidate) {
@@ -450,6 +470,7 @@ func (dc *directConn) markUp(sess *smux.Session, socket *net.UDPConn, peerAddr n
 		prevSock.Close()
 	}
 	dc.e.stats.punchSuccess.Add(1)
+	dc.ups.Add(1)
 }
 
 // markDead tears down the direct session after its accept loop ends and punches
@@ -580,6 +601,7 @@ func (dc *directConn) punch() {
 	}
 
 	e.stats.punchAttempts.Add(1)
+	dc.attempts.Add(1)
 
 	// 1. Collect one socket + candidate set per available family. A family that
 	// cannot be set up is dropped and the round continues on whatever remains,

@@ -322,7 +322,9 @@ func (s *server) addForwardAddr(addr, key string) error {
 func (s *server) status() p2p.Status {
 	var st p2p.Status
 	if s.engine != nil {
+		st.RelayConnected, st.RelayError = s.engine.relayState()
 		st.PeerTransports = s.engine.peerTransports()
+		st.PeerPunches = s.engine.peerPunches()
 		for _, transport := range st.PeerTransports {
 			if transport == "direct" {
 				st.DirectPeers++

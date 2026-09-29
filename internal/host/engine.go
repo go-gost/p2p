@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-gost/p2p"
 	"github.com/go-gost/p2p/internal/derpclient"
 	"github.com/xtaci/smux"
 )
@@ -148,6 +149,40 @@ func (e *engine) peerTransports() map[string]string {
 			// a punch has simply not been needed yet.
 			out[name] = transportRelay
 		}
+	}
+	return out
+}
+
+// relayState reports whether the relay holds a live connection, and the last
+// dial failure. Status exposes it because no other field can show a relay
+// outage: a live direct session keeps every gauge and counter healthy while the
+// relay is unreachable.
+func (e *engine) relayState() (connected bool, lastErr string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.dialErr != nil {
+		lastErr = e.dialErr.Error()
+	}
+	return e.client != nil, lastErr
+}
+
+// peerPunches returns each connected peer's own punch history, keyed by base64
+// public key. Empty when nothing has a direct connection, so a stub-mode or
+// relay-only host reports nothing rather than an empty map.
+func (e *engine) peerPunches() map[string]p2p.PeerPunch {
+	e.mu.Lock()
+	directs := make([]*directConn, 0, len(e.directs))
+	for _, dc := range e.directs {
+		directs = append(directs, dc)
+	}
+	e.mu.Unlock()
+
+	if len(directs) == 0 {
+		return nil
+	}
+	out := make(map[string]p2p.PeerPunch, len(directs))
+	for _, dc := range directs {
+		out[keyName(dc.peer)] = dc.punchCounts()
 	}
 	return out
 }

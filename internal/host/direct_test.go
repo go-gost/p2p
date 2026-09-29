@@ -1418,3 +1418,66 @@ func TestPunchWaitsForRelay(t *testing.T) {
 		t.Fatal("a round without the relay marked the peer as failed; it should wait instead")
 	}
 }
+
+// A live direct session ending must be counted once, and only when the session
+// actually owned the state: a round already rebuilding is not a new drop.
+func TestDetachSessionCountsDropOnce(t *testing.T) {
+	e := &engine{directs: make(map[derpclient.PublicKey]*directConn)}
+	// A punch session owns the socket kcp closes with it (ownConn=true), so a
+	// session that owned directUp must hand that socket back for closing.
+	uconn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uconn.Close()
+	dc := &directConn{e: e, peer: derpclient.PublicKey{1}, sess: newTestSess(t), socket: uconn, state: directUp}
+
+	sock, repunch := dc.detachSessionLocked(dc.sess)
+	if !repunch {
+		t.Fatal("repunch = false, want true for a session that owned directUp")
+	}
+	if sock == nil {
+		t.Error("socket = nil, want the session's socket")
+	}
+	if got := dc.drops.Load(); got != 1 {
+		t.Errorf("drops = %d, want 1", got)
+	}
+
+	// A second detach has nothing to detach: no second drop.
+	if _, repunch := dc.detachSessionLocked(dc.sess); repunch {
+		t.Error("a second detach reported a re-punch")
+	}
+	if got := dc.drops.Load(); got != 1 {
+		t.Errorf("drops = %d after a no-op detach, want 1", got)
+	}
+}
+
+// A session that did not own the state (a round is already rebuilding) is not
+// this side's drop to count: it returns repunch=false.
+func TestDetachSessionIgnoresNonOwningState(t *testing.T) {
+	e := &engine{directs: make(map[derpclient.PublicKey]*directConn)}
+	sess := newTestSess(t)
+	dc := &directConn{e: e, peer: derpclient.PublicKey{1}, sess: sess, state: directAttempting}
+
+	if _, repunch := dc.detachSessionLocked(sess); repunch {
+		t.Error("repunch = true for a session that did not own directUp")
+	}
+	if got := dc.drops.Load(); got != 0 {
+		t.Errorf("drops = %d, want 0", got)
+	}
+}
+
+// A session coming up counts as an up.
+func TestMarkUpCountsUps(t *testing.T) {
+	e := &engine{directs: make(map[derpclient.PublicKey]*directConn)}
+	dc := &directConn{e: e, peer: derpclient.PublicKey{1}}
+
+	dc.markUp(newTestSess(t), nil, netip.AddrPort{})
+
+	if got := dc.ups.Load(); got != 1 {
+		t.Errorf("ups = %d, want 1", got)
+	}
+	if dc.stateOf() != directUp {
+		t.Errorf("state = %v, want directUp", dc.stateOf())
+	}
+}
