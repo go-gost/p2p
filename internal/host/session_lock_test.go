@@ -1,6 +1,7 @@
 package host
 
 import (
+	"log/slog"
 	"net/netip"
 	"testing"
 	"time"
@@ -98,5 +99,62 @@ func TestEnsureSessionNoLockInversion(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("peerConn + ensureSession deadlocked: lock order inverted")
+	}
+}
+
+// TestRelaySessionChurnReconnectsRelay: a pair whose packets the relay stopped
+// routing rebuilds its session every keepalive timeout, forever, while the
+// shared connection stays busy with every other peer — the one shape the
+// connection-level silence check cannot see (frames still arrive; they are just
+// not this pair's). The engine tears the transport down itself, because the
+// stale registration that caused it is cleared by nothing smaller.
+func TestRelaySessionChurnReconnectsRelay(t *testing.T) {
+	defer func(w time.Duration, m int) { relayChurnWindow, relayChurnMax = w, m }(relayChurnWindow, relayChurnMax)
+	relayChurnWindow, relayChurnMax = time.Minute, 2
+
+	rs := &relayServer{}
+	url := rs.start(t)
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine(url, "", priv, slog.Default())
+	defer e.Close()
+	e.Connect()
+	if !e.relayConnected() {
+		t.Fatal("engine did not connect to the test relay")
+	}
+
+	peer := derpclient.PublicKey{9}
+	pc := e.peerConn(peer)
+	// One build more than the window allows, each preceded by killing the
+	// session it would have reused: rebuild after rebuild, as a pair left
+	// un-routed looks from here.
+	for i := 0; i <= relayChurnMax; i++ {
+		if i > 0 {
+			// Exactly what sessionLocked leaves behind when it finds the
+			// session dead. Closing the live session directly hangs here: smux
+			// retires a session by handing its error to the read loop, and that
+			// loop is parked in peerConn.Read, which nothing has woken (see the
+			// note on retireSession). This test is about the churn accounting,
+			// not that path.
+			pc.mu.Lock()
+			pc.sess = nil
+			pc.mu.Unlock()
+		}
+		if _, err := pc.ensureSession(false); err != nil {
+			t.Fatalf("build %d: %v", i, err)
+		}
+	}
+
+	if e.relayConnected() {
+		t.Fatal("a churned peer did not take the relay down with it")
+	}
+	// One-shot: the count is cleared, so a later window can trip again.
+	pc.mu.Lock()
+	churn, tripped := pc.churn, pc.churnTripped
+	pc.mu.Unlock()
+	if churn != 0 || tripped {
+		t.Fatalf("after the trip: churn=%d tripped=%v, want 0/false", churn, tripped)
 	}
 }

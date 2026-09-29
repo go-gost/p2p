@@ -200,19 +200,12 @@ func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 // Status before any traffic — and, when punch is set, starts a hole punch for
 // it too. See sessionLocked for why the two are separable.
 func (e *engine) warm(peer derpclient.PublicKey, punch bool) error {
-	pc := e.peerConn(peer)
-	pc.mu.Lock()
-	if pc.closed {
-		pc.mu.Unlock()
+	// One path with OpenStream: ensureSession takes pc.mu itself, releases it
+	// before the punch (which takes e.mu), and acts on a churned peer, so the
+	// lock order and the churn guard live in one place.
+	_, err := e.peerConn(peer).ensureSession(punch)
+	if errors.Is(err, errPeerSessionClosed) {
 		return p2p.ErrPeerUnreachable
-	}
-	_, err := pc.sessionLocked()
-	pc.mu.Unlock()
-	if err == nil && punch {
-		// Started out of pc.mu: maybeStartDirect takes e.mu, and pc.mu is taken
-		// under e.mu elsewhere (peerConn), so doing it locked would invert the
-		// two and deadlock a concurrent open of the same peer.
-		e.maybeStartDirect(peer)
 	}
 	return err
 }

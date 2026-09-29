@@ -200,6 +200,14 @@ type peerConn struct {
 	closeCh   chan struct{}
 	remainder []byte // partially consumed packet from inbound
 	current   []byte
+
+	// Relay-session churn for this peer: sessions built inside the current
+	// window, when that window opened, and whether its limit has been crossed.
+	// The crossing is acted on by the next caller, out of pc.mu (the reconnect
+	// takes e.mu, and pc.mu is taken under e.mu elsewhere).
+	churnFrom    time.Time
+	churn        int
+	churnTripped bool
 }
 
 const (
@@ -669,6 +677,27 @@ func (e *engine) keepalive(c *derpclient.Client) {
 		}
 		// A relay path can die without the WebSocket noticing: writes buffer and
 		// nothing errors, so every peer's streams keep being handed to a dead
+// relayChurnWindow and relayChurnMax bound how often one peer's relay session
+// may be rebuilt before the engine treats that *pair* — not the transport — as
+// wedged. A session dies on its own keepalive timeout when its packets stop
+// getting through, and the rebuild rides the same path it did before, so a pair
+// the relay no longer routes for looks like this and nothing else: a rebuild
+// every keepalive timeout, forever, while the shared connection stays busy with
+// every other peer and nothing logs an error. That is the one shape the
+// connection-level silence check above cannot see, and the only local cure is a
+// fresh registration, so the transport is torn down and redialed. The window is
+// generous on purpose: a network change or a peer restart costs a rebuild or
+// two and must not trip this. Vars so tests can shorten them.
+var (
+	relayChurnWindow = 5 * time.Minute
+	relayChurnMax    = 5
+)
+
+// errPeerSessionClosed is what a killed adapter answers with. It is one
+// identity so callers can map it: the p2p contract exposes the same thing as
+// p2p.ErrPeerUnreachable.
+var errPeerSessionClosed = errors.New("derp engine: peer session closed")
+
 		// path and nothing recovers until the host is restarted (a stale relay
 		// registration keeps serving as live). The age of the newest inbound
 		// frame is the only local evidence — a healthy connection hears from the
@@ -822,7 +851,7 @@ func (pc *peerConn) ensureSession(punch bool) (*smux.Session, error) {
 	pc.mu.Lock()
 	if pc.closed {
 		pc.mu.Unlock()
-		return nil, errors.New("derp engine: peer session closed")
+		return nil, errPeerSessionClosed
 	}
 	sess, err := pc.sessionLocked()
 	pc.mu.Unlock()
@@ -847,12 +876,36 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	cfg.KeepAliveTimeout = smuxKeepAliveTimeout
 	roleIsClient := bytes.Compare(pc.e.pub[:], pc.peer[:]) < 0
 	if roleIsClient {
+	if pc.takeChurnTripped() {
+		// This pair is rebuilding sessions far faster than a working one ever
+		// does: its packets are not getting through a relay that still looks
+		// healthy for every other peer, and each rebuild rides the same path.
+		// A fresh registration is the cure, so the transport goes down and the
+		// redial brings it back.
+		pc.e.log.Error("derp: peer relay session churn, reconnecting the relay",
+			"peer", keyName(pc.peer), "builds", relayChurnMax+1, "window", relayChurnWindow.String())
+		pc.e.reconnectRelay(fmt.Errorf("peer %s rebuilt its relay session more than %d times in %v",
+			keyName(pc.peer), relayChurnMax, relayChurnWindow))
+	}
 		pc.sess, _ = smux.Client(pc, cfg)
 	} else {
 		pc.sess, _ = smux.Server(pc, cfg)
 	}
 	if pc.sess == nil {
 		return nil, errors.New("derp engine: cannot establish mux session")
+// reconnectRelay tears the shared relay connection down, so the redial loop
+// registers with it afresh. Nothing smaller cures a stale registration: the
+// relay's routing table is per connection, and it is the registration that has
+// gone stale.
+func (e *engine) reconnectRelay(cause error) {
+	e.mu.Lock()
+	c := e.client
+	e.mu.Unlock()
+	if c != nil {
+		e.teardown(c, cause)
+	}
+}
+
 	}
 	pc.sessAt = time.Now()
 	pc.e.log.Debug("peer relay session up", "peer", keyName(pc.peer), "client", roleIsClient)
@@ -876,11 +929,39 @@ func (pc *peerConn) startAccept() {
 	}
 	pc.accepting = sess
 	go func() {
+	pc.noteBuildLocked(pc.sessAt)
 		defer func() {
 			pc.mu.Lock()
 			if pc.accepting == sess {
 				pc.accepting = nil
 			}
+// noteBuildLocked records one relay session built for this peer, opening a new
+// window when the old one has run out, and trips when the window's limit is
+// crossed. Caller must hold pc.mu.
+func (pc *peerConn) noteBuildLocked(now time.Time) {
+	if pc.churnFrom.IsZero() || now.Sub(pc.churnFrom) > relayChurnWindow {
+		pc.churnFrom, pc.churn = now, 0
+	}
+	pc.churn++
+	if pc.churn > relayChurnMax {
+		pc.churnTripped = true
+	}
+}
+
+// takeChurnTripped reports — once — that this peer's churn limit was crossed,
+// and clears the count so the next window can trip again. It takes pc.mu, so it
+// must be called once the session lock is released.
+func (pc *peerConn) takeChurnTripped() bool {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if !pc.churnTripped {
+		return false
+	}
+	pc.churnTripped = false
+	pc.churn, pc.churnFrom = 0, time.Time{}
+	return true
+}
+
 			pc.mu.Unlock()
 		}()
 		pc.e.acceptLoop(sess, "derp", pc.peer, "")
@@ -939,7 +1020,7 @@ func (pc *peerConn) Write(p []byte) (int, error) {
 	closed := pc.closed
 	pc.mu.Unlock()
 	if closed {
-		return 0, errors.New("derp engine: peer session closed")
+		return 0, errPeerSessionClosed
 	}
 	e := pc.e
 	e.mu.Lock()
