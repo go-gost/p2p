@@ -88,6 +88,12 @@ const (
 // a Tailscale node private key).
 type PrivateKey [keyLen]byte
 
+// writeTimeout bounds one frame write (see writeFrame). It is a var so tests
+// can shorten it. The value is generous on purpose: it exists to catch a path
+// that is gone, not to police a slow one — a healthy frame write is
+// sub-millisecond, and the DERP server's own keepalives keep a live path busy.
+var writeTimeout = 10 * time.Second
+
 // PublicKey is a curve25519 public key; its base64 form is the peer address.
 type PublicKey [keyLen]byte
 
@@ -369,6 +375,14 @@ func (c *Client) readFrame() (t byte, body []byte, err error) {
 func (c *Client) writeFrame(t byte, body []byte) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	// Bound the write. A half-open path — the phone's Wi-Fi/cellular switch,
+	// where TCP still looks open and writes sink into the kernel buffer — must
+	// surface here as an error, or the write parks inside wmu and every other
+	// writer (the engine's keepalive, the pong replies) waits on it: the engine
+	// then never sees a failure and never reconnects. The deadline is per write,
+	// so a live but slow path is not penalised.
+	c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
 	var hdr [frameHeaderLen]byte
 	hdr[0] = t
 	binary.BigEndian.PutUint32(hdr[1:], uint32(len(body)))
