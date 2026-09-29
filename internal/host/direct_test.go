@@ -1054,6 +1054,60 @@ func TestRelaySessionRecoversAfterAdapterClosed(t *testing.T) {
 	roundTrip(t, s2, "recovered")
 }
 
+// TestInboundRecoversAfterAdapterClosed: a killed adapter that stays cached must
+// not leave the peer without an inbound path. The pump used to read e.peers
+// directly, so it kept handing packets to the closed adapter and only an
+// outbound open replaced it; a host that only receives (a reverse tunnel) then
+// served nothing until it happened to dial. peerConn drops the closed adapter,
+// so the peer's next inbound stream is served.
+func TestInboundRecoversAfterAdapterClosed(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, pubA, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, echo, privA, slog.Default()) // A answers inbound
+	engineB := newEngine(url, "", privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	// First inbound stream: A builds its adapter from the packet pump alone.
+	s, err := engineB.OpenStream(keyName(pubA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+	waitFor(t, 5*time.Second, func() bool {
+		engineA.mu.Lock()
+		_, ok := engineA.peers[pubB]
+		engineA.mu.Unlock()
+		return ok
+	})
+
+	// Simulate the adapter dying (queue overflow, or a peer restart A was not
+	// told about): closed, but left cached in e.peers.
+	engineA.mu.Lock()
+	pc := engineA.peers[pubB]
+	engineA.mu.Unlock()
+	if pc == nil {
+		t.Fatal("no inbound adapter to peer")
+	}
+	pc.Close()
+
+	// The peer's next inbound stream must still be served.
+	s2, err := engineB.OpenStream(keyName(pubA))
+	if err != nil {
+		t.Fatalf("inbound open after adapter kill: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "recovered")
+}
+
 // TestPeerGoneFastFail proves that once a peer's DERP connection drops, a
 // request to the (still down) peer fails fast once the relay reports it gone,
 // instead of hanging until the smux keepalive timeout (~30s).

@@ -77,7 +77,15 @@ var (
 	// so the first connection rides the direct path instead of starting on
 	// the relay.
 	punchWaitTimeout = 5 * time.Second
-	backoffPeriod    = 30 * time.Second
+	// directOpenTimeout bounds opening a stream on an *existing* direct session.
+	// Deliberately shorter than the relay's streamOpenTimeout: a healthy direct
+	// open is sub-millisecond, and the session may already be dead without smux
+	// having noticed (the documented "a dead session is served as live" hole),
+	// where a long wait is a stall on a path that will not answer while the
+	// relay stands ready. A session built by the punch just now is not this
+	// case, so that open keeps the full relay timeout.
+	directOpenTimeout = 3 * time.Second
+	backoffPeriod     = 30 * time.Second
 	// relayWaitRetry is how long a punch waits for the relay to come back
 	// before trying again; it is short because the relay is usually back
 	// within the reconnect ticker's period.

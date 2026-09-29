@@ -389,7 +389,7 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 	}
 	if dc := e.getDirect(peer); dc != nil {
 		if sess := dc.session(); sess != nil {
-			if c, err := openStream(sess, streamOpenTimeout); err == nil {
+			if c, err := openStream(sess, directOpenTimeout); err == nil {
 				e.stats.countStream("direct")
 				return &openedStream{Conn: c, transport: "direct", peerAddr: dc.peerAddrString()}, nil
 			}
@@ -493,6 +493,14 @@ func openStream(sess *smux.Session, timeout time.Duration) (net.Conn, error) {
 	case r := <-ch:
 		return r.c, r.err
 	case <-ctx.Done():
+		// The open can still succeed after the wait. Nobody is left to use or
+		// close that stream, so close it here or it rides the session forever
+		// (and the peer holds a stream this side never reads).
+		go func() {
+			if r := <-ch; r.c != nil {
+				r.c.Close()
+			}
+		}()
 		return nil, ctx.Err()
 	}
 }
@@ -580,14 +588,12 @@ func (e *engine) pump(c *derpclient.Client) {
 		}
 		pkt = pkt[1:]
 
-		e.mu.Lock()
-		pc := e.peers[src]
-		e.mu.Unlock()
-		if pc == nil {
-			// Packets from unknown peers: create the adapter so an inbound
-			// tunnel (the other side opening a stream) can be served.
-			pc = e.peerConn(src)
-		}
+		// peerConn creates the adapter for a peer we have not seen and drops a
+		// closed one instead of handing it back. Reaching into the map directly
+		// left a killed adapter (its session ended, e.g. on a queue overflow) in
+		// place, so every later packet failed against it and the peer had no
+		// inbound path at all until some outbound open happened to replace it.
+		pc := e.peerConn(src)
 		// Ensure a session exists on this side too: inbound packets must be
 		// consumed by smux (which then accepts streams) even when this host
 		// never opens a tunnel to the peer itself.
