@@ -754,7 +754,42 @@ func (dc *directConn) punch() {
 		return
 	}
 
-	// 4. Try each family once, in order. Per-family sockets preserve the kcp
+	// 4. Encryption gate: settle the direct security handshake BEFORE dialing.
+	// The gate must precede the dial/seed, not follow it: seedHandshake is a
+	// plaintext, version-agnostic path-liveness echo, so a peer that cannot
+	// encrypt would pass it, build its own direct mux, and report "direct" while
+	// our side refuses — its view is local and wrong, and every later punch
+	// re-succeeds. Gating first means it gets no seed echo, so its own punch
+	// fails and it backs off. The handshake rides the relay control channel (our
+	// half was sent at punch start), not the direct path, so gating here has no
+	// bootstrap deadlock: the peer's half reaches us over the relay even though
+	// neither side has dialed. A settled session skips the loop; the retry
+	// re-sends our half (with want set while unsettled) so a lost reply heals;
+	// the deadline bounds a peer that does not support it, which is refused here.
+	deadline := time.Now().Add(handshakeTimeout)
+	for !dc.secure.settled() {
+		if err := e.sendSecureHalf(dc.peer, dc.secure); err != nil {
+			e.log.Debug("direct punch: secure half failed", "peer", pname, "error", err)
+			break
+		}
+		if dc.secure.waitReady(resendInterval) {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+	}
+	if !dc.secure.settled() {
+		// Forced encryption: do not dial a peer that cannot encrypt. Abandon the
+		// round; the relay stays the fallback.
+		closeFams()
+		e.log.Warn("direct punch refused: encryption required but the peer did not negotiate it",
+			"peer", pname)
+		dc.backoff()
+		return
+	}
+
+	// 5. Try each family once, in order. Per-family sockets preserve the kcp
 	// "one socket, one session" rule; both families failing backs off. The seed
 	// handshake requires a full own->peer->own round trip on both sides, so a
 	// one-way v6 path fails on both peers and both fall back to v4 in this
@@ -789,36 +824,9 @@ func (dc *directConn) punch() {
 			continue
 		}
 
-		// Settle the security handshake before building the mux. A settled
-		// session (both halves already exchanged, e.g. ours answered before this
-		// point) skips the loop outright. The retry re-sends our half (with want
-		// set while unsettled) so a lost reply heals within the round; the
-		// deadline bounds a peer that does not support it, which is then refused
-		// below.
-		deadline := time.Now().Add(handshakeTimeout)
-		for !dc.secure.settled() {
-			if err := e.sendSecureHalf(dc.peer, dc.secure); err != nil {
-				e.log.Debug("direct punch: secure half failed", "peer", pname, "error", err)
-				break
-			}
-			if dc.secure.waitReady(resendInterval) {
-				break
-			}
-			if time.Now().After(deadline) {
-				break
-			}
-		}
-		if !dc.secure.settled() {
-			// Forced encryption: a punch that did not settle the handshake must
-			// not come up as a plaintext direct session. Abandon the round; the
-			// relay stays the fallback.
-			kcpConn.Close() // ownConn=true closes f.sock with it
-			closeFams()
-			e.log.Warn("direct punch refused: encryption required but the peer did not negotiate it",
-				"peer", pname)
-			dc.backoff()
-			return
-		}
+		// The encryption gate above already refused an unsettled session before
+		// dialing, so conn() is expected to succeed here; the error stays as a
+		// safety.
 		underlay, err := dc.secure.conn(kcpConn)
 		if err != nil {
 			kcpConn.Close()
@@ -826,8 +834,8 @@ func (dc *directConn) punch() {
 			continue
 		}
 
-		// 5. smux over the (possibly ciphered) KCP underlay; role by key order
-		// (external to who dialed).
+		// 6. smux over the ciphered KCP underlay; role by key order (external to
+		// who dialed).
 		cfg := directSmuxConfig(dc.supports(capsTightKeepalive))
 		var sess *smux.Session
 		if roleIsClient {

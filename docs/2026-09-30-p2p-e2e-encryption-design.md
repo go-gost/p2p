@@ -216,6 +216,14 @@ for that transport arrived before the bring-up deadline; otherwise the session i
   trip, so it builds the cipher only if the session is already settled; an
   unsettled packet on that path is dropped rather than stalling the pump
   (`errEncryptionRequired`).
+- The **direct punch gates the cipher before it dials**: the settle loop runs once,
+  after the candidate exchange but *before* `kcp.NewConn4`/`seedHandshake`, and an
+  unsettled session refuses the round (backoff) without dialing. Order matters —
+  `seedHandshake` is a plaintext, version-agnostic liveness echo, so dialing first
+  would let a peer that cannot encrypt pass the seed and build its own direct mux,
+  reporting "direct" while our side refuses; with the gate first its seed gets no
+  echo, so its own punch fails. The handshake rides the relay control channel, not
+  the direct path, so gating before the dial introduces no bootstrap deadlock.
 
 **A dropped handshake is a denial of service, not a downgrade:** an on-path relay
 that *drops* both directions' `ctrlSecure` frames cannot force plaintext — it can

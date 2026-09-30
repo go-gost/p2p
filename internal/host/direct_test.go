@@ -1539,3 +1539,60 @@ func TestMarkUpCountsUps(t *testing.T) {
 		t.Errorf("state = %v, want directUp", dc.stateOf())
 	}
 }
+
+// TestPunchGatesBeforeDial: the encryption gate sits before the dial/seed, so a
+// peer that cannot negotiate the direct cipher is never dialed — it gets no seed
+// echo, so its own punch fails and it backs off instead of falsely reporting a
+// direct path. The round must end in backoff with no direct session.
+//
+// The relay's dropCtrl cannot target only the direct transport (the transport
+// byte is inside the seal), so this drives the punch path directly against a
+// peer that is not registered at the relay: no direct half ever arrives, so the
+// gate cannot settle.
+//
+// It deliberately does NOT shorten handshakeTimeout/resendInterval: another
+// test's lingering background punch/udp-link goroutine can be reading them, and
+// writing a package timing global races with it (see TestMain's note). The gate
+// therefore runs at the default handshakeTimeout.
+func TestPunchGatesBeforeDial(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+
+	priv, _, _ := derpclient.Generate()
+	e := newEngine(url, "", priv, slog.Default())
+	e.stunAddr = stun
+	t.Cleanup(e.Close)
+	if err := e.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	peer := derpclient.PublicKey{9}
+	dc := e.directConn(peer)
+	// A peer candidate list, so the round gets past the candidate exchange to the
+	// gate (otherwise it would back off for "no shared family" instead).
+	dc.cand <- []candidate{{addr: netip.MustParseAddrPort("127.0.0.1:9")}}
+
+	start := time.Now()
+	dc.punch()
+	elapsed := time.Since(start)
+
+	if dc.secure.settled() {
+		t.Fatal("direct session settled without a peer half")
+	}
+	if hasDirect(e, peer) {
+		t.Fatal("a peer that cannot encrypt was marked direct")
+	}
+	if sess := dc.session(); sess != nil {
+		t.Fatal("a direct smux session was built without the cipher")
+	}
+	if got := dc.stateOf(); got != directBackoff {
+		t.Fatalf("punch state = %v, want directBackoff", got)
+	}
+	// The gate returns before the family loop, so no dial/seed ran. A dial would
+	// have burned up to seedTimeout (5s) inside seedHandshake; the round is
+	// bounded well under that.
+	if elapsed >= seedTimeout {
+		t.Fatalf("punch took %v: it dialed/seeded despite the unsettled cipher", elapsed)
+	}
+}
