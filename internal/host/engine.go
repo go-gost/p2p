@@ -237,6 +237,7 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 			d.SessionAge = now.Sub(at)
 		}
 		d.Attempts, d.Ups, d.Drops = dc.punchCounters()
+		d.Trace = dc.traceLines()
 		out[name] = d
 	}
 	if len(out) == 0 {

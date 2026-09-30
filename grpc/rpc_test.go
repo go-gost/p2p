@@ -453,6 +453,7 @@ func TestPeerDiagnosticsToProto(t *testing.T) {
 			PeerAddr: "192.0.2.10:34567", Candidates: 2,
 			Caps: []string{"ipv6"}, SessionAge: 3 * time.Second,
 			LastRecvAge: 1500 * time.Millisecond, Attempts: 7, Ups: 1, Drops: 2,
+			Trace: []string{"round start", "peer candidates: 2", "v4 up"},
 		},
 	}
 	out := peerDiagnosticsToProto(in)
@@ -473,5 +474,8 @@ func TestPeerDiagnosticsToProto(t *testing.T) {
 	}
 	if len(got.Caps) != 1 || got.Caps[0] != "ipv6" {
 		t.Fatalf("caps wrong: %v", got.Caps)
+	}
+	if len(got.Trace) != 3 || got.Trace[0] != "round start" || got.Trace[2] != "v4 up" {
+		t.Fatalf("trace wrong: %v", got.Trace)
 	}
 }

@@ -67,6 +67,11 @@ const capsIPv6 uint8 = 1 << 0
 // peer got before the tighter one existed.
 const capsTightKeepalive uint8 = 1 << 1
 
+// punchTraceCap is the number of recent punch steps a peer's Status.Trace
+// holds: enough for a few failed rounds' worth of history, small enough to stay
+// a fixed-size array (no per-round allocation).
+const punchTraceCap = 16
+
 // v6AnnounceFunc maps the bound IPv6 punch socket's port to the endpoint to
 // advertise. Production advertises the socket's own local address; tests
 // override it to force an unreachable candidate.
@@ -164,6 +169,16 @@ type directConn struct {
 	attempts atomic.Int64 // punch rounds started
 	ups      atomic.Int64 // rounds that reached a live direct session
 	drops    atomic.Int64 // live direct sessions that ended
+
+	// trace is this peer's recent punch history, a fixed-size ring of short
+	// lines reported through Status.PeerDiagnostic.Trace. It holds the last
+	// punchTraceCap steps (the snapshot's single value cannot show a flaky
+	// punch's history). traceRing is allocated once and reused, so a round adds
+	// no growing state; tracePos is the next write slot and traceN the count
+	// written (saturating at the cap). Guarded by dc.mu.
+	traceRing [punchTraceCap]string
+	tracePos  int
+	traceN    int
 
 	// lastFrameAt is the UnixNano stamp of the last frame seen from this peer on
 	// the direct path. A direct-first peer has no relay adapter (OpenStream goes
@@ -440,6 +455,36 @@ func (dc *directConn) punchCounters() (attempts, ups, drops int64) {
 	return dc.attempts.Load(), dc.ups.Load(), dc.drops.Load()
 }
 
+// noteRound appends one short line to this peer's punch trace, dropping the
+// oldest once the ring is full. Called from the punch goroutine at the steps
+// that matter for diagnosing a punch; never per packet.
+func (dc *directConn) noteRound(format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	dc.mu.Lock()
+	dc.traceRing[dc.tracePos] = line
+	dc.tracePos = (dc.tracePos + 1) % punchTraceCap
+	if dc.traceN < punchTraceCap {
+		dc.traceN++
+	}
+	dc.mu.Unlock()
+}
+
+// traceLines returns this peer's punch trace oldest-first, as a copy so a
+// caller (a status builder) never aliases the ring.
+func (dc *directConn) traceLines() []string {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if dc.traceN == 0 {
+		return nil
+	}
+	out := make([]string, dc.traceN)
+	start := (dc.tracePos - dc.traceN + punchTraceCap) % punchTraceCap
+	for i := range out {
+		out[i] = dc.traceRing[(start+i)%punchTraceCap]
+	}
+	return out
+}
+
 func (dc *directConn) onCandidates(cands []candidate) {
 	dc.mu.Lock()
 	if sameCandidates(cands, dc.lastPeer) {
@@ -637,6 +682,7 @@ func (dc *directConn) retry(d time.Duration, failed bool) {
 	dc.mine = nil
 	dc.mu.Unlock()
 	dc.e.log.Debug("direct punch: backoff", "peer", keyName(dc.peer), "retryIn", d.String())
+	dc.noteRound("backoff %s", d.String())
 	go func() {
 		select {
 		case <-dc.e.stop:
@@ -685,6 +731,7 @@ func (dc *directConn) punch() {
 
 	e.stats.punchAttempts.Add(1)
 	dc.attempts.Add(1)
+	dc.noteRound("round start")
 
 	// 1. Collect one socket + candidate set per available family. A family that
 	// cannot be set up is dropped and the round continues on whatever remains,
@@ -781,6 +828,7 @@ func (dc *directConn) punch() {
 		e.log.Debug("direct punch: no peer candidates", "peer", pname)
 		closeFams()
 		dc.noteErr("no peer candidates")
+		dc.noteRound("no peer candidates")
 		dc.backoff()
 		return
 	}
@@ -797,6 +845,7 @@ func (dc *directConn) punch() {
 	peerV4 := ipv4Addrs(cands)
 	peerV6 := v6Addrs(cands)
 	e.log.Debug("direct punch: peer candidates", "peer", pname, "candidates", candAddrs(cands))
+	dc.noteRound("peer candidates: %d", len(cands))
 
 	// 3. Family order: IPv6 when both sides offer it, otherwise IPv4. The
 	// predicate uses only the two candidate lists, so both peers compute the
@@ -823,6 +872,7 @@ func (dc *directConn) punch() {
 		e.log.Debug("direct punch: no shared family", "peer", pname, "candidates", candAddrs(cands))
 		closeFams()
 		dc.noteErr("no shared family")
+		dc.noteRound("no shared family")
 		dc.backoff()
 		return
 	}
@@ -857,6 +907,7 @@ func (dc *directConn) punch() {
 		// round; the relay stays the fallback.
 		closeFams()
 		dc.noteErr("encryption not settled")
+		dc.noteRound("encrypted: not settled")
 		e.log.Warn("direct punch refused: encryption required but the peer did not negotiate it",
 			"peer", pname)
 		dc.backoff()
@@ -885,17 +936,20 @@ func (dc *directConn) punch() {
 		}
 		u := net.UDPAddrFromAddrPort(dial)
 		e.log.Debug("direct punch: dial", "peer", pname, "family", f.name, "addr", u.String(), "conv", dc.conv())
+		dc.noteRound("%s dial %s", f.name, dial.String())
 		// ownConn=true: Close closes the socket, so session death tears down the
 		// readLoop with no separate bookkeeping (kcp-go deep-dive R2).
 		kcpConn, err := kcp.NewConn4(dc.conv(), u, nil, 0, 0, true, f.sock)
 		if err != nil {
 			dc.noteErr(fmt.Sprintf("dial failed: %v", err))
+			dc.noteRound("%s dial failed: %v", f.name, err)
 			e.log.Debug("direct punch: dial failed", "peer", pname, "family", f.name, "addr", u.String(), "error", err)
 			continue
 		}
 		if err := seedHandshake(kcpConn, seedTimeout); err != nil {
 			kcpConn.Close() // ownConn=true closes f.sock with it
 			dc.noteErr(fmt.Sprintf("seed failed: %v", err))
+			dc.noteRound("%s seed failed: %v", f.name, err)
 			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", u.String(), "error", err)
 			continue
 		}
@@ -922,6 +976,7 @@ func (dc *directConn) punch() {
 		if err != nil {
 			kcpConn.Close()
 			dc.noteErr(fmt.Sprintf("smux failed: %v", err))
+			dc.noteRound("%s smux failed", f.name)
 			e.log.Debug("direct punch: smux failed", "peer", pname, "family", f.name, "error", err)
 			continue
 		}
@@ -935,6 +990,7 @@ func (dc *directConn) punch() {
 		dc.mine = f.mine
 		dc.mu.Unlock()
 		dc.markUp(sess, sock, dial)
+		dc.noteRound("%s up", f.name)
 		_, _, enc := dc.secure.keys()
 		e.log.Debug("direct established", "peer", pname, "family", f.name,
 			"mine", candAddrs(f.mine), "peerAddr", dial.String(),

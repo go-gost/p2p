@@ -1657,3 +1657,36 @@ func TestPunchGatesBeforeDial(t *testing.T) {
 		t.Fatalf("punch took %v: it dialed/seeded despite the unsettled cipher", elapsed)
 	}
 }
+
+// TestPunchTraceRing: the trace ring caps at punchTraceCap, reads oldest ->
+// newest, drops the oldest past the cap, and traceLines returns a copy.
+func TestPunchTraceRing(t *testing.T) {
+	dc := &directConn{}
+	if got := dc.traceLines(); got != nil {
+		t.Fatalf("fresh trace = %v, want nil", got)
+	}
+	for i := 1; i <= punchTraceCap; i++ {
+		dc.noteRound("line %d", i)
+	}
+	got := dc.traceLines()
+	if len(got) != punchTraceCap {
+		t.Fatalf("trace len = %d, want %d", len(got), punchTraceCap)
+	}
+	if got[0] != "line 1" || got[len(got)-1] != fmt.Sprintf("line %d", punchTraceCap) {
+		t.Fatalf("trace order wrong: first=%q last=%q", got[0], got[len(got)-1])
+	}
+	// One more line drops the oldest and keeps the newest at the end.
+	dc.noteRound("line %d", punchTraceCap+1)
+	got = dc.traceLines()
+	if len(got) != punchTraceCap {
+		t.Fatalf("trace len after wrap = %d, want %d", len(got), punchTraceCap)
+	}
+	if got[0] != "line 2" || got[len(got)-1] != fmt.Sprintf("line %d", punchTraceCap+1) {
+		t.Fatalf("ring did not drop the oldest: first=%q last=%q", got[0], got[len(got)-1])
+	}
+	// traceLines returns a copy: mutating it must not change the ring.
+	got[0] = "mutated"
+	if again := dc.traceLines(); again[0] == "mutated" {
+		t.Fatal("traceLines aliases the ring")
+	}
+}

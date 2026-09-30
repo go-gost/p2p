@@ -38,6 +38,8 @@ func (s *Server) Status(ctx context.Context, req *pb.StatusRequest) (*pb.StatusR
 		StreamsDerp:     st.StreamsDerp,
 		EncryptedPeers:  int32(st.EncryptedPeers),
 		PlaintextPeers:  int32(st.PlaintextPeers),
+		RelayConnected:  st.RelayConnected,
+		RelayError:      st.RelayError,
 		PeerDiagnostics: peerDiagnosticsToProto(st.PeerDiagnostics),
 	}, nil
 }
@@ -72,6 +74,7 @@ func peerDiagnosticsToProto(in map[string]p2p.PeerDiagnostic) []*pb.PeerDiagnost
 			Attempts:      d.Attempts,
 			Ups:           d.Ups,
 			Drops:         d.Drops,
+			Trace:         d.Trace,
 		})
 	}
 	return out

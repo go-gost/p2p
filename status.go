@@ -33,6 +33,10 @@ type PeerDiagnostic struct {
 	Attempts int64
 	Ups      int64
 	Drops    int64
+	// Trace is the peer's recent punch history: short human-readable lines, the
+	// oldest first, capped at the ring's size (the newest are kept). Nil for a
+	// peer with no direct punch state (a relay-only peer).
+	Trace []string
 }
 
 // Status is a point-in-time snapshot of an endpoint: the live tunnel count and
