@@ -83,7 +83,7 @@ func status(addr, token string) error {
 	if err != nil {
 		return err
 	}
-	out := map[string]int64{
+	out := map[string]any{
 		"tunnels":        int64(reply.GetTunnels()),
 		"direct_peers":   int64(reply.GetDirectPeers()),
 		"derp_peers":     int64(reply.GetDerpPeers()),
@@ -91,6 +91,9 @@ func status(addr, token string) error {
 		"punch_success":  reply.GetPunchSuccess(),
 		"streams_direct": reply.GetStreamsDirect(),
 		"streams_derp":   reply.GetStreamsDerp(),
+		// The per-peer diagnostic snapshot, so a scenario can assert it over a
+		// real relay rather than only in-process.
+		"peer_diagnostics": reply.GetPeerDiagnostics(),
 	}
 	b, _ := json.Marshal(out)
 	fmt.Println(string(b))

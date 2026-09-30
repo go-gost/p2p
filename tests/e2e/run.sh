@@ -402,6 +402,9 @@ scenario_derp_relay() {
 	save_status A 127.0.0.1:8003 "$dir/status.json"
 	check_grep "relay path is used" '"derp_peers":1' "$dir/status.json"
 	check_not_grep "no direct session in relay-only mode" '"direct_peers":[1-9]' "$dir/status.json"
+	check_grep "status carries a per-peer diagnostic" '"peer_diagnostics":\[' "$dir/status.json"
+	check_grep "the diagnostic is keyed by the peer" '"peer":"' "$dir/status.json"
+	check_grep "the diagnostic names the transport" '"path":"[a-z-]+"' "$dir/status.json"
 	# A non-mux tunnel must leave no residue once the request finishes.
 	if wait_status_eq A 127.0.0.1:8003 tunnels 0 15; then
 		ok "tunnel record reclaimed after the stream ends (zero residue)"

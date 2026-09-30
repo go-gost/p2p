@@ -653,7 +653,7 @@ Run: `cd p2p && go build ./... && go vet ./... && gofmt -l . && TMPDIR=/config/t
 Expected: green (workspace). The standalone `GOWORK=off` build needs the plugin
 release below.
 
-- [ ] **Step 2b: e2e**
+- [x] **Step 2b: e2e**
 
 In the container harness (`tests/e2e/run.sh` + the `helper`), extend a scenario's
 `Status` assertion: after a tunnel is up, the queried status carries a
