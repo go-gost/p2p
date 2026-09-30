@@ -152,6 +152,22 @@ func (h *Host) Punch(peerB64 string) error {
 	return h.warm(peerB64, true)
 }
 
+// WarmContext is Warm with the caller's action id read from ctx: the seam call
+// names it in its log line, so a UI action can be joined with the p2p work it
+// started. It is otherwise Warm — the id is a label and changes nothing.
+func (h *Host) WarmContext(ctx context.Context, peerB64 string) error {
+	h.logAction(ctx, "warm")
+	return h.Warm(peerB64)
+}
+
+// PunchContext is Punch with the caller's action id read from ctx: the seam
+// call names it in its log line, so a UI action can be joined with the p2p work
+// it started. It is otherwise Punch — the id is a label and changes nothing.
+func (h *Host) PunchContext(ctx context.Context, peerB64 string) error {
+	h.logAction(ctx, "punch")
+	return h.Punch(peerB64)
+}
+
 func (h *Host) warm(peerB64 string, punch bool) error {
 	if h.engine == nil {
 		return nil // stub mode: peers are host:port, there is no relay session to warm

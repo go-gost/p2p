@@ -65,6 +65,7 @@ func (h *Host) AttachTunnel(id string, s Stream, abort func()) error {
 // peer dial runs in the tunnel's serve goroutine, so the returned conn — not
 // ctx — is the cancellation handle: closing it tears the tunnel down.
 func (h *Host) Dial(ctx context.Context, network, peer string) (net.Conn, error) {
+	h.logAction(ctx, "dial")
 	if err := contextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -134,6 +135,14 @@ func (h *Host) Listen() (net.Listener, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.listener, nil
+}
+
+// ListenContext is Listen with the caller's action id read from ctx: the seam
+// call names it in its log line, so a UI action can be joined with the p2p work
+// it started. It is otherwise Listen — the id is a label and changes nothing.
+func (h *Host) ListenContext(ctx context.Context) (net.Listener, error) {
+	h.logAction(ctx, "listen")
+	return h.Listen()
 }
 
 // normalizeNetwork maps a dialer network to the two the tunnel protocol

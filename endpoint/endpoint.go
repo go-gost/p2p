@@ -142,6 +142,13 @@ func (e *Endpoint) Listen() (net.Listener, error) {
 	return e.h.Listen()
 }
 
+// ListenContext is Listen with the caller's action id read from ctx, so the
+// seam call names it in its log line and a UI action can be joined with the p2p
+// work it started. Additive: Listen is unchanged for callers with no action.
+func (e *Endpoint) ListenContext(ctx context.Context) (net.Listener, error) {
+	return e.h.ListenContext(ctx)
+}
+
 // Warm brings up the peer's relay session without opening a tunnel stream or
 // starting a punch: for a caller that only answers its peers, so they have a
 // path in Status before any traffic. Idempotent.
@@ -149,11 +156,33 @@ func (e *Endpoint) Warm(peer string) error {
 	return e.h.Warm(peer)
 }
 
+// WarmContext is Warm with the caller's action id read from ctx, named in the
+// seam call's log line. Additive: Warm is unchanged for callers with no action.
+func (e *Endpoint) WarmContext(ctx context.Context, peer string) error {
+	return e.h.WarmContext(ctx, peer)
+}
+
 // Punch is Warm plus a hole punch for the peer: for a caller that dials out,
 // so the direct path is being arranged before the first stream needs it.
 // Idempotent; the punch runs in the background.
 func (e *Endpoint) Punch(peer string) error {
 	return e.h.Punch(peer)
+}
+
+// PunchContext is Punch with the caller's action id read from ctx, named in the
+// seam call's log line. Additive: Punch is unchanged for callers with no action.
+func (e *Endpoint) PunchContext(ctx context.Context, peer string) error {
+	return e.h.PunchContext(ctx, peer)
+}
+
+// WithAction returns ctx carrying an action id — a short, opaque label a caller
+// (wisper's HTTP middleware) put on the request — so the seam calls made with
+// it name the action in their log line. It is never auth and never parsed: an
+// empty id is ignored, and the value only ever reaches a log field. It is
+// exported so an embedder can set the id on its own request context without
+// reaching into the host (which is internal).
+func WithAction(ctx context.Context, id string) context.Context {
+	return host.WithAction(ctx, id)
 }
 
 // Status reports the endpoint's tunnel count and transport stats.
