@@ -24,6 +24,13 @@ import (
 )
 
 func main() {
+	// `doctor` is a read-only client of a running host's control plane: it
+	// prints one diagnostic report and exits, so it never reaches the host path.
+	if len(os.Args) > 1 && os.Args[1] == "doctor" {
+		runDoctor(os.Args[2:])
+		return
+	}
+
 	// Flags are overrides on top of the config file; their defaults are only
 	// used as a fallback when neither the config nor the flag sets the value.
 	addr := flag.String("addr", "", "gRPC listen address (control plane); empty runs none — a --target/--forward node has no GOST client to serve")

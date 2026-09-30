@@ -491,6 +491,22 @@ scenario_derp_direct() {
 	fi
 	save_status A 127.0.0.1:8003 "$dir/status.json"
 	check_grep "status shows a live direct peer" '"direct_peers":[1-9]' "$dir/status.json"
+	check_grep "the diagnostic carries a punch trace" '"trace":\["' "$dir/status.json"
+
+	# `p2p doctor` is a control-plane client: it dials the running host, renders
+	# the report and exits. The relay/STUN names come from the flags (a host does
+	# not report its own config over Status).
+	local report="$dir/doctor.txt"
+	if ns_run A "$P2P_BIN" doctor --addr 127.0.0.1:8003 \
+		--key "$dir/keys/a" --peer "$bkey" \
+		--derp "wss://$DERP_IP:443/derp" --stun "$DERP_IP:3478" >"$report" 2>&1; then
+		ok "p2p doctor queried the host"
+	else
+		fail "p2p doctor exited nonzero: $(cat "$report")"
+	fi
+	check_grep "doctor names the local identity" "^local key: *[A-Za-z0-9_-]{20}" "$report"
+	check_grep "doctor reports the peer's direct path" "peer $bkey: direct path up" "$report"
+	check_grep "doctor carries the punch trace" "^ +trace:" "$report"
 
 	# Kill the relay: the direct session must survive.
 	local dpid

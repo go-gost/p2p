@@ -51,6 +51,25 @@ func loadOrCreateKey(path, hexKey string) (derpclient.PrivateKey, derpclient.Pub
 	return priv, pub, nil
 }
 
+// PublicKeyFile returns the base64 public key of the identity at path (empty
+// means the default key path), read-only. Unlike loadOrCreateKey it never
+// creates one, so a diagnostic can name the local identity without a side
+// effect; it fails when the file is missing or malformed.
+func PublicKeyFile(path string) (string, error) {
+	if path == "" {
+		path = defaultKeyPath()
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	_, pub, err := keyFromHex(string(b))
+	if err != nil {
+		return "", err
+	}
+	return keyName(pub), nil
+}
+
 // keyFromHex decodes a hex-encoded 32-byte curve25519 private key.
 func keyFromHex(s string) (derpclient.PrivateKey, derpclient.PublicKey, error) {
 	raw, err := hex.DecodeString(strings.TrimSpace(s))
