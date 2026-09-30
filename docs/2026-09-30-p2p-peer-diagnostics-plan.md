@@ -45,7 +45,7 @@ Design spec: [docs/2026-09-30-p2p-peer-diagnostics-design.md](docs/2026-09-30-p2
 - Modify: `internal/host/direct.go`, `internal/host/engine.go`
 - Test: `internal/host/direct_test.go`, `internal/host/engine_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 A punch failure must record its reason. In `internal/host/direct_test.go`:
 
@@ -70,12 +70,12 @@ func TestDirectConnRecordsLastError(t *testing.T) {
 covered instead by Task 2's snapshot test, which asserts `SessionAge > 0` when
 the path is `direct`.)
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cd p2p && go test ./internal/host/ -run 'TestDirectConnRecordsLastError' -v`
 Expected: FAIL — `dc.noteErr undefined`.
 
-- [ ] **Step 3: Add the fields + accessors + `noteErr`**
+- [x] **Step 3: Add the fields + accessors + `noteErr`**
 
 In `internal/host/direct.go`, add to `directConn` (next to `peerCaps`):
 
@@ -124,7 +124,7 @@ In `markUp`, stamp the session and clear the error (inside the existing lock):
 	dc.mu.Unlock()
 ```
 
-- [ ] **Step 4: Record the reason at each punch failure point**
+- [x] **Step 4: Record the reason at each punch failure point**
 
 In `punch`/`retry`, call `dc.noteErr(...)` where the round gives up for that
 peer. The call sites (line numbers from the current file — adapt to the real
@@ -150,7 +150,7 @@ Example for the seed site:
 		}
 ```
 
-- [ ] **Step 5: Add `peerConn.lastFrameAt`**
+- [x] **Step 5: Add `peerConn.lastFrameAt`**
 
 In `internal/host/engine.go`, add to `peerConn`:
 
@@ -165,12 +165,12 @@ In `pump`, when a frame from `src` is routed (right after `pc := e.peerConn(src)
 		pc.lastFrameAt.Store(time.Now().UnixNano())
 ```
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `cd p2p && TMPDIR=/config/tmp CGO_ENABLED=1 go test -race -count=1 ./internal/host/`
 Expected: green (`TestSeedHandshake` is a known sandbox flake — rerun if only it fails).
 
-- [ ] **Step 7: Commit (gated)**
+- [x] **Step 7: Commit (gated)**
 
 ```bash
 cd p2p && git add internal/host/direct.go internal/host/engine.go internal/host/direct_test.go
@@ -185,7 +185,7 @@ git commit -m "host: record the punch failure reason, session start and last fra
 - Modify: `status.go`, `internal/host/engine.go`, `internal/host/server.go`
 - Test: `internal/host/engine_test.go`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```go
 func TestPeerDiagnosticsSnapshot(t *testing.T) {
@@ -227,12 +227,12 @@ func TestPeerDiagnosticsSnapshot(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cd p2p && go test ./internal/host/ -run TestPeerDiagnosticsSnapshot -v`
 Expected: FAIL — `st.PeerDiagnostics undefined`.
 
-- [ ] **Step 3: Add the type and supersede `PeerPunches`**
+- [x] **Step 3: Add the type and supersede `PeerPunches`**
 
 In `status.go`, replace the `PeerPunch` type + the `PeerPunches` field with:
 
@@ -281,7 +281,7 @@ and on `Status`:
 
 Delete the `PeerPunch` type and the `PeerPunches` field.
 
-- [ ] **Step 4: Build the snapshot**
+- [x] **Step 4: Build the snapshot**
 
 In `internal/host/engine.go`, replace `peerPunches()` with:
 
@@ -400,7 +400,7 @@ func (dc *directConn) punchCounters() (attempts, ups, drops int64) {
 (`peerAddr.String()` on a zero `netip.AddrPort` is `"invalid AddrPort"` — guard
 it: return `""` when `!dc.peerAddr.IsValid()`.)
 
-- [ ] **Step 5: Wire it into `status()`**
+- [x] **Step 5: Wire it into `status()`**
 
 In `internal/host/server.go`:
 
@@ -410,12 +410,12 @@ In `internal/host/server.go`:
 		st.PeerEncryption = s.engine.peerEncryptions()
 ```
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `cd p2p && TMPDIR=/config/tmp CGO_ENABLED=1 go test -race -count=1 ./internal/host/`
 Expected: green. Fix every reader of the removed `PeerPunches` (grep `PeerPunches`, `peerPunches`, `punchCounts`).
 
-- [ ] **Step 7: Commit (gated)**
+- [x] **Step 7: Commit (gated)**
 
 ```bash
 cd p2p && git add status.go internal/host/engine.go internal/host/direct.go internal/host/server.go internal/host/engine_test.go
@@ -430,7 +430,7 @@ git commit -m "host: report a per-peer diagnostic snapshot in Status"
 - Modify: `../plugin/p2p/proto/p2p.proto`, `grpc/rpc.go`
 - Test: `grpc/rpc_test.go`
 
-- [ ] **Step 1: Extend the proto**
+- [x] **Step 1: Extend the proto**
 
 In `../plugin/p2p/proto/p2p.proto`, add a message and a field:
 
@@ -466,7 +466,7 @@ protoc --proto_path=. --go_out=. --go_opt=paths=source_relative \
   --go-grpc_out=. --go-grpc_opt=paths=source_relative p2p/proto/p2p.proto
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 The mapping is a pure function, so it is tested without a live endpoint (the
 grpc tests here have no relay harness, so a `Status` round trip has no peers).
@@ -502,7 +502,7 @@ func TestPeerDiagnosticsToProto(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: Map it**
+- [x] **Step 3: Map it**
 
 In `grpc/rpc.go`, add the pure mapper and call it from `Status`:
 
@@ -551,13 +551,13 @@ and in the `Status` handler:
 The proto message carries no peer key — a client already knows the keys it asked
 by; add `string peer = 14` and fill it only if a keyless list proves awkward.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run: `cd ../plugin && go build ./... && cd ../p2p && go build ./... && go vet ./... && TMPDIR=/config/tmp CGO_ENABLED=1 go test -race -count=1 ./grpc/ ./internal/host/`
 Expected: green. Note: the `p2p` standalone build (`GOWORK=off`) will be red
 until the `plugin` tag is pushed and `p2p`'s pin bumped (the release step).
 
-- [ ] **Step 5: Commit (gated)**
+- [x] **Step 5: Commit (gated)**
 
 ```bash
 cd ../plugin && git add p2p/proto/p2p.proto p2p/proto/*.go && git commit -m "plugin: add per-peer diagnostics to StatusReply"
@@ -569,10 +569,25 @@ cd ../p2p && git add grpc/rpc.go grpc/rpc_test.go && git commit -m "grpc: carry 
 ## Task 4: wisper API and UI
 
 **Files:**
-- Modify: `../wisper/api/p2p_handler.go`, `../wisper/api/tunnel_handler.go`, `../wisper/web-src/src/**`
-- Test: `../wisper/api/api_test.go`, `../wisper/web-e2e/tests/*.spec.ts`
+- Modify: `../wisper/runner/task/diff.go`, `../wisper/runner/task/stats.go`, `../wisper/api/p2p_handler.go`, `../wisper/api/tunnel_handler.go`, `../wisper/web-src/src/**`
+- Test: `../wisper/runner/task/diff_test.go`, `../wisper/api/api_test.go`, `../wisper/web-e2e/tests/*.spec.ts`
 
-- [ ] **Step 1: Pass it through the API**
+> **Found while executing Task 2:** removing `p2p.PeerPunch` breaks **more of wisper
+> than the API** — `runner/task` reads the punch counters directly
+> (`diffPunchDrops`/`diffPunchFailures` take `map[string]p2p.PeerPunch`; `stats.go`
+> reads `st.PeerPunches`). The workspace (go.work) build is red from Task 2 until
+> this task lands. The p2p module itself stays green (verify per module).
+
+- [x] **Step 0: migrate the punch-counter readers in `runner/task`**
+
+`diffPunchDrops`/`diffPunchFailures` change their parameter to
+`map[string]p2p.PeerDiagnostic` and read `d.Drops` / `d.Attempts - d.Ups` (the
+same fields, renamed); `stats.go` reads `st.PeerDiagnostics` for `t.punches` (and
+`t.peers` keeps `PeerTransports`). Update `diff_test.go` to build
+`PeerDiagnostic` instead of `PeerPunch`. Run `cd ../wisper &&
+CGO_ENABLED=1 go test -race ./runner/... ./event/`.
+
+- [x] **Step 1: Pass it through the API**
 
 `../wisper/api/p2p_handler.go`: expose `PeerDiagnostics` (add a
 `peer_diagnostics` array to the `/api/p2p` response, or fold the fields into the
@@ -598,7 +613,7 @@ type peerStatsJSON struct {
 
 Fill it from `tunnel.P2PHostStatus().PeerDiagnostics[p.Key]`.
 
-- [ ] **Step 2: The peers-page expand**
+- [x] **Step 2: The peers-page expand**
 
 In `../wisper/web-src/src/pages/tunnel-peers-page.ts`, add a per-row expand
 (mirroring the row's existing structure): the path + reason, the punch state and
@@ -606,13 +621,13 @@ last error, the dialled endpoint, the candidate count and caps, the session and
 silence ages. Add i18n keys to **both** `en.ts` and `zh.ts` for each label; the
 values (`direct`, `failed`, …) come from the engine and are shown as-is.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 `../wisper`: `go build ./...`, `GOWORK=off go build ./...`, `go vet ./...`,
 `gofmt -l .`, `go test ./api/`, then `make web` and `cd web-src && npx tsc
 --noEmit`, and `make ui-test` (add a spec asserting the expand shows the path).
 
-- [ ] **Step 4: Commit (gated)**
+- [x] **Step 4: Commit (gated)**
 
 ```bash
 cd ../wisper && git add api/ web-src/src web/ && git commit -m "web: show a peer's diagnostics on the peers page"
@@ -625,14 +640,14 @@ cd ../wisper && git add api/ web-src/src web/ && git commit -m "web: show a peer
 **Files:**
 - Modify: `README.md`, `CLAUDE.md`, `docs/2026-09-30-p2p-peer-diagnostics-design.md`
 
-- [ ] **Step 1: Update the docs**
+- [x] **Step 1: Update the docs**
 
 - `README.md` / `CLAUDE.md`: the `Status` bullet — `PeerDiagnostics` (superseding
   `PeerPunches`), what each field answers, in-process vs the gRPC repeated
   message.
 - The design doc: turn "Status: proposed" into "implemented" once it is.
 
-- [ ] **Step 2: Full verification**
+- [x] **Step 2: Full verification**
 
 Run: `cd p2p && go build ./... && go vet ./... && gofmt -l . && TMPDIR=/config/tmp CGO_ENABLED=1 go test -race -count=1 ./...` (per package if the wildcard is slow).
 Expected: green (workspace). The standalone `GOWORK=off` build needs the plugin

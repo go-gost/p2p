@@ -1,6 +1,6 @@
 # p2p per-peer diagnostics — design
 
-Status: **proposed** (2026-09-30). Turns "grep the debug log of a running peer"
+Status: **implemented** (2026-09-30). Turns "grep the debug log of a running peer"
 into one structured snapshot per peer, in `Status` and over gRPC.
 
 ## Context (why)
@@ -43,6 +43,10 @@ three.
 | `LastRecvAge` | **new** per-peer `lastFrameAt` | time since the last frame from the peer, relay or direct — the signal a silent peer is otherwise invisible by |
 | `Attempts` / `Ups` / `Drops` | `directConn` atomics | as `PeerPunches` today |
 
+Over gRPC each entry also names the peer — `peer`, field 14, the base64 key — so
+the repeated list is attributable (a keyless list would leave two relay-only
+peers byte-identical).
+
 New engine state is small: `lastErr` (a string set at the punch failure points),
 `sessAt` (one assignment in `markUp`), `lastFrameAt` (one atomic store in the
 relay pump and the direct accept loop).
@@ -81,7 +85,8 @@ relay pump and the direct accept loop).
 ## Decisions (settled)
 
 1. **`PeerDiagnostics` supersedes `PeerPunches`** — one per-peer map, not three.
-   `p2p.Status` changes (in-process; the proto carries aggregates), so every
+   `p2p.Status` changes (in-process the map; the gRPC reply carries it as the
+   repeated `peer_diagnostics` message), so every
    reader (`wisper`'s `/api/p2p`, the UI, tests) moves with it.
 2. **`PeerAddr` is exposed in full; candidates as a count only.** The dialled
    endpoint is the peer's own; its announced address list is not enumerated.

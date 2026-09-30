@@ -439,6 +439,20 @@ handshake was refused has no data path and is not reported at all; the fields
 are kept for API stability. See [Security](#security). With `--token` set, add
 `-H 'token: <token>'`.
 
+`StatusReply` also carries a **per-peer diagnostic** — `peer_diagnostics`, one
+`PeerDiagnostic` per connected peer (keyed by `peer`, the base64 key). Each entry
+answers: `path` (the transport word — `direct`/`punching`/`failed`/`derp`/
+`disabled`/`no-candidates`/`stun-unreachable`), `reason` (the host-wide cause when
+it outranks the peer's own; empty on a live direct session), `state` (the punch
+state machine `none`/`attempting`/`up`/`backoff`), `failed`, `last_error` (the
+last punch failure, e.g. `seed failed: timeout`), `peer_addr` (the endpoint
+dialled for the direct path), `candidates` (how many the peer announced), `caps`
+(`ipv6`/`tightKeepalive`), `session_age_ms`/`last_recv_age_ms` (the live direct
+session's age, 0 when none; time since the last frame from the peer, relay or
+direct), and the `attempts`/`ups`/`drops` counters. It is a point-in-time read
+that never probes a session, so a status query does not churn a connection.
+In-process the same snapshot is `p2p.Status.PeerDiagnostics`.
+
 ## Security
 
 The control channel is unauthenticated by default: any process that can reach `--addr` can make this host dial arbitrary addresses. Keep `--addr` on loopback (the default). For cross-machine deployment set `--token` (the GOST client sends it as gRPC metadata) **and** control TLS — the token alone travels over a plaintext gRPC channel today.

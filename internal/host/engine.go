@@ -170,25 +170,87 @@ func (e *engine) relayState() (connected bool, lastErr string) {
 	return e.client != nil, lastErr
 }
 
-// peerPunches returns each connected peer's own punch history, keyed by base64
-// public key. Empty when nothing has a direct connection, so a stub-mode or
-// relay-only host reports nothing rather than an empty map.
-func (e *engine) peerPunches() map[string]p2p.PeerPunch {
+// peerDiagnostics snapshots each connected peer. transports is the peer-set
+// snapshot peerTransports just computed (its only caller is status()), so the
+// paths are read once per status tick. The host-wide reason applies to every
+// peer it outranks — but only on a path that is not already direct, matching
+// peerTransports, where a live session outranks the reason: a peer that reads
+// Path="direct" must not also carry Reason="stun-unreachable". The per-peer
+// fields come from the adapter and the punch state machine, read without
+// probing a session.
+func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.PeerDiagnostic {
 	e.mu.Lock()
+	peers := make([]*peerConn, 0, len(e.peers))
+	for _, pc := range e.peers {
+		peers = append(peers, pc)
+	}
 	directs := make([]*directConn, 0, len(e.directs))
 	for _, dc := range e.directs {
 		directs = append(directs, dc)
 	}
 	e.mu.Unlock()
 
-	if len(directs) == 0 {
+	reason := e.directReason()
+	// A live direct session outranks the host-wide reason (peerTransports), so
+	// the reason is reported only on the paths that did not go direct.
+	reasonFor := func(path string) string {
+		if path == transportDirect {
+			return ""
+		}
+		return reason
+	}
+
+	now := time.Now()
+	out := make(map[string]p2p.PeerDiagnostic, len(peers)+len(directs))
+	for _, pc := range peers {
+		name := keyName(pc.peer)
+		path := transports[name]
+		out[name] = p2p.PeerDiagnostic{
+			Path:   path,
+			Reason: reasonFor(path),
+			// The snapshot's zero value must read the same everywhere: a peer with
+			// no directConn is in the same state as one whose directConn is in
+			// directNone.
+			State:       "none",
+			LastRecvAge: ageOf(now, pc.lastFrameAt.Load()),
+		}
+	}
+	for _, dc := range directs {
+		name := keyName(dc.peer)
+		d := out[name] // keep a relay connector's lastFrame age if there is one
+		d.Path = transports[name]
+		d.Reason = reasonFor(d.Path)
+		d.State = dc.stateName()
+		d.Failed = dc.hasFailed()
+		d.LastError = dc.lastErrOf()
+		d.PeerAddr = dc.peerAddrString()
+		d.Candidates = dc.candidateCount()
+		d.Caps = dc.capNames()
+		// The freshest last-recv of the two paths: a direct-first peer has no
+		// relay adapter, a peer with both may have sent on either.
+		if at := dc.lastFrameAt.Load(); at != 0 {
+			if a := ageOf(now, at); d.LastRecvAge == 0 || a < d.LastRecvAge {
+				d.LastRecvAge = a
+			}
+		}
+		if at := dc.sessAtOf(); !at.IsZero() {
+			d.SessionAge = now.Sub(at)
+		}
+		d.Attempts, d.Ups, d.Drops = dc.punchCounters()
+		out[name] = d
+	}
+	if len(out) == 0 {
 		return nil
 	}
-	out := make(map[string]p2p.PeerPunch, len(directs))
-	for _, dc := range directs {
-		out[keyName(dc.peer)] = dc.punchCounts()
-	}
 	return out
+}
+
+// ageOf is the time since a UnixNano stamp, or 0 when unset.
+func ageOf(now time.Time, nano int64) time.Duration {
+	if nano == 0 {
+		return 0
+	}
+	return now.Sub(time.Unix(0, nano))
 }
 
 // peerEncryptions names each connected peer's session state — "secure" or
@@ -306,6 +368,10 @@ type peerConn struct {
 	// wraps the smux underlay once both halves are exchanged, and stays
 	// plaintext (peer predates encryption) otherwise.
 	secure *secureSession
+
+	// lastFrameAt is the UnixNano stamp of the last frame seen from this peer
+	// (relay). An atomic so a status read never takes pc.mu.
+	lastFrameAt atomic.Int64
 
 	mu        sync.Mutex
 	sess      *smux.Session
@@ -526,7 +592,8 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 		if sess := dc.session(); sess != nil {
 			if c, err := openStream(sess, directOpenTimeout); err == nil {
 				e.stats.countStream("direct")
-				return &openedStream{Conn: c, transport: "direct", peerAddr: dc.peerAddrString()}, nil
+				return &openedStream{Conn: &stampConn{Conn: c, at: &dc.lastFrameAt},
+					transport: "direct", peerAddr: dc.peerAddrString()}, nil
 			}
 		}
 	}
@@ -537,11 +604,13 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 	if sess := e.punchAndWait(peer); sess != nil {
 		if c, err := openStream(sess, streamOpenTimeout); err == nil {
 			pa := ""
+			var conn net.Conn = c
 			if dc := e.getDirect(peer); dc != nil {
 				pa = dc.peerAddrString()
+				conn = &stampConn{Conn: c, at: &dc.lastFrameAt}
 			}
 			e.stats.countStream("direct")
-			return &openedStream{Conn: c, transport: "direct", peerAddr: pa}, nil
+			return &openedStream{Conn: conn, transport: "direct", peerAddr: pa}, nil
 		}
 	}
 
@@ -594,6 +663,23 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 	}
 	e.stats.countStream("derp")
 	return &openedStream{Conn: c, transport: "derp"}, nil
+}
+
+// stampConn stamps a per-peer last-recv atomic on every successful read, so a
+// peer that sends only on one long-lived stream — one it opened, or one it
+// accepted — does not read as silent. The store is lock-free: it hits the
+// directConn's own atomic, never the engine lock.
+type stampConn struct {
+	net.Conn
+	at *atomic.Int64
+}
+
+func (c *stampConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.at.Store(time.Now().UnixNano())
+	}
+	return n, err
 }
 
 // openedStream is a tunnel stream tagged with the transport it uses, so the
@@ -778,6 +864,7 @@ func (e *engine) pump(c *derpclient.Client) {
 		// place, so every later packet failed against it and the peer had no
 		// inbound path at all until some outbound open happened to replace it.
 		pc := e.peerConn(src)
+		pc.lastFrameAt.Store(time.Now().UnixNano())
 		// Ensure a session exists on this side too: inbound packets must be
 		// consumed by smux (which then accepts streams) even when this host
 		// never opens a tunnel to the peer itself.

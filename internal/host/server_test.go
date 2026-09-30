@@ -18,8 +18,8 @@ func TestStatusNoEngine(t *testing.T) {
 		st.StreamsDirect != 0 || st.StreamsDerp != 0 {
 		t.Fatalf("stub-mode Status = %+v, want all zeros", st)
 	}
-	if st.RelayConnected || st.PeerPunches != nil {
-		t.Errorf("stub-mode relay/peer fields = %v/%v, want false/nil", st.RelayConnected, st.PeerPunches)
+	if st.RelayConnected || st.PeerDiagnostics != nil {
+		t.Errorf("stub-mode relay/peer fields = %v/%v, want false/nil", st.RelayConnected, st.PeerDiagnostics)
 	}
 }
 
@@ -59,10 +59,10 @@ func TestStatusReportsTransportStats(t *testing.T) {
 	if st.RelayConnected {
 		t.Error("RelayConnected = true, want false for an engine with no client")
 	}
-	if got, ok := st.PeerPunches[base64.RawURLEncoding.EncodeToString(peerDirect[:])]; !ok {
-		t.Errorf("PeerPunches has no entry for the direct peer: %+v", st.PeerPunches)
+	if got, ok := st.PeerDiagnostics[base64.RawURLEncoding.EncodeToString(peerDirect[:])]; !ok {
+		t.Errorf("PeerDiagnostics has no entry for the direct peer: %+v", st.PeerDiagnostics)
 	} else if got.Attempts != 4 || got.Ups != 2 || got.Drops != 1 {
-		t.Errorf("PeerPunch = %+v, want attempts=4 ups=2 drops=1", got)
+		t.Errorf("PeerDiagnostic = %+v, want attempts=4 ups=2 drops=1", got)
 	}
 }
 

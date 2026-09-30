@@ -368,6 +368,18 @@ grpcurl -plaintext 127.0.0.1:8003 proto.P2P/Status
 `plaintextPeers` 恒为 0。握手被拒绝的 peer 没有数据通路，根本不会被上报；这两个
 字段为 API 稳定而保留。见[安全](#安全)。设了 `--token` 时加 `-H 'token: <token>'`。
 
+`StatusReply` 还带一份**每 peer 诊断**——`peer_diagnostics`，每个已连接 peer 一条
+`PeerDiagnostic`（键为 `peer`，即 base64 公钥）。每条回答：`path`（传输词
+`direct`/`punching`/`failed`/`derp`/`disabled`/`no-candidates`/`stun-unreachable`）、
+`reason`（主机级原因压过该 peer 自身时给出；直连会话活跃时为空）、`state`（打洞
+状态机 `none`/`attempting`/`up`/`backoff`）、`failed`、`last_error`（最近一次打洞
+失败，如 `seed failed: timeout`）、`peer_addr`（直连路径实际拨的端点）、
+`candidates`（对端广播的候选数）、`caps`（`ipv6`/`tightKeepalive`）、
+`session_age_ms`/`last_recv_age_ms`（活跃直连会话的时长，无会话为 0；距对端最后一个
+帧的时长，relay 或直连皆可），以及继承自旧计数器的 `attempts`/`ups`/`drops`。它是
+一次时点读取，不会探测会话，因此状态查询不会搅动连接。进程内同一份快照即
+`p2p.Status.PeerDiagnostics`。
+
 ## 安全
 
 控制面默认**未认证**：任何能访问 `--addr` 的进程都能让本宿主拨任意地址。让 `--addr` 保持回环（默认值）。跨机部署需设 `--token`（GOST client 以 gRPC metadata 发送）**且**配控制面 TLS——仅凭 token 目前走的是明文 gRPC 通道。

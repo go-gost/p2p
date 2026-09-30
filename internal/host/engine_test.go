@@ -187,6 +187,123 @@ func TestPeerTransportReasons(t *testing.T) {
 	}
 }
 
+// TestPeerDiagnosticsReasonOnlyWhenNotDirect: a peer on a live direct path must
+// not also carry the host-wide reason — the row would otherwise read
+// Path="direct" and Reason="stun-unreachable". peerTransports lets a live
+// session outrank the reason; the diagnostics match it. A relay-only peer with
+// no directConn reads State "none", the same as a directConn in directNone.
+func TestPeerDiagnosticsReasonOnlyWhenNotDirect(t *testing.T) {
+	e := &engine{
+		direct:   true,
+		stunAddr: "127.0.0.1:3478",
+		directs:  make(map[derpclient.PublicKey]*directConn),
+		peers:    make(map[derpclient.PublicKey]*peerConn),
+	}
+	e.stunFailed.Store(true) // host-wide reason: STUN silent, no IPv6 to fall back on
+	peer := derpclient.PublicKey{9}
+	e.peers[peer] = &peerConn{peer: peer}
+
+	d := e.peerDiagnostics(e.peerTransports())[keyName(peer)]
+	if d.Path != transportStunUnreachable || d.Reason != transportStunUnreachable {
+		t.Errorf("relay-only: path=%q reason=%q, want %q on both", d.Path, d.Reason, transportStunUnreachable)
+	}
+	if d.State != "none" {
+		t.Errorf("relay-only state = %q, want none", d.State)
+	}
+
+	// A live direct session outranks the reason: no stale Reason on a direct row.
+	e.directs[peer] = &directConn{e: e, peer: peer, sess: newTestSess(t), state: directUp}
+	d = e.peerDiagnostics(e.peerTransports())[keyName(peer)]
+	if d.Path != transportDirect {
+		t.Fatalf("live session: path = %q, want direct", d.Path)
+	}
+	if d.Reason != "" {
+		t.Errorf("direct path reason = %q, want empty", d.Reason)
+	}
+}
+
+// TestPeerDiagnosticsSnapshot: a connected peer must appear in Status with the
+// path its traffic takes, its punch history and the ages a diagnosis needs.
+func TestPeerDiagnosticsSnapshot(t *testing.T) {
+	eA, eB, _ := newEncryptedPair(t) // the relay server is closed by the helper's t.Cleanup
+	// A candidate source is what makes a punch run at all (directEnabled);
+	// without one there are no attempts and no path word beyond "no-candidates".
+	stun := startFakeSTUN(t, "")
+	eA.stunAddr, eB.stunAddr = stun, stun
+
+	conn, err := eA.OpenStream(eB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	go conn.Write([]byte("hi"))
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	st := newServer(eA).status()
+	d, ok := st.PeerDiagnostics[eB.PublicKey()]
+	if !ok {
+		t.Fatal("no diagnostic for the peer")
+	}
+	if d.Path != "direct" && d.Path != "derp" {
+		t.Fatalf("path = %q", d.Path)
+	}
+	if d.Attempts == 0 {
+		t.Fatal("attempts not reported")
+	}
+	if d.LastRecvAge <= 0 {
+		t.Fatal("last-recv age not reported for a peer that just sent")
+	}
+	// A live direct session carries its age. The sandbox may keep this pair on
+	// the relay (the punch's UDP send is denied here), so assert only when the
+	// path really is direct.
+	if d.Path == "direct" && d.SessionAge <= 0 {
+		t.Fatal("a direct session must carry its age")
+	}
+}
+
+// TestPeerDiagnosticsMerge covers the two map shapes the builder folds together:
+// a relay-only peer must still report a path word (not the empty string), and a
+// peer present in both maps takes the direct row while keeping the relay's
+// last-recv age.
+func TestPeerDiagnosticsMerge(t *testing.T) {
+	e := &engine{
+		direct:   true,
+		stunAddr: "127.0.0.1:3478", // a candidate source: directReason() is empty
+		directs:  make(map[derpclient.PublicKey]*directConn),
+		peers:    make(map[derpclient.PublicKey]*peerConn),
+	}
+	relayOnly := derpclient.PublicKey{1}
+	both := derpclient.PublicKey{2}
+
+	e.peers[relayOnly] = &peerConn{peer: relayOnly}
+
+	pcBoth := &peerConn{peer: both}
+	pcBoth.lastFrameAt.Store(time.Now().Add(-3 * time.Second).UnixNano())
+	e.peers[both] = pcBoth
+	// The directConn's own stamp is left unset, so the relay age survives.
+	e.directs[both] = &directConn{e: e, peer: both, sess: newTestSess(t), state: directUp}
+
+	out := e.peerDiagnostics(e.peerTransports())
+
+	if d := out[keyName(relayOnly)]; d.Path != transportRelay {
+		t.Errorf("relay-only path = %q, want %q", d.Path, transportRelay)
+	}
+	d := out[keyName(both)]
+	if d.Path != transportDirect {
+		t.Errorf("both-maps path = %q, want %q", d.Path, transportDirect)
+	}
+	if d.State != "up" {
+		t.Errorf("both-maps state = %q, want up", d.State)
+	}
+	if d.LastRecvAge <= 0 {
+		t.Errorf("both-maps last-recv age = %v, want the relay age retained", d.LastRecvAge)
+	}
+}
+
 // TestTransportStatsCounters drives a real punch and checks the counters the
 // status reply reads.
 func TestTransportStatsCounters(t *testing.T) {

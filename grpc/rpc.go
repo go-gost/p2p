@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sort"
 
 	"github.com/go-gost/p2p"
 	pb "github.com/go-gost/plugin/p2p/proto"
@@ -28,16 +29,52 @@ func (s *Server) OpenTunnel(ctx context.Context, req *pb.OpenTunnelRequest) (*pb
 func (s *Server) Status(ctx context.Context, req *pb.StatusRequest) (*pb.StatusReply, error) {
 	st := s.ep.Status()
 	return &pb.StatusReply{
-		Tunnels:        int32(st.Tunnels),
-		DirectPeers:    int32(st.DirectPeers),
-		DerpPeers:      int32(st.DerpPeers),
-		PunchAttempts:  st.PunchAttempts,
-		PunchSuccess:   st.PunchSuccess,
-		StreamsDirect:  st.StreamsDirect,
-		StreamsDerp:    st.StreamsDerp,
-		EncryptedPeers: int32(st.EncryptedPeers),
-		PlaintextPeers: int32(st.PlaintextPeers),
+		Tunnels:         int32(st.Tunnels),
+		DirectPeers:     int32(st.DirectPeers),
+		DerpPeers:       int32(st.DerpPeers),
+		PunchAttempts:   st.PunchAttempts,
+		PunchSuccess:    st.PunchSuccess,
+		StreamsDirect:   st.StreamsDirect,
+		StreamsDerp:     st.StreamsDerp,
+		EncryptedPeers:  int32(st.EncryptedPeers),
+		PlaintextPeers:  int32(st.PlaintextPeers),
+		PeerDiagnostics: peerDiagnosticsToProto(st.PeerDiagnostics),
 	}, nil
+}
+
+// peerDiagnosticsToProto maps the status snapshot onto the wire form, ordered by
+// peer key for a stable reply. Pure, so the mapping is tested without a live
+// endpoint.
+func peerDiagnosticsToProto(in map[string]p2p.PeerDiagnostic) []*pb.PeerDiagnostic {
+	if len(in) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]*pb.PeerDiagnostic, 0, len(in))
+	for _, k := range keys {
+		d := in[k]
+		out = append(out, &pb.PeerDiagnostic{
+			Peer:          k,
+			Path:          d.Path,
+			Reason:        d.Reason,
+			State:         d.State,
+			Failed:        d.Failed,
+			LastError:     d.LastError,
+			PeerAddr:      d.PeerAddr,
+			Candidates:    int32(d.Candidates),
+			Caps:          d.Caps,
+			SessionAgeMs:  d.SessionAge.Milliseconds(),
+			LastRecvAgeMs: d.LastRecvAge.Milliseconds(),
+			Attempts:      d.Attempts,
+			Ups:           d.Ups,
+			Drops:         d.Drops,
+		})
+	}
+	return out
 }
 
 // Tunnel serves a tunnel's data stream. The stream is authorized by the id

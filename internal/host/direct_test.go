@@ -1510,6 +1510,51 @@ func TestDetachSessionCountsDropOnce(t *testing.T) {
 	}
 }
 
+// TestDirectSessionAgeZeroedAfterEnd: SessionAge is the age of the *live*
+// session, so a peer whose direct session has ended (state none/backoff, path
+// no longer direct) must report 0 — never a phantom age that keeps growing
+// while the same row's state/path say the session is gone. Both detach paths
+// (teardown, and the detachSessionLocked that markDead uses) zero it.
+func TestDirectSessionAgeZeroedAfterEnd(t *testing.T) {
+	e := &engine{
+		direct:   true,
+		stunAddr: "127.0.0.1:3478", // a candidate source: directReason() is empty
+		directs:  make(map[derpclient.PublicKey]*directConn),
+		peers:    make(map[derpclient.PublicKey]*peerConn),
+	}
+	peer := derpclient.PublicKey{7}
+	e.peers[peer] = &peerConn{peer: peer}
+	dc := &directConn{e: e, peer: peer}
+	e.directs[peer] = dc
+
+	dc.markUp(newTestSess(t), nil, netip.AddrPort{})
+	if d := e.peerDiagnostics(e.peerTransports())[keyName(peer)]; d.Path != transportDirect || d.SessionAge <= 0 {
+		t.Fatalf("live session: path=%q age=%v, want direct with age > 0", d.Path, d.SessionAge)
+	}
+
+	// markDead's path.
+	dc.markUp(newTestSess(t), nil, netip.AddrPort{})
+	if sock, _ := dc.detachSessionLocked(dc.sess); sock != nil {
+		sock.Close()
+	}
+	if at := dc.sessAtOf(); !at.IsZero() {
+		t.Errorf("sessAt = %v after detach, want zero", at)
+	}
+	if d := e.peerDiagnostics(e.peerTransports())[keyName(peer)]; d.SessionAge != 0 {
+		t.Errorf("SessionAge = %v after the session ended, want 0", d.SessionAge)
+	}
+
+	// teardown's path.
+	dc.markUp(newTestSess(t), nil, netip.AddrPort{})
+	dc.teardown()
+	if at := dc.sessAtOf(); !at.IsZero() {
+		t.Errorf("sessAt = %v after teardown, want zero", at)
+	}
+	if d := e.peerDiagnostics(e.peerTransports())[keyName(peer)]; d.SessionAge != 0 {
+		t.Errorf("SessionAge = %v after teardown, want 0", d.SessionAge)
+	}
+}
+
 // A session that did not own the state (a round is already rebuilding) is not
 // this side's drop to count: it returns repunch=false.
 func TestDetachSessionIgnoresNonOwningState(t *testing.T) {
@@ -1537,6 +1582,22 @@ func TestMarkUpCountsUps(t *testing.T) {
 	}
 	if dc.stateOf() != directUp {
 		t.Errorf("state = %v, want directUp", dc.stateOf())
+	}
+}
+
+// TestDirectConnRecordsLastError: a punch failure records its reason so a status
+// reader sees why a peer is stuck, and a success clears it.
+func TestDirectConnRecordsLastError(t *testing.T) {
+	dc := &directConn{}
+	dc.noteErr("seed timeout")
+	if got := dc.lastErrOf(); got != "seed timeout" {
+		t.Fatalf("lastErr = %q, want %q", got, "seed timeout")
+	}
+	dc.mu.Lock()
+	dc.lastErr = ""
+	dc.mu.Unlock()
+	if got := dc.lastErrOf(); got != "" {
+		t.Fatalf("lastErr = %q, want empty", got)
 	}
 }
 

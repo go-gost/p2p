@@ -1,12 +1,38 @@
 package p2p
 
-// PeerPunch is one peer's hole-punch history. The process-wide
-// PunchAttempts/PunchSuccess cannot say which peer is re-punching, which is the
-// question a direct session that keeps dying raises.
-type PeerPunch struct {
-	Attempts int64 // punch rounds started for this peer
-	Ups      int64 // rounds that reached a live direct session
-	Drops    int64 // live direct sessions that ended (and re-punched)
+import "time"
+
+// PeerDiagnostic is one connected peer's live state: where its traffic goes, why,
+// and enough detail (the last error, the dialled endpoint, the ages) to diagnose
+// it without raising the log level. It supersedes the old punch counters, which
+// it carries.
+type PeerDiagnostic struct {
+	// Path is the current transport word: "direct", "punching", "failed",
+	// "derp", "disabled", "no-candidates" or "stun-unreachable".
+	Path string
+	// Reason is the host-wide cause when it outranks this peer's own round
+	// ("no-candidates", "stun-unreachable", "disabled"), else empty.
+	Reason string
+	// State is the punch state machine: "none", "attempting", "up" or "backoff".
+	State string
+	// Failed reports a punch round that has failed (sticky).
+	Failed bool
+	// LastError is the last punch failure's reason (empty after a success).
+	LastError string
+	// PeerAddr is the endpoint dialled for the direct path (empty until a round
+	// dials). Candidates is how many the peer announced.
+	PeerAddr   string
+	Candidates int
+	// Caps is the peer's advertised capabilities ("ipv6", "tightKeepalive").
+	Caps []string
+	// SessionAge is how long the live direct session has been up (0 when none);
+	// LastRecvAge is how long since the last frame from the peer.
+	SessionAge  time.Duration
+	LastRecvAge time.Duration
+	// Attempts/Ups/Drops are the peer's punch history (what PeerPunch held).
+	Attempts int64
+	Ups      int64
+	Drops    int64
 }
 
 // Status is a point-in-time snapshot of an endpoint: the live tunnel count and
@@ -53,10 +79,10 @@ type Status struct {
 	RelayConnected bool
 	RelayError     string
 
-	// PeerPunches is each connected peer's own punch history, keyed by base64
-	// public key. A peer that has never attempted a direct path is absent.
-	// In-process only, like PeerTransports.
-	PeerPunches map[string]PeerPunch
+	// PeerDiagnostics is each connected peer's live state, keyed by base64
+	// public key. The gRPC transport carries it as the repeated
+	// peer_diagnostics message (each entry keyed by the base64 key).
+	PeerDiagnostics map[string]PeerDiagnostic
 
 	// EncryptedPeers counts connected peers whose live sessions settled
 	// encrypted. Encryption is forced: a session that does not settle is refused,

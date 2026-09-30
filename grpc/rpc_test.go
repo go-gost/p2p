@@ -444,3 +444,34 @@ func TestMapErrorEncryptionRequired(t *testing.T) {
 		t.Fatalf("ErrPeerUnreachable -> %v, want %v", got, codes.Unavailable)
 	}
 }
+
+func TestPeerDiagnosticsToProto(t *testing.T) {
+	in := map[string]p2p.PeerDiagnostic{
+		"peerA": {
+			Path: "failed", Reason: "stun-unreachable", State: "backoff",
+			Failed: true, LastError: "seed failed: timeout",
+			PeerAddr: "192.0.2.10:34567", Candidates: 2,
+			Caps: []string{"ipv6"}, SessionAge: 3 * time.Second,
+			LastRecvAge: 1500 * time.Millisecond, Attempts: 7, Ups: 1, Drops: 2,
+		},
+	}
+	out := peerDiagnosticsToProto(in)
+	if len(out) != 1 {
+		t.Fatalf("got %d diagnostics", len(out))
+	}
+	got := out[0]
+	if got.Peer != "peerA" {
+		t.Fatalf("peer key = %q, want peerA", got.Peer)
+	}
+	if got.Path != "failed" || got.Reason != "stun-unreachable" || !got.Failed ||
+		got.LastError != "seed failed: timeout" || got.PeerAddr != "192.0.2.10:34567" ||
+		got.Candidates != 2 || got.Attempts != 7 || got.Ups != 1 || got.Drops != 2 {
+		t.Fatalf("mapping wrong: %+v", got)
+	}
+	if got.SessionAgeMs != 3000 || got.LastRecvAgeMs != 1500 {
+		t.Fatalf("ages wrong: %d / %d", got.SessionAgeMs, got.LastRecvAgeMs)
+	}
+	if len(got.Caps) != 1 || got.Caps[0] != "ipv6" {
+		t.Fatalf("caps wrong: %v", got.Caps)
+	}
+}

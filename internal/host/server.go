@@ -324,7 +324,7 @@ func (s *server) status() p2p.Status {
 	if s.engine != nil {
 		st.RelayConnected, st.RelayError = s.engine.relayState()
 		st.PeerTransports = s.engine.peerTransports()
-		st.PeerPunches = s.engine.peerPunches()
+		st.PeerDiagnostics = s.engine.peerDiagnostics(st.PeerTransports)
 		st.PeerEncryption = s.engine.peerEncryptions()
 		for _, state := range st.PeerEncryption {
 			if state == encStateSecure {

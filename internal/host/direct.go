@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -146,6 +147,8 @@ type directConn struct {
 	mine     []candidate    // our candidates for the current punch, answered to the peer
 	lastPeer []candidate    // peer candidates already acted on (dedupes re-announcements)
 	peerCaps uint8          // capability bits the peer advertised via ctrlCaps
+	lastErr  string         // the last punch failure's reason, cleared when one succeeds
+	sessAt   time.Time      // when the live direct session came up (zero when none)
 
 	// secure is this pair's direct security session, borrowed from e.secure (one
 	// per (peer, transport), outliving any one smux session). The AEAD record
@@ -154,13 +157,19 @@ type directConn struct {
 	// across re-punches is what keeps the nonce counters from restarting.
 	secure *secureSession
 
-	// This peer's punch history, reported through Status.PeerPunches. Atomics so
-	// a status query reads them without taking dc.mu and queueing behind a punch
-	// round; drops is also incremented while dc.mu is held, where a second lock
-	// would enter the engine's lock order for no reason.
+	// This peer's punch history, reported through Status.PeerDiagnostics. Atomics
+	// so a status query reads them without taking dc.mu and queueing behind a
+	// punch round; drops is also incremented while dc.mu is held, where a second
+	// lock would enter the engine's lock order for no reason.
 	attempts atomic.Int64 // punch rounds started
 	ups      atomic.Int64 // rounds that reached a live direct session
 	drops    atomic.Int64 // live direct sessions that ended
+
+	// lastFrameAt is the UnixNano stamp of the last frame seen from this peer on
+	// the direct path. A direct-first peer has no relay adapter (OpenStream goes
+	// direct without ever building one), so the per-peer last-recv cannot live on
+	// peerConn alone; the relay path keeps its own stamp there.
+	lastFrameAt atomic.Int64
 }
 
 func (e *engine) directConn(peer derpclient.PublicKey) *directConn {
@@ -325,6 +334,7 @@ func (dc *directConn) detachSessionLocked(sess *smux.Session) (*net.UDPConn, boo
 		return nil, false
 	}
 	dc.sess = nil
+	dc.sessAt = time.Time{} // no live session: SessionAge must read 0, not the dead session's age
 	sock := dc.socket
 	dc.socket = nil
 	if dc.state != directAttempting {
@@ -365,14 +375,69 @@ func (dc *directConn) live() bool {
 	return dc.sess != nil && !dc.sess.IsClosed()
 }
 
-// punchCounts snapshots this peer's punch history. The counters are atomics, so
-// this takes no lock: a status query must not queue behind a punch round.
-func (dc *directConn) punchCounts() p2p.PeerPunch {
-	return p2p.PeerPunch{
-		Attempts: dc.attempts.Load(),
-		Ups:      dc.ups.Load(),
-		Drops:    dc.drops.Load(),
+// noteErr records why a punch round failed. The latest reason wins; markUp
+// clears it on a success, so a live session never carries a stale failure.
+func (dc *directConn) noteErr(reason string) {
+	dc.mu.Lock()
+	dc.lastErr = reason
+	dc.mu.Unlock()
+}
+
+// lastErrOf reads the last punch failure's reason.
+func (dc *directConn) lastErrOf() string {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.lastErr
+}
+
+// sessAtOf reads when the live direct session came up.
+func (dc *directConn) sessAtOf() time.Time {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.sessAt
+}
+
+// stateName names the punch state machine's current state for a diagnostic
+// reader.
+func (dc *directConn) stateName() string {
+	switch dc.stateOf() {
+	case directAttempting:
+		return "attempting"
+	case directUp:
+		return "up"
+	case directBackoff:
+		return "backoff"
+	default:
+		return "none"
 	}
+}
+
+// candidateCount is how many candidates the peer last announced.
+func (dc *directConn) candidateCount() int {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return len(dc.lastPeer)
+}
+
+// capNames names the capability bits the peer advertised.
+func (dc *directConn) capNames() []string {
+	dc.mu.Lock()
+	bits := dc.peerCaps
+	dc.mu.Unlock()
+	var out []string
+	if bits&capsIPv6 != 0 {
+		out = append(out, "ipv6")
+	}
+	if bits&capsTightKeepalive != 0 {
+		out = append(out, "tightKeepalive")
+	}
+	return out
+}
+
+// punchCounters snapshots this peer's punch history. The counters are atomics,
+// so this takes no lock: a status query must not queue behind a punch round.
+func (dc *directConn) punchCounters() (attempts, ups, drops int64) {
+	return dc.attempts.Load(), dc.ups.Load(), dc.drops.Load()
 }
 
 func (dc *directConn) onCandidates(cands []candidate) {
@@ -450,6 +515,7 @@ func (dc *directConn) teardown() {
 	sess := dc.sess
 	sock := dc.socket
 	dc.sess = nil
+	dc.sessAt = time.Time{} // no live session: SessionAge must read 0, not the dead session's age
 	dc.socket = nil
 	dc.mine = nil
 	dc.state = directNone
@@ -474,6 +540,8 @@ func (dc *directConn) markUp(sess *smux.Session, socket *net.UDPConn, peerAddr n
 	dc.peerAddr = peerAddr
 	dc.state = directUp
 	dc.failed = false
+	dc.lastErr = ""
+	dc.sessAt = time.Now()
 	dc.mu.Unlock()
 	if prevSess != nil && prevSess != sess {
 		prevSess.Close()
@@ -546,6 +614,9 @@ func (dc *directConn) supports(bits uint8) bool {
 func (dc *directConn) peerAddrString() string {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
+	if !dc.peerAddr.IsValid() {
+		return ""
+	}
 	return dc.peerAddr.String()
 }
 
@@ -709,6 +780,7 @@ func (dc *directConn) punch() {
 	if !ok {
 		e.log.Debug("direct punch: no peer candidates", "peer", pname)
 		closeFams()
+		dc.noteErr("no peer candidates")
 		dc.backoff()
 		return
 	}
@@ -750,6 +822,7 @@ func (dc *directConn) punch() {
 	if len(order) == 0 {
 		e.log.Debug("direct punch: no shared family", "peer", pname, "candidates", candAddrs(cands))
 		closeFams()
+		dc.noteErr("no shared family")
 		dc.backoff()
 		return
 	}
@@ -783,6 +856,7 @@ func (dc *directConn) punch() {
 		// Forced encryption: do not dial a peer that cannot encrypt. Abandon the
 		// round; the relay stays the fallback.
 		closeFams()
+		dc.noteErr("encryption not settled")
 		e.log.Warn("direct punch refused: encryption required but the peer did not negotiate it",
 			"peer", pname)
 		dc.backoff()
@@ -815,11 +889,13 @@ func (dc *directConn) punch() {
 		// readLoop with no separate bookkeeping (kcp-go deep-dive R2).
 		kcpConn, err := kcp.NewConn4(dc.conv(), u, nil, 0, 0, true, f.sock)
 		if err != nil {
+			dc.noteErr(fmt.Sprintf("dial failed: %v", err))
 			e.log.Debug("direct punch: dial failed", "peer", pname, "family", f.name, "addr", u.String(), "error", err)
 			continue
 		}
 		if err := seedHandshake(kcpConn, seedTimeout); err != nil {
 			kcpConn.Close() // ownConn=true closes f.sock with it
+			dc.noteErr(fmt.Sprintf("seed failed: %v", err))
 			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", u.String(), "error", err)
 			continue
 		}
@@ -845,6 +921,7 @@ func (dc *directConn) punch() {
 		}
 		if err != nil {
 			kcpConn.Close()
+			dc.noteErr(fmt.Sprintf("smux failed: %v", err))
 			e.log.Debug("direct punch: smux failed", "peer", pname, "family", f.name, "error", err)
 			continue
 		}
@@ -1201,6 +1278,15 @@ func decodeCandidates(b []byte) ([]candidate, error) {
 // (direct only).
 func (e *engine) acceptLoop(sess *smux.Session, transport string, peer derpclient.PublicKey, peerAddr string) {
 	start := time.Now()
+	// The direct path never touches the relay pump, so inbound reads on it stamp
+	// the peer's last-recv. The directConn is stable across re-punches, so the
+	// lookup is done once and no engine lock is taken per stream.
+	var stamp *atomic.Int64
+	if transport == "direct" {
+		if dc := e.getDirect(peer); dc != nil {
+			stamp = &dc.lastFrameAt
+		}
+	}
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
@@ -1214,10 +1300,14 @@ func (e *engine) acceptLoop(sess *smux.Session, transport string, peer derpclien
 			return // session dead
 		}
 		e.stats.countStream(transport)
+		var c net.Conn = stream
+		if stamp != nil {
+			c = &stampConn{Conn: stream, at: stamp}
+		}
 		// Classification reads the stream's leading bytes, so it runs in the
 		// stream's own goroutine: a silent stream must not stall the accept
 		// loop (and with it every other stream on the session).
-		go e.serveInbound(stream, transport, peer, peerAddr)
+		go e.serveInbound(c, transport, peer, peerAddr)
 	}
 }
 
