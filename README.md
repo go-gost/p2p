@@ -6,7 +6,7 @@
 
 Peer-to-peer tunnel host for [GOST](https://github.com/go-gost/gost)'s [p2p plugin](https://github.com/go-gost/plugin) protocol, usable either as a standalone binary or as a **Go library embedded in another process** (see [In-process embedding](#in-process-embedding)). It lets GOST establish the network path to a chain node through a tunnel opened by this host — the traversal strategy (rendezvous, relay, hole punching) is entirely up to the plugin, and GOST only ever sees a plain byte stream (the `Tunnel` gRPC stream) to carry its protocol over.
 
-**Status: stub + mux + DERP relay + STUN/UDP hole punching + datagram links.** The host bridges tunnels with a local TCP forward, either directly (stub mode, loopback) or through a **DERP relay** (engine mode, cross-machine/NAT). In engine mode, after a relay session is up, both peers probe their NAT via STUN and punch a UDP hole; once the direct path (KCP + smux) is established, new tunnels flow over it while the relay stays up as fallback. Inner dialers `tcp/tls/ws/mtcp/mtls/mws/udp` are supported — the mux family reuses one tunnel as a multiplexed session, and `udp` asks for a **datagram stream** instead of a byte stream (this is what carries a tun link: GOST owns the device, this host is only the pipe).
+**Status: stub + mux + DERP relay + STUN/UDP hole punching + datagram links + end-to-end encryption.** The host bridges tunnels with a local TCP forward, either directly (stub mode, loopback) or through a **DERP relay** (engine mode, cross-machine/NAT). In engine mode, after a relay session is up, both peers probe their NAT via STUN and punch a UDP hole; once the direct path (KCP + smux) is established, new tunnels flow over it while the relay stays up as fallback. Inner dialers `tcp/tls/ws/mtcp/mtls/mws/udp` are supported — the mux family reuses one tunnel as a multiplexed session, and `udp` asks for a **datagram stream** instead of a byte stream (this is what carries a tun link: GOST owns the device, this host is only the pipe).
 
 ## How it works
 
@@ -22,17 +22,20 @@ GOST client ══Tunnel stream ("id" key)════▶ p2p host ──bridge�
 
 ## Positioning: a generic P2P connectivity primitive
 
-`p2p` is a **P2P connectivity layer, not a turnkey secure tunnel**. Its contract is deliberately narrow:
+`p2p` is a **P2P connectivity layer**. Its contract is deliberately narrow:
 
-> Give me a peer public key, get back a TCP tunnel; NAT traversal is best-effort (STUN + UDP hole punching with a relay fallback); end-to-end reachability is this layer's job, security is the caller's.
+> Give me a peer public key, get back a TCP tunnel; NAT traversal is best-effort (STUN + UDP hole punching with a relay fallback); end-to-end reachability and confidentiality are this layer's job.
 
 It provides **reachability, not policy** — the same layering as IP/TCP:
 
-- **Encryption is out of scope by design.** The relay and hole-punched transports carry plaintext (matching the relay's trust model: it can observe but never decrypt). Confidentiality belongs to the layer above — run `tls`/`mtls`/`wss` over the tunnel, exactly as the GOST inner dialers do. This is the standard connectivity/security layering, not a gap.
+- **The data plane is encrypted end to end by default.** Every per-peer `smux` session's underlay — relay and hole-punched alike — is wrapped in an AEAD cipher (chacha20poly1305 records), with a per-(peer, transport) ephemeral X25519 → HKDF-SHA256 key agreement negotiated through a sealed `ctrlSecure` control frame. The relay routes ciphertext it cannot read, and the ephemerals are discarded at session end, so forward secrecy holds even against a later compromise of a peer's static key. This is default-on with no flag, and it covers a `udp` tunnel too — the tun case, where there is no inner dialer to secure it.
+  - **Fallback.** Encryption is negotiated, not forced: a peer that predates the feature never sends a `ctrlSecure` half, so the session falls back to **plaintext** — backward compatible, no flag. A mixed-version pair still passes traffic, in the clear.
+  - **Downgrade caveat.** Because the exchange is negotiated, an on-path relay that *drops* the handshake frames can force a session to plaintext, and that is indistinguishable from an older peer. It is **surfaced, not prevented**: a plaintext session shows up in `Status` (`EncryptedPeers`/`PlaintextPeers`, plus the per-peer `PeerEncryption` map) and the build is logged (`secure=false`); no reason is reported.
+  - The control frames (`ctrlPunchCandidates`, `ctrlCaps`, `ctrlSecure`) stay sealed to the peer's static key as before; only the *data* frames changed.
 - **Peer discovery is an enhancement, not a requirement.** Peers are addressed by base64 curve25519 public key — a complete addressing scheme. Name→key lookup is intentionally not built in (see Roadmap).
 - **A relay is inherent to NAT traversal.** Cross-NAT reachability without a rendezvous is impossible; `derper` is a deployment/infrastructure choice, not a design flaw. Symmetric-NAT peers stay on relay permanently.
 
-**What an integrator must supply:** a relay (self-hosted `derper` or a third-party DERP), the public keys of the peers to reach, and — if confidentiality is required — its own encryption above the tunnel.
+**What an integrator must supply:** a relay (self-hosted `derper` or a third-party DERP) and the public keys of the peers to reach. The data plane is encrypted automatically between current peers; an inner `tls`/`mtls`/`wss` dialer is still available for a caller that wants its own layer above the tunnel, and remains the only confidentiality option against a peer old enough to fall back to plaintext.
 
 ## Quick start
 
@@ -268,9 +271,9 @@ Handshake: the server greets with `ServerKey`, the client replies `ClientInfo` (
 | Byte | Meaning |
 |---|---|
 | `0x00` | control frame: `[0x00][kind 1B][NaCl-boxed payload]` |
-| `0x01` | data frame: `[0x01][smux byte stream]` — one DERP packet per smux write |
+| `0x01` | data frame: `[0x01][session ciphertext]` — the peer's smux session, wrapped in AEAD records (see [Security](#security)) |
 
-Control kinds: `0x02` punch candidates (sealed `[count]([family][addr][port])*`), `0x04` capability bitfield (sealed 1 byte; bit 0 = IPv6-aware, re-sent with each broadcast and OR'd by the receiver). (`0x03`, the udp-tunnel dial notice, is retired: a datagram link presents its own edge, so no notice is sent and none is acted on.) All control payloads are sealed to the peer key (`PrivateKey.SealTo`), so the relay can route but not forge them. Control frames are consumed by the engine; data frames feed the per-peer smux session.
+Control kinds: `0x02` punch candidates (sealed `[count]([family][addr][port])*`), `0x04` capability bitfield (sealed 1 byte; bit 0 = IPv6-aware, re-sent with each broadcast and OR'd by the receiver), `0x05` session handshake (sealed `[transport 1B][ephemeral public key 32B][want 1B]` — the per-peer data-plane key agreement, see [Security](#security)). (`0x03`, the udp-tunnel dial notice, is retired: a datagram link presents its own edge, so no notice is sent and none is acted on.) All control payloads are sealed to the peer key (`PrivateKey.SealTo`), so the relay can route but not forge them. Control frames are consumed by the engine; data frames feed the per-peer smux session.
 
 ### Hole punching
 
@@ -294,7 +297,7 @@ timeouts:
     timeout: 30s      # must be >= 2x interval
 ```
 
-Symmetric NAT defeats UDP punching; those peers stay on relay permanently (periodic retry). The KCP transport is unencrypted, matching the relay's trust model — confidentiality is the inner dialer's job (`mtls`/`tls`/`wss`).
+Symmetric NAT defeats UDP punching; those peers stay on relay permanently (periodic retry). The direct path is encrypted by the p2p session cipher like the relay — the KCP payload is AEAD ciphertext, with its keys negotiated over the relay control channel (see [Security](#security)).
 
 The derper's STUN server answers only Tailscale's binding-request dialect (`SOFTWARE` + `FINGERPRINT` attributes) and binds to the same IP as `-a`. Run derper with an explicit IP (`-a 1.2.3.4:443`) so STUN is reachable on the address family the peers will query; with a wildcard `-a :443` it binds IPv6-only, and the default IPv4 `--stun` (`derp host :3478`) won't reach it — set `--stun` explicitly in that case.
 
@@ -353,9 +356,9 @@ peer key.
 A link with no live peer edge **buffers** what the local side writes (32 KiB, then drops), so
 the datagram that triggered a dial is not lost while the presentation opens; after that bytes
 are dropped whenever the opposite edge is absent (IP tolerates loss), so a side that has
-nothing to send yet is still reachable. The data path is **unencrypted** like the rest of the
-data plane: there is no inner dialer here to secure it, so run it over a trusted path or add
-your own encryption above it.
+nothing to send yet is still reachable. The data path is encrypted by the p2p layer like every
+other tunnel — there is no inner dialer here to secure it, which is exactly why the session
+cipher (negotiated end to end) covers it.
 
 ## UDP target (a global datagram outlet)
 
@@ -420,7 +423,8 @@ grpcurl -plaintext 127.0.0.1:8003 proto.P2P/Status
   "tunnels": 4,
   "directPeers": 12, "derpPeers": 3,
   "punchAttempts": 45, "punchSuccess": 15,
-  "streamsDirect": 210, "streamsDerp": 30
+  "streamsDirect": 210, "streamsDerp": 30,
+  "encryptedPeers": 14, "plaintextPeers": 1
 }
 ```
 
@@ -428,15 +432,20 @@ grpcurl -plaintext 127.0.0.1:8003 proto.P2P/Status
 now*; `punch*` and `streams*` are cumulative since start. A `punchAttempts`
 that climbs while `punchSuccess` stays flat means hole punching is being tried
 and failing (symmetric NAT / CGNAT) — the case IPv6 or port mapping would
-address. With `--token` set, add `-H 'token: <token>'`.
+address. `encryptedPeers`/`plaintextPeers` are gauges for the data-plane
+cipher: a nonzero `plaintextPeers` means a connected peer's session fell back
+to plaintext (an older peer, or a relay dropping the handshake) — see
+[Security](#security). With `--token` set, add `-H 'token: <token>'`.
 
 ## Security
 
 The control channel is unauthenticated by default: any process that can reach `--addr` can make this host dial arbitrary addresses. Keep `--addr` on loopback (the default). For cross-machine deployment set `--token` (the GOST client sends it as gRPC metadata) **and** control TLS — the token alone travels over a plaintext gRPC channel today.
 
-A DERP relay with `-verify-clients=false` is an open relay: it sees and can drop the bytes, but never decrypts them. Confidentiality is the inner protocol's job (use `mtls`/`tls`/`wss` inner dialers); the relay is transport, not trust.
+The data plane is encrypted end to end by default when both peers support it: the relay and hole-punched transports carry AEAD ciphertext, the keys are agreed per (peer, transport) from ephemeral X25519 through HKDF-SHA256, and the relay sees only bytes it cannot read. Control frames stay sealed to the peer's static key as before; only the data frames changed. Two caveats: a peer that predates the feature falls back to plaintext (no flag, backward compatible), and a relay that drops the handshake frames can force that same fallback — indistinguishable from an old peer, so it is surfaced, not prevented. A plaintext session shows in `Status` (`EncryptedPeers`/`PlaintextPeers` and the per-peer `PeerEncryption` map) and the build is logged (`secure=false`); watch a nonzero `PlaintextPeers`. For a guarantee that does not depend on the peer, run an inner `mtls`/`tls`/`wss` dialer over the tunnel.
 
-A **datagram link** is plaintext too: IP packets cross the relay or hole-punched path unencrypted, and unlike a tunnel dialer there is nothing above them in this host to secure them. Run it only over a trusted path, or add your own encryption above the link (GOST's `tls`/`mtls` dialers do not apply to a `udp` tunnel).
+A DERP relay with `-verify-clients=false` is an open relay: it sees and can drop the bytes, but never decrypts them. The relay is transport, not trust.
+
+A **datagram link** is encrypted by the p2p layer like every other tunnel: IP packets cross the relay or hole-punched path under the same session cipher. There is no inner dialer here — which is exactly why this layer secures it.
 
 **A udp outlet** shifts admission to the caller: p2p holds none. Who may reach the outlet's tun
 server is decided above — the tun `auther`'s per-spoke passphrase, the relay's

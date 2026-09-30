@@ -125,8 +125,21 @@ func TestRelaySessionChurnReconnectsRelay(t *testing.T) {
 		t.Fatal("engine did not connect to the test relay")
 	}
 
-	peer := derpclient.PublicKey{9}
-	pc := e.peerConn(peer)
+	// A real, registered peer: it answers the relay-session handshake. A
+	// fabricated key would make the relay answer our handshake with PeerGone (it
+	// reports one for a key it does not hold, like derper's ReasonNotHere), which
+	// kills the adapter between builds and defeats the churn accounting here.
+	privB, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	eB := newEngine(url, "", privB, slog.Default())
+	defer eB.Close()
+	if err := eB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	pc := e.peerConn(eB.pub)
 	// One build more than the window allows, each preceded by killing the
 	// session it would have reused: rebuild after rebuild, as a pair left
 	// un-routed looks from here.

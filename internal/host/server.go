@@ -325,6 +325,14 @@ func (s *server) status() p2p.Status {
 		st.RelayConnected, st.RelayError = s.engine.relayState()
 		st.PeerTransports = s.engine.peerTransports()
 		st.PeerPunches = s.engine.peerPunches()
+		st.PeerEncryption = s.engine.peerEncryptions()
+		for _, state := range st.PeerEncryption {
+			if state == encStateSecure {
+				st.EncryptedPeers++
+			} else {
+				st.PlaintextPeers++
+			}
+		}
 		for _, transport := range st.PeerTransports {
 			if transport == "direct" {
 				st.DirectPeers++

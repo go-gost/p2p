@@ -128,9 +128,15 @@ not the one a later punch will use.
   constant-time token check on every RPC, and a cross-machine deployment needs
   the token **plus** control TLS in front of the server (the token travels
   plaintext).
-- The data plane is **plaintext**, on the relay and on the hole-punched path
-  alike. Confidentiality is the inner protocol's job: run a `tls`/`mtls`/`wss`
-  dialer inside the tunnel. The transports are intentionally plain.
+- An endpoint's tunnels are **encrypted to the peer automatically** — no opt-in,
+  no flag. Every per-peer smux session's underlay (relay and hole-punched alike)
+  is wrapped in an AEAD cipher keyed from a per-(peer, transport) ephemeral
+  X25519 handshake, so the relay routes ciphertext it cannot read, and the `udp`
+  case is covered with no inner dialer. The fallback to **plaintext** happens
+  only when the peer predates the feature (it never answers the handshake) or
+  the handshake times out; that state is reported in `Status`. An inner
+  `tls`/`mtls`/`wss` dialer still adds a layer above the tunnel, and is the only
+  confidentiality option against such a peer.
 - A tunnel id is a single-use credential; the stream bound to it is the tunnel,
   and its end is the teardown.
 
@@ -138,7 +144,6 @@ not the one a later punch will use.
 
 Deliberate scope, not gaps:
 
-- **No encryption** of the relay or direct path (see above).
 - **No peer discovery**: peers are addressed by their base64 key. A
   human-friendly name belongs in the caller's own configuration.
 - **No admission control**: who may use a `udp://` target outlet is the caller's

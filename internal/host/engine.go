@@ -66,7 +66,11 @@ type engine struct {
 	directs map[derpclient.PublicKey]*directConn
 	links   map[derpclient.PublicKey][]*link // per-peer datagram links (one per udp dial)
 	gone    map[derpclient.PublicKey]bool    // peers reported gone (DERP connection dropped)
-	stop    chan struct{}
+	// secure holds one security session per (peer, transport), keyed so it
+	// outlives any one smux session: a rebuilt mux session reuses its keys and
+	// nonce counters, and a peer restart is seen as a changed half.
+	secure map[secureKey]*secureSession
+	stop   chan struct{}
 
 	stats engineStats
 }
@@ -187,6 +191,68 @@ func (e *engine) peerPunches() map[string]p2p.PeerPunch {
 	return out
 }
 
+// peerEncryptions names each connected peer's session state — "secure" or
+// "plaintext" (the value set documented on p2p.Status.PeerEncryption), over the
+// same peer set peerTransports reports. A peer is "secure" only when every live
+// session it has holds keys: the relay session (when it has an adapter) and the
+// direct session (when one is live). One plaintext live session makes the whole
+// peer "plaintext", so a peer whose active path is a plaintext direct session is
+// not masked by an encrypted relay session. The *secureSession pointers are
+// stable and keys() takes its own lock, so neither the engine lock nor dc.mu is
+// held across it.
+func (e *engine) peerEncryptions() map[string]string {
+	e.mu.Lock()
+	peers := make(map[derpclient.PublicKey]*peerConn, len(e.peers))
+	for k, pc := range e.peers {
+		peers[k] = pc
+	}
+	directs := make(map[derpclient.PublicKey]*directConn, len(e.directs))
+	for k, dc := range e.directs {
+		directs[k] = dc
+	}
+	e.mu.Unlock()
+
+	out := make(map[string]string, len(peers)+len(directs))
+	for k, pc := range peers {
+		out[keyName(k)] = encryptionState(pc, directs[k])
+	}
+	for k, dc := range directs {
+		if _, ok := out[keyName(k)]; ok {
+			continue // already classified through its relay adapter
+		}
+		out[keyName(k)] = encryptionState(nil, dc)
+	}
+	return out
+}
+
+// encryptionState classifies one peer by its live sessions: "secure" only when
+// every considered session holds keys — the relay session when the peer has one,
+// the direct session while one is live — else "plaintext". Reporting "plaintext"
+// for any unsettled live session is the safe direction for a downgrade alarm: it
+// may over-report transiently (a direct session mid-handshake), but never masks
+// a plaintext data path behind an encrypted relay session. Either argument may
+// be nil: a peer can be present with only a relay adapter or only a direct
+// connection.
+func encryptionState(pc *peerConn, dc *directConn) string {
+	considered, allSecure := false, true
+	if pc != nil && pc.secure != nil {
+		considered = true
+		if _, _, ok := pc.secure.keys(); !ok {
+			allSecure = false
+		}
+	}
+	if dc != nil && dc.live() && dc.secure != nil {
+		considered = true
+		if _, _, ok := dc.secure.keys(); !ok {
+			allSecure = false
+		}
+	}
+	if considered && allSecure {
+		return encStateSecure
+	}
+	return encStatePlaintext
+}
+
 // directReason names what stands between this host and a direct path when
 // nothing peer-specific does: "" while punching is possible, else "disabled"
 // (the master switch), "no-candidates" (no STUN server and no IPv6 egress) or
@@ -227,6 +293,12 @@ type peerConn struct {
 	peer    derpclient.PublicKey
 	inbound chan []byte
 
+	// secure is this pair's relay security session, borrowed from e.secure (one
+	// per (peer, transport), outliving this adapter). The AEAD record layer
+	// wraps the smux underlay once both halves are exchanged, and stays
+	// plaintext (peer predates encryption) otherwise.
+	secure *secureSession
+
 	mu        sync.Mutex
 	sess      *smux.Session
 	sessAt    time.Time     // when sess was established, for the stream-open log
@@ -261,9 +333,20 @@ const (
 	// notifies PeerGone once): if no traffic from the peer arrives within the
 	// bound the session is torn down so the request fails fast.
 	goneProbeTimeout = 5 * time.Second
+	// goneHandshakeTimeout bounds waiting for a peer's handshake half when the
+	// peer is marked gone: it answers only if it is already back, and the wait
+	// must not charge a full handshake timeout to an open that will fall through
+	// to the plaintext (and then fail-fast) path.
+	goneHandshakeTimeout = 1 * time.Second
 	// dialTimeout caps the DERP connection establishment.
 	dialTimeout = 10 * time.Second
 )
+
+// resendInterval is how often an unsettled handshake re-sends its half while
+// ensureSession waits out handshakeTimeout, so a dropped reply heals instead of
+// leaving one side plaintext while the other encrypts. A var so tests can
+// shorten it.
+var resendInterval = 500 * time.Millisecond
 
 // Deployment-dependent timings, adjustable via the `timeouts` config section
 // (applyTimeouts in config.go). Vars, not consts, so tests can shorten them.
@@ -329,6 +412,7 @@ func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger)
 		directs: make(map[derpclient.PublicKey]*directConn),
 		links:   make(map[derpclient.PublicKey][]*link),
 		gone:    make(map[derpclient.PublicKey]bool),
+		secure:  make(map[secureKey]*secureSession),
 		log:     log,
 		stop:    make(chan struct{}),
 	}
@@ -548,10 +632,58 @@ func openStream(sess *smux.Session, timeout time.Duration) (net.Conn, error) {
 	}
 }
 
+// secureKey identifies one (peer, transport) security session.
+type secureKey struct {
+	peer      derpclient.PublicKey
+	transport byte
+}
+
+// secureSessionLocked returns (creating if needed) the cached per-(peer,
+// transport) session. Caller must hold e.mu.
+func (e *engine) secureSessionLocked(peer derpclient.PublicKey, transport byte) *secureSession {
+	k := secureKey{peer: peer, transport: transport}
+	ss := e.secure[k]
+	if ss == nil {
+		ss = newSecureSession(e.log, transport, e.priv, peer)
+		e.secure[k] = ss
+	}
+	return ss
+}
+
+// secureSessionFor returns (creating if needed) the cached per-(peer,
+// transport) session, which outlives any one smux session. Must NOT be called
+// while holding e.mu.
+func (e *engine) secureSessionFor(peer derpclient.PublicKey, transport byte) *secureSession {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.secureSessionLocked(peer, transport)
+}
+
+// dropRelaySecure forgets the peer's relay security session so the next rebuilt
+// adapter re-handshakes on a fresh ephemeral. The invariant the shared counters
+// rely on is that every nonce drawn is either delivered-and-consumed by the peer
+// or both sides reset; it breaks when the relay link is lost (derpclient reports
+// the write failure only after the nonce is spent, so sendCtr can be one ahead
+// of the peer's recvCtr) or when a local kill abandons records still queued in
+// the adapter (smux's read loop stops without draining them). Either way the
+// peer never consumes those nonces and can never realign, so the pair must
+// re-handshake: our next half carries a new ephemeral, the peer sees `changed`,
+// resets its counters and rebuilds — both converge. It must NOT be used on the
+// peer-restart path (resetPeerSession): there the peer already changed its half
+// and respond re-derived ours, so both counters already match and dropping would
+// send yet another fresh half, loop the two ends, and never settle.
+func (e *engine) dropRelaySecure(peer derpclient.PublicKey) {
+	e.mu.Lock()
+	delete(e.secure, secureKey{peer: peer, transport: secureTransportRelay})
+	e.mu.Unlock()
+}
+
 // peerConn returns (creating if needed) the adapter for peer, dialing the
 // DERP server and starting the pump on first use. A cached adapter that was
 // closed (e.g. the peer process died and its relay session broke) is replaced
-// with a fresh one so the next stream rebuilds instead of failing forever.
+// with a fresh one so the next stream rebuilds instead of failing forever. The
+// adapter borrows the per-(peer, transport) security session from e.secure, so
+// a rebuild keeps the settled keys.
 func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -570,6 +702,7 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		peer:    peer,
 		inbound: make(chan []byte, inboundQueueSize),
 		closeCh: make(chan struct{}),
+		secure:  e.secureSessionLocked(peer, secureTransportRelay),
 	}
 	e.peers[peer] = pc
 	return pc
@@ -641,6 +774,10 @@ func (e *engine) pump(c *derpclient.Client) {
 		// consumed by smux (which then accepts streams) even when this host
 		// never opens a tunnel to the peer itself.
 		if _, err := pc.ensureSession(true); err != nil {
+			// The session could not be built, so records already queued for this
+			// peer are abandoned and their nonces never consumed: drop the pair's
+			// relay security session so the rebuild re-handshakes (see dropRelaySecure).
+			e.dropRelaySecure(src)
 			pc.kill(err)
 			continue
 		}
@@ -650,7 +787,12 @@ func (e *engine) pump(c *derpclient.Client) {
 			// session already dead; drop
 		default:
 			// Queue overflow: the session is unrecoverable (smux needs
-			// lossless delivery) — kill it and let the peer redial.
+			// lossless delivery) — kill it and let the peer redial. Killing
+			// abandons the records still queued (smux's read loop stops without
+			// draining them), so those nonces are spent but never consumed: drop
+			// the relay security session so both ends reset and realign instead
+			// of wedging on a permanent counter offset.
+			e.dropRelaySecure(src)
 			pc.kill(errors.New("derp engine: inbound queue overflow"))
 		}
 	}
@@ -683,6 +825,104 @@ func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
 			return
 		}
 		e.directConn(src).addCaps(clear[0])
+	case ctrlSecure:
+		clear, ok := e.priv.OpenFrom(src, body[1:])
+		if !ok || len(clear) < 1 {
+			e.log.Debug("secure: bad box", "peer", keyName(src))
+			return
+		}
+		// Only the two known transports: a bogus tag must not create a cached
+		// session (respond would reject the half anyway).
+		if clear[0] != secureTransportRelay && clear[0] != secureTransportDirect {
+			return
+		}
+		if len(clear) != secureHalfLen {
+			e.log.Debug("secure: bad half length", "peer", keyName(src), "len", len(clear))
+			return
+		}
+		// Rule (b): a received half makes us answer with our own, so a
+		// one-sided tunnel cannot deadlock (the opener cannot send data before
+		// the key exists, so it cannot trigger the peer with data). We answer
+		// while we are unsettled, when the peer's ephemeral changed (a peer
+		// restart), or when the peer is asking (its want bit), so a lost reply
+		// heals. Once both ends settle, neither sets want and a repeated half is
+		// a no-op, so the exchange terminates — no mutual resend.
+		ss := e.secureSessionFor(src, clear[0])
+		wasSettled := ss.settled()
+		accepted, changed := ss.respond(clear)
+		if !accepted {
+			// Well-formed but unusable (its ephemeral does not derive): surfaced
+			// so a silent plaintext downgrade cannot hide here.
+			e.log.Warn("secure: unusable peer half", "peer", keyName(src), "transport", clear[0])
+			return
+		}
+		want := clear[1+32] != 0
+		if want || !wasSettled || changed {
+			if err := e.sendSecureHalf(src, ss); err != nil {
+				e.log.Debug("secure: respond failed", "peer", keyName(src), "error", err)
+			}
+		}
+		if changed {
+			if clear[0] == secureTransportRelay {
+				// The peer restarted: its half changed. Tear the relay mux session
+				// down so it rebuilds over the new key (kill also unblocks the
+				// parked read loop; a session left reading would eat the new
+				// session's packets). The secure session itself is kept.
+				e.resetPeerSession(src)
+			} else {
+				// Same on the direct transport: tear the direct mux session down
+				// so the next punch rebuilds it over the new key. The session
+				// itself is kept (resetDirectSession only detaches the smux layer).
+				e.resetDirectSession(src)
+			}
+		}
+	}
+}
+
+// sendSecureHalf sends our relay-session handshake half to the peer. Idempotent
+// (re-sealing the same public half); safe to call more than once.
+func (e *engine) sendSecureHalf(peer derpclient.PublicKey, ss *secureSession) error {
+	sealed, err := ss.start()
+	if err != nil {
+		return err
+	}
+	return e.sendControl(peer, ctrlSecure, sealed)
+}
+
+// resetPeerSession tears the peer's relay mux session down so the next packet
+// or open rebuilds it over the current key. The peer adapter is killed (not
+// just its session): kill unblocks the parked read loop, which a bare
+// sess.Close would deadlock against.
+func (e *engine) resetPeerSession(peer derpclient.PublicKey) {
+	e.mu.Lock()
+	pc := e.peers[peer]
+	e.mu.Unlock()
+	if pc != nil {
+		pc.kill(errors.New("derp engine: peer rekeyed"))
+	}
+}
+
+// resetDirectSession tears the peer's direct mux session down so a re-punch
+// rebuilds it over the peer's new key (a peer restart arrives as a changed
+// secure half). It mirrors resetPeerSession, but the direct path lives in
+// e.directs and is rebuilt by a punch rather than a packet-driven ensureSession,
+// so markDead is what reclaims it: it detaches the session, closes its socket,
+// and (when that session owned directUp) schedules the re-punch. The secure
+// session itself is kept — respond already re-derived it under the new key, and
+// the next punch's conn() wraps the fresh underlay with those keys. It is not
+// added to peerGone: the direct path survives a relay loss by design.
+func (e *engine) resetDirectSession(peer derpclient.PublicKey) {
+	e.mu.Lock()
+	dc := e.directs[peer]
+	e.mu.Unlock()
+	if dc == nil {
+		return
+	}
+	dc.mu.Lock()
+	sess := dc.sess
+	dc.mu.Unlock()
+	if sess != nil {
+		dc.markDead(sess)
 	}
 }
 
@@ -804,9 +1044,22 @@ func (e *engine) peerGone(peer derpclient.PublicKey) {
 	e.gone[peer] = true
 	pc := e.peers[peer]
 	delete(e.peers, peer)
+	// The peer's relay connection dropped: forget its security session too. The
+	// peer may have restarted (a new ephemeral will arrive), and holding a stale
+	// key would leave the next rebuild mismatched. A peer that merely blipped
+	// re-handshakes once on its return.
+	delete(e.secure, secureKey{peer: peer, transport: secureTransportRelay})
 	e.mu.Unlock()
 	if pc != nil {
-		pc.kill(errors.New("derp engine: peer gone"))
+		// A session-less adapter is a handshake in flight: killing it would fail
+		// that open before its bounded wait can decide, and the peer may already
+		// be back. Only a built session is torn down.
+		pc.mu.Lock()
+		built := pc.sess != nil
+		pc.mu.Unlock()
+		if built {
+			pc.kill(errors.New("derp engine: peer gone"))
+		}
 	}
 	e.log.Debug("derp peer gone", "peer", keyName(peer))
 }
@@ -848,6 +1101,12 @@ func (e *engine) teardown(c *derpclient.Client, cause error) {
 	peers := make([]*peerConn, 0, len(e.peers))
 	for _, pc := range e.peers {
 		peers = append(peers, pc)
+		// The relay link is gone: forget each peer's relay security session so a
+		// reconnect re-handshakes instead of reusing counters a lost record may
+		// have advanced (see dropRelaySecure). Without this a peer whose link
+		// dropped — the Wi-Fi<->cellular switch — would come back with our
+		// sendCtr one ahead of its recvCtr, with no way to realign.
+		delete(e.secure, secureKey{peer: pc.peer, transport: secureTransportRelay})
 	}
 	e.peers = make(map[derpclient.PublicKey]*peerConn)
 	e.mu.Unlock()
@@ -919,6 +1178,44 @@ func (pc *peerConn) ensureSession(punch bool) (*smux.Session, error) {
 		pc.mu.Unlock()
 		return nil, errPeerSessionClosed
 	}
+	live := pc.sess != nil && !pc.sess.IsClosed()
+	pc.mu.Unlock()
+
+	// No live session: settle the handshake before building, so both ends agree
+	// on encrypted-vs-plaintext for this session. A settled security session
+	// needs none of this: its keys outlive the mux session, so a rebuild just
+	// reuses them (and a peer restart arrives as a changed half, not here). The
+	// send and the wait run OUTSIDE pc.mu: sendControl takes e.mu, which pc.mu
+	// is taken under elsewhere, so holding pc.mu here would invert the two.
+	if !live && !pc.secure.settled() {
+		// Retry the half on an interval: a reply lost in flight leaves us
+		// unsettled while the peer is settled, so re-sending (with want set) is
+		// what makes the peer answer again — otherwise we would stay plaintext
+		// while it encrypts, and both mux sessions would churn. The loop ends the
+		// moment we settle, or once the deadline passes.
+		total := handshakeTimeout
+		if pc.e.isGone(pc.peer) {
+			// The peer's relay dropped: it answers only if it is already back.
+			// Bound the whole attempt well under handshakeTimeout so an open to a
+			// still-down peer falls through to plaintext (and the fail-fast
+			// probe) instead of burning a full timeout first.
+			total = goneHandshakeTimeout
+		}
+		deadline := time.Now().Add(total)
+		for {
+			if err := pc.e.sendSecureHalf(pc.peer, pc.secure); err != nil {
+				pc.e.log.Debug("secure: send half failed", "peer", keyName(pc.peer), "error", err)
+			}
+			if pc.secure.waitReady(resendInterval) {
+				break
+			}
+			if pc.secure.settled() || !time.Now().Before(deadline) {
+				break
+			}
+		}
+	}
+
+	pc.mu.Lock()
 	sess, err := pc.sessionLocked()
 	pc.mu.Unlock()
 	if pc.takeChurnTripped() {
@@ -965,17 +1262,22 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	cfg.KeepAliveInterval = smuxKeepAliveInterval
 	cfg.KeepAliveTimeout = smuxKeepAliveTimeout
 	roleIsClient := bytes.Compare(pc.e.pub[:], pc.peer[:]) < 0
+	underlay, err := pc.secure.conn(pc)
+	if err != nil {
+		return nil, err
+	}
 	if roleIsClient {
-		pc.sess, _ = smux.Client(pc, cfg)
+		pc.sess, _ = smux.Client(underlay, cfg)
 	} else {
-		pc.sess, _ = smux.Server(pc, cfg)
+		pc.sess, _ = smux.Server(underlay, cfg)
 	}
 	if pc.sess == nil {
 		return nil, errors.New("derp engine: cannot establish mux session")
 	}
 	pc.sessAt = time.Now()
 	pc.noteBuildLocked(pc.sessAt)
-	pc.e.log.Debug("peer relay session up", "peer", keyName(pc.peer), "client", roleIsClient)
+	_, _, enc := pc.secure.keys()
+	pc.e.log.Debug("peer relay session up", "peer", keyName(pc.peer), "client", roleIsClient, "secure", enc)
 	pc.startAccept()
 	return pc.sess, nil
 }

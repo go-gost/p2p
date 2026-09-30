@@ -106,6 +106,20 @@ func hasDirect(e *engine, peer derpclient.PublicKey) bool {
 	return dc != nil && dc.session() != nil
 }
 
+// directSecureForTest reports whether an engine's direct session to peer is
+// encrypted. It reads the direct session under the engine lock, then its keys
+// under the session's own lock — never the session's lock while holding e.mu.
+func directSecureForTest(e *engine, peer derpclient.PublicKey) bool {
+	e.mu.Lock()
+	dc := e.directs[peer]
+	e.mu.Unlock()
+	if dc == nil {
+		return false
+	}
+	_, _, ok := dc.secure.keys()
+	return ok
+}
+
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -400,6 +414,59 @@ func TestDirectPunchRoundTrip(t *testing.T) {
 	}
 	defer s2.Close()
 	roundTrip(t, s2, "ping!")
+}
+
+// TestDirectSessionEncrypted proves the hole-punched direct path is
+// end-to-end encrypted: after a direct session is up, a stream round-trips
+// over it and both ends report the direct session as settled encrypted (the
+// handshake ran, not just a plaintext round trip).
+func TestDirectSessionEncrypted(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	// Bring the relay session up, which triggers the mutual punch.
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+
+	waitFor(t, 5*time.Second, func() bool {
+		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
+	})
+
+	// Cut relay data; only the direct path can carry this. Its payload is sealed
+	// end to end, so a successful round trip proves the ciphered transport works.
+	rs.setDropData(true)
+	s2, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatalf("open on direct: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "encrypted-direct")
+
+	// A direct session is built only after its own side settled the handshake,
+	// so both ends must report it encrypted once the sessions are up.
+	if !directSecureForTest(engineA, pubB) {
+		t.Fatal("A's direct session did not settle encrypted")
+	}
+	if !directSecureForTest(engineB, engineA.pub) {
+		t.Fatal("B's direct session did not settle encrypted")
+	}
 }
 
 // TestDirectSurvivesPunchTimeout proves the direct session outlives the

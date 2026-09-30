@@ -46,6 +46,7 @@ const (
 	ctrlCaps            = 0x04 // sealed capability bitfield (forward-looking seam)
 	// 0x03 was the udp dial notice: a datagram link now always presents its own
 	// edge, so no notice is sent and none is acted on. The kind stays unused.
+	ctrlSecure = 0x05 // sealed [transport][ephemeral X25519 public key]
 )
 
 // Capability bits exchanged via ctrlCaps. Bit 0 marks IPv6 awareness. The frame
@@ -146,6 +147,13 @@ type directConn struct {
 	lastPeer []candidate    // peer candidates already acted on (dedupes re-announcements)
 	peerCaps uint8          // capability bits the peer advertised via ctrlCaps
 
+	// secure is this pair's direct security session, borrowed from e.secure (one
+	// per (peer, transport), outliving any one smux session). The AEAD record
+	// layer wraps the KCP underlay once both halves are exchanged, and stays
+	// plaintext (peer predates encryption) otherwise. Reusing the cached object
+	// across re-punches is what keeps the nonce counters from restarting.
+	secure *secureSession
+
 	// This peer's punch history, reported through Status.PeerPunches. Atomics so
 	// a status query reads them without taking dc.mu and queueing behind a punch
 	// round; drops is also incremented while dc.mu is held, where a second lock
@@ -162,9 +170,10 @@ func (e *engine) directConn(peer derpclient.PublicKey) *directConn {
 		return dc
 	}
 	dc := &directConn{
-		e:    e,
-		peer: peer,
-		cand: make(chan []candidate, 1),
+		e:      e,
+		peer:   peer,
+		cand:   make(chan []candidate, 1),
+		secure: e.secureSessionLocked(peer, secureTransportDirect),
 	}
 	e.directs[peer] = dc
 	return dc
@@ -666,8 +675,22 @@ func (dc *directConn) punch() {
 	dc.mu.Lock()
 	dc.mine = mine
 	dc.mu.Unlock()
+	// This punch rebuilds a dead session (a live one is never disturbed by an
+	// announcement): rotate the ephemeral so the rebuilt session runs over a
+	// fresh key and nonce space. The old KCP underlay is gone, so its shared
+	// counter cannot continue without desyncing (see rekeyIfUsed); a live
+	// session's punch skips this and is left serving.
+	if !dc.live() {
+		dc.secure.rekeyIfUsed()
+	}
 	if err := e.sendCaps(dc.peer, capsIPv6|capsTightKeepalive); err != nil {
 		e.log.Debug("direct punch: send caps failed", "peer", pname, "error", err)
+	}
+	// Our half of the direct security handshake, next to the candidate exchange
+	// it rides with. Sent wanting (unsettled) so the peer answers and a lost
+	// reply heals via the retry below.
+	if err := e.sendSecureHalf(dc.peer, dc.secure); err != nil {
+		e.log.Debug("direct punch: send secure half failed", "peer", pname, "error", err)
 	}
 	if err := e.sendCandidates(dc.peer, mine); err != nil {
 		e.log.Debug("direct punch: send candidates failed", "peer", pname, "error", err)
@@ -763,13 +786,41 @@ func (dc *directConn) punch() {
 			continue
 		}
 
-		// 5. smux over KCP; role by key order (external to who dialed).
+		// Settle the security handshake before building the mux, so both ends
+		// agree on encrypted-vs-plaintext for this session. A settled session
+		// (both halves already exchanged, e.g. ours answered before this point)
+		// skips the loop outright. The retry re-sends our half (with want set
+		// while unsettled) so a lost reply heals within the round; the deadline
+		// bounds a peer that does not support it, which then rides plaintext.
+		deadline := time.Now().Add(handshakeTimeout)
+		for !dc.secure.settled() {
+			if err := e.sendSecureHalf(dc.peer, dc.secure); err != nil {
+				e.log.Debug("direct punch: secure half failed", "peer", pname, "error", err)
+				break
+			}
+			if dc.secure.waitReady(resendInterval) {
+				break
+			}
+			if time.Now().After(deadline) {
+				e.log.Debug("direct punch: secure half not received, plaintext session", "peer", pname)
+				break
+			}
+		}
+		underlay, err := dc.secure.conn(kcpConn)
+		if err != nil {
+			kcpConn.Close()
+			e.log.Debug("direct punch: secure wrap failed", "peer", pname, "error", err)
+			continue
+		}
+
+		// 5. smux over the (possibly ciphered) KCP underlay; role by key order
+		// (external to who dialed).
 		cfg := directSmuxConfig(dc.supports(capsTightKeepalive))
 		var sess *smux.Session
 		if roleIsClient {
-			sess, err = smux.Client(kcpConn, cfg)
+			sess, err = smux.Client(underlay, cfg)
 		} else {
-			sess, err = smux.Server(kcpConn, cfg)
+			sess, err = smux.Server(underlay, cfg)
 		}
 		if err != nil {
 			kcpConn.Close()
@@ -786,9 +837,11 @@ func (dc *directConn) punch() {
 		dc.mine = f.mine
 		dc.mu.Unlock()
 		dc.markUp(sess, sock, dial)
+		_, _, enc := dc.secure.keys()
 		e.log.Debug("direct established", "peer", pname, "family", f.name,
 			"mine", candAddrs(f.mine), "peerAddr", dial.String(),
-			"keepalive", cfg.KeepAliveInterval.String()+"/"+cfg.KeepAliveTimeout.String())
+			"keepalive", cfg.KeepAliveInterval.String()+"/"+cfg.KeepAliveTimeout.String(),
+			"secure", enc)
 		go func() {
 			e.acceptLoop(sess, "direct", dc.peer, dial.String())
 			dc.markDead(sess)

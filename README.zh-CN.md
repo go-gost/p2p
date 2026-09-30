@@ -6,7 +6,7 @@
 
 为 [GOST](https://github.com/go-gost/gost) 的 [p2p 插件](https://github.com/go-gost/plugin) 协议服务的 P2P 隧道宿主，既可以作为独立二进制运行，也可以作为 **Go 库嵌入到其他进程**（见[进程内嵌入](#进程内嵌入in-process)）。它让 GOST 通过本宿主打开的隧道，建立到链节点的网络通路——穿越策略（rendezvous、relay、打洞）完全由插件决定，GOST 侧永远只看到一条普通的字节流（`Tunnel` gRPC 流）来承载它的协议。
 
-**当前状态：stub + mux + DERP relay + STUN/UDP 打洞 + 数据报链路。** 宿主用本地 TCP 转发桥接隧道：stub 模式（回环）直接转发，**DERP relay** 模式（engine）跨机/NAT。engine 模式下，relay 会话建立后，两端各自用 STUN 探测 NAT 并打 UDP 洞；直连路径（KCP + smux）建立后，新隧道走直连、relay 保持为回退。支持内层 dialer `tcp/tls/ws/mtcp/mtls/mws/udp`——mux 一族把一条隧道复用成多路会话，`udp` 则要求一条**数据报流**而不是字节流（tun 链路靠它：设备归 GOST 管，本进程只是管道）。
+**当前状态：stub + mux + DERP relay + STUN/UDP 打洞 + 数据报链路 + 端到端加密。** 宿主用本地 TCP 转发桥接隧道：stub 模式（回环）直接转发，**DERP relay** 模式（engine）跨机/NAT。engine 模式下，relay 会话建立后，两端各自用 STUN 探测 NAT 并打 UDP 洞；直连路径（KCP + smux）建立后，新隧道走直连、relay 保持为回退。支持内层 dialer `tcp/tls/ws/mtcp/mtls/mws/udp`——mux 一族把一条隧道复用成多路会话，`udp` 则要求一条**数据报流**而不是字节流（tun 链路靠它：设备归 GOST 管，本进程只是管道）。
 
 ## 工作原理
 
@@ -22,17 +22,20 @@ GOST client ══Tunnel 流（"id" metadata）══▶ p2p host ──bridge�
 
 ## 定位：一个通用的 P2P 连通性原语
 
-`p2p` 是一个 **P2P 连通层，不是开箱即用的加密隧道**。它的契约刻意收得很窄：
+`p2p` 是一个 **P2P 连通层**。它的契约刻意收得很窄：
 
-> 给我一个 peer 公钥，我返回一条 TCP 隧道；NAT 穿越尽力而为（STUN + UDP 打洞，relay 回退）；端到端可达性归本层，安全性归调用方。
+> 给我一个 peer 公钥，我返回一条 TCP 隧道；NAT 穿越尽力而为（STUN + UDP 打洞，relay 回退）；端到端可达性与保密性都归本层。
 
 它提供的是**可达性，不是策略**——与 IP/TCP 同款分层：
 
-- **加密在设计上不归本层管。** relay 与打洞链路都走明文（与 relay 的信任模型一致：它能看到但永远解不了密）。保密属于上一层——在隧道之上跑 `tls`/`mtls`/`wss`，正如 GOST 内层 dialer 所做。这是标准的分层，不是缺口。
+- **数据面默认端到端加密。** 每个 peer 的 `smux` 会话的下层——无论 relay 还是打洞——都包进一层 AEAD 密码（chacha20poly1305 记录），密钥经一个 sealed 的 `ctrlSecure` 控制帧协商，按 (peer, transport) 用一次性 X25519 → HKDF-SHA256 派生。relay 只能路由它读不懂的密文，且临时密钥在会话结束时丢弃，因此即便日后对端静态密钥泄露，前向保密仍然成立。默认开启、无需开关，`udp` 隧道（tun 场景——那里没有内层 dialer 可托付）同样覆盖。
+  - **回退。** 加密是协商而非强制：早于该特性的旧对端从不会发 `ctrlSecure`，会话便回退到**明文**——向后兼容、无需开关。新旧混搭仍可通信，只是不加密。
+  - **降级警示。** 因为该交换是协商的，路径上的 relay 只要*丢弃*握手帧，就能把会话逼回明文，而这一行为与旧对端无从区分。对此的处置是**呈现，而非阻止**：明文会话会出现在 `Status` 中（`EncryptedPeers`/`PlaintextPeers`，以及 per-peer 的 `PeerEncryption` map），并打日志（`secure=false`，不报告原因）。
+  - 控制帧（`ctrlPunchCandidates`、`ctrlCaps`、`ctrlSecure`）与以往一样密封给对端静态密钥；只有*数据*帧变了。
 - **peer 发现是增强项，不是必需项。** peer 以 base64 curve25519 公钥寻址——这是完整的寻址方案。name→key 查找刻意不做（见 Roadmap）。
 - **relay 是 NAT 穿越的固有前提。** 跨 NAT 没有 rendezvous 就不可能可达；`derper` 是部署/基础设施选型，不是设计缺陷。对称 NAT 的对端会永久留在 relay 上。
 
-**接入方需要自备：** 一个 relay（自建 `derper` 或第三方 DERP）、要连接的各 peer 公钥，以及（若需要保密）隧道之上的自有加密。
+**接入方需要自备：** 一个 relay（自建 `derper` 或第三方 DERP）和要连接的各 peer 公钥。当前版本之间数据面自动加密；隧道之上仍可自行叠加 `tls`/`mtls`/`wss`，且对于会回退到明文的旧对端，它是唯一的保密手段。
 
 ## 快速开始
 
@@ -248,9 +251,9 @@ relay 链路是一条承载 DERP 二进制帧的 WebSocket。值得了解的有�
 | 字节 | 含义 |
 |---|---|
 | `0x00` | 控制帧：`[0x00][kind 1B][NaCl-box 载荷]` |
-| `0x01` | 数据帧：`[0x01][smux 字节流]` —— 每次 smux 写对应一个 DERP 包 |
+| `0x01` | 数据帧：`[0x01][会话密文]` —— 该 peer 的 smux 会话，外包 AEAD 记录（见[安全](#安全)） |
 
-控制 kind：`0x02` 打洞候选（sealed `[count]([family][addr][port])*`）、`0x04` 能力位域（sealed 1 字节；bit 0 = 支持 IPv6，随每次广播重发、接收方 OR）。（`0x03` udp 隧道拨号通知已废弃：数据报链路自己呈现边，不再发送、也不再消费该通知。）所有控制载荷都用对端公钥 seal（`PrivateKey.SealTo`），relay 只能路由、无法伪造。控制帧由 engine 消费；数据帧喂给每个 peer 的 smux 会话。
+控制 kind：`0x02` 打洞候选（sealed `[count]([family][addr][port])*`）、`0x04` 能力位域（sealed 1 字节；bit 0 = 支持 IPv6，随每次广播重发、接收方 OR）、`0x05` 会话握手（sealed `[transport 1B][临时公钥 32B][want 1B]`——peer 间数据面的密钥协商，见[安全](#安全)）。（`0x03` udp 隧道拨号通知已废弃：数据报链路自己呈现边，不再发送、也不再消费该通知。）所有控制载荷都用对端公钥 seal（`PrivateKey.SealTo`），relay 只能路由、无法伪造。控制帧由 engine 消费；数据帧携带会话密文，喂给每个 peer 的 smux 会话。
 
 ### 打洞
 
@@ -274,7 +277,7 @@ timeouts:
     timeout: 30s      # 必须 >= 2x interval
 ```
 
-对称 NAT 打洞失败；这类 peer 永久留在 relay（周期性重试）。KCP 传输不加密，与 relay 的信任模型一致——保密是内层 dialer 的职责（`mtls`/`tls`/`wss`）。
+对称 NAT 打洞失败；这类 peer 永久留在 relay（周期性重试）。直连路径与 relay 一样由 p2p 会话密码加密——KCP 载荷是 AEAD 密文，其密钥经 relay 控制信道协商（见[安全](#安全)）。
 
 derper 的 STUN 服务器只应答 Tailscale 的 binding-request 方言（`SOFTWARE` + `FINGERPRINT` 属性），并绑定与 `-a` 相同的 IP。用显式 IP 运行 derper（`-a 1.2.3.4:443`），使 STUN 在对端要查询的地址族上可达；用通配 `-a :443` 时它会绑到 IPv6-only，默认的 IPv4 `--stun`（`derp host :3478`）够不着——此时需显式设置 `--stun`。
 
@@ -313,7 +316,7 @@ chains:
 
 **拨号方总是呈现**：链路在分配时立刻开一条自己的标记流作为呈现边（无存活边时按退避重呈现），因此单侧链路——对端自己没有任何拨号——与公钥顺序无关地工作，且到同一 peer 的并发拨号永不共享一条边。两侧各有一条拨号时，它们是**同一条边上的 rendezvous**：**公钥较大**的一端**采纳**较小一端呈现的边（自己的呈现边只是暂定，被采纳时丢弃），且已持有采纳边的链路不会被顶掉。链路优先走直连（打洞）路径，失败回退 relay，与隧道一致。`network=udp` 需要 engine 模式（`--derp`）：链路以 peer 公钥寻址。
 
-链路没有存活 peer 边时会**缓冲**本地写入（32 KiB，超出即丢），因此触发拨号的那个数据报不会在呈现边建立期间丢失；之后对端边缺席时字节照常丢弃（IP 能容忍丢包），暂时无话可说的一端依然可达。数据面**不加密**，与其余数据面一致：这里没有内层 dialer 可托付，仅在可信链路上使用，或在链路之上自行加密。
+链路没有存活 peer 边时会**缓冲**本地写入（32 KiB，超出即丢），因此触发拨号的那个数据报不会在呈现边建立期间丢失；之后对端边缺席时字节照常丢弃（IP 能容忍丢包），暂时无话可说的一端依然可达。数据面与其他隧道一样由 p2p 层加密——这里没有内层 dialer 可托付，这正是会话密码（端到端协商）覆盖它的原因。
 
 ## UDP target(全局数据报出口)
 
@@ -352,22 +355,27 @@ grpcurl -plaintext 127.0.0.1:8003 proto.P2P/Status
   "tunnels": 4,
   "directPeers": 12, "derpPeers": 3,
   "punchAttempts": 45, "punchSuccess": 15,
-  "streamsDirect": 210, "streamsDerp": 30
+  "streamsDirect": 210, "streamsDerp": 30,
+  "encryptedPeers": 14, "plaintextPeers": 1
 }
 ```
 
 `directPeers`/`derpPeers` 是 gauge——每个 peer **当前**实际走哪条路；`punch*`
 与 `streams*` 是自启动以来的累计值。`punchAttempts` 一直涨而 `punchSuccess`
 不动，说明打洞在被尝试但失败（对称 NAT / CGNAT）——正是 IPv6 或端口映射要解决
-的场景。设了 `--token` 时加 `-H 'token: <token>'`。
+的场景。`encryptedPeers`/`plaintextPeers` 是数据面密码的 gauge：
+`plaintextPeers` 非零意味着某个已连接 peer 的会话回退到了明文（旧对端，或 relay
+丢弃了握手）——见[安全](#安全)。设了 `--token` 时加 `-H 'token: <token>'`。
 
 ## 安全
 
 控制面默认**未认证**：任何能访问 `--addr` 的进程都能让本宿主拨任意地址。让 `--addr` 保持回环（默认值）。跨机部署需设 `--token`（GOST client 以 gRPC metadata 发送）**且**配控制面 TLS——仅凭 token 目前走的是明文 gRPC 通道。
 
-`-verify-clients=false` 的 DERP relay 是开放中继：它能看到并丢弃字节，但永远不解密。保密是内层协议的职责（用 `mtls`/`tls`/`wss` 内层 dialer）；relay 是传输，不是信任。
+两端都支持时，数据面默认端到端加密：relay 与打洞路径都承载 AEAD 密文，密钥按 (peer, transport) 由一次性 X25519 经 HKDF-SHA256 协商，relay 只能看到读不懂的字节。控制帧与以往一样密封给对端静态密钥；只有数据帧变了。两点警示：早于该特性的对端会回退到明文（无需开关、向后兼容）；relay 丢弃握手帧也能逼出同样的回退——与旧对端无从区分，因此只呈现、不阻止。明文会话会出现在 `Status`（`EncryptedPeers`/`PlaintextPeers` 与 per-peer 的 `PeerEncryption` map）并打日志（`secure=false`）；关注非零的 `PlaintextPeers`。若要不受对端版本影响的保证，请在隧道之上叠加 `mtls`/`tls`/`wss` 内层 dialer。
 
-**数据报链路**同样是明文：IP 包经 relay 或打洞路径不加密传输，而且与隧道不同，本宿主里没有东西给它加密（GOST 的 `tls`/`mtls` dialer 对 `udp` 隧道不适用）。仅在可信链路上使用，或在链路之上自行加密。
+`-verify-clients=false` 的 DERP relay 是开放中继：它能看到并丢弃字节，但永远不解密。relay 是传输，不是信任。
+
+**数据报链路**与其他隧道一样由 p2p 层加密：IP 包经 relay 或打洞路径时受同一会话密码保护。这里没有内层 dialer——这正是本层负责加密它的原因。
 
 **udp 出口**把准入交给调用方：p2p 不做准入。谁可访问出口的 tun server 由上层决定——tun `auther` 的 per-spoke passphrase、relay 的 `-verify-clients=true`，或端口绑定/防火墙。前面没有东西挡着的出口，就是一个暴露在数据面上的未认证 tun server。
 

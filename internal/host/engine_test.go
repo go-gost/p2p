@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -249,6 +250,9 @@ type relayServer struct {
 	clients  map[[32]byte]*relayClient
 	dropData bool // when true, drop 0x01 data frames (control still flows)
 	dropPong bool // when true, stop answering pings (a half-open relay path)
+	// dropCtrl, when set, is consulted for every forwarded control frame; true
+	// drops it, so a test can lose one handshake half and prove the retry heals.
+	dropCtrl func(dst [32]byte, payload []byte) bool
 }
 
 func (s *relayServer) setDropData(v bool) {
@@ -382,6 +386,7 @@ func (s *relayServer) serveClient(ctx context.Context, ws *websocket.Conn) {
 			s.mu.Lock()
 			rc := s.clients[dst]
 			drop := s.dropData && len(payload) > 0 && payload[0] == 0x01
+			dropCtrl := s.dropCtrl
 			s.mu.Unlock()
 			if rc == nil {
 				// Unknown destination: tell the sender the peer is gone once,
@@ -396,6 +401,9 @@ func (s *relayServer) serveClient(ctx context.Context, ws *websocket.Conn) {
 			}
 			if drop {
 				continue // drop data frames, keep control frames flowing
+			}
+			if dropCtrl != nil && len(payload) > 0 && payload[0] == 0x00 && dropCtrl(dst, payload) {
+				continue // a test deliberately lost this control frame
 			}
 			pkt := make([]byte, 0, 32+len(payload))
 			pkt = append(pkt, myPub[:]...)
@@ -620,5 +628,347 @@ func TestRelayState(t *testing.T) {
 	}
 	if !strings.Contains(msg, "connection refused") {
 		t.Errorf("msg = %q, want the dial failure", msg)
+	}
+}
+
+// newEncryptedPair starts two engines on one in-process relay with the echo
+// target, connected and ready.
+func newEncryptedPair(t *testing.T) (*engine, *engine, *relayServer) {
+	t.Helper()
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+	privA, _, _ := derpclient.Generate()
+	privB, _, _ := derpclient.Generate()
+	eA := newEngine(url, "", privA, slog.Default())
+	eB := newEngine(url, echo, privB, slog.Default())
+	t.Cleanup(func() { eA.Close(); eB.Close() })
+	if err := eA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := eB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	return eA, eB, rs
+}
+
+// peerSecureForTest reports whether this engine's session to peer is encrypted.
+func (e *engine) peerSecureForTest(peer derpclient.PublicKey) bool {
+	e.mu.Lock()
+	pc := e.peers[peer]
+	e.mu.Unlock()
+	if pc == nil {
+		return false
+	}
+	_, _, ok := pc.secure.keys()
+	return ok
+}
+
+// TestRelaySessionEncrypted drives a stream through the relay and checks that
+// both ends settled an encrypted relay session (the handshake ran, not just the
+// round trip).
+func TestRelaySessionEncrypted(t *testing.T) {
+	eA, eB, _ := newEncryptedPair(t)
+
+	conn, err := eA.OpenStream(eB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	go conn.Write([]byte("hello"))
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "hello" {
+		t.Fatalf("round trip: got %q", buf)
+	}
+	if !eA.peerSecureForTest(eB.pub) {
+		t.Fatal("A's session did not settle encrypted")
+	}
+	if !eB.peerSecureForTest(eA.pub) {
+		t.Fatal("B's session did not settle encrypted")
+	}
+}
+
+// TestRelayLinkLossRekeys: a lost relay link must drop the pair's relay security
+// session, so the reconnect re-handshakes instead of reusing counters a record
+// lost mid-drop advanced (sendCtr can be one ahead of the peer's recvCtr, with no
+// way to realign). Both ends must settle encrypted again and traffic must flow.
+// No STUN is configured, so this is relay-only and the direct path is off.
+func TestRelayLinkLossRekeys(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+	if err := engineA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Carry traffic over the relay and confirm the session is encrypted.
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "before")
+	s.Close()
+	if !engineA.peerSecureForTest(pubB) || !engineB.peerSecureForTest(engineA.pub) {
+		t.Fatal("relay session not encrypted before the loss")
+	}
+
+	// The relay link drops. teardown kills A's adapters; it must also drop the
+	// pair's relay security session or the reconnect would reuse a counter the
+	// lost record advanced and never realign.
+	engineA.mu.Lock()
+	c := engineA.client
+	engineA.mu.Unlock()
+	if c == nil {
+		t.Fatal("A has no relay connection")
+	}
+	engineA.teardown(c, errors.New("test: relay link lost"))
+	engineA.mu.Lock()
+	_, cached := engineA.secure[secureKey{peer: pubB, transport: secureTransportRelay}]
+	engineA.mu.Unlock()
+	if cached {
+		t.Fatal("teardown left the peer's relay security session cached")
+	}
+
+	// A redials on the next open. Both ends must re-handshake and settle
+	// encrypted, and traffic must flow again (no permanent wedge).
+	waitFor(t, 10*time.Second, func() bool {
+		conn, err := engineA.OpenStream(engineB.PublicKey())
+		if err != nil {
+			return false
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.Write([]byte("after")); err != nil {
+			return false
+		}
+		buf := make([]byte, len("after"))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return false
+		}
+		return string(buf) == "after"
+	})
+	if !engineA.peerSecureForTest(pubB) {
+		t.Fatal("A's relay session did not settle encrypted after reconnect")
+	}
+	if !engineB.peerSecureForTest(engineA.pub) {
+		t.Fatal("B's relay session did not settle encrypted after reconnect")
+	}
+}
+
+// TestRelayHandshakeLostReplyHeals: a dropped reply must not strand one side in
+// plaintext. A sends its half (want set), B settles and replies, the reply is
+// lost, and A's retry — still asking — makes B answer again. Without the want
+// bit A would stay unsettled (and plaintext) while B encrypts, killing both mux
+// sessions and churning the shared relay.
+func TestRelayHandshakeLostReplyHeals(t *testing.T) {
+	defer func(d time.Duration) { resendInterval = d }(resendInterval)
+	resendInterval = 50 * time.Millisecond
+
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+	privA, _, _ := derpclient.Generate()
+	privB, _, _ := derpclient.Generate()
+	eA := newEngine(url, "", privA, slog.Default())
+	eB := newEngine(url, echo, privB, slog.Default())
+	t.Cleanup(func() { eA.Close(); eB.Close() })
+	if err := eA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := eB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drop the first ctrlSecure frame the relay routes to A (B's first reply);
+	// seen counts every such reply, so a retry reply proves A's want bit worked.
+	var seen, dropped atomic.Int32
+	rs.mu.Lock()
+	rs.dropCtrl = func(dst [32]byte, payload []byte) bool {
+		if dst != [32]byte(eA.pub) || len(payload) < 2 || payload[1] != ctrlSecure {
+			return false
+		}
+		if seen.Add(1) == 1 {
+			dropped.Add(1)
+			return true
+		}
+		return false
+	}
+	rs.mu.Unlock()
+
+	conn, err := eA.OpenStream(eB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	go conn.Write([]byte("hello"))
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "hello" {
+		t.Fatalf("round trip: got %q", buf)
+	}
+	if !eA.peerSecureForTest(eB.pub) {
+		t.Fatal("A did not settle encrypted after a lost reply")
+	}
+	if !eB.peerSecureForTest(eA.pub) {
+		t.Fatal("B did not settle encrypted")
+	}
+	if n := dropped.Load(); n != 1 {
+		t.Fatalf("relay dropped %d replies, want exactly 1", n)
+	}
+	// The retry reply is the healing: without the want bit B would not answer a
+	// half it had already settled on, and A would have stayed plaintext.
+	if n := seen.Load(); n < 2 {
+		t.Fatalf("relay routed %d replies to A, want >= 2 (the retry must draw one)", n)
+	}
+}
+
+// TestStatusReportsEncryption drives an encrypted round trip and checks the host
+// status counts the peer as encrypted and names it "secure".
+func TestStatusReportsEncryption(t *testing.T) {
+	eA, eB, _ := newEncryptedPair(t)
+
+	conn, err := eA.OpenStream(eB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn, "enc")
+
+	srv := newServer(eA)
+	defer srv.close()
+	st := srv.status()
+	if st.EncryptedPeers < 1 {
+		t.Fatalf("EncryptedPeers = %d, want >= 1", st.EncryptedPeers)
+	}
+	if got := st.PeerEncryption[keyName(eB.pub)]; got != encStateSecure {
+		t.Fatalf("PeerEncryption[peer] = %q, want %q", got, encStateSecure)
+	}
+}
+
+// settledSecurePair returns two secureSessions that have exchanged their halves,
+// so keys() reports ready on both — a stand-in for an encrypted (peer,
+// transport) session without driving a full punch.
+func settledSecurePair(t *testing.T, transport byte) (*secureSession, *secureSession) {
+	t.Helper()
+	privA, pubA, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	a := newSecureSession(nil, transport, privA, pubB)
+	b := newSecureSession(nil, transport, privB, pubA)
+	boxA, err := a.start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	boxB, err := b.start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearA, ok := privB.OpenFrom(pubA, boxA)
+	if !ok {
+		t.Fatal("unseal A's half")
+	}
+	clearB, ok := privA.OpenFrom(pubB, boxB)
+	if !ok {
+		t.Fatal("unseal B's half")
+	}
+	if ok, _ := a.respond(clearB); !ok {
+		t.Fatal("A rejected B's half")
+	}
+	if ok, _ := b.respond(clearA); !ok {
+		t.Fatal("B rejected A's half")
+	}
+	return a, b
+}
+
+// TestEncryptionState pins the peer-level rule: "secure" only when every live
+// session the peer has holds keys. A plaintext live direct session must not be
+// masked by an encrypted relay session — the visibility hole the review flagged.
+func TestEncryptionState(t *testing.T) {
+	peer := derpclient.PublicKey{7}
+	encRelay, _ := settledSecurePair(t, secureTransportRelay)
+	encDirect, _ := settledSecurePair(t, secureTransportDirect)
+	plain := newSecureSession(nil, secureTransportDirect, derpclient.PrivateKey{}, peer) // never settled
+
+	if got := encryptionState(nil, nil); got != encStatePlaintext {
+		t.Errorf("no sessions = %q, want plaintext", got)
+	}
+	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}, nil); got != encStateSecure {
+		t.Errorf("encrypted relay = %q, want secure", got)
+	}
+	if got := encryptionState(&peerConn{peer: peer, secure: plain}, nil); got != encStatePlaintext {
+		t.Errorf("plaintext relay = %q, want plaintext", got)
+	}
+	// Encrypted relay + a live plaintext direct session reads plaintext: the
+	// plaintext path is the one carrying data, so it must not be hidden.
+	dcPlain := &directConn{peer: peer, sess: newTestSess(t), state: directUp, secure: plain}
+	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}, dcPlain); got != encStatePlaintext {
+		t.Errorf("encrypted relay + plaintext live direct = %q, want plaintext", got)
+	}
+	// Both live and encrypted: secure.
+	dcEnc := &directConn{peer: peer, sess: newTestSess(t), state: directUp, secure: encDirect}
+	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}, dcEnc); got != encStateSecure {
+		t.Errorf("encrypted relay + encrypted direct = %q, want secure", got)
+	}
+	// A direct session that is not live is not considered: it must not downgrade
+	// an otherwise-encrypted peer.
+	dcDead := &directConn{peer: peer, state: directUp, secure: plain} // sess == nil → !live()
+	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}, dcDead); got != encStateSecure {
+		t.Errorf("encrypted relay + non-live plaintext direct = %q, want secure", got)
+	}
+}
+
+// TestStatusReportsPlaintextPeer: a relay that drops the handshake leaves the
+// session plaintext, and the status must surface that rather than hide it. Every
+// ctrlSecure frame is dropped in both directions, so neither end settles; the
+// shortened handshake timeout keeps the test prompt. The session is still
+// usable (plaintext), so the round trip succeeds.
+func TestStatusReportsPlaintextPeer(t *testing.T) {
+	defer func(d time.Duration) { handshakeTimeout = d }(handshakeTimeout)
+	handshakeTimeout = 300 * time.Millisecond
+	defer func(d time.Duration) { resendInterval = d }(resendInterval)
+	resendInterval = 50 * time.Millisecond
+
+	eA, eB, rs := newEncryptedPair(t)
+	rs.mu.Lock()
+	rs.dropCtrl = func(_ [32]byte, payload []byte) bool {
+		return len(payload) > 1 && payload[1] == ctrlSecure
+	}
+	rs.mu.Unlock()
+
+	conn, err := eA.OpenStream(eB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn, "plain")
+
+	srv := newServer(eA)
+	defer srv.close()
+	st := srv.status()
+	if st.PlaintextPeers < 1 {
+		t.Fatalf("PlaintextPeers = %d, want >= 1", st.PlaintextPeers)
+	}
+	if st.EncryptedPeers != 0 {
+		t.Errorf("EncryptedPeers = %d, want 0", st.EncryptedPeers)
+	}
+	if got := st.PeerEncryption[keyName(eB.pub)]; got != encStatePlaintext {
+		t.Fatalf("PeerEncryption[peer] = %q, want %q", got, encStatePlaintext)
 	}
 }

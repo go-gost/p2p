@@ -28,13 +28,15 @@ func (s *Server) OpenTunnel(ctx context.Context, req *pb.OpenTunnelRequest) (*pb
 func (s *Server) Status(ctx context.Context, req *pb.StatusRequest) (*pb.StatusReply, error) {
 	st := s.ep.Status()
 	return &pb.StatusReply{
-		Tunnels:       int32(st.Tunnels),
-		DirectPeers:   int32(st.DirectPeers),
-		DerpPeers:     int32(st.DerpPeers),
-		PunchAttempts: st.PunchAttempts,
-		PunchSuccess:  st.PunchSuccess,
-		StreamsDirect: st.StreamsDirect,
-		StreamsDerp:   st.StreamsDerp,
+		Tunnels:        int32(st.Tunnels),
+		DirectPeers:    int32(st.DirectPeers),
+		DerpPeers:      int32(st.DerpPeers),
+		PunchAttempts:  st.PunchAttempts,
+		PunchSuccess:   st.PunchSuccess,
+		StreamsDirect:  st.StreamsDirect,
+		StreamsDerp:    st.StreamsDerp,
+		EncryptedPeers: int32(st.EncryptedPeers),
+		PlaintextPeers: int32(st.PlaintextPeers),
 	}, nil
 }
 
