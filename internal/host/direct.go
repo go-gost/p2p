@@ -221,8 +221,11 @@ func (e *engine) warm(peer derpclient.PublicKey, punch bool) error {
 	// One path with OpenStream: ensureSession takes pc.mu itself, releases it
 	// before the punch (which takes e.mu), and acts on a churned peer, so the
 	// lock order and the churn guard live in one place.
-	_, err := e.peerConn(peer).ensureSession(punch)
-	if errors.Is(err, errPeerSessionClosed) {
+	_, err := e.peerConn(peer).ensureSession(punch, true)
+	switch {
+	case errors.Is(err, errEncryptionRequired):
+		return p2p.ErrEncryptionRequired
+	case errors.Is(err, errPeerSessionClosed):
 		return p2p.ErrPeerUnreachable
 	}
 	return err
@@ -786,12 +789,12 @@ func (dc *directConn) punch() {
 			continue
 		}
 
-		// Settle the security handshake before building the mux, so both ends
-		// agree on encrypted-vs-plaintext for this session. A settled session
-		// (both halves already exchanged, e.g. ours answered before this point)
-		// skips the loop outright. The retry re-sends our half (with want set
-		// while unsettled) so a lost reply heals within the round; the deadline
-		// bounds a peer that does not support it, which then rides plaintext.
+		// Settle the security handshake before building the mux. A settled
+		// session (both halves already exchanged, e.g. ours answered before this
+		// point) skips the loop outright. The retry re-sends our half (with want
+		// set while unsettled) so a lost reply heals within the round; the
+		// deadline bounds a peer that does not support it, which is then refused
+		// below.
 		deadline := time.Now().Add(handshakeTimeout)
 		for !dc.secure.settled() {
 			if err := e.sendSecureHalf(dc.peer, dc.secure); err != nil {
@@ -802,9 +805,19 @@ func (dc *directConn) punch() {
 				break
 			}
 			if time.Now().After(deadline) {
-				e.log.Debug("direct punch: secure half not received, plaintext session", "peer", pname)
 				break
 			}
+		}
+		if !dc.secure.settled() {
+			// Forced encryption: a punch that did not settle the handshake must
+			// not come up as a plaintext direct session. Abandon the round; the
+			// relay stays the fallback.
+			kcpConn.Close() // ownConn=true closes f.sock with it
+			closeFams()
+			e.log.Warn("direct punch refused: encryption required but the peer did not negotiate it",
+				"peer", pname)
+			dc.backoff()
+			return
 		}
 		underlay, err := dc.secure.conn(kcpConn)
 		if err != nil {

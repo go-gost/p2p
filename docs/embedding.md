@@ -128,15 +128,16 @@ not the one a later punch will use.
   constant-time token check on every RPC, and a cross-machine deployment needs
   the token **plus** control TLS in front of the server (the token travels
   plaintext).
-- An endpoint's tunnels are **encrypted to the peer automatically** — no opt-in,
-  no flag. Every per-peer smux session's underlay (relay and hole-punched alike)
-  is wrapped in an AEAD cipher keyed from a per-(peer, transport) ephemeral
-  X25519 handshake, so the relay routes ciphertext it cannot read, and the `udp`
-  case is covered with no inner dialer. The fallback to **plaintext** happens
-  only when the peer predates the feature (it never answers the handshake) or
-  the handshake times out; that state is reported in `Status`. An inner
-  `tls`/`mtls`/`wss` dialer still adds a layer above the tunnel, and is the only
-  confidentiality option against such a peer.
+- An endpoint's tunnels are **encrypted to the peer automatically and
+  mandatorily** — no opt-in, no flag, no fallback. Every per-peer smux session's
+  underlay (relay and hole-punched alike) is wrapped in an AEAD cipher keyed from
+  a per-(peer, transport) ephemeral X25519 handshake, so the relay routes
+  ciphertext it cannot read, and the `udp` case is covered with no inner dialer.
+  A session that does not settle encrypted is **refused** — `Dial` returns
+  `p2p.ErrEncryptionRequired` — so a peer that predates the feature (it never
+  answers the handshake) cannot connect at all: both ends must run a supporting
+  version. An inner `tls`/`mtls`/`wss` dialer still adds a layer above the
+  tunnel, but is no longer needed for confidentiality.
 - A tunnel id is a single-use credential; the stream bound to it is the tunnel,
   and its end is the teardown.
 

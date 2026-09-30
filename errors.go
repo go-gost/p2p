@@ -23,6 +23,12 @@ var (
 	// ErrPeerUnreachable reports that the tunnel's peer end could not be
 	// opened; the cause is wrapped, so errors.Is/errors.As still match it.
 	ErrPeerUnreachable = errors.New("p2p: peer unreachable")
+	// ErrEncryptionRequired reports that the peer end refused to open because
+	// the data-plane handshake did not settle: encryption is forced, and a
+	// session that would be plaintext is refused rather than built. It is
+	// distinct from ErrPeerUnreachable — the peer is reachable, it just will not
+	// speak the cipher (an old or misbehaving peer). The cause is wrapped.
+	ErrEncryptionRequired = errors.New("p2p: peer encryption required")
 	// ErrForward reports a failed static forward registration: a configuration
 	// error (bad listen address, no relay configured, port in use), not a
 	// transient one. A caller that serves through an unreachable relay must

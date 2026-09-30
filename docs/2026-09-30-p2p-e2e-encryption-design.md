@@ -1,8 +1,17 @@
 # p2p end-to-end encryption — design
 
-Status: **implemented** (2026-09-30). Supersedes the "encryption is out of scope"
-positioning for the *data plane*: the relay and the hole-punched path stop being
-intentionally plaintext. Control frames are unchanged.
+Status: **implemented** (2026-09-30), **revised to forced encryption**. Supersedes
+the "encryption is out of scope" positioning for the *data plane*: the relay and
+the hole-punched path stop being intentionally plaintext. Control frames are
+unchanged.
+
+> **Revision (forced encryption):** the original design negotiated encryption and
+> fell back to plaintext for a peer that did not support it (decisions 4, 5, 7).
+> That fallback is **replaced by mandatory encryption**: a session that does not
+> settle encrypted is refused, never built as plaintext, and a peer that predates
+> the feature is incompatible. There is no flag and no downgrade. Decisions 4, 5
+> and 7 are updated in place below, and the fallback-specific wording elsewhere
+> ("falls back to plaintext") is corrected to a refusal.
 
 ## Context (why)
 
@@ -38,20 +47,21 @@ frames are already sealed end to end with `PrivateKey.SealTo`/`OpenFrom`
    (destroyed at process end), *not* per smux session — see the lifetime note
    below. It is still ephemeral, so forward secrecy holds against a later
    static-key compromise. No new dependency the module does not already have.
-4. **Negotiation, not force, with a plaintext fallback.** A peer that supports it
-   proves it by sending a handshake frame; a peer that does not (an older version)
-   is silently ignored and the session stays plaintext. This keeps deployed peers
-   working.
-5. **Default-on when both ends support.** No flag. Two current versions negotiate
-   encryption automatically; a mixed pair falls back to plaintext (see the
-   downgrade caveat).
+4. **Forced, not negotiated.** A peer that supports it proves it by sending a
+   handshake frame; a peer that does not (an older version, or a relay that drops
+   the frame) never settles, and the session is **refused** — no plaintext session
+   is built. A mixed-version pair is incompatible; there is no fallback.
+5. **Always on, no flag.** Encryption is the only mode, not a default that can be
+   turned off. Both ends must support it; a pair that does not settle is refused
+   (decisions 4 and 7).
 6. **Independent transports.** Relay and direct have separate secure sessions
    (separate ephemerals, keys and counters), so their nonce spaces never touch.
    Cost: the relay session's first-ever bring-up pays one control round trip.
-7. **Downgrade is surfaced, not prevented.** A `plaintext` session is reported in
-   `Status` and the build is logged (`secure=false`, no reason field). Making
-   downgrade impossible means the forced mode that was rejected; visibility is the
-   accepted middle.
+7. **No downgrade.** Because encryption is forced, an on-path relay that *drops*
+   the handshake frames cannot force plaintext — it can only prevent the session
+   (a denial of service, not a confidentiality break). The old "surfaced, not
+   prevented" caveat no longer applies; the refusal is reported as
+   `p2p.ErrEncryptionRequired` (`codes.FailedPrecondition` over gRPC).
 
 ## Design
 
@@ -100,8 +110,8 @@ is a new kind or the existing `ctrlCaps` (0x04). It is a new kind (0x05):
   point "reuse" is a rename and 0x04's contract is broken.
 - **A new kind costs no compatibility.** `handleControl` is a switch with no
   `default`, so an unknown kind is skipped; an old peer drops 0x05, sends none,
-  and we fall back to plaintext. A new frame is no harder to interop than an
-  extended one.
+  and the session is refused (it does not settle). A new frame is no harder to
+  interop than an extended one.
 
 The alternative with *zero* new frames is static-static ECDH over a `capsEncrypted`
 bit — but that forfeits forward secrecy, which was the rejected option. Forward
@@ -185,52 +195,59 @@ therefore self-heals within one interval: the `want` bit makes the settled peer
 answer a retry even though the half it already holds is unchanged. No resend timer
 is needed past the bring-up deadline — the DERP control channel is a WebSocket
 over TCP, so transport loss does not occur; the only way both halves are dropped
-is a relay dropping them deliberately, which is the downgrade case below.
+is a relay dropping them deliberately, which is the refusal case below.
 
-### Negotiation and fallback
+### Negotiation and refusal (no fallback)
 
 Support is proven by receipt: a session is encrypted **iff** the peer's `ctrlSecure`
 for that transport arrived before the bring-up deadline; otherwise the session is
-built plaintext and marked.
+**refused** — no underlay is wrapped and no plaintext session is built.
 
 - Old peers: `handleControl`'s switch has no `default`, so an unknown kind is
   dropped silently. An old peer ignores `ctrlSecure` and never sends one → we time
-  out → plaintext. Backward compatible without a caps bit for this feature (the
-  frame *is* the advertisement and the key material).
+  out → the session is refused. A mixed-version pair is therefore incompatible (no
+  caps bit is needed for this feature: the frame *is* the advertisement and the key
+  material).
 - A session's first data packet may arrive before the handshake settles. The
-  bring-up **waits a bounded time** for the handshake and, on timeout, proceeds
-  plaintext — no unbounded buffering of pre-handshake data.
+  bring-up **waits a bounded time** for the handshake and, on timeout, refuses the
+  session — no unbounded buffering of pre-handshake data, and never a plaintext
+  send.
+- The inbound/pump path is **non-blocking**: it does not wait on a relay round
+  trip, so it builds the cipher only if the session is already settled; an
+  unsettled packet on that path is dropped rather than stalling the pump
+  (`errEncryptionRequired`).
 
-**Downgrade caveat (state it, do not hide it):** because the exchange is
-negotiated, an on-path relay that *drops* both directions' `ctrlSecure` frames can
-force a session to plaintext, and that is indistinguishable from an older peer. The
-mitigation is visibility — the peer reads as `plaintext` in `Status` and the build
-is logged (`secure=false`, no reason field) — not prevention. Callers that need a
-guarantee use the future `requireEncryption` knob (not in this change).
+**A dropped handshake is a denial of service, not a downgrade:** an on-path relay
+that *drops* both directions' `ctrlSecure` frames cannot force plaintext — it can
+only keep the session from settling, so the tunnel never comes up. There is no
+confidentiality loss to surface; the refusal is reported as
+`p2p.ErrEncryptionRequired` (`codes.FailedPrecondition` over gRPC).
 
 ### Integration points
 
 | Where | Change |
 |---|---|
-| `internal/host/secure.go` (new) | `cryptoConn`, key derivation, the per-session secure state (booleans `started`/`ready` — an unsettled session is plaintext; it becomes `ready` once both halves are present and the keys derive). |
+| `internal/host/secure.go` (new) | `cryptoConn`, key derivation, the per-session secure state (booleans `started`/`ready` — an unsettled session is refused, `errEncryptionRequired`; it becomes `ready` once both halves are present and the keys derive). |
 | `internal/host/engine.go` `sessionLocked` (~969) | ensure the secure state is `ready`, then `smux.Client(&cryptoConn{pc}, cfg)` instead of `smux.Client(pc, cfg)`. The handshake wait runs **outside `pc.mu`**, following the existing `maybeStartDirect` release-then-start pattern (see the lock-inversion note at engine.go:905). |
 | `internal/host/engine.go` `handleControl` (~662) | `case ctrlSecure`: open the box, drive the state machine, ensure the `peerConn` and our own half (rule (b) above). |
 | `internal/host/direct.go` punch (~660) | send the direct half alongside `sendCaps`/`sendCandidates`; await the peer's half before building the direct smux session; wrap the KCP conn (~770). |
 | `internal/host/direct.go` kinds (~45) | add `ctrlSecure = 0x05`. |
 
-`peerConn` gains a `secure` field; `directConn` gains an equivalent. Both build the
-cipher only after `ready`, so smux never reads plaintext it would have to interpret
-as a record.
+`peerConn` gains a `secure` field; `directConn` gains an equivalent. Both refuse to
+build the cipher before `ready`, so smux never runs over a plaintext underlay.
 
 ### Observability
 
 - `Status`: aggregate gauges `encrypted_peers` / `plaintext_peers` (the proto
   change lands in `plugin/p2p/proto` and bumps that module), plus a per-peer
   in-process map shaped like `PeerTransports` but keyed by base64 peer key, whose
-  value is `secure` or `plaintext`. As implemented it carries **no reason** — a
-  plaintext peer (an older peer, or a handshake that timed out) reports only
-  `plaintext`.
-- One log line per session build: `session up peer=… transport=… secure=true|false`.
+  value is `secure` or `plaintext`. With encryption forced, `encrypted_peers`
+  counts every connected (always-encrypted) peer and `plaintext_peers` is a
+  **constant 0**; a refused peer has no data path and is not reported at all. The
+  fields are retained for API/wire stability; the `plaintext` map value is kept
+  for compatibility and never produced for a live peer.
+- One log line per session build: `session up peer=… transport=… secure=true|false`
+  (always `true` for a live session); a refusal is logged separately at `warn`.
 
 Release note: the two aggregate gauges require new fields
 (`encrypted_peers`/`plaintext_peers`) on `StatusReply` in `plugin/p2p/proto`, so
@@ -248,6 +265,9 @@ transport carries the two aggregate gauges and nothing per-peer.
 - **Authentication** rests on the existing static curve25519 identities; the
   handshake is sealed to the peer's static key, so a malicious relay cannot MITM.
 - **Forward secrecy per session**: the ephemerals are ephemeral and discarded.
+- **No downgrade**: encryption is forced, so a relay that drops the handshake can
+  only prevent the session (a denial of service), never force plaintext — the data
+  plane cannot be silently downgraded by an on-path relay.
 - **Not addressed (by design):** traffic analysis / size or timing correlation
   (padding is out of scope); replay across sessions (a fresh ephemeral makes replay
   useless, and there is no session-id echo to exploit); rekeying within a session
@@ -257,12 +277,13 @@ transport carries the two aggregate gauges and nothing per-peer.
 
 - **Unit:** `cryptoConn` round-trip, tamper detection (a flipped byte fails
   authentication and kills the session), counter advance, and partial reads; the
-  handshake state machine (peer-supported, timeout→plaintext, resend, one-sided
+  handshake state machine (peer-supported, timeout→refusal, resend, one-sided
   rule (b)); HKDF/key-separation determinism.
 - **e2e** (nested netns + real derper, per the existing harness): a tunnel comes up
   encrypted and curl succeeds; `--direct=false` (relay-only) is also encrypted; a
   packet capture on the relay shows the `0x01` payload is **not** plaintext; a
-  mixed old/new pair falls back to plaintext and still passes traffic.
+  mixed old/new pair is refused (the session never comes up), not carried in the
+  clear.
 - Run tests with `-race` and `CGO_ENABLED=1` per the repo standard.
 
 ## Non-goals
@@ -270,5 +291,5 @@ transport carries the two aggregate gauges and nothing per-peer.
 - Traffic-analysis resistance (padding, constant-rate).
 - In-session rekey.
 - Changing the control channel (it stays statically sealed).
-- A `requireEncryption` flag that refuses plaintext (a possible follow-up; the
-  downgrade caveat above is the reason it exists).
+- A `requireEncryption` flag. Forced encryption (no fallback) is now the
+  behavior, so no flag is needed: a session that does not settle is refused.

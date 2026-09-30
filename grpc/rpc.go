@@ -100,6 +100,11 @@ func mapError(err error) error {
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, p2p.ErrTunnelAttached):
 		return status.Error(codes.AlreadyExists, err.Error())
+	case errors.Is(err, p2p.ErrEncryptionRequired):
+		// The peer is reachable but would not negotiate the data-plane cipher.
+		// FailedPrecondition keeps it distinct from an ordinary unreachable
+		// peer (Unavailable), so a caller can tell the two apart.
+		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, p2p.ErrPeerUnreachable):
 		return status.Error(codes.Unavailable, err.Error())
 	default:

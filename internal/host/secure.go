@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,6 +19,11 @@ import (
 	"github.com/go-gost/p2p/internal/derpclient"
 	"golang.org/x/crypto/chacha20poly1305"
 )
+
+// errEncryptionRequired is returned when a session is asked to wrap an underlay
+// before it settled. Encryption is forced: a session that did not negotiate keys
+// is refused, never built as plaintext.
+var errEncryptionRequired = errors.New("p2p: encryption required but the session did not negotiate it")
 
 // maxSecureRecord bounds one AEAD record's plaintext. 16 KiB keeps the 4-byte
 // length prefix and the 16-byte tag at ~0.1% overhead.
@@ -37,8 +43,12 @@ const (
 // The values p2p.Status.PeerEncryption reports, one per connected peer. Keep
 // them in sync with that field's doc.
 const (
-	encStateSecure    = "secure"    // the session settled encrypted
-	encStatePlaintext = "plaintext" // no keys: peer predates encryption, or the handshake timed out
+	encStateSecure = "secure" // the session settled encrypted
+	// encStatePlaintext is retained for API/wire compatibility only. Encryption
+	// is forced, so a peer either connects encrypted (encStateSecure) or is
+	// refused (no session is built), and this value is not reported for a live
+	// peer. It is kept so the field and its proto value stay stable.
+	encStatePlaintext = "plaintext"
 )
 
 // nonceCtr is a shared, monotonic 64-bit nonce counter for one direction of one
@@ -429,8 +439,8 @@ func (s *secureSession) keys() (send, recv []byte, ok bool) {
 	return s.sendKey, s.recvKey, s.ready
 }
 
-// conn wraps underlay with the session cipher, or returns it unchanged when the
-// session settled plaintext (the peer does not support encryption). It may be
+// conn wraps underlay with the session cipher and refuses when the session did
+// not settle: encryption is forced, so there is no plaintext fallback. It may be
 // called once per session rebuild: each call builds a fresh cryptoConn over the
 // same keys, the same shared counters and the same write mutex, so a rebuilt
 // session continues the nonce sequence instead of restarting it.
@@ -443,7 +453,7 @@ func (s *secureSession) conn(underlay net.Conn) (net.Conn, error) {
 	sendCtr, recvCtr := s.sendCtr, s.recvCtr
 	s.mu.Unlock()
 	if !ok {
-		return underlay, nil
+		return nil, errEncryptionRequired
 	}
 	sa, err := chacha20poly1305.New(send)
 	if err != nil {

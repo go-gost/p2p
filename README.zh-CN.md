@@ -28,14 +28,14 @@ GOST client ══Tunnel 流（"id" metadata）══▶ p2p host ──bridge�
 
 它提供的是**可达性，不是策略**——与 IP/TCP 同款分层：
 
-- **数据面默认端到端加密。** 每个 peer 的 `smux` 会话的下层——无论 relay 还是打洞——都包进一层 AEAD 密码（chacha20poly1305 记录），密钥经一个 sealed 的 `ctrlSecure` 控制帧协商，按 (peer, transport) 用一次性 X25519 → HKDF-SHA256 派生。relay 只能路由它读不懂的密文，且临时密钥在会话结束时丢弃，因此即便日后对端静态密钥泄露，前向保密仍然成立。默认开启、无需开关，`udp` 隧道（tun 场景——那里没有内层 dialer 可托付）同样覆盖。
-  - **回退。** 加密是协商而非强制：早于该特性的旧对端从不会发 `ctrlSecure`，会话便回退到**明文**——向后兼容、无需开关。新旧混搭仍可通信，只是不加密。
-  - **降级警示。** 因为该交换是协商的，路径上的 relay 只要*丢弃*握手帧，就能把会话逼回明文，而这一行为与旧对端无从区分。对此的处置是**呈现，而非阻止**：明文会话会出现在 `Status` 中（`EncryptedPeers`/`PlaintextPeers`，以及 per-peer 的 `PeerEncryption` map），并打日志（`secure=false`，不报告原因）。
+- **数据面端到端加密，且强制加密。** 每个 peer 的 `smux` 会话的下层——无论 relay 还是打洞——都包进一层 AEAD 密码（chacha20poly1305 记录），密钥经一个 sealed 的 `ctrlSecure` 控制帧协商，按 (peer, transport) 用一次性 X25519 → HKDF-SHA256 派生。relay 只能路由它读不懂的密文，且临时密钥在会话结束时丢弃，因此即便日后对端静态密钥泄露，前向保密仍然成立。无开关、无回退，`udp` 隧道（tun 场景——那里没有内层 dialer 可托付）同样覆盖。
+  - **永不回退明文。** 会话必须落定为加密。若不落定——对端从不发它的 `ctrlSecure` 半边（早于该特性的版本），或 relay 丢弃了握手帧——该会话即被**拒绝**：不会建立明文会话，隧道失败（`p2p.ErrEncryptionRequired`）。**新旧版本不兼容**：两端都必须运行支持该特性的版本。没有任何设置、也没有回退。
+  - **无法降级。** relay 丢弃握手再也逼不出明文——它只能阻止连接（拒绝服务，而非保密性破坏）。
   - 控制帧（`ctrlPunchCandidates`、`ctrlCaps`、`ctrlSecure`）与以往一样密封给对端静态密钥；只有*数据*帧变了。
 - **peer 发现是增强项，不是必需项。** peer 以 base64 curve25519 公钥寻址——这是完整的寻址方案。name→key 查找刻意不做（见 Roadmap）。
 - **relay 是 NAT 穿越的固有前提。** 跨 NAT 没有 rendezvous 就不可能可达；`derper` 是部署/基础设施选型，不是设计缺陷。对称 NAT 的对端会永久留在 relay 上。
 
-**接入方需要自备：** 一个 relay（自建 `derper` 或第三方 DERP）和要连接的各 peer 公钥。当前版本之间数据面自动加密；隧道之上仍可自行叠加 `tls`/`mtls`/`wss`，且对于会回退到明文的旧对端，它是唯一的保密手段。
+**接入方需要自备：** 一个 relay（自建 `derper` 或第三方 DERP）和要连接的各 peer 公钥。支持该特性的版本之间数据面自动、无条件加密；隧道之上仍可自行叠加 `tls`/`mtls`/`wss`，但已不再是为保密所必需。
 
 ## 快速开始
 
@@ -356,22 +356,23 @@ grpcurl -plaintext 127.0.0.1:8003 proto.P2P/Status
   "directPeers": 12, "derpPeers": 3,
   "punchAttempts": 45, "punchSuccess": 15,
   "streamsDirect": 210, "streamsDerp": 30,
-  "encryptedPeers": 14, "plaintextPeers": 1
+  "encryptedPeers": 14, "plaintextPeers": 0
 }
 ```
 
 `directPeers`/`derpPeers` 是 gauge——每个 peer **当前**实际走哪条路；`punch*`
 与 `streams*` 是自启动以来的累计值。`punchAttempts` 一直涨而 `punchSuccess`
 不动，说明打洞在被尝试但失败（对称 NAT / CGNAT）——正是 IPv6 或端口映射要解决
-的场景。`encryptedPeers`/`plaintextPeers` 是数据面密码的 gauge：
-`plaintextPeers` 非零意味着某个已连接 peer 的会话回退到了明文（旧对端，或 relay
-丢弃了握手）——见[安全](#安全)。设了 `--token` 时加 `-H 'token: <token>'`。
+的场景。`encryptedPeers`/`plaintextPeers` 是数据面密码的 gauge。加密是强制的，
+因此每个已连接 peer 都处于加密状态：`encryptedPeers` 统计它们，
+`plaintextPeers` 恒为 0。握手被拒绝的 peer 没有数据通路，根本不会被上报；这两个
+字段为 API 稳定而保留。见[安全](#安全)。设了 `--token` 时加 `-H 'token: <token>'`。
 
 ## 安全
 
 控制面默认**未认证**：任何能访问 `--addr` 的进程都能让本宿主拨任意地址。让 `--addr` 保持回环（默认值）。跨机部署需设 `--token`（GOST client 以 gRPC metadata 发送）**且**配控制面 TLS——仅凭 token 目前走的是明文 gRPC 通道。
 
-两端都支持时，数据面默认端到端加密：relay 与打洞路径都承载 AEAD 密文，密钥按 (peer, transport) 由一次性 X25519 经 HKDF-SHA256 协商，relay 只能看到读不懂的字节。控制帧与以往一样密封给对端静态密钥；只有数据帧变了。两点警示：早于该特性的对端会回退到明文（无需开关、向后兼容）；relay 丢弃握手帧也能逼出同样的回退——与旧对端无从区分，因此只呈现、不阻止。明文会话会出现在 `Status`（`EncryptedPeers`/`PlaintextPeers` 与 per-peer 的 `PeerEncryption` map）并打日志（`secure=false`）；关注非零的 `PlaintextPeers`。若要不受对端版本影响的保证，请在隧道之上叠加 `mtls`/`tls`/`wss` 内层 dialer。
+数据面端到端加密，且强制加密：relay 与打洞路径都承载 AEAD 密文，密钥按 (peer, transport) 由一次性 X25519 经 HKDF-SHA256 协商，relay 只能看到读不懂的字节。控制帧与以往一样密封给对端静态密钥；只有数据帧变了。没有回退：未落定为加密的会话会被拒绝（`p2p.ErrEncryptionRequired`），因此早于该特性的对端不兼容——它根本无法连接，两端都必须运行支持该特性的版本。relay 丢弃握手帧再也逼不出明文；它只能阻止连接（拒绝服务，而非保密性破坏）。在 `Status` 中，`EncryptedPeers` 统计每个已连接（始终加密的）peer，`PlaintextPeers` 恒为 0；被拒绝的 peer 没有数据通路，不会被上报。
 
 `-verify-clients=false` 的 DERP relay 是开放中继：它能看到并丢弃字节，但永远不解密。relay 是传输，不是信任。
 

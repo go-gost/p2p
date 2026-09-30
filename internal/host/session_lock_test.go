@@ -93,7 +93,7 @@ func TestEnsureSessionNoLockInversion(t *testing.T) {
 		}
 	}()
 	for i := 0; i < 500; i++ {
-		pc.ensureSession(true) // pc.mu, released, then e.mu
+		pc.ensureSession(true, true) // pc.mu, released, then e.mu
 	}
 	select {
 	case <-done:
@@ -155,7 +155,7 @@ func TestRelaySessionChurnReconnectsRelay(t *testing.T) {
 			pc.sess = nil
 			pc.mu.Unlock()
 		}
-		if _, err := pc.ensureSession(false); err != nil {
+		if _, err := pc.ensureSession(false, true); err != nil {
 			t.Fatalf("build %d: %v", i, err)
 		}
 	}

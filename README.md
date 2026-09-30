@@ -28,14 +28,14 @@ GOST client ══Tunnel stream ("id" key)════▶ p2p host ──bridge�
 
 It provides **reachability, not policy** — the same layering as IP/TCP:
 
-- **The data plane is encrypted end to end by default.** Every per-peer `smux` session's underlay — relay and hole-punched alike — is wrapped in an AEAD cipher (chacha20poly1305 records), with a per-(peer, transport) ephemeral X25519 → HKDF-SHA256 key agreement negotiated through a sealed `ctrlSecure` control frame. The relay routes ciphertext it cannot read, and the ephemerals are discarded at session end, so forward secrecy holds even against a later compromise of a peer's static key. This is default-on with no flag, and it covers a `udp` tunnel too — the tun case, where there is no inner dialer to secure it.
-  - **Fallback.** Encryption is negotiated, not forced: a peer that predates the feature never sends a `ctrlSecure` half, so the session falls back to **plaintext** — backward compatible, no flag. A mixed-version pair still passes traffic, in the clear.
-  - **Downgrade caveat.** Because the exchange is negotiated, an on-path relay that *drops* the handshake frames can force a session to plaintext, and that is indistinguishable from an older peer. It is **surfaced, not prevented**: a plaintext session shows up in `Status` (`EncryptedPeers`/`PlaintextPeers`, plus the per-peer `PeerEncryption` map) and the build is logged (`secure=false`); no reason is reported.
+- **The data plane is encrypted end to end, and encryption is forced.** Every per-peer `smux` session's underlay — relay and hole-punched alike — is wrapped in an AEAD cipher (chacha20poly1305 records), with a per-(peer, transport) ephemeral X25519 → HKDF-SHA256 key agreement negotiated through a sealed `ctrlSecure` control frame. The relay routes ciphertext it cannot read, and the ephemerals are discarded at session end, so forward secrecy holds even against a later compromise of a peer's static key. There is no flag and no fallback, and it covers a `udp` tunnel too — the tun case, where there is no inner dialer to secure it.
+  - **No plaintext, ever.** A session must settle encrypted. If it does not — the peer never sends its `ctrlSecure` half (a version that predates the feature) or a relay drops the frames — the session is **refused**: no plaintext session is built and the tunnel fails (`p2p.ErrEncryptionRequired`). **Mixed versions are incompatible**: both ends must run a version that supports the feature. There is no setting and no fallback.
+  - **No downgrade.** A relay that drops the handshake can no longer force plaintext — it can only prevent the connection (a denial of service, not a confidentiality break).
   - The control frames (`ctrlPunchCandidates`, `ctrlCaps`, `ctrlSecure`) stay sealed to the peer's static key as before; only the *data* frames changed.
 - **Peer discovery is an enhancement, not a requirement.** Peers are addressed by base64 curve25519 public key — a complete addressing scheme. Name→key lookup is intentionally not built in (see Roadmap).
 - **A relay is inherent to NAT traversal.** Cross-NAT reachability without a rendezvous is impossible; `derper` is a deployment/infrastructure choice, not a design flaw. Symmetric-NAT peers stay on relay permanently.
 
-**What an integrator must supply:** a relay (self-hosted `derper` or a third-party DERP) and the public keys of the peers to reach. The data plane is encrypted automatically between current peers; an inner `tls`/`mtls`/`wss` dialer is still available for a caller that wants its own layer above the tunnel, and remains the only confidentiality option against a peer old enough to fall back to plaintext.
+**What an integrator must supply:** a relay (self-hosted `derper` or a third-party DERP) and the public keys of the peers to reach. The data plane is encrypted automatically and unconditionally between peers on a version that supports the feature; an inner `tls`/`mtls`/`wss` dialer is still available for a caller that wants its own layer above the tunnel, but it is no longer needed for confidentiality.
 
 ## Quick start
 
@@ -424,7 +424,7 @@ grpcurl -plaintext 127.0.0.1:8003 proto.P2P/Status
   "directPeers": 12, "derpPeers": 3,
   "punchAttempts": 45, "punchSuccess": 15,
   "streamsDirect": 210, "streamsDerp": 30,
-  "encryptedPeers": 14, "plaintextPeers": 1
+  "encryptedPeers": 14, "plaintextPeers": 0
 }
 ```
 
@@ -433,15 +433,17 @@ now*; `punch*` and `streams*` are cumulative since start. A `punchAttempts`
 that climbs while `punchSuccess` stays flat means hole punching is being tried
 and failing (symmetric NAT / CGNAT) — the case IPv6 or port mapping would
 address. `encryptedPeers`/`plaintextPeers` are gauges for the data-plane
-cipher: a nonzero `plaintextPeers` means a connected peer's session fell back
-to plaintext (an older peer, or a relay dropping the handshake) — see
-[Security](#security). With `--token` set, add `-H 'token: <token>'`.
+cipher. Encryption is forced, so every connected peer is encrypted:
+`encryptedPeers` counts them and `plaintextPeers` is always 0. A peer whose
+handshake was refused has no data path and is not reported at all; the fields
+are kept for API stability. See [Security](#security). With `--token` set, add
+`-H 'token: <token>'`.
 
 ## Security
 
 The control channel is unauthenticated by default: any process that can reach `--addr` can make this host dial arbitrary addresses. Keep `--addr` on loopback (the default). For cross-machine deployment set `--token` (the GOST client sends it as gRPC metadata) **and** control TLS — the token alone travels over a plaintext gRPC channel today.
 
-The data plane is encrypted end to end by default when both peers support it: the relay and hole-punched transports carry AEAD ciphertext, the keys are agreed per (peer, transport) from ephemeral X25519 through HKDF-SHA256, and the relay sees only bytes it cannot read. Control frames stay sealed to the peer's static key as before; only the data frames changed. Two caveats: a peer that predates the feature falls back to plaintext (no flag, backward compatible), and a relay that drops the handshake frames can force that same fallback — indistinguishable from an old peer, so it is surfaced, not prevented. A plaintext session shows in `Status` (`EncryptedPeers`/`PlaintextPeers` and the per-peer `PeerEncryption` map) and the build is logged (`secure=false`); watch a nonzero `PlaintextPeers`. For a guarantee that does not depend on the peer, run an inner `mtls`/`tls`/`wss` dialer over the tunnel.
+The data plane is encrypted end to end, and encryption is forced: the relay and hole-punched transports carry AEAD ciphertext, the keys are agreed per (peer, transport) from ephemeral X25519 through HKDF-SHA256, and the relay sees only bytes it cannot read. Control frames stay sealed to the peer's static key as before; only the data frames changed. There is no fallback: a session that does not settle encrypted is refused (`p2p.ErrEncryptionRequired`), so a peer that predates the feature is incompatible — it cannot connect at all, and both ends must run a supporting version. A relay that drops the handshake frames can no longer force plaintext; it can only prevent the connection (a denial of service, not a confidentiality break). In `Status`, `EncryptedPeers` counts every connected (always-encrypted) peer and `PlaintextPeers` is always 0; a refused peer has no data path and is not reported.
 
 A DERP relay with `-verify-clients=false` is an open relay: it sees and can drop the bytes, but never decrypts them. The relay is transport, not trust.
 

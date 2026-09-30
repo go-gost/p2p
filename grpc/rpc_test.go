@@ -433,3 +433,14 @@ func TestPeerOpenFailureMapsToUnavailable(t *testing.T) {
 		t.Fatalf("Recv err = %v, want Unavailable", err)
 	}
 }
+
+// TestMapErrorEncryptionRequired: a refused (unencrypted) open is distinct from
+// an unreachable peer, so it maps to FailedPrecondition, not Unavailable.
+func TestMapErrorEncryptionRequired(t *testing.T) {
+	if got := status.Code(mapError(p2p.ErrEncryptionRequired)); got != codes.FailedPrecondition {
+		t.Fatalf("ErrEncryptionRequired -> %v, want %v", got, codes.FailedPrecondition)
+	}
+	if got := status.Code(mapError(p2p.ErrPeerUnreachable)); got != codes.Unavailable {
+		t.Fatalf("ErrPeerUnreachable -> %v, want %v", got, codes.Unavailable)
+	}
+}

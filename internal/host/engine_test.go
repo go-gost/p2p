@@ -900,6 +900,9 @@ func settledSecurePair(t *testing.T, transport byte) (*secureSession, *secureSes
 // TestEncryptionState pins the peer-level rule: "secure" only when every live
 // session the peer has holds keys. A plaintext live direct session must not be
 // masked by an encrypted relay session — the visibility hole the review flagged.
+// These inputs are synthetic: peerEncryptions skips a peer with no live session
+// entirely (see TestPeerEncryptionsSkipsSessionless), so a live Status never
+// asks the classifier about one; the unit test still covers its own contract.
 func TestEncryptionState(t *testing.T) {
 	peer := derpclient.PublicKey{7}
 	encRelay, _ := settledSecurePair(t, secureTransportRelay)
@@ -934,12 +937,12 @@ func TestEncryptionState(t *testing.T) {
 	}
 }
 
-// TestStatusReportsPlaintextPeer: a relay that drops the handshake leaves the
-// session plaintext, and the status must surface that rather than hide it. Every
-// ctrlSecure frame is dropped in both directions, so neither end settles; the
-// shortened handshake timeout keeps the test prompt. The session is still
-// usable (plaintext), so the round trip succeeds.
-func TestStatusReportsPlaintextPeer(t *testing.T) {
+// TestRelayRefusesUnencryptedPeer: a relay that drops every ctrlSecure frame
+// leaves the handshake unsettleable, and forced encryption must refuse the
+// session rather than fall back to plaintext. The open fails; no cleartext
+// session is built. Every ctrlSecure frame is dropped in both directions, so
+// neither end settles; the shortened handshake timeout keeps the test prompt.
+func TestRelayRefusesUnencryptedPeer(t *testing.T) {
 	defer func(d time.Duration) { handshakeTimeout = d }(handshakeTimeout)
 	handshakeTimeout = 300 * time.Millisecond
 	defer func(d time.Duration) { resendInterval = d }(resendInterval)
@@ -952,23 +955,86 @@ func TestStatusReportsPlaintextPeer(t *testing.T) {
 	}
 	rs.mu.Unlock()
 
+	start := time.Now()
 	conn, err := eA.OpenStream(eB.PublicKey())
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		conn.Close()
+		t.Fatal("open succeeded without a settled handshake, want refusal")
 	}
-	defer conn.Close()
-	roundTrip(t, conn, "plain")
+	if !errors.Is(err, errEncryptionRequired) {
+		t.Fatalf("open error = %v, want errEncryptionRequired", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("refusal took %v, want it bounded by handshakeTimeout", elapsed)
+	}
 
+	// No cleartext session was built, and the refused peer has no live data path,
+	// so it is not reported at all: PlaintextPeers stays 0 (forced encryption).
 	srv := newServer(eA)
 	defer srv.close()
 	st := srv.status()
-	if st.PlaintextPeers < 1 {
-		t.Fatalf("PlaintextPeers = %d, want >= 1", st.PlaintextPeers)
+	if st.EncryptedPeers != 0 || st.PlaintextPeers != 0 {
+		t.Errorf("EncryptedPeers=%d PlaintextPeers=%d, want 0/0 (a refused peer has no session)", st.EncryptedPeers, st.PlaintextPeers)
 	}
-	if st.EncryptedPeers != 0 {
-		t.Errorf("EncryptedPeers = %d, want 0", st.EncryptedPeers)
+	if got, ok := st.PeerEncryption[keyName(eB.pub)]; ok {
+		t.Errorf("PeerEncryption[peer] = %q, want absent (no live session)", got)
 	}
-	if got := st.PeerEncryption[keyName(eB.pub)]; got != encStatePlaintext {
-		t.Fatalf("PeerEncryption[peer] = %q, want %q", got, encStatePlaintext)
+}
+
+// TestPeerEncryptionsSkipsSessionless: a peer with no live data path (e.g. its
+// session was refused) is not reported — otherwise PlaintextPeers would count a
+// refused peer as a plaintext session. A live encrypted session reports secure.
+func TestPeerEncryptionsSkipsSessionless(t *testing.T) {
+	peer := derpclient.PublicKey{7}
+	encRelay, _ := settledSecurePair(t, secureTransportRelay)
+	plain := newSecureSession(nil, secureTransportRelay, derpclient.PrivateKey{}, peer)
+
+	e := &engine{
+		peers: map[derpclient.PublicKey]*peerConn{peer: {peer: peer, secure: plain}},
+		log:   slog.Default(),
+	}
+	if got, ok := e.peerEncryptions()[keyName(peer)]; ok {
+		t.Fatalf("session-less peer reported as %q, want absent", got)
+	}
+
+	// A live session is reported, and it is always secure under forced
+	// encryption.
+	e.peers[peer] = &peerConn{peer: peer, secure: encRelay, sess: newTestSess(t)}
+	if got := e.peerEncryptions()[keyName(peer)]; got != encStateSecure {
+		t.Fatalf("live encrypted peer = %q, want %q", got, encStateSecure)
+	}
+}
+
+// TestEnsureSessionInboundDoesNotBlock: the pump path (wait=false) must never
+// wait on the relay round trip, or one non-negotiating peer stalls inbound
+// routing for every peer. With a large handshakeTimeout a non-blocking call on
+// an unsettled adapter returns at once with a refusal, not after the timeout.
+func TestEnsureSessionInboundDoesNotBlock(t *testing.T) {
+	defer func(d time.Duration) { handshakeTimeout = d }(handshakeTimeout)
+	handshakeTimeout = 30 * time.Second // a blocking call would take this long
+
+	e := &engine{
+		peers:  make(map[derpclient.PublicKey]*peerConn),
+		secure: make(map[secureKey]*secureSession),
+		gone:   make(map[derpclient.PublicKey]bool),
+		log:    slog.Default(),
+	}
+	peer := derpclient.PublicKey{9}
+	priv, _, _ := derpclient.Generate()
+	pc := &peerConn{
+		e:       e,
+		peer:    peer,
+		inbound: make(chan []byte, inboundQueueSize),
+		closeCh: make(chan struct{}),
+		secure:  newSecureSession(nil, secureTransportRelay, priv, peer),
+	}
+
+	start := time.Now()
+	_, err := pc.ensureSession(true, false)
+	if !errors.Is(err, errEncryptionRequired) {
+		t.Fatalf("inbound call error = %v, want errEncryptionRequired", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("inbound call took %v with handshakeTimeout=%v: it blocked on the round trip", elapsed, handshakeTimeout)
 	}
 }

@@ -1,6 +1,7 @@
 package host
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/go-gost/p2p"
@@ -58,6 +59,11 @@ func (s *server) serveTunnel(t *tunnelRecord, stream Stream, abort func()) error
 	up, err := t.openPeer()
 	if err != nil {
 		t.log.Debug("tunnel open peer failed", "tunnel", shortID(t.id), "target", t.target, "error", err)
+		if errors.Is(err, errEncryptionRequired) {
+			// The peer is reachable but refused to negotiate the cipher: distinct
+			// from an unreachable peer, so a transport can classify it.
+			return fmt.Errorf("%w: %w", p2p.ErrEncryptionRequired, err)
+		}
 		return fmt.Errorf("%w: %w", p2p.ErrPeerUnreachable, err)
 	}
 	t.pipe(conn, up, "stream:"+shortID(t.id), t.target)

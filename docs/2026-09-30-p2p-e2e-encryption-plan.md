@@ -54,6 +54,24 @@ session for the direct transport.
 
 ---
 
+## Revision (v3): forced encryption, no fallback
+
+The negotiated design this plan implements — a session built **plaintext** when the
+peer's `ctrlSecure` half does not arrive — was **replaced by mandatory encryption**.
+A session that does not settle now ends in **refusal** (`errEncryptionRequired`,
+surfaced as `p2p.ErrEncryptionRequired` / `codes.FailedPrecondition`), never
+plaintext, and a peer that predates the feature is incompatible: no fallback, no
+flag. Superseded by this revision: every step that builds a plaintext session on a
+handshake timeout; Task 6's "mixed old/new pair falls back to plaintext and still
+passes traffic" (a mixed pair is now refused); and the `requireEncryption` item in
+"Open follow-ups" (forced encryption is now the behavior). The status fields are
+kept, but `PlaintextPeers` is a constant 0 and `PeerEncryption` is `secure` for any
+live peer. The cipher, the per-(peer, transport) lifetime, the `ctrlSecure` frame
+and the `want`-bit heal are unchanged — the terminal state is refusal, not
+plaintext.
+
+---
+
 ## File structure
 
 | File | Responsibility |

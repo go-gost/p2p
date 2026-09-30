@@ -193,13 +193,14 @@ func (e *engine) peerPunches() map[string]p2p.PeerPunch {
 
 // peerEncryptions names each connected peer's session state — "secure" or
 // "plaintext" (the value set documented on p2p.Status.PeerEncryption), over the
-// same peer set peerTransports reports. A peer is "secure" only when every live
-// session it has holds keys: the relay session (when it has an adapter) and the
-// direct session (when one is live). One plaintext live session makes the whole
-// peer "plaintext", so a peer whose active path is a plaintext direct session is
-// not masked by an encrypted relay session. The *secureSession pointers are
-// stable and keys() takes its own lock, so neither the engine lock nor dc.mu is
-// held across it.
+// same peer set peerTransports reports. A peer is reported only while it has a
+// live data path (a built relay session or a live direct session): a peer whose
+// session was refused has no path and is not a plaintext session, so it is
+// skipped — which is what keeps PlaintextPeers at 0 under forced encryption.
+// When reported, a peer is "secure" only when every live session it has holds
+// keys, so a plaintext direct path is not masked by an encrypted relay session.
+// The *secureSession pointers are stable and keys() takes its own lock, so
+// neither the engine lock nor pc.mu/dc.mu is held across the classification.
 func (e *engine) peerEncryptions() map[string]string {
 	e.mu.Lock()
 	peers := make(map[derpclient.PublicKey]*peerConn, len(e.peers))
@@ -214,11 +215,18 @@ func (e *engine) peerEncryptions() map[string]string {
 
 	out := make(map[string]string, len(peers)+len(directs))
 	for k, pc := range peers {
-		out[keyName(k)] = encryptionState(pc, directs[k])
+		dc := directs[k]
+		if !pc.liveSession() && !(dc != nil && dc.live()) {
+			continue // no live data path — not a connected session
+		}
+		out[keyName(k)] = encryptionState(pc, dc)
 	}
 	for k, dc := range directs {
 		if _, ok := out[keyName(k)]; ok {
 			continue // already classified through its relay adapter
+		}
+		if !dc.live() {
+			continue // no live data path
 		}
 		out[keyName(k)] = encryptionState(nil, dc)
 	}
@@ -538,7 +546,7 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 	}
 
 	pc := e.peerConn(peer)
-	sess, err := pc.ensureSession(true)
+	sess, err := pc.ensureSession(true, true)
 	if err != nil {
 		return nil, err
 	}
@@ -773,7 +781,7 @@ func (e *engine) pump(c *derpclient.Client) {
 		// Ensure a session exists on this side too: inbound packets must be
 		// consumed by smux (which then accepts streams) even when this host
 		// never opens a tunnel to the peer itself.
-		if _, err := pc.ensureSession(true); err != nil {
+		if _, err := pc.ensureSession(true, false); err != nil {
 			// The session could not be built, so records already queued for this
 			// peer are abandoned and their nonces never consumed: drop the pair's
 			// relay security session so the rebuild re-handshakes (see dropRelaySecure).
@@ -1172,13 +1180,27 @@ func (e *engine) Close() {
 // reverse tunnel) should not spend a round on a peer that has not engaged yet —
 // that round fails by construction and its failure is indistinguishable, in the
 // status, from a punch that cannot work.
-func (pc *peerConn) ensureSession(punch bool) (*smux.Session, error) {
+// liveSession reports whether the adapter has a built, open relay smux session
+// — a live data path. It is the side-effect-free probe Status uses: unlike
+// sessionLocked it never builds or tears down.
+func (pc *peerConn) liveSession() bool {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	return pc.liveSessionLocked()
+}
+
+// liveSessionLocked is liveSession with pc.mu already held.
+func (pc *peerConn) liveSessionLocked() bool {
+	return pc.sess != nil && !pc.sess.IsClosed()
+}
+
+func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) {
 	pc.mu.Lock()
 	if pc.closed {
 		pc.mu.Unlock()
 		return nil, errPeerSessionClosed
 	}
-	live := pc.sess != nil && !pc.sess.IsClosed()
+	live := pc.liveSessionLocked()
 	pc.mu.Unlock()
 
 	// No live session: settle the handshake before building, so both ends agree
@@ -1187,6 +1209,15 @@ func (pc *peerConn) ensureSession(punch bool) (*smux.Session, error) {
 	// reuses them (and a peer restart arrives as a changed half, not here). The
 	// send and the wait run OUTSIDE pc.mu: sendControl takes e.mu, which pc.mu
 	// is taken under elsewhere, so holding pc.mu here would invert the two.
+	if !live && !pc.secure.settled() && !wait {
+		// Inbound (pump) path: never block on a relay round trip. handleControl
+		// already sent our half when the peer's ctrlSecure arrived, so there is
+		// nothing to send here; if the session is not settled yet, drop this
+		// packet fast and let the next one (or an outbound open) retry. Waiting
+		// here would stall the single pump goroutine — and every peer's inbound
+		// routing — for up to handshakeTimeout, per packet.
+		return nil, errEncryptionRequired
+	}
 	if !live && !pc.secure.settled() {
 		// Retry the half on an interval: a reply lost in flight leaves us
 		// unsettled while the peer is settled, so re-sending (with want set) is
@@ -1213,6 +1244,15 @@ func (pc *peerConn) ensureSession(punch bool) (*smux.Session, error) {
 				break
 			}
 		}
+	}
+
+	if !pc.secure.settled() {
+		// Forced encryption: a session that did not settle is refused, never
+		// built as plaintext. Return before sessionLocked (and before the churn
+		// accounting) so the open fails loudly instead of sending cleartext.
+		pc.e.log.Warn("relay session refused: encryption required but the peer did not negotiate it",
+			"peer", keyName(pc.peer))
+		return nil, errEncryptionRequired
 	}
 
 	pc.mu.Lock()

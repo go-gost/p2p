@@ -58,18 +58,21 @@ type Status struct {
 	// In-process only, like PeerTransports.
 	PeerPunches map[string]PeerPunch
 
-	// EncryptedPeers counts connected peers all of whose live sessions settled
-	// encrypted; PlaintextPeers counts the rest (the peer predates encryption,
-	// the handshake timed out, or a live direct session is plaintext). A relay
-	// that drops the handshake can force a session to plaintext, so a nonzero
-	// PlaintextPeers is the signal to watch.
+	// EncryptedPeers counts connected peers whose live sessions settled
+	// encrypted. Encryption is forced: a session that does not settle is refused,
+	// never built as plaintext, so a live session is always encrypted and a live
+	// peer is always counted here. Both fields are retained for API/wire
+	// compatibility; the plaintext data path they once distinguished no longer
+	// occurs.
 	EncryptedPeers int
 	PlaintextPeers int
 	// PeerEncryption names each connected peer's session state, keyed by base64
-	// public key: "secure" only when every live session the peer has (the relay
+	// public key: "secure" when every live session the peer has (the relay
 	// session, and the direct session while one is live) settled encrypted, else
-	// "plaintext". The rule errs toward the alarm: a plaintext direct path is not
-	// masked by an encrypted relay session, and an unsettled session reads as
-	// plaintext. In-process only, like PeerTransports.
+	// "plaintext". In-process only, like PeerTransports. With forced encryption a
+	// peer's live sessions are always encrypted, so any live session reports
+	// "secure"; the "plaintext" value is retained for compatibility and is not
+	// produced for a live session (it can only describe a peer whose handshake
+	// was refused, and which therefore has no data path).
 	PeerEncryption map[string]string
 }

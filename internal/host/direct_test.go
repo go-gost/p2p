@@ -3,6 +3,7 @@ package host
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1184,7 +1185,9 @@ func TestInboundRecoversAfterAdapterClosed(t *testing.T) {
 
 // TestPeerGoneFastFail proves that once a peer's DERP connection drops, a
 // request to the (still down) peer fails fast once the relay reports it gone,
-// instead of hanging until the smux keepalive timeout (~30s).
+// instead of hanging until the smux keepalive timeout (~30s). With forced
+// encryption the open itself is refused — the down peer cannot re-negotiate,
+// and there is no plaintext fallback to serve it.
 func TestPeerGoneFastFail(t *testing.T) {
 	rs := &relayServer{}
 	url := rs.start(t)
@@ -1218,36 +1221,17 @@ func TestPeerGoneFastFail(t *testing.T) {
 	})
 	waitFor(t, 5*time.Second, func() bool { return engineA.isGone(pubB) })
 
-	// smux open is async (SYN is fire-and-forget), so the failure surfaces on
-	// the stream. derper notifies PeerGone only once, so the gone probe must
-	// tear the session down after goneProbeTimeout instead of letting the
-	// request hang until the smux keepalive (~30s).
+	// The peer is down, so its security session cannot be re-negotiated and the
+	// open must be refused quickly (bounded by goneHandshakeTimeout once the
+	// relay reports it gone) instead of hanging until the smux keepalive (~30s).
 	start := time.Now()
-	s2, err := engineA.OpenStream(keyName(pubB))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
-	type readRes struct{ err error }
-	done := make(chan readRes, 1)
-	go func() {
-		if _, werr := s2.Write([]byte("ping")); werr != nil {
-			done <- readRes{werr}
-			return
-		}
-		_, rerr := io.ReadFull(s2, make([]byte, 4))
-		done <- readRes{rerr}
-	}()
-	select {
-	case r := <-done:
-		if r.err == nil {
-			t.Fatal("request to down peer unexpectedly succeeded")
-		}
-	case <-time.After(7 * time.Second):
-		t.Fatal("request to down peer did not fail fast")
+	if _, err := engineA.OpenStream(keyName(pubB)); err == nil {
+		t.Fatal("open to a down peer succeeded, want a fast refusal")
+	} else if !errors.Is(err, errEncryptionRequired) {
+		t.Fatalf("open to a down peer: %v, want errEncryptionRequired", err)
 	}
 	if elapsed := time.Since(start); elapsed > 7*time.Second {
-		t.Fatalf("request to down peer took %v, want fast fail (~%v)", elapsed, goneProbeTimeout)
+		t.Fatalf("open to a down peer took %v, want a fast refusal (~%v)", elapsed, goneHandshakeTimeout)
 	}
 }
 
