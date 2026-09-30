@@ -7,6 +7,25 @@ import (
 	"github.com/go-gost/p2p"
 )
 
+// shippedDirectSmuxTimeout is read before TestMain shortens the timing globals
+// (package-level initialisers run first), so the floor below is checked against
+// what production ships rather than against test speed.
+var shippedDirectSmuxTimeout = directSmuxKeepAliveTimeout
+
+// TestDirectKeepAliveCoversTheMeasuredSilence pins the direct session's timeout
+// as a silence budget. A phone on Wi-Fi lost its direct session at exactly
+// 18.000s (~3 ticks of the 6s timeout it then was), and the cause was ~12s of
+// one-way silence from RF batching — so a timeout at or below that window
+// re-introduces the churn. The mechanism itself is what
+// TestDirectSilentPeerIsNoticed measures; this is the value it is given.
+func TestDirectKeepAliveCoversTheMeasuredSilence(t *testing.T) {
+	const measuredSilence = 12 * time.Second
+	if shippedDirectSmuxTimeout <= measuredSilence {
+		t.Fatalf("direct keepalive timeout %s must exceed the measured %s of one-way silence (see engine.go)",
+			shippedDirectSmuxTimeout, measuredSilence)
+	}
+}
+
 // TestApplyTimeouts covers validation and application of the timeouts section:
 // zero values keep defaults, invalid values are rejected, and a valid set is
 // applied to the package-level timing vars.

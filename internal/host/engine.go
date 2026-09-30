@@ -451,17 +451,19 @@ var (
 	smuxKeepAliveTimeout  = 15 * time.Second
 
 	// The direct session's own keepalive, deliberately tighter than the relay's.
-	// It is negotiated (capsTightKeepalive) and only used when the peer
-	// advertises the same pair: smux answers a NOP with nothing, so a session's
-	// liveness is fed by the frames the *peer* sends — a peer pinging every 10s
-	// cannot keep a 6s timeout alive, and would have its direct sessions torn
-	// down and re-punched every 6s. A peer that does not advertise it gets
-	// smuxKeepAliveInterval/Timeout above instead.
+	// Smux answers a NOP with nothing, so a session's liveness is fed by the
+	// frames the *peer* sends — which is why the pair is negotiated
+	// (capsTightKeepalive) rather than applied outright: a peer that does not
+	// advertise it gets smuxKeepAliveInterval/Timeout above instead.
 	//
-	// With both ends on it: smux clears its activity flag on one timeout tick
-	// and closes on the next, so a path that goes silent is noticed after ~2x
-	// the timeout (measured: 3.97s at a 2s timeout; this pair gives ~12s against
-	// the relay pair's whole timeout). Until then the session is served as live:
+	// The timeout is a silence budget, not a failover target, and a measured
+	// field case set it: a phone on Wi-Fi lost its direct session at exactly
+	// 18.000s (~3 ticks of the 6s timeout it then was), and the cause was ~12s
+	// of one-way silence from RF batching — a 6s timeout cannot survive that,
+	// while the relay's 15s one did (relaySilent, 60s, never fired). Smux clears
+	// its activity flag on one tick and closes on the next, so 15s puts the
+	// silent-path window at roughly 30-45s: long enough for the batching, still
+	// far shorter than the relay's. Until then the session is served as live:
 	// status calls the peer "direct" and a new stream is handed to a dead path
 	// instead of the relay. The relay's PeerGone is not a substitute — it is
 	// best-effort and says nothing about a path that does not run through the
@@ -471,9 +473,9 @@ var (
 	// retransmitted rather than dropped: silence for seconds means the path
 	// carries nothing at all, not that it is lossy. A false positive costs a
 	// fallback to the relay and a re-punch, so deployments with slow or lossy
-	// direct paths widen it through timeouts.directSmux.
+	// direct paths widen it further through timeouts.directSmux.
 	directSmuxKeepAliveInterval = 2 * time.Second
-	directSmuxKeepAliveTimeout  = 6 * time.Second
+	directSmuxKeepAliveTimeout  = 15 * time.Second
 )
 
 func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger) *engine {
