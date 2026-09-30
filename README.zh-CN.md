@@ -376,9 +376,81 @@ grpcurl -plaintext 127.0.0.1:8003 proto.P2P/Status
 失败，如 `seed failed: timeout`）、`peer_addr`（直连路径实际拨的端点）、
 `candidates`（对端广播的候选数）、`caps`（`ipv6`/`tightKeepalive`）、
 `session_age_ms`/`last_recv_age_ms`（活跃直连会话的时长，无会话为 0；距对端最后一个
-帧的时长，relay 或直连皆可），以及继承自旧计数器的 `attempts`/`ups`/`drops`。它是
+帧的时长，relay 或直连皆可）、`trace`（该 peer 最近的打洞步骤，最早的在前——固定
+环形缓冲，最多 16 行短文本，这是单次快照装不下的历史，也正是*抖动*的打洞所需要的；
+仅有 relay 的 peer 没有该字段），以及继承自旧计数器的 `attempts`/`ups`/`drops`。它是
 一次时点读取，不会探测会话，因此状态查询不会搅动连接。进程内同一份快照即
 `p2p.Status.PeerDiagnostics`。
+
+## 诊断（Diagnostics）
+
+`Status` 是给机器看的视图。给人看的是 `p2p doctor`——它渲染一份可直接粘贴的报告：
+同一份每 peer 快照，加上运行中的宿主不会通过链路汇报的本地上下文，再加一段
+`verdicts:`，把结论直接说出来而不留给读者判断。对应的场景是「peer 挂在 relay 上，
+我不知道为什么」和「网络切换之后就不好使了」。
+
+```bash
+# 只读：连上一个正在运行的宿主控制面，打印后退出
+./p2p doctor --addr 127.0.0.1:8003 --key peer.key
+```
+
+```text
+p2p doctor v0.9.1
+host:            127.0.0.1:8003
+local key:       7D3hUOuIcplL3CCSjsiyIqolF6AkdiXqcdAUZgQzkEs
+relay:           wss://derp.example.com/derp
+relay state:     connected
+
+summary:
+  tunnels:       0
+  direct peers:  1
+  relay peers:   0
+  punches:       1 attempts, 1 success
+  streams:       1 direct, 0 relay
+  encryption:    1 encrypted, 0 plaintext (encryption is forced)
+
+peers:
+  6Fg4Wtn6SpaOQms96jFxL2r4CVJGIkhrEmWxpCsU-xg
+    path:        direct
+    state:       up
+    last error:  (none)
+    peer addr:   10.99.0.3:39028
+    candidates:  1
+    caps:        ipv6, tightKeepalive
+    session age: 122ms
+    last recv:   21ms
+    trace:
+      round start
+      peer candidates: 1
+      v4 dial 10.99.0.3:39028
+      v4 up
+
+verdicts:
+  relay: connected
+  encryption: every connected peer
+  STUN 10.99.0.254:3478: configured
+  peer 6Fg4Wtn6SpaOQms96jFxL2r4CVJGIkhrEmWxpCsU-xg: direct path up (session 122ms, last frame 21ms)
+```
+
+挂在 relay 上的 peer 则会在 `verdicts:` 里直接给出原因：
+
+```text
+  peer b9K9SwU0SEPqAY6ym3YLk9HT857KL-9i2F0F4batgzQ: on the relay; punch failed (seed failed: timeout) — candidates 2
+```
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `--addr` | *（必填）* | 运行中宿主的控制面地址 |
+| `--token` | *（空）* | 控制面 token，宿主校验时使用 |
+| `--peer` | *（空）* | 只报告某一个 peer（base64 公钥） |
+| `--key` | *（空：默认密钥路径）* | 身份密钥文件，用于给出本机公钥。只读——与宿主路径不同，它绝不会顺手创建一个 |
+| `--derp` / `--stun` | *（空）* | 报告中要打印的 relay/STUN 名字：宿主不会通过 `Status` 汇报自己的配置 |
+| `-C` | *（空）* | 用配置文件提供上述取值 |
+
+`doctor` 是独立模式，不是参数：它不启动 endpoint、不监听 `--addr`、也不加入 relay。
+它与 wisper 进程内展示的是同一份报告（设置 → 诊断），那里的 relay 存活状态是直接
+读到的而非推断的；报告本体在 [`p2p/doctor`](doctor/doctor.go)，除契约包与标准库外
+不依赖任何东西。
 
 ## 安全
 
