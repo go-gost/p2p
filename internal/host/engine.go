@@ -53,6 +53,13 @@ type engine struct {
 	// while the pump goroutines run.
 	inbound atomic.Pointer[inboundQueue]
 
+	// faults is the debug-only injection state, set once from the config by
+	// host.New. An atomic pointer for the same reason as inbound: it is read on
+	// the pump, punch and smux write paths, so it can be handed in without a
+	// race against a goroutine already running (tests swap it to open a silence
+	// window on demand; nothing in production ever changes it).
+	faults atomic.Pointer[faults]
+
 	// stunFailed records whether the last IPv4 candidate collection failed
 	// (an unreachable STUN server, or no socket to ask from). It is only
 	// meaningful when STUN is configured; Status turns it into the
@@ -821,6 +828,9 @@ func (e *engine) ensureClientLocked() {
 	}
 	e.dialErr = nil
 	e.client = c
+	// Debug fault injection, read once here because the fault config is
+	// startup-only: the flag must be in place before the read loop starts.
+	c.SetDropPong(e.faults.Load().pong())
 	e.log.Debug("derp connected", "url", e.url, "server", keyName(c.ServerPublicKey()))
 	go e.pump(c)
 	go e.keepalive(c)
@@ -861,6 +871,13 @@ func (e *engine) pump(c *derpclient.Client) {
 		}
 		pkt = pkt[1:]
 
+		// Fault injection (see faults): an inbound data frame is dropped before
+		// delivery, as indistinguishable from a path loss as the outbound one —
+		// which is what starves a session whose peer looks healthy.
+		if e.faults.Load().muteData(time.Now()) {
+			continue
+		}
+
 		// peerConn creates the adapter for a peer we have not seen and drops a
 		// closed one instead of handing it back. Reaching into the map directly
 		// left a killed adapter (its session ended, e.g. on a queue overflow) in
@@ -900,6 +917,11 @@ func (e *engine) pump(c *derpclient.Client) {
 // src. The source key is relay-authenticated; candidate payloads are
 // additionally sealed to the peer so a malicious relay cannot inject them.
 func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
+	// Fault injection (see faults): the inbound half of the same mute. Nothing
+	// is negotiated while a control fault is on, which is the point.
+	if e.faults.Load().muteCtrl(time.Now()) {
+		return
+	}
 	if len(body) < 1 {
 		return
 	}
@@ -1514,6 +1536,11 @@ func (pc *peerConn) Read(p []byte) (int, error) {
 
 // Write implements net.Conn: each write is one DERP SendPacket.
 func (pc *peerConn) Write(p []byte) (int, error) {
+	// Fault injection (see faults): the frame never reaches the relay, and the
+	// write reports success — smux cannot tell this from a path that ate it.
+	if pc.e.faults.Load().muteData(time.Now()) {
+		return len(p), nil
+	}
 	pc.mu.Lock()
 	closed := pc.closed
 	pc.mu.Unlock()

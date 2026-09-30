@@ -123,6 +123,35 @@ mapped, err := endpoint.StunLookup(ctx, "derp.example:3478")
 The probe dials its own socket: the address it reports is that socket's mapping,
 not the one a later punch will use.
 
+## Faults (debug only)
+
+`Config.Faults` makes the engine drop its own frames, so a failure that only
+reproduces in the field — a one-way silence, a path that stays up and carries
+nothing — can be reproduced on demand:
+
+```go
+ep, _ := endpoint.New(&p2p.Config{
+	Derp:   derpURL,
+	Faults: &p2p.FaultsConfig{DropData: true},
+})
+```
+
+`DropCtrl` drops every relay control frame — the candidate exchange, the
+capability bits, the `ctrlSecure` half — which stops negotiation entirely:
+encryption is forced and rides that same channel, so no session is built at all.
+`DropData` drops every data frame in both directions, on the relay and on the
+hole-punched path, keepalive NOPs included, so a session starves until its own
+keepalive gives up on it. `DropPong` swallows the relay's pong replies, so the
+ping watchdog declares a live relay dead. `SilenceFor`/`SilenceEvery` is the one
+timed knob: everything sent to the peer stops for `SilenceFor`, every
+`SilenceEvery`, from process start — the measured field failure, survived or not
+depending on the session's keepalive timeout.
+
+**An injected failure is indistinguishable from a real one at every layer above
+it** — that is the point, and the reason never to enable it in a deployment that
+matters. It is built once, when the endpoint is created, from the config: there
+is no setter, and nothing on the wire can turn it on.
+
 ## Trust boundary
 
 - The control plane is **unauthenticated by default** and anyone who can reach

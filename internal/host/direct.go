@@ -957,12 +957,18 @@ func (dc *directConn) punch() {
 		// The encryption gate above already refused an unsettled session before
 		// dialing, so conn() is expected to succeed here; the error stays as a
 		// safety.
-		underlay, err := dc.secure.conn(kcpConn)
+		raw, err := dc.secure.conn(kcpConn)
 		if err != nil {
 			kcpConn.Close()
 			e.log.Debug("direct punch: secure wrap failed", "peer", pname, "error", err)
 			continue
 		}
+		// Fault injection (see faults): the wrapper sits below smux, so a data
+		// fault covers every frame the session would send — stream payload and
+		// the keepalive NOP alike — which is how a live path starves a session.
+		// The seed handshake above stays outside it: it proves the path, and the
+		// path is not what a fault is reproducing.
+		underlay := &faultConn{Conn: raw, e: dc.e}
 
 		// 6. smux over the ciphered KCP underlay; role by key order (external to
 		// who dialed).
@@ -1006,6 +1012,23 @@ func (dc *directConn) punch() {
 	// Every available family failed this round.
 	closeFams()
 	dc.backoff()
+}
+
+// faultConn wraps a direct session's underlay and drops its writes while a data
+// fault is on (see faults). It sits below smux so the drop covers every frame
+// the session sends, and it reports the write as done: a real black hole is
+// silent too, and a session that starves without an error is the failure this
+// must reproduce.
+type faultConn struct {
+	net.Conn
+	e *engine
+}
+
+func (c *faultConn) Write(p []byte) (int, error) {
+	if c.e.faults.Load().muteData(time.Now()) {
+		return len(p), nil
+	}
+	return c.Conn.Write(p)
 }
 
 // seedHandshake runs the symmetric echo handshake over a fresh KCP session.
@@ -1254,6 +1277,11 @@ func (e *engine) sendCaps(peer derpclient.PublicKey, caps uint8) error {
 
 // sendControl sends a control frame ([frameControl][kind][payload]) to peer.
 func (e *engine) sendControl(peer derpclient.PublicKey, kind byte, payload []byte) error {
+	// Fault injection (see faults): a dropped control frame is silent — the
+	// caller is told it went out, exactly as it would be on a path that lost it.
+	if e.faults.Load().muteCtrl(time.Now()) {
+		return nil
+	}
 	e.mu.Lock()
 	c := e.client
 	e.mu.Unlock()

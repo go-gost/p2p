@@ -79,6 +79,11 @@ func New(cfg *p2p.Config, opts ...Option) (*Host, error) {
 		h.engine.direct = *cfg.Direct
 		h.engine.stunAddr = cfg.Stun
 		h.engine.tlsCfg = buildTLSConfig(*cfg.TLS.Secure, cfg.TLS.CAFile, h.log)
+		// Debug-only fault injection (p2p.FaultsConfig). Stub mode has no relay
+		// or direct plane to break, so the state lives on the engine alone.
+		f := newFaults(cfg.Faults)
+		h.engine.faults.Store(f)
+		f.warn(h.log)
 	}
 
 	h.server = newServer(h.engine)

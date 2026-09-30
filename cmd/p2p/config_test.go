@@ -52,6 +52,10 @@ timeouts:
   smux:
     interval: 5s
     timeout: 10s
+faults:
+  dropCtrl: true
+  silenceFor: 12s
+  silenceEvery: 1m
 `)
 	c, err := loadConfig(path)
 	if err != nil {
@@ -81,6 +85,9 @@ timeouts:
 	}
 	if c.Timeouts.Smux == nil || c.Timeouts.Smux.Interval != 5*time.Second || c.Timeouts.Smux.Timeout != 10*time.Second {
 		t.Fatalf("timeouts.smux = %+v", c.Timeouts.Smux)
+	}
+	if c.Faults == nil || !c.Faults.DropCtrl || c.Faults.SilenceFor != 12*time.Second || c.Faults.SilenceEvery != time.Minute {
+		t.Fatalf("faults = %+v", c.Faults)
 	}
 
 	// omitted secure -> nil pointer (so the endpoint keeps the default true)

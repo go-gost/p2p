@@ -17,6 +17,43 @@ type Config struct {
 	TLS      *TLSConfig      `yaml:"tls,omitempty"`
 	Timeouts *TimeoutsConfig `yaml:"timeouts,omitempty"`
 	Forwards []ForwardConfig `yaml:"forwards,omitempty"`
+	// Faults injects deliberate transport failures (debug only — see
+	// FaultsConfig). Nil or zero means nothing is injected.
+	Faults *FaultsConfig `yaml:"faults,omitempty"`
+}
+
+// FaultsConfig deliberately breaks the transport to reproduce a field failure
+// locally: each knob makes the engine drop frames it would otherwise send or
+// deliver. Every knob is off in the zero value, and a process that enables one
+// says so loudly at startup.
+//
+// This is a debugging tool, not a feature. An injected drop is indistinguishable
+// from a real one at every layer above, which is the point — and why it must
+// never be enabled in a deployment that matters. It is config-file only: there
+// is no RPC, no env var and no flag, so a running host cannot be told to break
+// itself over the network.
+type FaultsConfig struct {
+	// DropCtrl drops every control-plane frame on the relay path: the candidate
+	// exchange, ctrlCaps, and the ctrlSecure half. Encryption is forced and
+	// negotiates on that same channel, so with this on nothing settles — the
+	// punch and the session itself alike, which is what a peer that cannot
+	// negotiate looks like from here.
+	DropCtrl bool `yaml:"dropCtrl" json:"dropCtrl"`
+	// DropData drops every data frame — tunnel payload and the smux keepalive
+	// NOP alike — on both the relay and the direct path, in both directions.
+	DropData bool `yaml:"dropData" json:"dropData"`
+	// DropPong swallows the relay's pong replies: our own answer to the relay's
+	// ping and the stamp that feeds the relay-silence watchdog, so a live relay
+	// reads as a dead one.
+	DropPong bool `yaml:"dropPong" json:"dropPong"`
+	// Silence stops sending *anything* to the peer for SilenceFor, every
+	// SilenceEvery, while SilenceEvery > 0. This is the measured field failure:
+	// the session's peer-side frames stop arriving without the path dying, and
+	// the direct session lives or dies by its keepalive timeout (a timeout
+	// shorter than SilenceFor tears it down; the shipped 15s survives). The
+	// window opens when the process does.
+	SilenceFor   time.Duration `yaml:"silenceFor" json:"silenceFor"`
+	SilenceEvery time.Duration `yaml:"silenceEvery" json:"silenceEvery"`
 }
 
 // TimeoutsConfig tunes deployment-dependent timings. Zero values keep the

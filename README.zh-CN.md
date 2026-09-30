@@ -452,6 +452,33 @@ verdicts:
 读到的而非推断的；报告本体在 [`p2p/doctor`](doctor/doctor.go)，除契约包与标准库外
 不依赖任何东西。
 
+## 故障注入（仅供调试）
+
+一个配置段，让引擎自己丢帧，把只能在现场复现的故障搬到本地按需复现。全部默认关闭、进程级生效、
+只认配置文件。
+
+| 旋钮 | 丢什么 |
+|---|---|
+| `dropCtrl` | 所有控制面帧：候选交换、`ctrlCaps`、`ctrlSecure` 半包。加密是强制的，且在同一通道上协商，因此什么都谈不成——打洞和会话本身都一样。 |
+| `dropData` | 所有数据帧，双向：隧道载荷与 smux keepalive NOP，relay 与打洞路径都算。会话断粮，由自己的 keepalive 判定死亡。 |
+| `dropPong` | relay 的 pong 应答：对 ping 的回答、以及收到 pong 的记录，于是一个活着的 relay 在 relay 静默看门狗眼里成了死的。 |
+| `silenceFor` / `silenceEvery` | 从进程启动起，每 `silenceEvery` 对 peer 完全静默 `silenceFor`。这就是现场量到的那次故障——路径完好、单向静默——直连会话活不活全看它的 keepalive 超时。 |
+
+```yaml
+derp: wss://derp.example.com/derp
+key: peer.key
+target: 127.0.0.1:18080
+faults:
+  silenceFor: 12s        # 手机在 Wi-Fi 上出现的那 ~12s 射频批量静默
+  silenceEvery: 1m
+```
+
+任一旋钮开启时，宿主启动会打一条 warn，列出开了哪些——被注入故障的宿主绝不能被误读成坏掉的宿主。
+
+**注入出的故障与其实现故障在上层完全无法区分。这正是它的目的，也是绝不要在会让人误判的地方开启
+它的原因。** 没有 RPC、没有环境变量、也没有 flag：运行中的宿主无法被网络上的人要求自残；配置段
+留空的二进制与之前的行为完全一致。
+
 ## 安全
 
 控制面默认**未认证**：任何能访问 `--addr` 的进程都能让本宿主拨任意地址。让 `--addr` 保持回环（默认值）。跨机部署需设 `--token`（GOST client 以 gRPC metadata 发送）**且**配控制面 TLS——仅凭 token 目前走的是明文 gRPC 通道。

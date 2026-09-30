@@ -187,7 +187,18 @@ type Client struct {
 	// the round trip is what tells the two apart.
 	pongAt atomic.Int64
 	pongN  atomic.Int64
+
+	// dropPong is a debug-only fault injection (p2p.FaultsConfig.DropPong): pong
+	// handling is swallowed, both the answer to the relay's ping and the stamp
+	// that records an arriving one, so a relay that is answering reads as silent
+	// to the engine's ping watchdog. Set once by the caller before Recv runs; the
+	// fault config is startup-only, never a runtime switch.
+	dropPong atomic.Bool
 }
+
+// SetDropPong turns the pong-swallowing debug fault on or off (see the field).
+// A no-op by default, and never reachable from the network.
+func (c *Client) SetDropPong(v bool) { c.dropPong.Store(v) }
 
 // LastRecv returns when the most recent frame arrived (zero if none has).
 func (c *Client) LastRecv() time.Time {
@@ -368,7 +379,11 @@ func (c *Client) Recv() (src PublicKey, pkt []byte, err error) {
 			copy(src[:], body[:keyLen])
 			return src, body[keyLen:], nil
 		case framePing:
-			if len(body) > 0 {
+			// A ping from the relay is answered unless the pong fault is on: a
+			// relay that never hears back from us gives up on the connection, so
+			// the fault looks like a silent relay from both ends — which is what
+			// it is reproducing.
+			if len(body) > 0 && !c.dropPong.Load() {
 				c.pong(body)
 			}
 		case framePeerGone:
@@ -384,6 +399,11 @@ func (c *Client) Recv() (src PublicKey, pkt []byte, err error) {
 		case framePong:
 			// The answer to a Ping: the round trip is the engine's evidence
 			// that the path is alive, so it is stamped rather than ignored.
+			if c.dropPong.Load() {
+				// Fault injection: the answer arrives and is thrown away, so the
+				// engine's ping watchdog declares a live relay dead.
+				continue
+			}
 			c.pongAt.Store(time.Now().UnixNano())
 			c.pongN.Add(1)
 		default:

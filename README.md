@@ -529,6 +529,37 @@ than inferred; the report itself lives in
 [`p2p/doctor`](doctor/doctor.go), which depends on nothing but the contract
 package and the standard library.
 
+## Fault injection (debug only)
+
+A config section that makes the engine drop its own frames, so a failure that
+only reproduces in the field can be reproduced on demand. Everything is off by
+default, process-wide, and config-file only.
+
+| Knob | What it drops |
+|---|---|
+| `dropCtrl` | every control-plane frame: the candidate exchange, `ctrlCaps`, the `ctrlSecure` half. Encryption is forced and negotiates on that same channel, so nothing settles — the punch and the session itself alike. |
+| `dropData` | every data frame, in both directions: tunnel payload and the smux keepalive NOP, on the relay and on the hole-punched path. The session starves and is given up on its own keepalive. |
+| `dropPong` | the relay's pong replies, both the answer to a ping and the record of one arriving, so a live relay reads as a dead one to the relay-silence watchdog. |
+| `silenceFor` / `silenceEvery` | *everything* to the peer for `silenceFor`, every `silenceEvery`, from process start. This is the measured field failure — a one-way silence with the path intact — and the direct session lives or dies by its keepalive timeout. |
+
+```yaml
+derp: wss://derp.example.com/derp
+key: peer.key
+target: 127.0.0.1:18080
+faults:
+  silenceFor: 12s        # the ~12s of RF-batched silence a phone on Wi-Fi showed
+  silenceEvery: 1m
+```
+
+A host with any knob on logs one warning at startup, listing what is on — a
+fault-injected host must never read as a broken one.
+
+**An injected failure is indistinguishable from a real one at every layer above
+it. That is the point — and the reason never to enable this where it can confuse
+someone.** There is no RPC, no environment variable and no flag: a running host
+cannot be told to break itself over the network, and a binary with the section
+unset behaves exactly as it did before.
+
 ## Security
 
 The control channel is unauthenticated by default: any process that can reach `--addr` can make this host dial arbitrary addresses. Keep `--addr` on loopback (the default). For cross-machine deployment set `--token` (the GOST client sends it as gRPC metadata) **and** control TLS — the token alone travels over a plaintext gRPC channel today.
