@@ -16,7 +16,8 @@ Current implementation: **stub + mux + token + DERP relay + STUN/UDP hole punchi
 | `p2p/endpoint` | the public endpoint: identity, engine, forwards, `Dial`/`Listen`/`Status`, and `StunLookup` (a STUN reachability/address probe). Owns the host; an embedder never holds it. |
 | `p2p/grpc` | the gRPC transport: serves an endpoint over the plugin protocol (`OpenTunnel`, `Tunnel`, `Status`) and owns its listener + token check. Named after its protocol, so it aliases grpc-go as `ggrpc` inside itself. |
 | `p2p/internal/host` | the host: engine, registry, data planes, and the **seam** (`OpenTunnel`/`AttachTunnel`/`Dial`/`Listen`); `secure.go` holds the per-(peer, transport) session cipher (`cryptoConn`, AEAD records) and the `ctrlSecure` handshake that derives its keys. The package is unimportable outside the module, so third-party transports are not supported — a value obtained from `Endpoint.Host()` still has callable methods, but the seam is not a stable contract and changes without notice. |
-| `cmd/p2p` | the CLI: flags, its own config-file format (`addr`/`token`/`log` + the inlined `p2p.Config`), and the assembly of endpoint + gRPC transport. |
+| `p2p/doctor` | the human-readable diagnostic report: a **pure formatter over the contract's `Status`** plus the local context an endpoint does not report (identity, relay URL, STUN), with verdicts. Depends on nothing but the contract package and the standard library (enforced by `deps_test.go`). Two callers: `cmd/p2p`'s `doctor` subcommand (over gRPC) and wisper (`/api/p2p/doctor`, in-process). |
+| `cmd/p2p` | the CLI: flags, its own config-file format (`addr`/`token`/`log` + the inlined `p2p.Config`), the `doctor` subcommand (a read-only control-plane client — see Diagnostics), and the assembly of endpoint + gRPC transport. |
 
 Rules that follow from the layout: the root never learns a protocol or a config
 file; a transport never learns the host's internals (it maps the root's sentinel
@@ -48,6 +49,9 @@ GOWORK=off go build ./...   # standalone build must also pass
 
 # Run in DERP engine mode
 ./p2p --derp wss://derp.example.com/derp --key peer.key --target 127.0.0.1:18080
+
+# Diagnose a running host (read-only; starts nothing — see Diagnostics)
+./p2p doctor --addr 127.0.0.1:8003 --key peer.key
 ```
 
 | Flag | Default | Meaning |
@@ -74,13 +78,38 @@ fully replace the command line. The YAML keys are unchanged from earlier version
 the endpoint keys come from the inlined `p2p.Config`, `addr`/`token`/`log` are the
 CLI's own.
 
+### Diagnostics (`p2p doctor`)
+
+`p2p doctor` is a **separate mode, not a flag**: it is a read-only client of a
+*running* host's control plane — it dials `--addr` (with `--token` when the host
+checks one), renders one report, and exits; it never starts an endpoint. Its own
+flags are only the local context the host does not report over `Status`: `--key`
+(to name the local identity; `host.PublicKeyFile` reads it **without creating
+one** — unlike the host path, so a diagnostic has no side effect), `--derp`/
+`--stun` (the names to print; the host's own config is not on the wire), `--peer`
+(narrow to one key), and `-C` for the same values from a config file. The report
+is rendered by [`p2p/doctor`](doctor/doctor.go), shared with wisper — the
+subcommand is only the gRPC fetch + flag plumbing
+([cmd/p2p/doctor.go](cmd/p2p/doctor.go)).
+
+The report answers "why is this peer on the relay" in one pasteable block:
+identity, relay liveness, the aggregate summary, one block per peer (path,
+reason, state, last error, dialled endpoint, candidates, caps, session/silence
+ages, the punch counters, and the **trace** — the last steps of the round,
+oldest first), and a `verdicts:` section that states the conclusion (relay
+connected or unreachable, encryption coverage, STUN configured/unreachable, and
+per peer *why* it sits where it does). Everything the report shows over gRPC
+comes from `peer_diagnostics` — including the trace, the proto's
+`repeated string trace` (field 15) — plus the relay fields below; the peer key is
+the proto entry's `peer` (field 14).
+
 ## Architecture (two planes)
 
 **Control plane** — the gRPC transport ([grpc/server.go](grpc/server.go), [grpc/rpc.go](grpc/rpc.go)) over an endpoint:
 
 - `OpenTunnel(peer, network)` — authorizes a tunnel and replies `{ok, id}` with a cryptographically random id: it is the `Tunnel` stream's credential, so it must stay unguessable (never reuse the old guessable `tunnel-%d` scheme for it). `network` is `tcp` (a byte stream, the default) or `udp` (a datagram stream; requires DERP mode — a datagram link pairs two peers, not a host:port); anything else is `codes.InvalidArgument`. In stub mode `peer` must be `host:port` (validated); in DERP mode it must be a base64 32-byte public key. A record whose stream never arrives is reclaimed after ~10 s by a pending GC — the only cleanup for an abandoned setup.
 - `Tunnel` — the data plane stream. The client presents the id from `OpenTunnel` as the `id` metadata key; the handler looks the record up (`codes.NotFound` if unknown/expired) and bridges the stream to the peer. Peer and target come from the record, never from the stream, so the client cannot spoof them. The stream's lifetime IS the tunnel's lifetime: the handler returning (client EOF/abort, peer EOF) drops the record. The host side of the stream is a raw byte pipe in every network mode.
-- `Status` — tunnel count (pending records included) plus transport stats: gauges `direct_peers`/`derp_peers` (where each peer's traffic goes now), cumulative counters `punch_attempts`/`punch_success`/`streams_direct`/`streams_derp`, `relay_connected`/`relay_error` (the relay transport's own liveness and last dial failure — no other field can show an outage, since a live hole-punched session keeps every gauge healthy while the relay is unreachable), and `peer_diagnostics` — the gRPC reply's repeated `PeerDiagnostic`, one per connected peer keyed by `peer` (the base64 key); in-process it is `PeerDiagnostics map[string]PeerDiagnostic`, which **supersedes the removed `PeerPunches`** (it carries the same `attempts`/`ups`/`drops` counters). Each entry answers, per peer: `path` (the transport word), `reason` (the host-wide cause when it outranks the peer's own; empty on a live direct session), `state` (the punch state machine `none`/`attempting`/`up`/`backoff`), `failed`, `last_error` (the last punch failure, e.g. `seed failed: timeout`), `peer_addr` (the endpoint dialled for the direct path), `candidates` (how many the peer announced), `caps` (`ipv6`/`tightKeepalive`), `session_age`/`last_recv_age` (the live direct session's age, 0 when none; time since the last frame from the peer, relay or direct — so a silent peer is visible), and the `attempts`/`ups`/`drops` counters — enough to say *why* a peer is on the relay without raising the log level, read without probing a session. Unlike `PeerTransports` it is **not** in-process only: the proto carries the repeated message, so plugin clients see it too), and `PeerTransports` — one value per connected base64 peer key (`direct`, `punching`, `failed`, `derp`, `disabled`, `no-candidates`, `stun-unreachable`; a host-wide reason outranks a peer's own failed round, which outranks `punching`, so a peer that keeps retrying after a failure does not read as perpetually punching), for a caller that lists peers and wants to say *why* a peer is on the relay (in-process only: the proto has no field for them, so the gRPC transport carries the aggregate gauges), and `PeerEncryption` — one value per connected base64 peer key, always `secure` (encryption is forced, so a live session is always encrypted; the `plaintext` value is retained for compatibility and never produced), backed by the aggregate gauges `encrypted_peers`/`plaintext_peers` on the gRPC reply (`plaintext_peers` is always 0). The gauges probe each `directConn` with the side-effect-free `live()` — never `session()`, which tears a dead session down and schedules a re-punch, so a status query would churn connections. gRPC reflection is registered, so `grpcurl -plaintext <addr> proto.P2P/Status` works without shipping the proto (with `--token` set, add `-H 'token: …'`).
+- `Status` — tunnel count (pending records included) plus transport stats: gauges `direct_peers`/`derp_peers` (where each peer's traffic goes now), cumulative counters `punch_attempts`/`punch_success`/`streams_direct`/`streams_derp`, `relay_connected`/`relay_error` (the relay transport's own liveness and last dial failure — no other field can show an outage, since a live hole-punched session keeps every gauge healthy while the relay is unreachable), and `peer_diagnostics` — the gRPC reply's repeated `PeerDiagnostic`, one per connected peer keyed by `peer` (the base64 key); in-process it is `PeerDiagnostics map[string]PeerDiagnostic`, which **supersedes the removed `PeerPunches`** (it carries the same `attempts`/`ups`/`drops` counters). Each entry answers, per peer: `path` (the transport word), `reason` (the host-wide cause when it outranks the peer's own; empty on a live direct session), `state` (the punch state machine `none`/`attempting`/`up`/`backoff`), `failed`, `last_error` (the last punch failure, e.g. `seed failed: timeout`), `peer_addr` (the endpoint dialled for the direct path), `candidates` (how many the peer announced), `caps` (`ipv6`/`tightKeepalive`), `session_age`/`last_recv_age` (the live direct session's age, 0 when none; time since the last frame from the peer, relay or direct — so a silent peer is visible), `trace` (the peer's recent punch steps, oldest first, a fixed-size ring of at most 16 short lines — the history a single snapshot cannot hold, which is what a *flaky* punch needs; nil for a relay-only peer), and the `attempts`/`ups`/`drops` counters — enough to say *why* a peer is on the relay without raising the log level, read without probing a session. Unlike `PeerTransports` it is **not** in-process only: the proto carries the repeated message, so plugin clients see it too), and `PeerTransports` — one value per connected base64 peer key (`direct`, `punching`, `failed`, `derp`, `disabled`, `no-candidates`, `stun-unreachable`; a host-wide reason outranks a peer's own failed round, which outranks `punching`, so a peer that keeps retrying after a failure does not read as perpetually punching), for a caller that lists peers and wants to say *why* a peer is on the relay (in-process only: the proto has no field for them, so the gRPC transport carries the aggregate gauges), and `PeerEncryption` — one value per connected base64 peer key, always `secure` (encryption is forced, so a live session is always encrypted; the `plaintext` value is retained for compatibility and never produced), backed by the aggregate gauges `encrypted_peers`/`plaintext_peers` on the gRPC reply (`plaintext_peers` is always 0). The gauges probe each `directConn` with the side-effect-free `live()` — never `session()`, which tears a dead session down and schedules a re-punch, so a status query would churn connections. gRPC reflection is registered, so `grpcurl -plaintext <addr> proto.P2P/Status` works without shipping the proto (with `--token` set, add `-H 'token: …'`).
 
 There is no `CloseTunnel`: the stream ending is the close.
 

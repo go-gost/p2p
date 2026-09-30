@@ -663,10 +663,18 @@ confirm.
 
 - [ ] **Step 3: Release ordering (gated)**
 
+> One plugin release carries both proto additions: the per-peer diagnostic and its
+> later `trace` field (15) plus the relay fields `relay_connected`/`relay_error`
+> (16/17) — they were added on top of this plan, see the design doc's follow-ups.
+
 1. Push a `plugin` tag with the proto addition, then bump `p2p`'s `plugin`
    requirement + `go.sum` (`go mod edit -require=…` + `GOWORK=off go mod
    download …` — do **not** use `go get`/`go mod tidy` in this environment).
-2. Verify `GOWORK=off go build ./...` in `p2p`, then tag `p2p`.
+   Until this lands, `GOWORK=off go build ./...` in `p2p` fails exactly on the
+   proto additions.
+2. Verify `GOWORK=off go build ./...` in `p2p`, then tag `p2p`. The `p2p` tag is
+   also what `wisper` needs: it imports the new `p2p/doctor` package, so wisper's
+   `GOWORK=off go build ./...` is red until the pin moves.
 3. Bump `wisper` to the new `p2p` and release (the desktop/APK pipeline).
 
 ---

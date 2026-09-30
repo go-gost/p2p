@@ -449,9 +449,85 @@ last punch failure, e.g. `seed failed: timeout`), `peer_addr` (the endpoint
 dialled for the direct path), `candidates` (how many the peer announced), `caps`
 (`ipv6`/`tightKeepalive`), `session_age_ms`/`last_recv_age_ms` (the live direct
 session's age, 0 when none; time since the last frame from the peer, relay or
-direct), and the `attempts`/`ups`/`drops` counters. It is a point-in-time read
+direct), `trace` (the peer's recent punch steps, oldest first — a fixed ring of
+at most 16 short lines, the history a single snapshot cannot hold, which is what
+a *flaky* punch needs; absent for a relay-only peer), and the
+`attempts`/`ups`/`drops` counters. It is a point-in-time read
 that never probes a session, so a status query does not churn a connection.
 In-process the same snapshot is `p2p.Status.PeerDiagnostics`.
+
+## Diagnostics
+
+`Status` is the machine-readable view. For the human one — *"the peer is on the
+relay and I don't know why"*, *"after a network switch nothing works"* — `p2p
+doctor` renders one pasteable report: the same per-peer snapshot, plus the local
+context a running host does not report over the wire, plus a `verdicts:` section
+that states the conclusion instead of leaving it to the reader.
+
+```bash
+# read-only: it dials a *running* host's control plane, prints, and exits
+./p2p doctor --addr 127.0.0.1:8003 --key peer.key
+```
+
+```text
+p2p doctor v0.9.1
+host:            127.0.0.1:8003
+local key:       7D3hUOuIcplL3CCSjsiyIqolF6AkdiXqcdAUZgQzkEs
+relay:           wss://derp.example.com/derp
+relay state:     connected
+
+summary:
+  tunnels:       0
+  direct peers:  1
+  relay peers:   0
+  punches:       1 attempts, 1 success
+  streams:       1 direct, 0 relay
+  encryption:    1 encrypted, 0 plaintext (encryption is forced)
+
+peers:
+  6Fg4Wtn6SpaOQms96jFxL2r4CVJGIkhrEmWxpCsU-xg
+    path:        direct
+    state:       up
+    last error:  (none)
+    peer addr:   10.99.0.3:39028
+    candidates:  1
+    caps:        ipv6, tightKeepalive
+    session age: 122ms
+    last recv:   21ms
+    trace:
+      round start
+      peer candidates: 1
+      v4 dial 10.99.0.3:39028
+      v4 up
+
+verdicts:
+  relay: connected
+  encryption: every connected peer
+  STUN 10.99.0.254:3478: configured
+  peer 6Fg4Wtn6SpaOQms96jFxL2r4CVJGIkhrEmWxpCsU-xg: direct path up (session 122ms, last frame 21ms)
+```
+
+A peer on the relay instead reads, in `verdicts:`, the reason it is there:
+
+```text
+  peer b9K9SwU0SEPqAY6ym3YLk9HT857KL-9i2F0F4batgzQ: on the relay; punch failed (seed failed: timeout) — candidates 2
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--addr` | *(required)* | the running host's control-plane address |
+| `--token` | *(empty)* | control-plane token, when the host checks one |
+| `--peer` | *(empty)* | narrow the report to one peer (base64 public key) |
+| `--key` | *(empty: the default key path)* | identity key file, to name the local key. Read-only — unlike the host path it never creates one |
+| `--derp` / `--stun` | *(empty)* | the relay/STUN names to print: a host does not report its own config over `Status` |
+| `-C` | *(empty)* | config file supplying the values above |
+
+`doctor` is a separate mode, not a flag — it never starts an endpoint, opens no
+`--addr`, and joins no relay. It is the same report wisper shows in-process
+(Settings → Diagnostics), where the relay's liveness is read directly rather
+than inferred; the report itself lives in
+[`p2p/doctor`](doctor/doctor.go), which depends on nothing but the contract
+package and the standard library.
 
 ## Security
 

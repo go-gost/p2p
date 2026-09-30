@@ -106,16 +106,26 @@ relay pump and the direct accept loop).
 ## Follow-ups (assessed, not in this design)
 
 From the same debugging-levers assessment. The last-frame age (originally a
-separate idea) is folded into the snapshot above; these remain:
+separate idea) is folded into the snapshot above. Two more shipped on top of this
+design (2026-09-30):
 
-- **A bounded per-peer punch trace.** The last N rounds per peer — candidate
-  sets, family order, seed result and reason, backoff — in a ring, exposed in
-  `Status`. A flaky punch (symmetric NAT, a STUN server that does not answer, a
-  network switch) is exactly the case a single snapshot cannot hold. Cost:
-  moderate (a ring on `directConn` + a snapshot field).
-- **A human-readable `p2p status --peer <key>` / doctor.** Renders the diagnostic
-  plus the relay and identity state as pasteable text, replacing "raise the log
-  level and send me the log". Cost: small (a formatter over `Status`).
+- **A bounded per-peer punch trace — shipped.** `directConn` carries a fixed ring
+  of the last 16 punch steps (`noteRound` at the round's decision points:
+  round start, the peer's candidate count, no shared family, the encryption gate,
+  each family's dial/seed/smux result, `up`, and the backoff), reported as
+  `PeerDiagnostic.Trace` and `PeerDiagnostic.trace` (proto field 15). A single
+  snapshot cannot hold a flaky punch's history; the ring can, at fixed size and
+  no per-round allocation.
+- **A human-readable `p2p doctor [--peer <key>]` — shipped.** A separate CLI mode
+  (`p2p doctor --addr <running host>`, read-only: it starts nothing), rendering
+  identity, relay liveness, the aggregate summary, each peer's snapshot *and*
+  trace, and a `verdicts:` section. The formatter is the shared `p2p/doctor`
+  package — wisper serves the same report at `/api/p2p/doctor`, in-process, where
+  the relay's liveness is read directly. Named `doctor`, not `status`: `status`
+  is the raw gRPC RPC, this renders checks.
+
+Still open:
+
 - **Runtime fault injection.** The engine already has the test-only hooks (the
   relay double's `dropCtrl`/`dropData`/`dropPong`); expose equivalents behind an
   explicit opt-in config so a field failure can be reproduced locally. Cost:
