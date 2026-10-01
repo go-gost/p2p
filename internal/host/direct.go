@@ -295,7 +295,17 @@ func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 
 // start kicks off a punch when none is running, and reports whether this call
 // started one: false when a punch is already in flight or backing off.
+//
+// The direct switch is checked here, at the one point every start routes
+// through, rather than at each caller: the inbound path (a peer's candidate
+// announcement) and the internal re-punch triggers (a dead session, a relay
+// reconnect) reach it without the guard the outbound callers carry, and any of
+// them starting a round would put the pair on a direct session the switch was
+// turned off to prevent.
 func (dc *directConn) start() bool {
+	if !dc.e.directEnabled() {
+		return false
+	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	if dc.state != directNone {

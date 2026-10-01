@@ -1077,6 +1077,37 @@ func TestCandidatesKeepLiveSession(t *testing.T) {
 	}
 }
 
+// TestCandidatesIgnoredWhenDirectOff: the direct switch is a master gate, and
+// it must hold on the inbound path too. A peer that still punches announces its
+// candidates over the relay; a host with the direct path off must not start a
+// round for it, or the pair ends up on a hole-punched session the switch was
+// turned off to prevent.
+func TestCandidatesIgnoredWhenDirectOff(t *testing.T) {
+	e := &engine{
+		direct:   false,
+		stunAddr: "127.0.0.1:3478", // a candidate source exists; the switch, not the source, is what is off
+		log:      slog.Default(),
+		stop:     make(chan struct{}),
+		directs:  make(map[derpclient.PublicKey]*directConn),
+		peers:    make(map[derpclient.PublicKey]*peerConn),
+	}
+	peer := derpclient.PublicKey{9}
+	dc := &directConn{e: e, peer: peer, cand: make(chan []candidate, 1)}
+	e.directs[peer] = dc
+
+	dc.onCandidates([]candidate{{addr: netip.MustParseAddrPort("203.0.113.7:1234")}})
+
+	if got := dc.stateOf(); got != directNone {
+		t.Errorf("state = %v, want directNone: the direct path is off", got)
+	}
+	if dc.session() != nil {
+		t.Error("session() = a live session, want nil with the direct path off")
+	}
+	if got := dc.start(); got {
+		t.Error("start() = true, want false: no round may start with the direct path off")
+	}
+}
+
 // TestRelaySessionRecoversAfterAdapterClosed reproduces the stuck state where a
 // peer's relay adapter is closed (the peer process died) but stays cached: the
 // next OpenStream must drop it and rebuild a fresh session instead of failing
