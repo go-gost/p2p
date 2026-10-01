@@ -78,8 +78,11 @@ func TestTransportCounts(t *testing.T) {
 
 	dc := &directConn{e: e, peer: peerDirect, sess: newTestSess(t), state: directUp}
 	e.directs[peerDirect] = dc
-	e.peers[peerDirect] = &peerConn{}
-	e.peers[peerRelay] = &peerConn{}
+	// Both peers carry a live relay session — the base path a peer has before
+	// and after a punch — so losing the direct session must leave peerDirect on
+	// the relay, not drop it off the list.
+	e.peers[peerDirect] = &peerConn{peer: peerDirect, sess: newTestSess(t)}
+	e.peers[peerRelay] = &peerConn{peer: peerRelay, sess: newTestSess(t)}
 
 	direct, derp := e.transportCounts()
 	if direct != 1 {
@@ -160,7 +163,10 @@ func TestPeerTransportReasons(t *testing.T) {
 	}
 	for _, tc := range cases {
 		e := newEngine()
-		e.peers[peer] = &peerConn{}
+		// The peer must have a live path to be reported at all (peerTransports
+		// filters on it), so it carries a built relay session: these cases are
+		// about the word a *connected* peer gets.
+		e.peers[peer] = &peerConn{peer: peer, sess: newTestSess(t)}
 		tc.mut(e)
 		if got := e.peerTransports()[keyName(peer)]; got != tc.want {
 			t.Errorf("%s: transport = %q, want %q", tc.name, got, tc.want)
@@ -179,11 +185,56 @@ func TestPeerTransportReasons(t *testing.T) {
 	// A host-wide cause outranks a peer's own failed round: with STUN silent
 	// and no IPv6, that is the thing to fix, not the symptom.
 	e = newEngine()
-	e.peers[peer] = &peerConn{}
+	e.peers[peer] = &peerConn{peer: peer, sess: newTestSess(t)}
 	e.stunFailed.Store(true)
 	e.directs[peer] = &directConn{e: e, peer: peer, state: directBackoff, failed: true}
 	if got := e.peerTransports()[keyName(peer)]; got != transportStunUnreachable {
 		t.Errorf("stun silent + failed round: transport = %q, want %q", got, transportStunUnreachable)
+	}
+}
+
+// TestPeerTransportsDropsPeersWithoutLivePath: the peer list says who is
+// connected, and a peer is connected only while it has a live data path. A
+// killed app sends no PeerGone to an open relay, so its adapter outlives it in
+// the engine's maps and its relay session is noticed dead only by the smux
+// keepalive. peerEncryptions already filters on exactly that; peerTransports
+// must agree with it, or one snapshot reports two different peer sets (the
+// field case: a phone gone for over an hour still listed, and still punched).
+func TestPeerTransportsDropsPeersWithoutLivePath(t *testing.T) {
+	e := &engine{
+		direct:   true,
+		stunAddr: "127.0.0.1:3478",
+		directs:  make(map[derpclient.PublicKey]*directConn),
+		peers:    make(map[derpclient.PublicKey]*peerConn),
+	}
+	up := derpclient.PublicKey{1}
+	gone := derpclient.PublicKey{2}
+	gonePunching := derpclient.PublicKey{3}
+
+	// A live relay session: reported.
+	e.peers[up] = &peerConn{peer: up, sess: newTestSess(t)}
+
+	// A peer whose relay session has ended with no direct session to fall back
+	// on: the killed-app case, adapter still cached.
+	dead := newTestSess(t)
+	dead.Close()
+	e.peers[gone] = &peerConn{peer: gone, sess: dead}
+
+	// The same, plus a directConn stuck in backoff — the punch keeps retrying a
+	// peer that is not there, and that state must not ride the row back onto
+	// the list.
+	e.peers[gonePunching] = &peerConn{peer: gonePunching, sess: dead}
+	e.directs[gonePunching] = &directConn{e: e, peer: gonePunching, state: directBackoff, failed: true}
+
+	got := e.peerTransports()
+	if got[keyName(up)] == "" {
+		t.Errorf("live peer missing from %v", got)
+	}
+	if w := got[keyName(gone)]; w != "" {
+		t.Errorf("peer with no live path reported as %q, want absent", w)
+	}
+	if w := got[keyName(gonePunching)]; w != "" {
+		t.Errorf("peer with no live path reported as %q, want absent", w)
 	}
 }
 
@@ -201,7 +252,7 @@ func TestPeerDiagnosticsReasonOnlyWhenNotDirect(t *testing.T) {
 	}
 	e.stunFailed.Store(true) // host-wide reason: STUN silent, no IPv6 to fall back on
 	peer := derpclient.PublicKey{9}
-	e.peers[peer] = &peerConn{peer: peer}
+	e.peers[peer] = &peerConn{peer: peer, sess: newTestSess(t)} // connected: it carries a path word
 
 	d := e.peerDiagnostics(e.peerTransports())[keyName(peer)]
 	if d.Path != transportStunUnreachable || d.Reason != transportStunUnreachable {
@@ -279,9 +330,9 @@ func TestPeerDiagnosticsMerge(t *testing.T) {
 	relayOnly := derpclient.PublicKey{1}
 	both := derpclient.PublicKey{2}
 
-	e.peers[relayOnly] = &peerConn{peer: relayOnly}
+	e.peers[relayOnly] = &peerConn{peer: relayOnly, sess: newTestSess(t)}
 
-	pcBoth := &peerConn{peer: both}
+	pcBoth := &peerConn{peer: both, sess: newTestSess(t)}
 	pcBoth.lastFrameAt.Store(time.Now().Add(-3 * time.Second).UnixNano())
 	e.peers[both] = pcBoth
 	// The directConn's own stamp is left unset, so the relay age survives.

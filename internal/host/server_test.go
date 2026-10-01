@@ -42,7 +42,7 @@ func TestStatusReportsTransportStats(t *testing.T) {
 	dc.ups.Store(2)
 	dc.drops.Store(1)
 	e.directs[peerDirect] = dc
-	e.peers[peerRelay] = &peerConn{}
+	e.peers[peerRelay] = &peerConn{peer: peerRelay, sess: newTestSess(t)}
 
 	s := newServer(e)
 	st := s.status()

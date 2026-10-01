@@ -111,19 +111,21 @@ func (s *engineStats) countStream(transport string) {
 // what makes it connected); the value says whether it rides a hole-punched
 // session instead, and when it does not, the most specific reason available:
 // this peer's own punch state first, then the host-wide reason (which is the
-// same for every peer). It probes each directConn with the side-effect-free
-// live() rather than session(): session() tears down a dead session and
-// schedules a re-punch, which a status query must never do. The engine lock is
-// released before probing, so directConn.mu is never taken while holding it.
+// same for every peer). Only peers with a live data path appear, the same set
+// peerEncryptions reports. It probes with the side-effect-free
+// peerConn.liveSession() and directConn.live() rather than session(): session()
+// tears down a dead session and schedules a re-punch, which a status query must
+// never do. The engine lock is released before probing, so pc.mu and dc.mu are
+// never taken while holding it.
 func (e *engine) peerTransports() map[string]string {
 	e.mu.Lock()
-	directs := make([]*directConn, 0, len(e.directs))
-	for _, dc := range e.directs {
-		directs = append(directs, dc)
+	peers := make(map[derpclient.PublicKey]*peerConn, len(e.peers))
+	for k, pc := range e.peers {
+		peers[k] = pc
 	}
-	peers := make([]derpclient.PublicKey, 0, len(e.peers))
-	for p := range e.peers {
-		peers = append(peers, p)
+	directs := make(map[derpclient.PublicKey]*directConn, len(e.directs))
+	for k, dc := range e.directs {
+		directs[k] = dc
 	}
 	e.mu.Unlock()
 
@@ -133,12 +135,31 @@ func (e *engine) peerTransports() map[string]string {
 		fallback = reason
 	}
 
-	out := make(map[string]string, len(peers)+len(directs))
-	for _, p := range peers {
-		out[keyName(p)] = fallback
+	// A peer is reported only while it has a live data path: a built relay
+	// session or a live direct one — the same predicate peerEncryptions applies,
+	// so a single snapshot cannot report two different peer sets. A killed app
+	// sends no PeerGone to an open relay, so its adapter outlives it in these
+	// maps and its relay session is noticed dead only by the smux keepalive;
+	// without this a peer that is long gone still reads as connected.
+	live := func(k derpclient.PublicKey) bool {
+		if pc := peers[k]; pc != nil && pc.liveSession() {
+			return true
+		}
+		return directs[k] != nil && directs[k].live()
 	}
-	for _, dc := range directs {
-		name := keyName(dc.peer)
+
+	out := make(map[string]string, len(peers)+len(directs))
+	for k := range peers {
+		if !live(k) {
+			continue // no live data path — the peer is not connected
+		}
+		out[keyName(k)] = fallback
+	}
+	for k, dc := range directs {
+		if !live(k) {
+			continue // no live data path — whatever the punch state says
+		}
+		name := keyName(k)
 		switch {
 		case dc.live():
 			out[name] = transportDirect
@@ -178,13 +199,13 @@ func (e *engine) relayState() (connected bool, lastErr string) {
 }
 
 // peerDiagnostics snapshots each connected peer. transports is the peer-set
-// snapshot peerTransports just computed (its only caller is status()), so the
-// paths are read once per status tick. The host-wide reason applies to every
-// peer it outranks — but only on a path that is not already direct, matching
-// peerTransports, where a live session outranks the reason: a peer that reads
-// Path="direct" must not also carry Reason="stun-unreachable". The per-peer
-// fields come from the adapter and the punch state machine, read without
-// probing a session.
+// snapshot peerTransports just computed (its only caller is status()), so it is
+// also the peer set here: the same filter, the paths read once per status tick.
+// The host-wide reason applies to every peer it outranks — but only on a path
+// that is not already direct, matching peerTransports, where a live session
+// outranks the reason: a peer that reads Path="direct" must not also carry
+// Reason="stun-unreachable". The per-peer fields come from the adapter and the
+// punch state machine, read without probing a session.
 func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.PeerDiagnostic {
 	e.mu.Lock()
 	peers := make([]*peerConn, 0, len(e.peers))
@@ -212,6 +233,9 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 	for _, pc := range peers {
 		name := keyName(pc.peer)
 		path := transports[name]
+		if path == "" {
+			continue // no live data path — not a connected peer (peerTransports)
+		}
 		out[name] = p2p.PeerDiagnostic{
 			Path:   path,
 			Reason: reasonFor(path),
@@ -224,9 +248,13 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 	}
 	for _, dc := range directs {
 		name := keyName(dc.peer)
+		path := transports[name]
+		if path == "" {
+			continue // no live data path — not a connected peer (peerTransports)
+		}
 		d := out[name] // keep a relay connector's lastFrame age if there is one
-		d.Path = transports[name]
-		d.Reason = reasonFor(d.Path)
+		d.Path = path
+		d.Reason = reasonFor(path)
 		d.State = dc.stateName()
 		d.Failed = dc.hasFailed()
 		d.LastError = dc.lastErrOf()
