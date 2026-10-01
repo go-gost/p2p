@@ -237,6 +237,21 @@ func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 	e.directConn(peer).start()
 }
 
+// peerLive reports whether the peer currently has a live data path: a built
+// relay session or a live direct one — the same definition of "connected" the
+// status surfaces use (see peerTransports). A punch gets nowhere without it: the
+// candidate exchange rides the relay's control channel to the peer, so a peer
+// with no live path can neither announce nor answer.
+func (e *engine) peerLive(peer derpclient.PublicKey) bool {
+	e.mu.Lock()
+	pc, dc := e.peers[peer], e.directs[peer]
+	e.mu.Unlock()
+	if pc != nil && pc.liveSession() {
+		return true
+	}
+	return dc != nil && dc.live()
+}
+
 // warm brings up the peer's relay session (a smux session over the DERP
 // adapter, no stream on it) so the peer counts as connected and has a path in
 // Status before any traffic — and, when punch is set, starts a hole punch for
@@ -698,6 +713,21 @@ func (dc *directConn) retry(d time.Duration, failed bool) {
 		case <-dc.e.stop:
 			return
 		case <-time.After(d):
+		}
+		// A peer with no live data path cannot answer a round — candidates are
+		// exchanged over the relay's control channel to it — so skip it: running
+		// one only burns a STUN lookup, a broadcast and a timeout, forever (the
+		// field case: a killed phone re-punched every 30s for over an hour).
+		// Nothing announces that: an open relay sends no PeerGone, and only the
+		// relay keepalive's silence shows the session died.
+		//
+		// Re-arm rather than stop. Stopping would leave the state in
+		// directBackoff with no timer, and start() refuses to run from there —
+		// so a peer that came back could never be punched again: the field case
+		// is a phone that reconnected and sat on the relay for good.
+		if !dc.e.peerLive(dc.peer) {
+			dc.retry(d, false)
+			return
 		}
 		dc.mu.Lock()
 		// Only reset if we're still backing off: onCandidates may have already

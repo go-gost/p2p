@@ -119,13 +119,13 @@ func (s *engineStats) countStream(transport string) {
 // never taken while holding it.
 func (e *engine) peerTransports() map[string]string {
 	e.mu.Lock()
-	peers := make(map[derpclient.PublicKey]*peerConn, len(e.peers))
-	for k, pc := range e.peers {
-		peers[k] = pc
-	}
 	directs := make(map[derpclient.PublicKey]*directConn, len(e.directs))
 	for k, dc := range e.directs {
 		directs[k] = dc
+	}
+	peers := make([]derpclient.PublicKey, 0, len(e.peers))
+	for p := range e.peers {
+		peers = append(peers, p)
 	}
 	e.mu.Unlock()
 
@@ -135,28 +135,21 @@ func (e *engine) peerTransports() map[string]string {
 		fallback = reason
 	}
 
-	// A peer is reported only while it has a live data path: a built relay
-	// session or a live direct one — the same predicate peerEncryptions applies,
-	// so a single snapshot cannot report two different peer sets. A killed app
-	// sends no PeerGone to an open relay, so its adapter outlives it in these
-	// maps and its relay session is noticed dead only by the smux keepalive;
-	// without this a peer that is long gone still reads as connected.
-	live := func(k derpclient.PublicKey) bool {
-		if pc := peers[k]; pc != nil && pc.liveSession() {
-			return true
-		}
-		return directs[k] != nil && directs[k].live()
-	}
-
+	// A peer is reported only while it has a live data path (peerLive) — the
+	// same set peerEncryptions reports, so a single snapshot cannot report two
+	// different peer sets. A killed app sends no PeerGone to an open relay, so
+	// its adapter outlives it in these maps and its relay session is noticed
+	// dead only by the smux keepalive; without this a peer that is long gone
+	// still reads as connected.
 	out := make(map[string]string, len(peers)+len(directs))
-	for k := range peers {
-		if !live(k) {
+	for _, p := range peers {
+		if !e.peerLive(p) {
 			continue // no live data path — the peer is not connected
 		}
-		out[keyName(k)] = fallback
+		out[keyName(p)] = fallback
 	}
 	for k, dc := range directs {
-		if !live(k) {
+		if !e.peerLive(k) {
 			continue // no live data path — whatever the punch state says
 		}
 		name := keyName(k)

@@ -1377,6 +1377,61 @@ func TestBackoffDropsOwnCandidates(t *testing.T) {
 	}
 }
 
+// TestBackoffSkipsRoundsForAGonePeer: a failed round schedules a retry, but a
+// peer with no live data path cannot answer one — the candidate exchange rides
+// the relay's control channel to the peer. Running a round for it anyway burns
+// a STUN lookup, a broadcast and a timeout every backoff period, forever: the
+// field case is a killed phone re-punched for over an hour (197 rounds).
+//
+// The retry must stay armed, though. A skipped round that stopped the timer
+// would leave the state in directBackoff, which start() refuses to run from — a
+// one-way door, and also a field case: a phone that reconnected sat on the
+// relay for good because nothing could punch it again.
+func TestBackoffSkipsRoundsForAGonePeer(t *testing.T) {
+	dc := newSlotConn(t)
+	dc.e.client = &derpclient.Client{} // relay up, so a round would reach its STUN lookup
+	dead := newTestSess(t)
+	dead.Close()
+	pc := &peerConn{peer: dc.peer, sess: dead}
+	dc.e.peers[dc.peer] = pc
+
+	dc.retry(50*time.Millisecond, true)
+	time.Sleep(200 * time.Millisecond)
+	if a, _, _ := dc.punchCounters(); a != 0 {
+		t.Fatalf("attempts = %d, want 0 — a round ran for a peer with no live path", a)
+	}
+
+	// The peer comes back: the punch has to recover on its own, within a backoff
+	// period of the return.
+	pc.mu.Lock()
+	pc.sess = newTestSess(t)
+	pc.mu.Unlock()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if a, _, _ := dc.punchCounters(); a > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("no round ran after the peer came back: the skipped retry left the punch stuck")
+}
+
+// TestBackoffContinuesForALivePeer: the gate is "the peer is gone", not "the
+// round failed". A connected peer keeps retrying — a symmetric-NAT peer, and one
+// whose relay session is briefly down, must not be given up on.
+func TestBackoffContinuesForALivePeer(t *testing.T) {
+	dc := newSlotConn(t)
+	dc.e.client = &derpclient.Client{}
+	dc.e.peers[dc.peer] = &peerConn{peer: dc.peer, sess: newTestSess(t)}
+
+	dc.retry(50*time.Millisecond, true)
+	time.Sleep(300 * time.Millisecond)
+
+	if a, _, _ := dc.punchCounters(); a == 0 {
+		t.Error("attempts = 0, want a retry to have run for a peer that can answer")
+	}
+}
+
 // TestDirectPunchStaggeredStart covers the late-start case: A punches while B
 // is down, then B starts and punches. A must end up with B's candidates and B
 // with A's so both dial. The in-process relay sends A a PeerGone when it first
