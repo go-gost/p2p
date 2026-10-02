@@ -33,6 +33,14 @@ type PeerDiagnostic struct {
 	Attempts int64
 	Ups      int64
 	Drops    int64
+	// RelayRebuilds counts this peer's relay mux sessions built after the first,
+	// and PeerRekeys those torn down because the peer changed its secure half —
+	// the one teardown neither side causes from its own config. Both are 0 for a
+	// healthy pair, and a pair that rebuilds repeatedly is flapping: the field
+	// case was five peer-rekeyed teardowns in twelve minutes, which showed up
+	// only by grepping the log.
+	RelayRebuilds int64
+	PeerRekeys    int64
 	// Trace is the peer's recent punch history: short human-readable lines, the
 	// oldest first, capped at the ring's size (the newest are kept). Nil for a
 	// peer with no direct punch state (a relay-only peer).

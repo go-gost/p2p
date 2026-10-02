@@ -199,6 +199,37 @@ func TestReportOmitsDirectConfigWhenUnreported(t *testing.T) {
 	}
 }
 
+// TestReportRelayChurn: a pair whose relay session is rebuilt repeatedly is
+// flapping, and that used to be visible only by grepping the log (the field case
+// was five peer-rekeyed teardowns in twelve minutes). The counters show on the
+// peer's block — but only when non-zero, so a healthy pair's report is not
+// padded with zeros that read like a problem.
+func TestReportRelayChurn(t *testing.T) {
+	key := "peerkey-peerkey-peerkey-peerkey-peerkey-peerkey-pe"
+	base := func(rebuilds, rekeys int64) p2p.Status {
+		return p2p.Status{
+			PeerTransports: map[string]string{key: "derp"},
+			PeerDiagnostics: map[string]p2p.PeerDiagnostic{
+				key: {Path: "derp", State: "none", RelayRebuilds: rebuilds, PeerRekeys: rekeys},
+			},
+		}
+	}
+
+	out := Report(base(5, 5), Options{})
+	if !strings.Contains(out, "relay churn") {
+		t.Errorf("flapping peer has no churn line:\n%s", out)
+	}
+	for _, want := range []string{"5 rebuilds", "5 peer rekeys"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("churn line is missing %q:\n%s", want, out)
+		}
+	}
+
+	if out := Report(base(0, 0), Options{}); strings.Contains(out, "relay churn") {
+		t.Errorf("healthy peer carries a churn line:\n%s", out)
+	}
+}
+
 func TestReportDegradesWithoutRelayState(t *testing.T) {
 	served := p2p.Status{
 		DerpPeers:       1,

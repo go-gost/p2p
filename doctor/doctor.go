@@ -143,6 +143,13 @@ func peerBlock(b *strings.Builder, key string, d p2p.PeerDiagnostic) {
 	field(b, "    state", orNone(d.State))
 	field(b, "    failed", fmt.Sprintf("%t", d.Failed))
 	field(b, "    last error", orNone(d.LastError))
+	// Session churn, and only when it happened: a healthy pair's zeros are noise,
+	// but a pair rebuilding every few seconds is the thing being hunted for and
+	// used to be visible only by grepping the log.
+	if d.RelayRebuilds > 0 || d.PeerRekeys > 0 {
+		field(b, "    relay churn", fmt.Sprintf("%d rebuilds, %d peer rekeys",
+			d.RelayRebuilds, d.PeerRekeys))
+	}
 	field(b, "    peer addr", orNone(d.PeerAddr))
 	field(b, "    candidates", fmt.Sprintf("%d", d.Candidates))
 	field(b, "    caps", orNone(strings.Join(d.Caps, ", ")))

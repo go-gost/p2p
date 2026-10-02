@@ -237,6 +237,10 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 			// directNone.
 			State:       "none",
 			LastRecvAge: ageOf(now, pc.lastFrameAt.Load()),
+			// The peer's relay-session churn, so a pair that is flapping reads as
+			// such in the report instead of only in the log.
+			RelayRebuilds: pc.relayRebuilds.Load(),
+			PeerRekeys:    pc.relayRebuildPeers.Load(),
 		}
 	}
 	for _, dc := range directs {
@@ -417,6 +421,13 @@ type peerConn struct {
 	// lastFrameAt is the UnixNano stamp of the last frame seen from this peer
 	// (relay). An atomic so a status read never takes pc.mu.
 	lastFrameAt atomic.Int64
+
+	// Relay-session rebuilds for this peer, by cause. A pair that rebuilds often
+	// is flapping, and that was only visible by grepping the log: the field case
+	// was five "peer rekeyed" teardowns in twelve minutes, each taking the relay
+	// session down with it. Atomics so a status read never takes pc.mu.
+	relayRebuilds     atomic.Int64 // relay sessions built (first build excluded)
+	relayRebuildPeers atomic.Int64 // of those, the peer changed its secure half
 
 	mu        sync.Mutex
 	sess      *smux.Session
@@ -1055,6 +1066,10 @@ func (e *engine) resetPeerSession(peer derpclient.PublicKey) {
 	pc := e.peers[peer]
 	e.mu.Unlock()
 	if pc != nil {
+		// The one teardown a user cannot cause from either end: the peer changed
+		// its key. It tears the session down every time, so its rate is the one
+		// that separates "the network is flapping" from "we are churning".
+		pc.relayRebuildPeers.Add(1)
 		pc.kill(errors.New("derp engine: peer rekeyed"))
 	}
 }
@@ -1455,6 +1470,12 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A session built while one was already there is a rebuild (the caller
+	// cleared a closed one above), and a rebuild rate is what says "this pair is
+	// flapping" — the field case was a session rebuilt every few seconds, visible
+	// only by grepping the log. Counted before the build so a failed one still
+	// shows: the churn guard already acts on the same window.
+	rebuild := !pc.sessAt.IsZero()
 	if roleIsClient {
 		pc.sess, _ = smux.Client(underlay, cfg)
 	} else {
@@ -1462,6 +1483,9 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	}
 	if pc.sess == nil {
 		return nil, errors.New("derp engine: cannot establish mux session")
+	}
+	if rebuild {
+		pc.relayRebuilds.Add(1)
 	}
 	pc.sessAt = time.Now()
 	pc.noteBuildLocked(pc.sessAt)

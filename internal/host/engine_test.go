@@ -120,6 +120,66 @@ func TestTransportCounts(t *testing.T) {
 	}
 }
 
+// TestRelayRebuildCounters: a peer whose relay session is torn down and rebuilt
+// reports both counts — the rebuild and, separately, the rebuild caused by the
+// peer changing its secure half (the one teardown neither side triggers from its
+// own config). The field case was five of those in twelve minutes, and nothing
+// but a log grep showed it: a peer reads as healthy while its session is
+// rebuilt every few seconds.
+func TestRelayRebuildCounters(t *testing.T) {
+	e := &engine{
+		log:     slog.Default(),
+		stop:    make(chan struct{}),
+		directs: make(map[derpclient.PublicKey]*directConn),
+		peers:   make(map[derpclient.PublicKey]*peerConn),
+		secure:  make(map[secureKey]*secureSession),
+	}
+	peer := derpclient.PublicKey{3}
+	pc := &peerConn{e: e, peer: peer, closeCh: make(chan struct{})}
+	e.peers[peer] = pc
+
+	// A teardown the peer caused (a changed ctrlSecure half).
+	e.resetPeerSession(peer)
+	if got := pc.relayRebuildPeers.Load(); got != 1 {
+		t.Errorf("peer rekeys = %d, want 1", got)
+	}
+	if !pc.closed {
+		t.Errorf("the session was not torn down")
+	}
+
+	// A peer's first relay session is not a rebuild; a second one is. Two real
+	// builds over the loopback underlay, the second after the first was closed —
+	// which is what "rebuilt" means.
+	two := derpclient.PublicKey{4}
+	// A settled session, or the forced-encryption gate refuses the build (see
+	// settledSecurePair).
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	tpc := &peerConn{e: e, peer: two, closeCh: make(chan struct{}), secure: settled}
+	e.peers[two] = tpc
+	// sessionLocked's contract is "caller holds pc.mu", and startAccept's defer
+	// takes it from the goroutine it just spawned — so the lock is taken here as
+	// ensureSession does, or the race detector fires on our own test.
+	build := func() error {
+		tpc.mu.Lock()
+		defer tpc.mu.Unlock()
+		_, err := tpc.sessionLocked()
+		return err
+	}
+	if err := build(); err != nil {
+		t.Fatalf("first session: %v", err)
+	}
+	if got := tpc.relayRebuilds.Load(); got != 0 {
+		t.Errorf("after the first session: rebuilds = %d, want 0", got)
+	}
+	tpc.sess.Close()
+	if err := build(); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := tpc.relayRebuilds.Load(); got != 1 {
+		t.Errorf("after a rebuild: rebuilds = %d, want 1", got)
+	}
+}
+
 // TestStatusFacesAgreeOnWhoIsConnected: the transport map, the diagnostics and
 // the encryption map are three answers to one question — "which peers have a
 // live data path" — and a field bug came from one of them answering it
