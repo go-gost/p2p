@@ -448,8 +448,11 @@ state machine `none`/`attempting`/`up`/`backoff`), `failed`, `last_error` (the
 last punch failure, e.g. `seed failed: timeout`), `peer_addr` (the endpoint
 dialled for the direct path), `candidates` (how many the peer announced), `caps`
 (`ipv6`/`tightKeepalive`), `session_age_ms`/`last_recv_age_ms` (the live direct
-session's age, 0 when none; time since the last frame from the peer, relay or
-direct), `trace` (the peer's recent punch steps, oldest first — a fixed ring of
+session's age, 0 when none; time since this host last saw *traffic* from the
+peer, on either path — an inbound relay packet or bytes off a stream. Keepalive
+NOPs never reach the pump, so a connected but idle peer ages here: read it as
+"this peer is this quiet", not as the path being down), `trace` (the peer's
+recent punch steps, oldest first — a fixed ring of
 at most 16 short lines, the history a single snapshot cannot hold, which is what
 a *flaky* punch needs; absent for a relay-only peer), and the
 `attempts`/`ups`/`drops` counters. It is a point-in-time read
@@ -475,6 +478,7 @@ host:            127.0.0.1:8003
 local key:       7D3hUOuIcplL3CCSjsiyIqolF6AkdiXqcdAUZgQzkEs
 relay:           wss://derp.example.com/derp
 relay state:     connected
+direct config:   on=true, stun=stun.example.com:3478 (answered), ipv6=true
 
 summary:
   tunnels:       0
@@ -493,7 +497,7 @@ peers:
     candidates:  1
     caps:        ipv6, tightKeepalive
     session age: 122ms
-    last recv:   21ms
+    last traffic: 21ms (a connected idle peer ages here: keepalives carry no traffic)
     trace:
       round start
       peer candidates: 1
@@ -504,7 +508,7 @@ verdicts:
   relay: connected
   encryption: every connected peer
   STUN 10.99.0.254:3478: configured
-  peer 6Fg4Wtn6SpaOQms96jFxL2r4CVJGIkhrEmWxpCsU-xg: direct path up (session 122ms, last frame 21ms)
+  peer 6Fg4Wtn6SpaOQms96jFxL2r4CVJGIkhrEmWxpCsU-xg: direct path up (session 122ms, last traffic 21ms)
 ```
 
 A peer on the relay instead reads, in `verdicts:`, the reason it is there:

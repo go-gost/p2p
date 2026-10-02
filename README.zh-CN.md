@@ -400,6 +400,7 @@ host:            127.0.0.1:8003
 local key:       7D3hUOuIcplL3CCSjsiyIqolF6AkdiXqcdAUZgQzkEs
 relay:           wss://derp.example.com/derp
 relay state:     connected
+direct config:   on=true, stun=stun.example.com:3478 (answered), ipv6=true
 
 summary:
   tunnels:       0
@@ -418,7 +419,7 @@ peers:
     candidates:  1
     caps:        ipv6, tightKeepalive
     session age: 122ms
-    last recv:   21ms
+    last traffic: 21ms (a connected idle peer ages here: keepalives carry no traffic)
     trace:
       round start
       peer candidates: 1
@@ -429,7 +430,7 @@ verdicts:
   relay: connected
   encryption: every connected peer
   STUN 10.99.0.254:3478: configured
-  peer 6Fg4Wtn6SpaOQms96jFxL2r4CVJGIkhrEmWxpCsU-xg: direct path up (session 122ms, last frame 21ms)
+  peer 6Fg4Wtn6SpaOQms96jFxL2r4CVJGIkhrEmWxpCsU-xg: direct path up (session 122ms, last traffic 21ms)
 ```
 
 挂在 relay 上的 peer 则会在 `verdicts:` 里直接给出原因：

@@ -26,7 +26,14 @@ type PeerDiagnostic struct {
 	// Caps is the peer's advertised capabilities ("ipv6", "tightKeepalive").
 	Caps []string
 	// SessionAge is how long the live direct session has been up (0 when none);
-	// LastRecvAge is how long since the last frame from the peer.
+	// LastRecvAge is how long since this host last saw *traffic* from the peer,
+	// on either path: an inbound relay packet, or bytes off a stream (relay or
+	// direct).
+	//
+	// "Traffic", not "a frame": smux keepalive NOPs are consumed inside smux and
+	// never reach the pump, so a peer that is connected and merely idle ages.
+	// Read it as "this peer is this quiet", never as "the path is down" — the
+	// sessions' own ages and liveness say that. 0 when nothing was ever seen.
 	SessionAge  time.Duration
 	LastRecvAge time.Duration
 	// Attempts/Ups/Drops are the peer's punch history (what PeerPunch held).

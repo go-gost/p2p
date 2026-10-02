@@ -154,7 +154,11 @@ func peerBlock(b *strings.Builder, key string, d p2p.PeerDiagnostic) {
 	field(b, "    candidates", fmt.Sprintf("%d", d.Candidates))
 	field(b, "    caps", orNone(strings.Join(d.Caps, ", ")))
 	field(b, "    session age", d.SessionAge.String())
-	field(b, "    last recv", d.LastRecvAge.String())
+	// "last traffic", not "last frame": smux keepalive NOPs never reach the
+	// pump, so an idle peer ages here and "last recv" reads like a dead path.
+	// The window is stated next to the number for the same reason.
+	field(b, "    last traffic", fmt.Sprintf("%s (a connected idle peer ages here: keepalives carry no traffic)",
+		d.LastRecvAge))
 	field(b, "    punch", fmt.Sprintf("%d attempts, %d ups, %d drops", d.Attempts, d.Ups, d.Drops))
 	if len(d.Trace) > 0 {
 		b.WriteString("    trace:\n")
@@ -229,7 +233,7 @@ func stunVerdict(st p2p.Status, opts Options) string {
 func peerVerdict(key string, d p2p.PeerDiagnostic) string {
 	switch d.Path {
 	case "direct":
-		return fmt.Sprintf("peer %s: direct path up (session %s, last frame %s)", key, d.SessionAge, d.LastRecvAge)
+		return fmt.Sprintf("peer %s: direct path up (session %s, last traffic %s)", key, d.SessionAge, d.LastRecvAge)
 	case "punching":
 		return fmt.Sprintf("peer %s: punch in flight (candidates %d)", key, d.Candidates)
 	case "failed":
