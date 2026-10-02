@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1419,6 +1420,61 @@ func TestBackoffSkipsRoundsForAGonePeer(t *testing.T) {
 // TestBackoffContinuesForALivePeer: the gate is "the peer is gone", not "the
 // round failed". A connected peer keeps retrying — a symmetric-NAT peer, and one
 // whose relay session is briefly down, must not be given up on.
+// TestPeerDirectOffSkipsTheRound: the asymmetry that makes this bit worth
+// having — this host has direct on, the peer has it off. A round cannot be
+// answered, so starting one is what produced the endless "punch failed (often a
+// symmetric NAT)": the word names a NAT problem that is not there, and the
+// STUN lookup and broadcast go out every backoff period for a peer that will
+// never send candidates back.
+//
+// The bit is revoked by the peer's next candidate broadcast, so turning the
+// switch back on is not a restart: the round resumes on the announcement.
+func TestPeerDirectOffSkipsTheRound(t *testing.T) {
+	dc := newSlotConn(t)
+	eng := dc.e
+	eng.direct, eng.stunAddr = true, "127.0.0.1:3478"
+	eng.client = &derpclient.Client{} // relay up, so a round would reach its STUN lookup
+
+	// The peer says it will not punch.
+	dc.addCaps(capsNoDirect)
+	eng.maybeStartDirect(dc.peer)
+	// The decision is read from the trace, not from a counter: a skipped round
+	// is a synchronous decision, while "attempts == 0" is a race — a round that
+	// did start is counted by a goroutine, and a retry re-armed by an earlier
+	// case can fire after the assertion. The trace line is what the skip leaves.
+	skip := func() bool {
+		for _, l := range dc.traceLines() {
+			if strings.Contains(l, "peer has the direct path off") {
+				return true
+			}
+		}
+		return false
+	}
+	if !skip() {
+		t.Fatal("no round was skipped for a peer that advertised the direct path off")
+	}
+	// punchAndWait must not block for the full wait on the same peer either.
+	if sess := eng.punchAndWait(dc.peer); sess != nil {
+		t.Error("punchAndWait returned a session for a peer with direct off")
+	}
+
+	// The peer turns punching back on: the announcement revokes the bit and the
+	// next trigger starts a round again.
+	dc.onCandidates([]candidate{{addr: netip.MustParseAddrPort("203.0.113.7:1234")}})
+	if dc.peerDirectOff() {
+		t.Fatal("a candidate broadcast did not revoke capsNoDirect")
+	}
+	eng.maybeStartDirect(dc.peer)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if a, _, _ := dc.punchCounters(); a > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Error("no round ran after the peer resumed punching")
+}
+
 func TestBackoffContinuesForALivePeer(t *testing.T) {
 	dc := newSlotConn(t)
 	dc.e.client = &derpclient.Client{}

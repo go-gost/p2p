@@ -277,6 +277,7 @@ func TestPeerTransportReasons(t *testing.T) {
 		return &engine{
 			direct:   true,
 			stunAddr: "127.0.0.1:3478",
+			log:      slog.Default(), // a case that changes the peer's caps logs
 			directs:  make(map[derpclient.PublicKey]*directConn),
 			peers:    make(map[derpclient.PublicKey]*peerConn),
 		}
@@ -307,6 +308,14 @@ func TestPeerTransportReasons(t *testing.T) {
 			e.stunFailed.Store(true)
 			e.v6Available = true
 		}, transportRelay},
+		{"peer has the direct path off", func(e *engine) {
+			// A prior round failed, and the peer then advertised that its direct
+			// path is off — the asymmetry this word exists to name, so the bit is
+			// set on the same adapter the failed round left behind.
+			dc := &directConn{e: e, peer: peer, state: directBackoff, failed: true}
+			dc.addCaps(capsNoDirect)
+			e.directs[peer] = dc
+		}, transportPeerDirectOff},
 		{"plain relay", func(e *engine) {}, transportRelay},
 	}
 	for _, tc := range cases {

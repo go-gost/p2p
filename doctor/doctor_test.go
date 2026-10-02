@@ -230,6 +230,35 @@ func TestReportRelayChurn(t *testing.T) {
 	}
 }
 
+// TestReportPeerDirectOffVerdict: the asymmetry is a *setting*, not a failure.
+// "punch failed" names a symmetric NAT and sends the reader after a NAT problem
+// that is not there; the verdict has to say the peer asked for the relay.
+func TestReportPeerDirectOffVerdict(t *testing.T) {
+	key := "peerkey-peerkey-peerkey-peerkey-peerkey-peerkey-pe"
+	st := p2p.Status{
+		PeerTransports: map[string]string{key: "peer-direct-off"},
+		PeerDiagnostics: map[string]p2p.PeerDiagnostic{
+			key: {
+				Path:       "peer-direct-off",
+				State:      "none",
+				Candidates: 0,
+				Caps:       []string{"no-direct"},
+			},
+		},
+	}
+
+	out := Report(st, Options{})
+	if !strings.Contains(out, "the peer has its direct path off") {
+		t.Errorf("verdict does not name the peer's setting:\n%s", out)
+	}
+	// And it must not read as the punch-failure verdict.
+	for _, unwanted := range []string{"punch failed", "symmetric NAT"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("verdict reads as a failure (%q):\n%s", unwanted, out)
+		}
+	}
+}
+
 func TestReportDegradesWithoutRelayState(t *testing.T) {
 	served := p2p.Status{
 		DerpPeers:       1,

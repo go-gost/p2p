@@ -100,6 +100,10 @@ type Status struct {
 	//	"no-candidates"    no STUN server and no IPv6 egress: nothing to punch with
 	//	"stun-unreachable" STUN is configured but not answering, and there is no
 	//	                   IPv6 egress to fall back on
+	//	"peer-direct-off"   the peer has the direct path off (its Config.Direct),
+	//	                   so no round here could succeed — nothing is broken, and
+	//	                   it outranks "failed" so the pair is not read as a
+	//	                   symmetric NAT it is not
 	//
 	// The gRPC transport does not carry it: its proto is frozen, so plugin
 	// clients see the counts only.

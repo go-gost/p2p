@@ -67,6 +67,26 @@ const capsIPv6 uint8 = 1 << 0
 // peer got before the tighter one existed.
 const capsTightKeepalive uint8 = 1 << 1
 
+// capsNoDirect marks a peer that has turned the direct path OFF
+// (Config.Direct=false): it will neither start a round nor answer one. It
+// exists so the other end stops asking. Without it, a host with direct on and
+// a peer with it off is an unactionable asymmetry — the punching side sees
+// "no peer candidates", reports "punch failed (often a symmetric NAT)", and
+// retries forever, which sends the reader after a NAT problem that is not
+// there. The pair is connected; one end asked for the relay.
+//
+// It is the one bit that is *cleared* rather than only ORed: a peer that
+// announces candidates is punching, which is positive evidence it no longer
+// holds the switch off, and a bit that only ever accumulated would pin the
+// answer to the first frame a peer ever sent. Clearing on the candidate
+// broadcast fails safe — a lost frame leaves the punching side doing one round
+// it did not need — because the direction of the error is "asked when it
+// should not have", not the reverse.
+//
+// Sent with the caps frame rather than on its own: a host with direct off sends
+// no candidates, so this is the only frame it puts on the wire about punching.
+const capsNoDirect uint8 = 1 << 2
+
 // punchTraceCap is the number of recent punch steps a peer's Status.Trace
 // holds: enough for a few failed rounds' worth of history, small enough to stay
 // a fixed-size array (no per-round allocation).
@@ -124,6 +144,7 @@ const (
 	transportDirect          = "direct"           // live hole-punched session
 	transportPunching        = "punching"         // a punch for this peer is in flight
 	transportFailed          = "failed"           // this peer's punch failed (usually a symmetric NAT)
+	transportPeerDirectOff   = "peer-direct-off"  // the peer has the direct path off (its Config.Direct)
 	transportRelay           = "derp"             // on the relay, nothing in the way of a punch
 	transportDisabled        = "disabled"         // the direct path is off (Config.Direct)
 	transportNoCandidates    = "no-candidates"    // no STUN server and no IPv6 egress: nothing to punch with
@@ -234,7 +255,16 @@ func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 	if !e.directEnabled() {
 		return
 	}
-	e.directConn(peer).start()
+	dc := e.directConn(peer)
+	if dc.peerDirectOff() {
+		// The peer said it will not punch, so a round here is one it cannot
+		// answer — and "no peer candidates" then reads as a network problem when
+		// it is a setting. It will answer again the moment it turns punching
+		// back on, which revokes the bit (notePunching) and lets this through.
+		dc.noteRound("peer has the direct path off")
+		return
+	}
+	dc.start()
 }
 
 // peerLive reports whether the peer currently has a live data path: a built
@@ -261,6 +291,15 @@ func (e *engine) warm(peer derpclient.PublicKey, punch bool) error {
 	// before the punch (which takes e.mu), and acts on a churned peer, so the
 	// lock order and the churn guard live in one place.
 	_, err := e.peerConn(peer).ensureSession(punch, true)
+	// A host with the direct path off says so on every warm, whether or not it
+	// was asked to punch: this frame is the only thing it puts on the wire about
+	// punching, so without it the other end can only infer the answer from
+	// silence and report it as a failure. Sent after the session is up (the
+	// control channel rides it) and re-sent on each warm, which idempotently
+	// heals a lost frame.
+	if err == nil {
+		e.announceDirect(peer)
+	}
 	switch {
 	case errors.Is(err, errEncryptionRequired):
 		return p2p.ErrEncryptionRequired
@@ -268,6 +307,20 @@ func (e *engine) warm(peer derpclient.PublicKey, punch bool) error {
 		return p2p.ErrPeerUnreachable
 	}
 	return err
+}
+
+// announceDirect sends our caps to a peer, adding capsNoDirect when the direct
+// path is off so the peer stops asking. The IPv6 and tight-keepalive bits mean
+// nothing without a punch round, so they ride it instead (see sendCaps' callers
+// in punch) and only the "off" bit travels here.
+func (e *engine) announceDirect(peer derpclient.PublicKey) {
+	var caps uint8
+	if !e.directEnabled() {
+		caps = capsNoDirect
+	}
+	if err := e.sendCaps(peer, caps); err != nil {
+		e.log.Debug("direct: announce direct-off failed", "peer", keyName(peer), "error", err)
+	}
 }
 
 // punchAndWait triggers hole punching when a candidate source exists and blocks
@@ -288,6 +341,13 @@ func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 		return nil
 	}
 	dc := e.directConn(peer)
+	if dc.peerDirectOff() {
+		// Same as maybeStartDirect: a round for a peer that advertised the
+		// switch off cannot be answered, and waiting for it would charge the
+		// caller the full punchWaitTimeout for nothing.
+		dc.noteRound("peer has the direct path off")
+		return nil
+	}
 	if !dc.start() {
 		return nil
 	}
@@ -477,6 +537,9 @@ func (dc *directConn) capNames() []string {
 	if bits&capsTightKeepalive != 0 {
 		out = append(out, "tightKeepalive")
 	}
+	if bits&capsNoDirect != 0 {
+		out = append(out, "no-direct")
+	}
 	return out
 }
 
@@ -517,6 +580,11 @@ func (dc *directConn) traceLines() []string {
 }
 
 func (dc *directConn) onCandidates(cands []candidate) {
+	// A peer that is broadcasting candidates is punching, whatever it said
+	// earlier: that revokes a capsNoDirect, so this end stops refusing to
+	// answer. Done before the dedupe, so a re-announcement of an identical list
+	// still counts as punching.
+	dc.notePunching()
 	dc.mu.Lock()
 	if sameCandidates(cands, dc.lastPeer) {
 		dc.mu.Unlock()
@@ -659,22 +727,54 @@ func (dc *directConn) markDead(sess *smux.Session) {
 	go dc.start()
 }
 
-// addCaps ORs the capability bits the peer advertised. Capabilities are
-// cumulative: a re-announcement never clears a bit already set. The frame rides
-// every candidate broadcast, so it logs only when the set changes — which is
-// the line that says whether this peer's direct sessions get the tighter
-// keepalive (capsTightKeepalive) or the relay's pair.
+// addCaps records the capability bits the peer advertised. The IPv6 and
+// tight-keepalive bits are sticky: they describe a capability, and a frame that
+// omits one must not clear it. The frame rides every candidate broadcast, so it
+// logs only when the set changes — which is the line that says whether this
+// peer's direct sessions get the tighter keepalive (capsTightKeepalive) or the
+// relay's pair.
+//
+// capsNoDirect is the exception: it is a setting, not a capability, so it is
+// level-triggered (see its definition).
 func (dc *directConn) addCaps(bits uint8) {
 	dc.mu.Lock()
 	before := dc.peerCaps
-	dc.peerCaps |= bits
+	// capsNoDirect is level-triggered — it reflects the peer's switch *now*, so
+	// the last advertisement wins and a frame without it revokes an earlier one
+	// (which is what a peer sends along with its candidate broadcasts once it
+	// starts punching again). The rest are sticky: they describe a capability,
+	// not a setting, and a frame that omits one must not clear it.
+	dc.peerCaps = (dc.peerCaps &^ capsNoDirect) | bits
 	after := dc.peerCaps
 	dc.mu.Unlock()
 	if after != before {
 		dc.e.log.Debug("direct punch: peer caps", "peer", keyName(dc.peer),
 			"ipv6", after&capsIPv6 != 0,
-			"tightKeepalive", after&capsTightKeepalive != 0)
+			"tightKeepalive", after&capsTightKeepalive != 0,
+			"noDirect", after&capsNoDirect != 0)
 	}
+}
+
+// notePunching records that the peer is punching (it broadcast candidates),
+// which revokes a capsNoDirect it advertised earlier: the switch is back on, and
+// a host that keeps the bit would refuse to punch a peer that is asking.
+func (dc *directConn) notePunching() {
+	dc.mu.Lock()
+	cleared := dc.peerCaps&capsNoDirect != 0
+	dc.peerCaps &^= capsNoDirect
+	dc.mu.Unlock()
+	if cleared {
+		dc.e.log.Debug("direct punch: peer resumed punching", "peer", keyName(dc.peer))
+	}
+}
+
+// peerDirectOff reports whether the peer advertised capsNoDirect and has not
+// since broadcast candidates: this end must not start a round for it, because a
+// round it cannot answer is what produced the endless "punch failed" report.
+func (dc *directConn) peerDirectOff() bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.peerCaps&capsNoDirect != 0
 }
 
 // supports reports whether the peer has advertised all of the given capability
@@ -731,7 +831,12 @@ func (dc *directConn) retry(d time.Duration, failed bool) {
 		// directBackoff with no timer, and start() refuses to run from there —
 		// so a peer that came back could never be punched again: the field case
 		// is a phone that reconnected and sat on the relay for good.
-		if !dc.e.peerLive(dc.peer) {
+		//
+		// A peer that advertised the direct path off is skipped the same way, so
+		// a round armed before that advertisement does not run behind its back —
+		// the first symptom being that an endless "punch failed" keeps coming
+		// from a peer that said it was never going to answer.
+		if !dc.e.peerLive(dc.peer) || dc.peerDirectOff() {
 			dc.retry(d, false)
 			return
 		}

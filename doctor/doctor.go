@@ -244,6 +244,8 @@ func peerVerdict(key string, d p2p.PeerDiagnostic) string {
 		return fmt.Sprintf("peer %s: on the relay; %s — candidates %d", key, detail, d.Candidates)
 	case "disabled":
 		return fmt.Sprintf("peer %s: on the relay; direct path disabled", key)
+	case "peer-direct-off":
+		return fmt.Sprintf("peer %s: on the relay; the peer has its direct path off", key)
 	case "no-candidates":
 		return fmt.Sprintf("peer %s: on the relay; no candidates (no STUN and no IPv6 egress)", key)
 	case "stun-unreachable":

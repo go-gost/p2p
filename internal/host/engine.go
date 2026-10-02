@@ -161,6 +161,13 @@ func (e *engine) peerTransports() map[string]string {
 			// not answer, "this peer's punch failed" is the symptom, and the
 			// reason is what a user would fix.
 			out[name] = reason
+		case dc.peerDirectOff():
+			// The peer told us it will not punch, so no round here can succeed.
+			// This outranks "failed" on purpose: the failed word says "punch
+			// failed, usually a symmetric NAT", which sends the reader after a
+			// NAT problem that is not there. Nothing is broken — the pair is
+			// connected, and one end asked for the relay.
+			out[name] = transportPeerDirectOff
 		case dc.hasFailed():
 			// A round failed for this peer. Reported even while a retry is in
 			// flight: re-announcements restart rounds often enough that the
