@@ -63,6 +63,26 @@ func Report(st p2p.Status, opts Options) string {
 	if opts.Direct != nil {
 		field(&b, "direct path", onOff(*opts.Direct))
 	}
+	// The direct path the host is actually running with. The "direct path" line
+	// above is the caller's own configuration, which can disagree with it: an
+	// embedder that probed STUN and got no answer hands p2p an empty server, so
+	// a host configured for direct runs relay-only and says nothing about why.
+	if c := st.DirectConfig; c != (p2p.DirectConfig{}) {
+		stun := orNone(c.Stun)
+		switch {
+		case c.Stun == "":
+			// nothing to probe with
+		case c.StunFailed:
+			stun += " (does not answer)"
+		default:
+			stun += " (answered)"
+		}
+		field(&b, "direct config", fmt.Sprintf("on=%v, stun=%s, ipv6=%v",
+			c.Direct, stun, c.IPv6))
+		if c.Reason != "" {
+			field(&b, "direct reason", c.Reason)
+		}
+	}
 
 	b.WriteString("\nsummary:\n")
 	field(&b, "  tunnels", fmt.Sprintf("%d", st.Tunnels))

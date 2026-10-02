@@ -137,6 +137,68 @@ func TestReportVerdicts(t *testing.T) {
 // TestReportDegradesWithoutRelayState pins the degradation a gRPC caller that
 // does not carry the relay fields still gets: the state is inferred from a peer
 // served over the relay, and otherwise reported as unknown.
+// TestReportDirectConfig: the report must say which direct path the host is
+// *running* with, not only the caller's "direct path: on". An embedder that
+// probed STUN and got no answer hands p2p an empty server, so a host configured
+// for direct runs relay-only — and that gap is invisible unless the running
+// configuration is on the page.
+func TestReportDirectConfig(t *testing.T) {
+	st := p2p.Status{
+		DirectConfig: p2p.DirectConfig{
+			Direct:     true,
+			Stun:       "derp.example:3478",
+			StunFailed: true,
+			IPv6:       false,
+			Reason:     "stun-unreachable",
+		},
+	}
+	yes := true
+
+	out := Report(st, Options{Direct: &yes})
+
+	for _, want := range []string{
+		"direct path:", "on",
+		"direct config:", "on=true",
+		"derp.example:3478", "(does not answer)",
+		"ipv6=false",
+		"direct reason:", "stun-unreachable",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestReportDirectConfigOff: the switch off is the common case (relay-only),
+// and it must be legible too — including when no STUN server was ever held.
+func TestReportDirectConfigOff(t *testing.T) {
+	st := p2p.Status{
+		DirectConfig: p2p.DirectConfig{Direct: false, Reason: "disabled"},
+	}
+	no := false
+
+	out := Report(st, Options{Direct: &no})
+
+	for _, want := range []string{
+		"direct path:", "off",
+		"direct config:", "on=false",
+		"stun=(none)",
+		"direct reason:", "disabled",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestReportOmitsDirectConfigWhenUnreported: a control plane that does not
+// carry it (the frozen gRPC proto) must not get a misleading blank line.
+func TestReportOmitsDirectConfigWhenUnreported(t *testing.T) {
+	if out := Report(p2p.Status{}, Options{}); strings.Contains(out, "direct config") {
+		t.Errorf("report invents a direct config it was not given:\n%s", out)
+	}
+}
+
 func TestReportDegradesWithoutRelayState(t *testing.T) {
 	served := p2p.Status{
 		DerpPeers:       1,

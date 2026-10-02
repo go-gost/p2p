@@ -120,6 +120,94 @@ func TestTransportCounts(t *testing.T) {
 	}
 }
 
+// TestStatusFacesAgreeOnWhoIsConnected: the transport map, the diagnostics and
+// the encryption map are three answers to one question — "which peers have a
+// live data path" — and a field bug came from one of them answering it
+// differently (a killed phone stayed listed as connected while the encryption
+// count said otherwise, in the same snapshot). All three must be derived from
+// peerLive, so this table pins all three to it at once: any face that starts
+// answering for itself fails here.
+func TestStatusFacesAgreeOnWhoIsConnected(t *testing.T) {
+	// Peer shapes: what path, if any, the peer has right now.
+	cases := []struct {
+		name string
+		live func(t *testing.T) (*peerConn, *directConn)
+	}{
+		{"no adapter at all", func(t *testing.T) (*peerConn, *directConn) { return nil, nil }},
+		{"relay adapter, no session yet", func(t *testing.T) (*peerConn, *directConn) {
+			return &peerConn{}, nil
+		}},
+		{"relay session ended", func(t *testing.T) (*peerConn, *directConn) {
+			s := newTestSess(t)
+			s.Close()
+			return &peerConn{sess: s}, nil
+		}},
+		{"relay session live", func(t *testing.T) (*peerConn, *directConn) {
+			return &peerConn{sess: newTestSess(t)}, nil
+		}},
+		{"relay session live, direct backing off", func(t *testing.T) (*peerConn, *directConn) {
+			return &peerConn{sess: newTestSess(t)}, &directConn{state: directBackoff, failed: true}
+		}},
+		{"relay session ended, direct live", func(t *testing.T) (*peerConn, *directConn) {
+			s := newTestSess(t)
+			s.Close()
+			return &peerConn{sess: s}, &directConn{sess: newTestSess(t), state: directUp}
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &engine{
+				direct:   true,
+				stunAddr: "127.0.0.1:3478",
+				log:      slog.Default(),
+				stop:     make(chan struct{}),
+				directs:  make(map[derpclient.PublicKey]*directConn),
+				peers:    make(map[derpclient.PublicKey]*peerConn),
+			}
+			peer := derpclient.PublicKey{5}
+			pc, dc := tc.live(t)
+			if pc != nil {
+				pc.e, pc.peer = e, peer
+				e.peers[peer] = pc
+			}
+			if dc != nil {
+				dc.e, dc.peer = e, peer
+				e.directs[peer] = dc
+			}
+			name := keyName(peer)
+
+			transports := e.peerTransports()
+			diagnostics := e.peerDiagnostics(transports)
+			encryptions := e.peerEncryptions()
+
+			for _, face := range []struct {
+				what string
+				set  map[string]bool
+			}{
+				{"peerTransports", keysOf(transports)},
+				{"peerDiagnostics", keysOf(diagnostics)},
+				{"peerEncryptions", keysOf(encryptions)},
+			} {
+				_, listed := face.set[name]
+				if want := e.peerLive(peer); listed != want {
+					t.Errorf("%s: listed = %v, peerLive = %v — the faces must agree", face.what, listed, want)
+				}
+			}
+		})
+	}
+}
+
+// keysOf is a map's key set, so two Status faces can be compared without their
+// values (which are different words on purpose).
+func keysOf[V any](m map[string]V) map[string]bool {
+	out := make(map[string]bool, len(m))
+	for k := range m {
+		out[k] = true
+	}
+	return out
+}
+
 // TestPeerTransportReasons: a relayed peer reports the most specific reason
 // available — its own punch state first, then the host-wide one — which is what
 // a caller turns into an icon and a tooltip. Being able to tell "STUN does not

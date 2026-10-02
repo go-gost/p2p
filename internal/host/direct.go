@@ -319,6 +319,12 @@ func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 // turned off to prevent.
 func (dc *directConn) start() bool {
 	if !dc.e.directEnabled() {
+		// Without this line, "the switch is off" and "the punch cannot start"
+		// are the same silence in the log — which is exactly how a host built
+		// with the switch off (and one whose STUN probe silently dropped the
+		// server, see wisper's p2pHostStun) reads as a peer that never answers.
+		dc.e.log.Info("direct punch: not attempted, the direct path is off",
+			"peer", keyName(dc.peer), "reason", dc.e.directReason())
 		return false
 	}
 	dc.mu.Lock()

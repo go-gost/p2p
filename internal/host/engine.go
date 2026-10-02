@@ -352,6 +352,22 @@ func encryptionState(pc *peerConn, dc *directConn) string {
 	return encStatePlaintext
 }
 
+// directConfig reports the direct path this host is running with, for Status:
+// the master switch as resolved, the STUN server actually held (not the one
+// configured — an embedder may hand an empty one after a failed probe), whether
+// that server answered, whether IPv6 egress exists, and the host-wide reason
+// word. A host that never punches is explained by these alone, without reading
+// the engine's fields.
+func (e *engine) directConfig() p2p.DirectConfig {
+	return p2p.DirectConfig{
+		Direct:     e.direct,
+		Stun:       e.stunAddr,
+		StunFailed: e.stunFailed.Load(),
+		IPv6:       e.v6Available || e.v6Addr != nil,
+		Reason:     e.directReason(),
+	}
+}
+
 // directReason names what stands between this host and a direct path when
 // nothing peer-specific does: "" while punching is possible, else "disabled"
 // (the master switch), "no-candidates" (no STUN server and no IPv6 egress) or

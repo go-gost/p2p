@@ -107,6 +107,17 @@ func (h *Host) Connect() error {
 				// changed egress does not require a restart.
 				h.engine.v6Available = v6Egress() != nil
 			}
+			// The effective direct configuration, once, in a form a reader can
+			// copy: every "why is this host not punching" question comes down to
+			// these three values, and the engine's own state is otherwise
+			// invisible from outside — an embedder that hands p2p an empty Stun
+			// (because its own one-shot probe said no) and a host with the switch
+			// off look identical on the wire: no punch, no error.
+			h.log.Info("direct path: "+h.engine.directReason(),
+				"on", *h.cfg.Direct,
+				"stun", h.engine.stunAddr,
+				"stunFailed", h.engine.stunFailed.Load(),
+				"ipv6", h.engine.v6Available || h.engine.v6Addr != nil)
 			h.prepareErr = h.engine.Connect()
 		}
 		for _, f := range h.cfg.Forwards {

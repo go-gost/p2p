@@ -39,6 +39,25 @@ type PeerDiagnostic struct {
 	Trace []string
 }
 
+// DirectConfig is the direct path a host is running with. It answers "why is
+// this host not punching?" without reading the engine: a caller hands p2p a
+// Config, and the engine narrows it (an embedder's STUN probe that fails leaves
+// Stun empty, an egress without IPv6 leaves IPv6 false), so the configured
+// values are not what the host acts on.
+type DirectConfig struct {
+	// Direct is the master switch as the host resolved it (Config.Direct).
+	Direct bool
+	// Stun is the STUN server the engine holds ("host:port"), empty when none.
+	Stun string
+	// StunFailed is whether the last IPv4 candidate collection failed.
+	StunFailed bool
+	// IPv6 is whether a usable global IPv6 egress was found (or configured).
+	IPv6 bool
+	// Reason is the host-wide transport word: "disabled", "no-candidates",
+	// "stun-unreachable", or "" while a punch is possible.
+	Reason string
+}
+
 // Status is a point-in-time snapshot of an endpoint: the live tunnel count and
 // the transport counters behind it. A stub-mode endpoint (no relay configured)
 // reports zeros for the transport fields.
@@ -82,6 +101,18 @@ type Status struct {
 	// frozen, so plugin clients see neither.
 	RelayConnected bool
 	RelayError     string
+
+	// DirectConfig is the direct path this host is *running* with, not the one
+	// it was configured with: Direct is Config.Direct, Stun is the server the
+	// engine actually holds (an embedder that probed one and got no answer
+	// hands p2p an empty one), StunFailed is whether its last collection
+	// failed, and IPv6 is whether a global IPv6 egress was found. A host that
+	// never punches is explained by these four values alone.
+	//
+	// Reason is the host-wide word the transport reports ("disabled",
+	// "no-candidates", "stun-unreachable", or "" while a punch is possible).
+	// In-process only: the gRPC transport's proto is frozen.
+	DirectConfig DirectConfig
 
 	// PeerDiagnostics is each connected peer's live state, keyed by base64
 	// public key. The gRPC transport carries it as the repeated
