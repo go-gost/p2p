@@ -75,6 +75,67 @@ func TestCryptoConnRejectsBadLength(t *testing.T) {
 	}
 }
 
+// shortWriteConn truncates every Write to max bytes and reports it as a short
+// write with no error, which is what the record layer has to survive: a
+// truncated length prefix or body is a desync the reader cannot recover from.
+type shortWriteConn struct {
+	net.Conn
+	max int
+}
+
+func (c shortWriteConn) Write(p []byte) (int, error) {
+	if len(p) > c.max {
+		p = p[:c.max]
+	}
+	return c.Conn.Write(p)
+}
+
+func TestCryptoConnWriteRetriesShortWrites(t *testing.T) {
+	a, b := net.Pipe()
+	send, _ := chacha20poly1305.New(bytes.Repeat([]byte{1}, 32))
+	recv, _ := chacha20poly1305.New(bytes.Repeat([]byte{2}, 32))
+	var asc, arc, bsc, brc nonceCtr
+	ca := newCryptoConn(shortWriteConn{a, 7}, send, recv, &asc, &arc, &sync.Mutex{}, nil, derpclient.PublicKey{}, nil)
+	cb := newCryptoConn(b, recv, send, &bsc, &brc, &sync.Mutex{}, nil, derpclient.PublicKey{}, nil)
+
+	want := bytes.Repeat([]byte("y"), 40000) // 3 records, each split by the underlay
+	go func() {
+		if _, err := ca.Write(want); err != nil {
+			t.Errorf("write: %v", err)
+		}
+		ca.Close()
+	}()
+
+	got, err := io.ReadAll(cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("short-write round trip mismatch: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
+// stuckWriter accepts nothing and reports no error, so a writeFull loop that
+// trusted the byte count would spin or silently drop the tail.
+type stuckWriter struct{}
+
+func (stuckWriter) Write([]byte) (int, error) { return 0, nil }
+
+// errorWriter reports an error before writing anything.
+type errorWriter struct{ err error }
+
+func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestWriteFullRejectsNilErrorShortWrite(t *testing.T) {
+	if err := writeFull(stuckWriter{}, []byte("x")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("writeFull(stuck) = %v, want io.ErrShortWrite", err)
+	}
+	want := errors.New("underlay gone")
+	if err := writeFull(errorWriter{want}, []byte("x")); !errors.Is(err, want) {
+		t.Fatalf("writeFull(error) = %v, want %v", err, want)
+	}
+}
+
 func TestSecureSessionNegotiatesDeterministically(t *testing.T) {
 	privA, pubA, _ := derpclient.Generate()
 	privB, pubB, _ := derpclient.Generate()

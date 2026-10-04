@@ -163,14 +163,15 @@ func (c *cryptoConn) Write(p []byte) (int, error) {
 	for len(p) > 0 {
 		n := min(len(p), maxSecureRecord)
 		nonce := c.sendCtr.next()
-		ct := c.send.Seal(nil, nonce[:], p[:n], nil)
-		var hdr [4]byte
-		binary.BigEndian.PutUint32(hdr[:], uint32(len(ct)))
+		// Seal the ciphertext into a single buffer behind its 4-byte length
+		// prefix, so a whole record leaves in one underlay write. The relay
+		// turns each write into one packet, and a header and body split across
+		// two packets is one more way a drop can land mid-record.
+		buf := make([]byte, 4, 4+len(p[:n])+c.send.Overhead())
+		buf = c.send.Seal(buf, nonce[:], p[:n], nil)
+		binary.BigEndian.PutUint32(buf[:4], uint32(len(buf)-4))
 		c.wmu.Lock()
-		_, err := c.Conn.Write(hdr[:])
-		if err == nil {
-			_, err = c.Conn.Write(ct)
-		}
+		err := writeFull(c.Conn, buf)
 		c.wmu.Unlock()
 		if err != nil {
 			return total, err
@@ -179,6 +180,26 @@ func (c *cryptoConn) Write(p []byte) (int, error) {
 		p = p[n:]
 	}
 	return total, nil
+}
+
+// writeFull writes all of p, retrying partial writes, and reports a short
+// write that came back with no error as io.ErrShortWrite. The underlay is a
+// byte stream the record layer needs to stay exact: a truncated record is a
+// desync the reader cannot resync from, so the tail of a write must never be
+// dropped silently. The caller holds the write mutex, which keeps the retry
+// loop free of a second writer.
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return nil
 }
 
 func (c *cryptoConn) Read(b []byte) (int, error) {
