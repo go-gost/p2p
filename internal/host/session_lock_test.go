@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-gost/p2p"
 	"github.com/go-gost/p2p/internal/derpclient"
 	"github.com/xtaci/kcp-go/v5"
 )
@@ -1057,4 +1058,132 @@ func TestRelaySessionRunsOverKCP(t *testing.T) {
 	}
 	defer conn.Close()
 	roundTrip(t, conn, "relay bytes over kcp")
+}
+
+// TestRelayToleratesDroppedDataFrames pins the KCP-underlay fix against the
+// failure it exists to absorb: one dropped relay data frame used to desync the
+// crypto record framing forever ("p2p: bad secure record length") and kill the
+// link at ~2 MB. Here the pair's smux stream carries a multi-megabyte payload
+// while the sender drops every Nth relay data frame (p2p.FaultsConfig.
+// DropDataRate): KCP must retransmit the lost segments and the payload must
+// arrive intact, with no secure-record desync, no relay-session rebuild, and
+// the pair's KCP session never resetting — loss repaired by KCP, not by
+// tearing the session down and redialing.
+func TestRelayToleratesDroppedDataFrames(t *testing.T) {
+	eA, eB, _ := newEncryptedPair(t)
+
+	// Build both sides explicitly (as TestRelaySessionRunsOverKCP does), so the
+	// pair's KCP session and secure session exist before the loss is turned on
+	// and their identity can be snapshotted.
+	pcA := eA.peerConn(eB.pub)
+	if _, err := pcA.ensureSession(false, true); err != nil {
+		t.Fatal(err)
+	}
+	pcB := eB.peerConn(eA.pub)
+	if _, err := pcB.ensureSession(false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot the identities the loss must not disturb.
+	kcpA := pairKCPSession(eA, eB.pub)
+	kcpB := pairKCPSession(eB, eA.pub)
+	if kcpA == nil || kcpB == nil {
+		t.Fatal("a side was built without a KCP underlay")
+	}
+	pcA.mu.Lock()
+	secureA, rebuildsA, rebuildPeersA := pcA.secure, pcA.relayRebuilds.Load(), pcA.relayRebuildPeers.Load()
+	pcA.mu.Unlock()
+	pcB.mu.Lock()
+	secureB, rebuildsB, rebuildPeersB := pcB.secure, pcB.relayRebuilds.Load(), pcB.relayRebuildPeers.Load()
+	pcB.mu.Unlock()
+
+	// Loss on the sender only, installed the same way the fault tests install
+	// one: a fresh fault state on the engine's atomic pointer. rate=0.02 drops
+	// every round(1/0.02)=50th relay data frame.
+	const rate = 0.02
+	loss := newFaults(&p2p.FaultsConfig{DropDataRate: rate})
+	eA.faults.Store(loss)
+
+	// A payload well past the KCP receive window (256 packets * 1400 B ≈ 350
+	// KiB): 2 MiB forces the send window to cycle ~6 times, so retransmitted
+	// segments land in a window that has already moved on — the case that must
+	// not desync the record stream. A position-dependent pattern so reordering,
+	// truncation or corruption is caught by the byte-for-byte check below.
+	const payloadSize = 2 << 20 // 2 MiB
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	conn, err := eA.OpenStream(eB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, payloadSize)
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("the full payload did not round-trip intact and in order")
+	}
+
+	// The injector genuinely exercised the lossy path: it counted every relay
+	// data frame A sent and dropped every 50th, so a non-trivial number of
+	// drops must have occurred — the test cannot pass vacuously.
+	period := loss.dropDataPeriod
+	sent := loss.dropDataSeq.Load()
+	if period == 0 {
+		t.Fatal("dropDataRate did not enable the deterministic drop")
+	}
+	if drops := sent / period; drops < 10 {
+		t.Fatalf("only %d frames dropped over %d sent (want a non-trivial count)", drops, sent)
+	}
+
+	// No secure-record desync on either side: the pair's secure session is the
+	// same object it was, and its desync streak is clean. A desync would have
+	// reset the session (dropRelaySecure) and killed the adapter, so identity is
+	// the hard assertion; the streak is the desync accounting itself.
+	pcA.mu.Lock()
+	secureA2 := pcA.secure
+	pcA.mu.Unlock()
+	pcB.mu.Lock()
+	secureB2 := pcB.secure
+	pcB.mu.Unlock()
+	if secureA2 != secureA || secureB2 != secureB {
+		t.Fatal("the pair re-handshaked: a secure-record desync reset the session")
+	}
+	if s := secureA.desyncStreakValue(); s != 0 {
+		t.Fatalf("A's desync streak = %d after the transfer, want 0", s)
+	}
+	if s := secureB.desyncStreakValue(); s != 0 {
+		t.Fatalf("B's desync streak = %d after the transfer, want 0", s)
+	}
+
+	// No relay session rebuild: loss was repaired by KCP, not by tearing the
+	// session down and redialing.
+	if got := pcA.relayRebuilds.Load(); got != rebuildsA {
+		t.Fatalf("A rebuilt its relay session %d time(s) under loss, want 0", got-rebuildsA)
+	}
+	if got := pcA.relayRebuildPeers.Load(); got != rebuildPeersA {
+		t.Fatalf("A saw %d peer rekeys under loss, want 0", got-rebuildPeersA)
+	}
+	if got := pcB.relayRebuilds.Load(); got != rebuildsB {
+		t.Fatalf("B rebuilt its relay session %d time(s) under loss, want 0", got-rebuildsB)
+	}
+	if got := pcB.relayRebuildPeers.Load(); got != rebuildPeersB {
+		t.Fatalf("B saw %d peer rekeys under loss, want 0", got-rebuildPeersB)
+	}
+
+	// The pair's KCP session never reset: same object before and after.
+	if kcpA2 := pairKCPSession(eA, eB.pub); kcpA2 != kcpA {
+		t.Fatal("A's pair KCP session changed across the transfer")
+	}
+	if kcpB2 := pairKCPSession(eB, eA.pub); kcpB2 != kcpB {
+		t.Fatal("B's pair KCP session changed across the transfer")
+	}
 }
