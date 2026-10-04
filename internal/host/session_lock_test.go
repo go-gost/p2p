@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
+	"github.com/xtaci/kcp-go/v5"
 )
 
 // TestDetachSessionKeepsInFlightRound pins the markDead/session fix: a punch
@@ -594,6 +595,287 @@ func TestRelayRebuildLogFiresOnFreshAdapter(t *testing.T) {
 	}
 	if got := attrs["secureReuse"]; got != "false" {
 		t.Fatalf("secureReuse = %q, want \"false\": an abandoning kill dropped the keys", got)
+	}
+}
+
+// count returns how many records carry the given message.
+func (c *logCapture) count(msg string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, m := range c.messages {
+		if m == msg {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRelayCleanKillKeepsPairKCPAndRecovers pins the pair-level KCP session: a
+// clean kill (nothing abandoned, keys kept) must leave the pair's KCP session
+// running across the adapter swap, so the rebuilt mux session continues the
+// pair's sequence epoch instead of restarting at sn=0 under a peer whose
+// session is still running. That one-sided reset is the livelock this fixes:
+// kcp-go buffers the peer's advanced segments as out-of-order holes and ACKs
+// them, and the secure counters keep the peer's smux from ever timing out.
+func TestRelayCleanKillKeepsPairKCPAndRecovers(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, pubA, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, echo, privA, slog.Default()) // A answers inbound
+	engineB := newEngine(url, "", privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+	engineA.Connect()
+	engineB.Connect()
+
+	// First inbound stream: A builds its adapter from the packet pump alone.
+	s, err := engineB.OpenStream(keyName(pubA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+	waitFor(t, 5*time.Second, func() bool {
+		engineA.mu.Lock()
+		_, ok := engineA.peers[pubB]
+		engineA.mu.Unlock()
+		return ok
+	})
+
+	// Snapshot the pair state a clean kill must preserve.
+	pcA1 := engineA.livePeerConn(pubB)
+	pcA1.mu.Lock()
+	kcpA1, secureA1 := pcA1.kcp, pcA1.secure
+	pcA1.mu.Unlock()
+	if kcpA1 == nil {
+		t.Fatal("A's session was built without a KCP underlay")
+	}
+	pcB1 := engineB.livePeerConn(pubA)
+	pcB1.mu.Lock()
+	kcpB1 := pcB1.kcp
+	pcB1.mu.Unlock()
+
+	// Mute the relay so no KCP segment is in flight across the kill: the kill
+	// must deterministically be the clean one (nothing abandoned), which is the
+	// case under test.
+	rs.setDropData(true)
+	time.Sleep(50 * time.Millisecond)
+	pcA1.killSession(errors.New("test: clean kill"), true, reasonLocalKill)
+	if n := len(pcA1.inbound); n != 0 {
+		t.Fatalf("the kill was not clean: %d packets still queued", n)
+	}
+
+	// The pair's KCP session outlives the adapter it was built on.
+	engineA.kcpMu.Lock()
+	pairA := engineA.relayKCPs[pubB]
+	engineA.kcpMu.Unlock()
+	if pairA == nil {
+		t.Fatal("the clean kill dropped the pair's KCP holder")
+	}
+	pairA.mu.Lock()
+	pairSess := pairA.sess
+	pairA.mu.Unlock()
+	if pairSess != kcpA1 {
+		t.Fatal("the clean kill replaced the pair's KCP session, restarting its sequence epoch")
+	}
+
+	// The peer's next inbound stream is still served, over the same session.
+	rs.setDropData(false)
+	s2, err := engineB.OpenStream(keyName(pubA))
+	if err != nil {
+		t.Fatalf("inbound open after the clean kill: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "recovered")
+
+	// The replacement adapter continues the pair: same KCP session, same keys.
+	pcA2 := engineA.livePeerConn(pubB)
+	if pcA2 == pcA1 {
+		t.Fatal("the killed adapter was handed back instead of a replacement")
+	}
+	pcA2.mu.Lock()
+	kcpA2, secureA2 := pcA2.kcp, pcA2.secure
+	pcA2.mu.Unlock()
+	if kcpA2 != kcpA1 {
+		t.Fatal("the rebuild did not continue the pair's KCP session")
+	}
+	if secureA2 != secureA1 {
+		t.Fatal("the clean kill dropped the pair's settled keys")
+	}
+	// B was never touched: its session is the one it started with.
+	pcB2 := engineB.livePeerConn(pubA)
+	pcB2.mu.Lock()
+	kcpB2 := pcB2.kcp
+	pcB2.mu.Unlock()
+	if kcpB2 != kcpB1 {
+		t.Fatal("B's KCP session changed although B was never touched")
+	}
+}
+
+// TestRelayKCPClosedOnRekeyAndLinkLoss pins the other half of the lifecycle: a
+// kill that ends the pair's epoch (the peer restarted, or the relay link
+// carrying the session died) must close the pair's KCP session, and the next
+// build starts a fresh one — same conv, both ends' sequence numbers aligned
+// from 0 again.
+func TestRelayKCPClosedOnRekeyAndLinkLoss(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		reason     sessionEndReason
+		dropSecure bool
+	}{
+		{"rekey", reasonPeerRekeyed, false},
+		{"link-loss", reasonLinkLost, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eA, eB, rs := newEncryptedPair(t)
+
+			// Both sides build a session, so both hold a pair-level KCP.
+			pcA := eA.peerConn(eB.pub)
+			if _, err := pcA.ensureSession(false, true); err != nil {
+				t.Fatal(err)
+			}
+			pcB := eB.peerConn(eA.pub)
+			if _, err := pcB.ensureSession(false, true); err != nil {
+				t.Fatal(err)
+			}
+			pcA.mu.Lock()
+			kcpA1 := pcA.kcp
+			pcA.mu.Unlock()
+			pcB.mu.Lock()
+			kcpB1 := pcB.kcp
+			pcB.mu.Unlock()
+			if kcpA1 == nil || kcpB1 == nil {
+				t.Fatal("a side was built without a KCP underlay")
+			}
+
+			// Quiet the relay so the kills are the clean kind (nothing
+			// abandoned): what is under test is the reason's classification,
+			// not the race. The end of a pair's epoch resets BOTH ends (a
+			// restarted peer's sequence numbers start over; a lost link ends the
+			// session for both), so the rebuild below is the convergent shape.
+			rs.setDropData(true)
+			time.Sleep(50 * time.Millisecond)
+			pcA.killSession(errors.New("test: "+tc.name), tc.dropSecure, tc.reason)
+			pcB.killSession(errors.New("test: "+tc.name), tc.dropSecure, tc.reason)
+
+			rebuild := func(name string, e *engine, peer derpclient.PublicKey, old *kcp.UDPSession) {
+				t.Helper()
+				e.kcpMu.Lock()
+				pair := e.relayKCPs[peer]
+				e.kcpMu.Unlock()
+				if pair != nil {
+					pair.mu.Lock()
+					live := pair.sess
+					pair.mu.Unlock()
+					if live != nil {
+						t.Fatalf("%s: the %s kill left the pair's KCP session alive", name, tc.name)
+					}
+				}
+				pc := e.peerConn(peer)
+				if _, err := pc.ensureSession(false, true); err != nil {
+					t.Fatalf("%s: rebuild after %s: %v", name, tc.name, err)
+				}
+				pc.mu.Lock()
+				fresh := pc.kcp
+				pc.mu.Unlock()
+				if fresh == nil || fresh == old {
+					t.Fatalf("%s: the rebuild did not create a fresh KCP session", name)
+				}
+				if fresh.GetConv() != old.GetConv() {
+					t.Fatalf("%s: conv changed across the rebuild", name)
+				}
+			}
+			rs.setDropData(false)
+			rebuild("A", eA, eB.pub, kcpA1)
+			rebuild("B", eB, eA.pub, kcpB1)
+
+			// Both ends restarted their sequence numbers together: the pair
+			// carries data again.
+			conn, err := eA.OpenStream(eB.PublicKey())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			roundTrip(t, conn, "after "+tc.name)
+		})
+	}
+}
+
+// TestRelayKCPRebuildConvergesOnce pins the recovery shape (Review Focus 2):
+// one clean kill is exactly one rebuild — the pair converges on the surviving
+// KCP session at once, and the recovery window shows no second kill, no second
+// rebuild, and no livelock (the storm the one-sided epoch reset used to cause).
+func TestRelayKCPRebuildConvergesOnce(t *testing.T) {
+	capture := &logCapture{}
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, pubA, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, echo, privA, slog.New(capture))
+	engineB := newEngine(url, "", privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineB.OpenStream(keyName(pubA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+	waitFor(t, 5*time.Second, func() bool {
+		engineA.mu.Lock()
+		_, ok := engineA.peers[pubB]
+		engineA.mu.Unlock()
+		return ok
+	})
+
+	rs.setDropData(true)
+	time.Sleep(50 * time.Millisecond)
+	pc := engineA.livePeerConn(pubB)
+	pc.killSession(errors.New("test: clean kill"), true, reasonLocalKill)
+	rs.setDropData(false)
+
+	s2, err := engineB.OpenStream(keyName(pubA))
+	if err != nil {
+		t.Fatalf("inbound open after the clean kill: %v", err)
+	}
+	roundTrip(t, s2, "recovered")
+	s2.Close()
+
+	// Exactly one rebuild for the one kill.
+	pc2 := engineA.livePeerConn(pubB)
+	if pc2 == pc {
+		t.Fatal("the killed adapter was handed back instead of a replacement")
+	}
+	if got := pc2.relayRebuilds.Load(); got != 1 {
+		t.Fatalf("relayRebuilds = %d after one clean kill, want 1", got)
+	}
+
+	// ... and nothing more: a quiet window must show no second kill, no second
+	// rebuild, and the pair still carrying data afterwards.
+	time.Sleep(2 * time.Second)
+	if got := capture.count("peer session killed"); got != 1 {
+		t.Fatalf("peer session killed = %d in the recovery window, want 1", got)
+	}
+	if got := capture.count("relay session rebuilt"); got != 1 {
+		t.Fatalf("relay session rebuilt = %d in the recovery window, want 1", got)
+	}
+	conn, err := engineB.OpenStream(keyName(pubA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn, "still up")
+	if got := pc2.relayRebuilds.Load(); got != 1 {
+		t.Fatalf("relayRebuilds = %d after the recovery window, want 1 (no rebuild storm)", got)
 	}
 }
 

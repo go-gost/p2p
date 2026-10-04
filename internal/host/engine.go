@@ -78,7 +78,15 @@ type engine struct {
 	// outlives any one smux session: a rebuilt mux session reuses its keys and
 	// nonce counters, and a peer restart is seen as a changed half.
 	secure map[secureKey]*secureSession
-	stop   chan struct{}
+	// relayKCPs holds one relay KCP holder per peer, on the same principle as
+	// secure: the pair's KCP session outlives any one adapter, so an adapter
+	// swap does not restart the pair's sequence epoch under a peer whose
+	// session is still running (see relayKCPPair). Guarded by its own leaf
+	// lock, not e.mu: sessionLocked takes it under pc.mu, and e.mu is taken
+	// before pc.mu everywhere else.
+	kcpMu     sync.Mutex
+	relayKCPs map[derpclient.PublicKey]*relayKCPPair
+	stop      chan struct{}
 
 	stats engineStats
 }
@@ -446,11 +454,12 @@ type peerConn struct {
 
 	mu   sync.Mutex
 	sess *smux.Session
-	// kcp is the KCP session under sess (see newRelayKCP): the reliable
-	// datagram layer between the relay packet path and the crypto record
-	// framing, so a dropped relay packet is one retransmitted segment instead
-	// of a permanent record desync. Built with sess by sessionLocked, closed
-	// and cleared by killSession. Guarded by pc.mu.
+	// kcp is this adapter's view of the pair's KCP session under sess (see
+	// relayKCPPair): the reliable datagram layer between the relay packet path
+	// and the crypto record framing, so a dropped relay packet is one
+	// retransmitted segment instead of a permanent record desync. The pair owns
+	// the session — it outlives adapter swaps — and this view is set by
+	// sessionLocked's build and cleared by killSession. Guarded by pc.mu.
 	kcp       *kcp.UDPSession
 	sessAt    time.Time     // when sess was established, for the stream-open log
 	accepting *smux.Session // the session whose inbound accept loop is running, if any
@@ -556,18 +565,19 @@ var (
 
 func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger) *engine {
 	e := &engine{
-		url:     url,
-		targets: newTargetPool(),
-		direct:  true,
-		priv:    priv,
-		pub:     priv.Public(),
-		peers:   make(map[derpclient.PublicKey]*peerConn),
-		directs: make(map[derpclient.PublicKey]*directConn),
-		links:   make(map[derpclient.PublicKey][]*link),
-		gone:    make(map[derpclient.PublicKey]bool),
-		secure:  make(map[secureKey]*secureSession),
-		log:     log,
-		stop:    make(chan struct{}),
+		url:       url,
+		targets:   newTargetPool(),
+		direct:    true,
+		priv:      priv,
+		pub:       priv.Public(),
+		peers:     make(map[derpclient.PublicKey]*peerConn),
+		directs:   make(map[derpclient.PublicKey]*directConn),
+		links:     make(map[derpclient.PublicKey][]*link),
+		gone:      make(map[derpclient.PublicKey]bool),
+		secure:    make(map[secureKey]*secureSession),
+		relayKCPs: make(map[derpclient.PublicKey]*relayKCPPair),
+		log:       log,
+		stop:      make(chan struct{}),
 	}
 	if target != "" {
 		if err := e.addTargets([]string{target}); err != nil {
@@ -864,6 +874,76 @@ func (e *engine) dropRelaySecure(peer derpclient.PublicKey, expect *secureSessio
 	delete(e.secure, k)
 }
 
+// relayKCPPairFor returns (creating if needed) the pair's relay KCP holder,
+// which outlives any one adapter exactly like the pair's secure session. Must
+// NOT be called while holding e.mu — it takes kcpMu, the store's leaf lock.
+func (e *engine) relayKCPPairFor(peer derpclient.PublicKey) *relayKCPPair {
+	e.kcpMu.Lock()
+	defer e.kcpMu.Unlock()
+	if e.relayKCPs == nil {
+		e.relayKCPs = make(map[derpclient.PublicKey]*relayKCPPair)
+	}
+	pair := e.relayKCPs[peer]
+	if pair == nil {
+		pair = newRelayKCPPair(e, peer)
+		e.relayKCPs[peer] = pair
+	}
+	return pair
+}
+
+// dropRelayKCP ends and forgets the pair's relay KCP session, so the next build
+// starts a fresh epoch. It runs only where the pair's sequence state can no
+// longer align with the peer's: the peer restarted (its session starts over),
+// the pair re-handshakes after abandoning records or desyncing (the peer resets
+// alongside our changed half, see resetPeerSession), the relay link carrying it
+// is gone, or the engine is closing. A clean kill — nothing abandoned, keys
+// kept — must NOT call it: the rebuilt mux session continues the pair's session
+// instead of restarting at sn=0 under a peer whose session is still running.
+//
+// Compare-and-delete like dropRelaySecure: the decision is taken under pc.mu
+// (or outside any lock) and runs after, and by then the key may already hold a
+// replacement pair's session — evicting that one would kill a LIVE session's
+// epoch. expect names the session the decision was made about; nil forces the
+// drop (teardown paths, and kills of adapters that never built).
+func (e *engine) dropRelayKCP(peer derpclient.PublicKey, expect *kcp.UDPSession, cause error) {
+	e.kcpMu.Lock()
+	pair := e.relayKCPs[peer]
+	if pair == nil {
+		e.kcpMu.Unlock()
+		return
+	}
+	pair.mu.Lock()
+	live := pair.sess
+	pair.mu.Unlock()
+	if expect != nil && live != expect {
+		e.kcpMu.Unlock()
+		return
+	}
+	delete(e.relayKCPs, peer)
+	e.kcpMu.Unlock()
+	pair.shutdown()
+	e.log.Debug("relay kcp pair reset", "peer", keyName(peer), "cause", cause)
+}
+
+// closeRelayKCPs ends every pair's relay KCP session: the relay connection
+// carrying them all is gone, or the engine is closing. Pairs whose adapter is
+// already gone are included — a session left running would leak its read loop.
+func (e *engine) closeRelayKCPs(cause error) {
+	e.kcpMu.Lock()
+	pairs := make([]*relayKCPPair, 0, len(e.relayKCPs))
+	for peer, pair := range e.relayKCPs {
+		pairs = append(pairs, pair)
+		delete(e.relayKCPs, peer)
+	}
+	e.kcpMu.Unlock()
+	for _, pair := range pairs {
+		pair.shutdown()
+	}
+	if len(pairs) > 0 {
+		e.log.Debug("relay kcp pairs reset", "pairs", len(pairs), "cause", cause)
+	}
+}
+
 // armDesyncRecovery wires a relay security session's record-boundary self-heal:
 // secureDesyncThreshold consecutive failures mean the pair's framing can never
 // realign (see dropRelaySecure), so the session is dropped and the adapter
@@ -941,6 +1021,15 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		dead.mu.Lock()
 		prev, at := dead.secure, dead.sessAt
 		dead.mu.Unlock()
+		// The rebuild counters are the pair's, not the adapter's: the
+		// replacement continues them — and the pair's build timestamp with
+		// them, which is what makes the replacement's first build count as a
+		// rebuild (see sessionLocked's rebuild flag). One clean kill then shows
+		// as exactly one rebuild, and Status keeps reporting the pair's count
+		// across adapter swaps.
+		pc.sessAt = at
+		pc.relayRebuilds.Store(dead.relayRebuilds.Load())
+		pc.relayRebuildPeers.Store(dead.relayRebuildPeers.Load())
 		// The new session starts at a zero streak, so the count that explains
 		// the rebuild has to come off the session being replaced.
 		var streak int
@@ -1325,6 +1414,10 @@ func (e *engine) peerGone(peer derpclient.PublicKey) {
 	// re-handshakes once on its return.
 	delete(e.secure, secureKey{peer: peer, transport: secureTransportRelay})
 	e.mu.Unlock()
+	// The pair's KCP session goes with the peer: its sequence state is with a
+	// peer that is gone (or restarted), and a session left running would leak
+	// its read loop.
+	e.dropRelayKCP(peer, nil, errors.New("derp engine: peer gone"))
 	if pc != nil {
 		// A session-less adapter is a handshake in flight: killing it would fail
 		// that open before its bounded wait can decide, and the peer may already
@@ -1390,6 +1483,10 @@ func (e *engine) teardown(c *derpclient.Client, cause error) {
 	for _, pc := range peers {
 		pc.killSession(cause, true, reasonLinkLost)
 	}
+	// The peers' kills cover the pairs their adapters built; every other pair's
+	// KCP session (an adapter already swapped out, its replacement never built)
+	// rides the same dead relay and goes too.
+	e.closeRelayKCPs(cause)
 }
 
 // Close shuts the engine down.
@@ -1421,6 +1518,9 @@ func (e *engine) Close() {
 	for _, pc := range peers {
 		pc.killSession(errors.New("engine closed"), true, reasonEngineClosed)
 	}
+	// As in teardown: pairs whose adapter is already gone are not in the loop
+	// above, and a KCP session left running would leak its read loop.
+	e.closeRelayKCPs(errors.New("engine closed"))
 	for _, dc := range directs {
 		dc.teardown()
 	}
@@ -1504,6 +1604,16 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	}
 
 	if dropSecure {
+		// The re-handshake resets the pair's KCP epoch too: our next half is a
+		// changed one, and the peer answers by resetting its own session — and
+		// its KCP session with it (resetPeerSession). One side keeping an
+		// advanced sequence state across that reset is the one-sided epoch
+		// livelock again, in mirror image. The pair's session under this
+		// adapter's dead mux session is what the decision was made about.
+		pc.mu.Lock()
+		pairSess := pc.kcp
+		pc.mu.Unlock()
+		pc.e.dropRelayKCP(pc.peer, pairSess, errors.New("relay records abandoned at session replacement"))
 		// Compare-and-delete, then install only if this caller is still the one
 		// holding the session it decided about: ensureSession runs from the pump
 		// AND from OpenStream, and it releases pc.mu for the handshake below, so
@@ -1660,17 +1770,29 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	// KCP -> secure -> smux stack: the relay is a lossy datagram path, and one
 	// dropped packet desyncs the crypto record framing permanently ("bad
 	// secure record length"). Over KCP it is one lost segment, retransmitted.
-	kcpConn, err := pc.newRelayKCP()
+	//
+	// The KCP session is the PAIR's (see relayKCPPair), not this adapter's: a
+	// clean kill swaps the adapter and rebuilds smux and the record layer on
+	// top of the same session, so the pair's sequence epoch does not restart
+	// under a peer whose session is still running. This adapter registers as
+	// the session's endpoint — the queue KCP reads from and the send it writes
+	// through.
+	pair := pc.e.relayKCPPairFor(pc.peer)
+	pair.register(pc)
+	kcpConn, err := pair.session()
 	if err != nil {
 		return nil, err
 	}
-	underlay, err := pc.secure.conn(kcpConn)
+	// The underlay is this mux session's own view of the pair's stream: it dies
+	// with the session built on it (smux closes its underlay), retiring that
+	// session's reader while the pair's KCP session below survives.
+	stream := pair.newStream()
+	underlay, err := pc.secure.conn(stream)
 	if err != nil {
-		// Nothing rides this KCP session: close it here rather than leave a
-		// live session the next build would orphan (two KCP sessions racing
-		// on one peer).
-		kcpConn.Close()
-		pc.kcp = nil
+		// Nothing rides this view: retire it here rather than leave a reader
+		// the next build would race. The pair's KCP session stays — it outlives
+		// any one build (see relayKCPPair).
+		stream.Close()
 		return nil, err
 	}
 	// A session built while one was already there is a rebuild (the caller
@@ -1685,13 +1807,15 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 		pc.sess, _ = smux.Server(underlay, cfg)
 	}
 	if pc.sess == nil {
-		kcpConn.Close()
-		pc.kcp = nil
+		stream.Close()
 		return nil, errors.New("derp engine: cannot establish mux session")
 	}
 	if rebuild {
 		pc.relayRebuilds.Add(1)
 	}
+	// pc.kcp is this adapter's view of the pair's KCP session (the pair owns
+	// it): what the build rode, for the kill path and the KCP-underlay probes.
+	pc.kcp = kcpConn
 	pc.sessAt = time.Now()
 	pc.noteBuildLocked(pc.sessAt)
 	_, _, enc := pc.secure.keys()
@@ -1787,6 +1911,22 @@ const (
 	reasonAdapterClosed sessionEndReason = "adapter-closed"
 )
 
+// resetsPairKCP reports whether a kill with this reason must also end the
+// pair-level KCP session (see relayKCPPair). The pair's sequence state survives
+// adapter swaps; it cannot survive a reset of the far end's state or the end of
+// the pair: a peer restart (rekey) comes with a fresh session starting at sn=0,
+// a desync or dropped keys come with a re-handshake the peer answers by
+// resetting too, a lost link or a gone peer ends the session on both sides, and
+// the engine's end leaves nothing to run it. Every other reason is a clean
+// adapter death — the pair's session runs on.
+func resetsPairKCP(reason sessionEndReason) bool {
+	switch reason {
+	case reasonKeepaliveTimeout, reasonLinkLost, reasonPeerGone, reasonPeerRekeyed, reasonSecureDesync, reasonEngineClosed:
+		return true
+	}
+	return false
+}
+
 // killSession marks the adapter dead and tears down its session. Safe for
 // concurrent use and for already-dead adapters.
 //
@@ -1813,9 +1953,14 @@ const (
 // next rebuild reused its keys, so reporting the request would hide exactly the
 // case that matters — a kill that dropped nothing because nothing was abandoned.
 //
-// The session's KCP underlay is closed and pc.kcp cleared here as well:
-// killSession owns its lifecycle (newRelayKCP builds it with ownConn=false),
-// and a live leftover would race the rebuilt session's KCP on the same peer.
+// The session's KCP underlay is NOT closed here unconditionally: it is the
+// pair's session (see relayKCPPair), and a clean kill must leave it running so
+// the rebuild continues the pair's sequence epoch instead of restarting at sn=0
+// under a peer whose session is still running. It is closed exactly when the
+// pair's epoch must reset with the kill: the keys were dropped (the peer resets
+// alongside our changed half), the reason means the peer restarted or the pair
+// is ending (see resetsPairKCP), or the engine is going away. smux's Close
+// above reaches only the per-build stream view, never the pair's session.
 func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndReason) {
 	pc.mu.Lock()
 	if pc.closed {
@@ -1844,12 +1989,8 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	if sess != nil {
 		sess.Close()
 	}
-	// The smux Close above already reaches the KCP underlay through the
-	// record conn; closing it again (idempotent) covers the builds that
-	// never got a mux session, and the field was cleared under the lock so
-	// the next build cannot orphan this one.
-	if kcpConn != nil {
-		kcpConn.Close()
+	if pc.e != nil && (dropped || resetsPairKCP(reason)) {
+		pc.e.dropRelayKCP(pc.peer, kcpConn, cause)
 	}
 	pc.e.log.Debug("peer session killed",
 		"peer", keyName(pc.peer),

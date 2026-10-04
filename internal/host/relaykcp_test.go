@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -162,6 +163,32 @@ func TestRelayPacketConnReadFromTruncatesToBuffer(t *testing.T) {
 	}
 	if !bytes.Equal(small, large[:len(small)]) {
 		t.Fatal("ReadFrom did not copy the prefix of the oversized datagram")
+	}
+}
+
+// TestRelayPacketConnDrainsAfterClose pins the closeCh branch of ReadFrom: a
+// datagram queued before the close is still delivered, and only once the queue
+// is drained does ReadFrom degrade to io.EOF. The pair-level endpoint
+// forwarding (relayKCPPair) relies on exactly this contract.
+func TestRelayPacketConnDrainsAfterClose(t *testing.T) {
+	pc := &peerConn{
+		inbound: make(chan []byte, 1),
+		closeCh: make(chan struct{}),
+	}
+	rpc := newRelayPacketConn(pc)
+	pc.inbound <- []byte("queued before close")
+	close(pc.closeCh)
+
+	buf := make([]byte, 64)
+	n, _, err := rpc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom after close: %v", err)
+	}
+	if got := string(buf[:n]); got != "queued before close" {
+		t.Fatalf("ReadFrom after close = %q, want the queued datagram", got)
+	}
+	if _, _, err := rpc.ReadFrom(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadFrom on a drained adapter = %v, want io.EOF", err)
 	}
 }
 
