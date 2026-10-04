@@ -172,7 +172,21 @@ cd /root/code/go-gost/p2p && export PATH="$PATH:/root/.local/go/bin:/root/go/bin
 
 跟进建议：把 `faults` 透传到 wisper 的 `P2PSettings` 与 `acquire()`（或改用 `cmd/p2p` + 含 `faults` 的配置文件做丢包 e2e），再补运行 2。
 
+### 运行 2 补充：丢包场景改由仓库内 hermetic 测试覆盖
+
+上述"无法在 harness 上注入丢包"的结论**不变**（wisper 的 `acquire()` 不填 `Faults`，且本任务约束下不改 Go 源码、不改 harness）。丢包场景的**正确性**证据改由仓库内永久测试补上，不再依赖手工 netns harness：
+
+- 测试：`internal/host/session_lock_test.go` 的 `TestRelayToleratesDroppedDataFrames`，复用 `newEncryptedPair` 加密对与 `TestRelaySessionRunsOverKCP` 的往返 helper（不新建 harness、不用 `net.Pipe`）。
+- 注入方式：仅在**发送端**经引擎的 `faults` 原子指针安装 `p2p.FaultsConfig{DropDataRate: 0.02}`（每第 50 个 `frameData` 帧确定性丢一帧，与故障测试的注入路径一致），接收端不注入。
+- 传输量：**2 MiB**，远超 KCP 接收窗口（256 × 1400 B ≈ 350 KiB，约 6 倍窗口），足以迫使发送窗口循环并触发重传。
+- 断言（全部确定性，不断言时序 / 吞吐 / 精确重传数）：
+  1. 载荷按字节完整、有序到达（`bytes.Equal` 逐字节比对 2 MiB）；
+  2. 两端均无 secure record 失步：secure 会话对象身份不变（失步会经 `dropRelaySecure` 重置），且 `desyncStreak` 为 0；
+  3. 无中继会话重建：`relayRebuilds` / `relayRebuildPeers` 原子计数不变（丢包由 KCP 修复，而非拆会话重拨）；
+  4. 两端 pair 级 KCP 会话对象身份不变（epoch 未重置）；
+  5. 非空转：注入器自身计数器确认本次实际丢弃了非平凡数量的帧（实测约 33 / 1682 帧）。
+
 ### KCP 调优是否需要后续
 
 - 无丢包下可持续 94 Mbit/s 且 TCP 0 重传，`relayKCPMtu=1400`、`SndWnd=RcvWnd=256`、`SetNoDelay(1,10,2,1)` 的保守默认值未暴露瓶颈，暂无需暴露调参开关。
-- 5% 丢包场景的吞吐/重传开销因注入缺口未能实测，KCP 在丢包下的表现仍待补测后才能定论。
+- 5% 丢包场景的吞吐/重传开销因注入缺口未能实测，KCP 在丢包下的表现仍待补测后才能定论。丢包下的**正确性**（字节流完整、无 record desync、无重建）已由仓库内 `TestRelayToleratesDroppedDataFrames` 覆盖（见上文"运行 2 补充"）。
