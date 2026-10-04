@@ -3,6 +3,7 @@ package host
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -305,5 +306,63 @@ func TestSecureSessionUnderivableHalfDoesNotWake(t *testing.T) {
 	}
 	if a.settled() {
 		t.Fatal("settled after start() against an underivable peer half")
+	}
+}
+
+// TestKillSessionDropsRelaySecureUnlessRekeyed pins the dropSecure contract of
+// killSession: a kill that abandons records (queued, never-read packets whose
+// nonces the peer already spent) drops the pair's relay security session — but
+// never the direct one (that transport re-keys via rekeyIfUsed). A clean kill
+// abandons nothing and keeps the session (the nonce sequence is intact, so the
+// rebuild is transparent), and the peer-rekeyed teardown is the one kill that
+// must never drop it — respond already re-derived both halves, so dropping
+// would make the two ends swap halves forever.
+func TestKillSessionDropsRelaySecureUnlessRekeyed(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{7}
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// freshPC returns an adapter holding both cached sessions, optionally with
+	// one queued record — the packet the kill abandons.
+	newPC := func(queued bool) *peerConn {
+		e.mu.Lock()
+		relay := newSecureSession(nil, secureTransportRelay, priv, peer)
+		e.secure[secureKey{peer: peer, transport: secureTransportRelay}] = relay
+		e.secure[secureKey{peer: peer, transport: secureTransportDirect}] =
+			newSecureSession(nil, secureTransportDirect, priv, peer)
+		e.mu.Unlock()
+		inbound := make(chan []byte, 1)
+		if queued {
+			inbound <- []byte("stale record queued at kill time")
+		}
+		return &peerConn{e: e, peer: peer, inbound: inbound, closeCh: make(chan struct{}), secure: relay}
+	}
+	cached := func() (relay, direct bool) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		_, relay = e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
+		_, direct = e.secure[secureKey{peer: peer, transport: secureTransportDirect}]
+		return
+	}
+
+	// A kill that abandoned records drops the relay session, never the direct.
+	newPC(true).killSession(errors.New("test: local kill"), true)
+	if relay, direct := cached(); relay || !direct {
+		t.Fatalf("after an abandoning kill: relay kept=%v direct kept=%v, want false/true", relay, direct)
+	}
+
+	// A clean kill abandons nothing: the settled session is reused.
+	newPC(false).killSession(errors.New("test: local kill"), true)
+	if relay, direct := cached(); !relay || !direct {
+		t.Fatalf("after a clean kill: relay kept=%v direct kept=%v, want true/true", relay, direct)
+	}
+
+	// The peer-rekeyed teardown keeps it even when records were abandoned.
+	newPC(true).killSession(errors.New("derp engine: peer rekeyed"), false)
+	if relay, direct := cached(); !relay || !direct {
+		t.Fatalf("after the peer-rekeyed kill: relay kept=%v direct kept=%v, want true/true", relay, direct)
 	}
 }

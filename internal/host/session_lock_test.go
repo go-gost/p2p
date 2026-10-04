@@ -1,6 +1,9 @@
 package host
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"log/slog"
 	"net/netip"
 	"testing"
@@ -170,4 +173,159 @@ func TestRelaySessionChurnReconnectsRelay(t *testing.T) {
 	if churn != 0 || tripped {
 		t.Fatalf("after the trip: churn=%d tripped=%v, want 0/false", churn, tripped)
 	}
+}
+
+// TestRelaySessionReplaceRehandshakes pins the local-kill half of the rule in
+// dropRelaySecure: a kill abandons records still queued in the adapter (their
+// nonces are spent at the peer and will never be consumed), so the replacement
+// adapter must re-handshake on a fresh secure session instead of reusing the
+// cached one. Reuse fails every rebuilt session's first record from then on —
+// the production loop that churned a new session every 15s until restart.
+func TestRelaySessionReplaceRehandshakes(t *testing.T) {
+	eA, eB, rs := newEncryptedPair(t)
+
+	// A and B establish a relay session and carry traffic both ways, so the
+	// pair's key holds live counters when the kill hits.
+	conn, err := eA.OpenStream(eB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, conn, "before")
+	conn.Close()
+
+	pc := eA.peerConn(eB.pub)
+	pc.mu.Lock()
+	old := pc.secure
+	pc.mu.Unlock()
+
+	// Mute data frames at the relay for the rebuild window: the peer's smux
+	// keepalive NOPs must not reach A's pump between the kill and the rebuild,
+	// or each one re-kills the freshly built adapter. Control frames (the
+	// secure halves) still flow. The pause lets frames already in flight land
+	// in the old adapter's queue before the kill, so none of the old key's
+	// records can leak into the rebuilt session's first reads — that would be
+	// the very desync under test, but caused by the test itself.
+	rs.setDropData(true)
+	time.Sleep(50 * time.Millisecond)
+
+	// Records still queued when the session is killed are abandoned: smux's
+	// read loop stops without draining them. Two oversized packets, so the
+	// abandonment is deterministic — the transport delivers one record as a
+	// length-prefix packet and a body packet, and a read loop that happens to
+	// be mid-record consumes at most one of these as that record's missing
+	// piece (no record here is anywhere near this large).
+	stale := bytes.Repeat([]byte("x"), 200)
+	pc.inbound <- stale
+	pc.inbound <- stale
+	pc.killSession(errors.New("test: local kill"), true)
+
+	// The replacement adapter must borrow a fresh secure session: the cached
+	// one is dropped so the rebuild re-handshakes (see dropRelaySecure).
+	pc2 := eA.peerConn(eB.pub)
+	pc2.mu.Lock()
+	rebuilt := pc2.secure
+	pc2.mu.Unlock()
+	if rebuilt == old {
+		t.Fatal("replacement adapter reused the killed adapter's secure session")
+	}
+	if _, err := pc2.ensureSession(false, true); err != nil {
+		t.Fatal(err)
+	}
+	rs.setDropData(false)
+
+	// Both ends settle again on the fresh key within the handshake bound, and
+	// the pair carries data again.
+	waitFor(t, handshakeTimeout, func() bool {
+		return eA.peerSecureForTest(eB.pub) && eB.peerSecureForTest(eA.pub)
+	})
+	waitFor(t, 10*time.Second, func() bool {
+		conn, err := eA.OpenStream(eB.PublicKey())
+		if err != nil {
+			return false
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.Write([]byte("after")); err != nil {
+			return false
+		}
+		buf := make([]byte, len("after"))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return false
+		}
+		return string(buf) == "after"
+	})
+}
+
+// TestRelaySessionReplaceDeadSessionRehandshakes pins the session-replacement
+// half of the same rule: when a dead mux session is replaced on a live adapter
+// (the smux keepalive timeout starved it and nothing killed the adapter), the
+// rebuild must re-handshake on a fresh secure session rather than reuse the
+// cached one. This is the path that does not pass through pc.kill.
+func TestRelaySessionReplaceDeadSessionRehandshakes(t *testing.T) {
+	eA, eB, _ := newEncryptedPair(t)
+
+	// B's adapter up front: the half exchange below settles B's security
+	// session, and the assertions read it through the adapter.
+	eB.peerConn(eA.pub)
+
+	pc := eA.peerConn(eB.pub)
+	pc.mu.Lock()
+	old := pc.secure
+	pc.mu.Unlock()
+
+	// Settle the pair's key with a plain half exchange with B, so the cached
+	// session is a settled one a rebuild could be tempted to reuse. No mux
+	// session exists yet, so the swap below has nothing else to displace.
+	if err := eA.sendSecureHalf(eB.pub, old); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, handshakeTimeout, func() bool { return old.settled() })
+
+	// A dead smux session standing in for one that expired in place: closed,
+	// but built over its own pipe instead of this adapter's underlay, so the
+	// adapter stays live — exactly the state the replacement branch sees. The
+	// queued packet is what the dead session abandoned (its read loop is gone
+	// and the pump keeps pushing), which is what makes the replacement
+	// re-handshake instead of reusing the settled session.
+	dead := newTestSess(t)
+	if err := dead.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pc.inbound <- []byte("stale record queued when the session died")
+	pc.mu.Lock()
+	pc.sess, pc.sessAt = dead, time.Now()
+	pc.mu.Unlock()
+
+	if _, err := pc.ensureSession(false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	pc.mu.Lock()
+	rebuilt := pc.secure
+	pc.mu.Unlock()
+	if rebuilt == old {
+		t.Fatal("session replacement reused the old secure session instead of re-handshaking")
+	}
+
+	// Both ends settle on the fresh key within the handshake bound, and the
+	// pair carries data.
+	waitFor(t, handshakeTimeout, func() bool {
+		return eA.peerSecureForTest(eB.pub) && eB.peerSecureForTest(eA.pub)
+	})
+	waitFor(t, 10*time.Second, func() bool {
+		conn, err := eA.OpenStream(eB.PublicKey())
+		if err != nil {
+			return false
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.Write([]byte("after")); err != nil {
+			return false
+		}
+		buf := make([]byte, len("after"))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return false
+		}
+		return string(buf) == "after"
+	})
 }

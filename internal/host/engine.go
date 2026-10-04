@@ -345,10 +345,17 @@ func (e *engine) peerEncryptions() map[string]string {
 // connection.
 func encryptionState(pc *peerConn, dc *directConn) string {
 	considered, allSecure := false, true
-	if pc != nil && pc.secure != nil {
-		considered = true
-		if _, _, ok := pc.secure.keys(); !ok {
-			allSecure = false
+	if pc != nil {
+		// pc.secure is reassigned when a replaced session re-handshakes, so the
+		// field is read under pc.mu like sessionLocked's reads.
+		pc.mu.Lock()
+		secure := pc.secure
+		pc.mu.Unlock()
+		if secure != nil {
+			considered = true
+			if _, _, ok := secure.keys(); !ok {
+				allSecure = false
+			}
 		}
 	}
 	if dc != nil && dc.live() && dc.secure != nil {
@@ -722,7 +729,7 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 		go func() {
 			time.Sleep(goneProbeTimeout)
 			if e.isGone(peer) {
-				pc.kill(errors.New("derp engine: peer gone probe timeout"))
+				pc.killSession(errors.New("derp engine: peer gone probe timeout"), true)
 			}
 		}()
 	}
@@ -841,8 +848,9 @@ func (e *engine) dropRelaySecure(peer derpclient.PublicKey) {
 // DERP server and starting the pump on first use. A cached adapter that was
 // closed (e.g. the peer process died and its relay session broke) is replaced
 // with a fresh one so the next stream rebuilds instead of failing forever. The
-// adapter borrows the per-(peer, transport) security session from e.secure, so
-// a rebuild keeps the settled keys.
+// adapter borrows the per-(peer, transport) security session from e.secure: a
+// replacement adapter keeps the settled keys, unless the kill that closed the
+// old one dropped them (killSession) — then the next build re-handshakes.
 func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -945,10 +953,10 @@ func (e *engine) pump(c *derpclient.Client) {
 		// never opens a tunnel to the peer itself.
 		if _, err := pc.ensureSession(true, false); err != nil {
 			// The session could not be built, so records already queued for this
-			// peer are abandoned and their nonces never consumed: drop the pair's
-			// relay security session so the rebuild re-handshakes (see dropRelaySecure).
-			e.dropRelaySecure(src)
-			pc.kill(err)
+			// peer are abandoned and their nonces never consumed: the kill drops
+			// the pair's relay security session so the rebuild re-handshakes
+			// (see dropRelaySecure).
+			pc.killSession(err, true)
 			continue
 		}
 		select {
@@ -959,11 +967,10 @@ func (e *engine) pump(c *derpclient.Client) {
 			// Queue overflow: the session is unrecoverable (smux needs
 			// lossless delivery) — kill it and let the peer redial. Killing
 			// abandons the records still queued (smux's read loop stops without
-			// draining them), so those nonces are spent but never consumed: drop
-			// the relay security session so both ends reset and realign instead
-			// of wedging on a permanent counter offset.
-			e.dropRelaySecure(src)
-			pc.kill(errors.New("derp engine: inbound queue overflow"))
+			// draining them), so those nonces are spent but never consumed: the
+			// kill drops the relay security session so both ends reset and
+			// realign instead of wedging on a permanent counter offset.
+			pc.killSession(errors.New("derp engine: inbound queue overflow"), true)
 		}
 	}
 }
@@ -1077,7 +1084,11 @@ func (e *engine) resetPeerSession(peer derpclient.PublicKey) {
 		// its key. It tears the session down every time, so its rate is the one
 		// that separates "the network is flapping" from "we are churning".
 		pc.relayRebuildPeers.Add(1)
-		pc.kill(errors.New("derp engine: peer rekeyed"))
+		// The one kill that must NOT drop the secure session (dropSecure=false):
+		// the peer changed its half and respond re-derived ours, so both
+		// counters already match — re-handshaking would make the two ends swap
+		// halves forever (see dropRelaySecure).
+		pc.killSession(errors.New("derp engine: peer rekeyed"), false)
 	}
 }
 
@@ -1237,7 +1248,7 @@ func (e *engine) peerGone(peer derpclient.PublicKey) {
 		built := pc.sess != nil
 		pc.mu.Unlock()
 		if built {
-			pc.kill(errors.New("derp engine: peer gone"))
+			pc.killSession(errors.New("derp engine: peer gone"), true)
 		}
 	}
 	e.log.Debug("derp peer gone", "peer", keyName(peer))
@@ -1292,7 +1303,7 @@ func (e *engine) teardown(c *derpclient.Client, cause error) {
 	e.log.Error("derp connection lost", "error", cause)
 	c.Close()
 	for _, pc := range peers {
-		pc.kill(cause)
+		pc.killSession(cause, true)
 	}
 }
 
@@ -1323,7 +1334,7 @@ func (e *engine) Close() {
 	e.links = make(map[derpclient.PublicKey][]*link)
 	e.mu.Unlock()
 	for _, pc := range peers {
-		pc.kill(errors.New("engine closed"))
+		pc.killSession(errors.New("engine closed"), true)
 	}
 	for _, dc := range directs {
 		dc.teardown()
@@ -1372,24 +1383,67 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 		return nil, errPeerSessionClosed
 	}
 	live := pc.liveSessionLocked()
+	// A dead session standing here is about to be replaced by sessionLocked.
+	// When the dead session left records nothing will read (its read loop is
+	// gone, so what the pump kept pushing is abandoned), the replacement must
+	// re-handshake: those records' nonces are spent at the peer and can never
+	// realign (see dropRelaySecure), and their bytes are discarded below so the
+	// fresh key starts on a clean record boundary. The drop runs here, before
+	// the handshake below and outside pc.mu — dropRelaySecure takes e.mu, which
+	// is taken before pc.mu elsewhere (see peerConn), so it cannot run inside
+	// sessionLocked's pc.mu section. A replacement that abandons nothing keeps
+	// the settled session: the nonce sequence is intact, so the rebuild is
+	// transparent and costs no handshake round trip.
+	replaced := pc.sess != nil && pc.sess.IsClosed()
+	secure := pc.secure
+	dropSecure := replaced && pc.abandonedLocked()
 	pc.mu.Unlock()
+
+	if dropSecure {
+		pc.e.dropRelaySecure(pc.peer)
+		secure = pc.e.secureSessionFor(pc.peer, secureTransportRelay)
+		pc.mu.Lock()
+		pc.secure = secure
+		// Discard the abandoned stream bytes with the old session: they belong
+		// to the old key's record sequence, and the fresh session would
+		// misparse them as its first records. Only dead ciphertext is lost —
+		// the peer's respond resets its counters alongside ours.
+		pc.current, pc.remainder = nil, nil
+		for {
+			select {
+			case <-pc.inbound:
+				continue
+			default:
+			}
+			break
+		}
+		pc.mu.Unlock()
+	}
 
 	// No live session: settle the handshake before building, so both ends agree
 	// on encrypted-vs-plaintext for this session. A settled security session
 	// needs none of this: its keys outlive the mux session, so a rebuild just
-	// reuses them (and a peer restart arrives as a changed half, not here). The
+	// reuses them — except a replaced session, which re-handshakes above — and
+	// a peer restart arrives as a changed half, not here. The
 	// send and the wait run OUTSIDE pc.mu: sendControl takes e.mu, which pc.mu
 	// is taken under elsewhere, so holding pc.mu here would invert the two.
-	if !live && !pc.secure.settled() && !wait {
-		// Inbound (pump) path: never block on a relay round trip. handleControl
-		// already sent our half when the peer's ctrlSecure arrived, so there is
-		// nothing to send here; if the session is not settled yet, drop this
-		// packet fast and let the next one (or an outbound open) retry. Waiting
-		// here would stall the single pump goroutine — and every peer's inbound
-		// routing — for up to handshakeTimeout, per packet.
+	if !live && !secure.settled() && !wait {
+		// Inbound (pump) path: never block on a relay round trip. Announce our
+		// half anyway (idempotent: start re-seals the same half) — the peer may
+		// be settled on a key this side just dropped and will then send no half
+		// of its own, and without the announce a pump-driven rebuild would wait
+		// for the peer's next rebuild to re-handshake. The peer sees `changed`
+		// (or a want bit), resets its counters and answers, and handleControl
+		// settles us. If it does not, drop this packet fast and let the next
+		// one (or an outbound open) retry: waiting here would stall the single
+		// pump goroutine — and every peer's inbound routing — for up to
+		// handshakeTimeout, per packet.
+		if err := pc.e.sendSecureHalf(pc.peer, secure); err != nil {
+			pc.e.log.Debug("secure: send half failed", "peer", keyName(pc.peer), "error", err)
+		}
 		return nil, errEncryptionRequired
 	}
-	if !live && !pc.secure.settled() {
+	if !live && !secure.settled() {
 		// Retry the half on an interval: a reply lost in flight leaves us
 		// unsettled while the peer is settled, so re-sending (with want set) is
 		// what makes the peer answer again — otherwise we would stay plaintext
@@ -1405,19 +1459,19 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 		}
 		deadline := time.Now().Add(total)
 		for {
-			if err := pc.e.sendSecureHalf(pc.peer, pc.secure); err != nil {
+			if err := pc.e.sendSecureHalf(pc.peer, secure); err != nil {
 				pc.e.log.Debug("secure: send half failed", "peer", keyName(pc.peer), "error", err)
 			}
-			if pc.secure.waitReady(resendInterval) {
+			if secure.waitReady(resendInterval) {
 				break
 			}
-			if pc.secure.settled() || !time.Now().Before(deadline) {
+			if secure.settled() || !time.Now().Before(deadline) {
 				break
 			}
 		}
 	}
 
-	if !pc.secure.settled() {
+	if !secure.settled() {
 		// Forced encryption: a session that did not settle is refused, never
 		// built as plaintext. Return before sessionLocked (and before the churn
 		// accounting) so the open fails loudly instead of sending cleartext.
@@ -1464,6 +1518,12 @@ func (e *engine) reconnectRelay(cause error) {
 // session per pair. Caller must hold pc.mu.
 func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	if pc.sess != nil && pc.sess.IsClosed() {
+		// A replacement that abandoned records re-handshakes: ensureSession
+		// dropped the pair's relay security session and settled a fresh one
+		// before calling in here (see dropRelaySecure); one that abandoned
+		// nothing keeps the settled session. The drop cannot happen in this
+		// pc.mu section — dropRelaySecure takes e.mu, which is taken before
+		// pc.mu elsewhere (see peerConn).
 		pc.sess = nil
 	}
 	if pc.sess != nil {
@@ -1556,9 +1616,27 @@ func (pc *peerConn) startAccept() {
 	}()
 }
 
-// kill marks the adapter dead and tears down its session. Safe for
+// killSession marks the adapter dead and tears down its session. Safe for
 // concurrent use and for already-dead adapters.
-func (pc *peerConn) kill(cause error) {
+//
+// dropSecure asks for the pair's relay security session to be dropped when the
+// kill abandons records: packets still queued (or partially consumed) whose
+// nonces the peer already spent and this side will never draw. A session
+// rebuilt over them can never realign (see dropRelaySecure), so the next build
+// must re-handshake. A kill that abandons nothing keeps the session: the dying
+// read loop drains what it still consumes (those nonces advance in step with
+// the peer's), so the leftover buffers are the exact abandoned set, and when
+// they are empty the nonce sequence is intact — the rebuild is the transparent
+// one secure.go documents. The one caller that passes false is resetPeerSession
+// (the peer rekeyed): there the peer already changed its half and respond
+// re-derived ours, so both counters already match and a drop would make the two
+// ends swap halves forever.
+//
+// Only the caller that flips the adapter dead decides the secure session, and
+// it runs once: smux's session Close re-enters here through the underlay
+// (Close), and a re-entry must not re-decide — it would drop what a
+// killSession(cause, false) deliberately kept.
+func (pc *peerConn) killSession(cause error, dropSecure bool) {
 	pc.mu.Lock()
 	if pc.closed {
 		pc.mu.Unlock()
@@ -1567,34 +1645,56 @@ func (pc *peerConn) kill(cause error) {
 	pc.closed = true
 	close(pc.closeCh)
 	sess := pc.sess
+	abandoned := pc.abandonedLocked()
 	pc.mu.Unlock()
+
+	if dropSecure && abandoned && pc.e != nil {
+		pc.e.dropRelaySecure(pc.peer)
+	}
 	if sess != nil {
 		sess.Close()
 	}
 	pc.e.log.Debug("peer session killed", "peer", keyName(pc.peer), "cause", cause)
 }
 
-// Read implements net.Conn: drain queued packets, honoring partial reads.
+// abandonedLocked reports whether the adapter still holds frame bytes nothing
+// will read: queued packets and partially consumed ones. Caller must hold
+// pc.mu, so pc.Read's bookkeeping and this snapshot cannot race.
+func (pc *peerConn) abandonedLocked() bool {
+	return len(pc.inbound) > 0 || len(pc.current) > 0 || len(pc.remainder) > 0
+}
+
+// Read implements net.Conn: drain queued packets, honoring partial reads. The
+// remainder/current bookkeeping runs under pc.mu (it is shared with
+// abandonedLocked's kill-time snapshot), never across a channel wait.
 func (pc *peerConn) Read(p []byte) (int, error) {
 	for {
+		pc.mu.Lock()
 		if len(pc.remainder) > 0 {
 			n := copy(p, pc.remainder)
 			pc.remainder = pc.remainder[n:]
+			pc.mu.Unlock()
 			return n, nil
 		}
 		if len(pc.current) > 0 {
 			n := copy(p, pc.current)
 			pc.current = pc.current[n:]
+			pc.mu.Unlock()
 			return n, nil
 		}
+		pc.mu.Unlock()
 		select {
 		case pkt := <-pc.inbound:
+			pc.mu.Lock()
 			pc.current = pkt
+			pc.mu.Unlock()
 		case <-pc.closeCh:
 			// drain remaining queued packets before reporting EOF
 			select {
 			case pkt := <-pc.inbound:
+				pc.mu.Lock()
 				pc.current = pkt
+				pc.mu.Unlock()
 			default:
 				return 0, io.EOF
 			}
@@ -1636,7 +1736,7 @@ func (pc *peerConn) Write(p []byte) (int, error) {
 // Close implements net.Conn: closing the adapter kills the session (streams
 // and all). It does not touch the shared DERP transport.
 func (pc *peerConn) Close() error {
-	pc.kill(errors.New("adapter closed"))
+	pc.killSession(errors.New("adapter closed"), true)
 	return nil
 }
 
