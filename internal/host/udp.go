@@ -2,10 +2,12 @@ package host
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
@@ -270,32 +272,96 @@ func (l *link) isClosed() bool {
 // then retires it. It is the edge's only reader, so the cleanup cannot race a
 // second reader of the same conn.
 func (l *link) serveEdge(c net.Conn) {
+	started := time.Now()
+	var read, written, drops int64
+	var readErr error
+
 	defer func() {
 		l.retireEdge(c)
 		c.Close()
+		// One line closes out the edge, because "datagram link down" alone left
+		// the only open question unanswered: did anything flow, and what broke
+		// it. readErr carries the reason when there was one.
+		l.logEdgeEnd(started, read, written, drops, readErr)
 	}()
 
 	buf := make([]byte, linkChunkSize)
 	for {
 		n, err := c.Read(buf)
 		if n > 0 {
+			read += int64(n)
 			l.mu.Lock()
 			local := l.local
 			l.mu.Unlock()
 			if local != nil {
-				if _, werr := local.Write(buf[:n]); werr != nil {
+				if wn, werr := local.Write(buf[:n]); werr != nil {
 					// Keep serving: a write error (e.g. the gost edge just died)
 					// must not cost the link its peer edge.
 					l.e.log.Debug("link: write local", "peer", keyName(l.peer), "error", werr)
+				} else {
+					written += int64(wn)
 				}
+			} else {
+				// No local yet: the carrier has not attached, so there is nobody to
+				// deliver to — dropped, like any datagram loss.
+				drops += int64(n)
 			}
-			// No local yet: the carrier has not attached, so there is nobody to
-			// deliver to — dropped, like any datagram loss.
 		}
 		if err != nil {
+			readErr = err
 			return
 		}
 	}
+}
+
+// logEdgeEnd reports how a peer edge ended. The byte counts are the point: every
+// reader of this log asks whether anything flowed before the edge died, and
+// answering that needed a packet capture before.
+//
+// The level follows the cause. A stream the peer ended (EOF) or that a teardown
+// closed (ErrClosed) is the ordinary case the presenter recovers from by
+// re-presenting, so it stays at debug; anything else means the edge broke while
+// it was still supposed to work, and that is a warning.
+func (l *link) logEdgeEnd(started time.Time, read, written, drops int64, err error) {
+	if l.e.log == nil {
+		return
+	}
+	if err != nil && !isEdgeEndError(err) {
+		l.e.log.Warn("link: edge failed", l.edgeEndFields(started, read, written, drops, err)...)
+		return
+	}
+	l.e.log.Debug("link: edge ended", l.edgeEndFields(started, read, written, drops, err)...)
+}
+
+func (l *link) edgeEndFields(started time.Time, read, written, drops int64, err error) []any {
+	fields := []any{
+		"peer", keyName(l.peer),
+		"age", time.Since(started).Round(time.Millisecond).String(),
+		"read", read, "written", written, "dropped", drops,
+	}
+	if err != nil {
+		fields = append(fields, "error", err)
+	}
+	return fields
+}
+
+// isEdgeEndError reports err as the peer or the path letting go rather than this
+// edge breaking on its own. Both are recoverable by re-presenting. The framing
+// failures the relay can produce — a lost record boundary, a bad length — are
+// deliberately not here: those mean the byte stream no longer means what it did,
+// which re-presenting cannot fix.
+func isEdgeEndError(err error) bool {
+	switch {
+	case errors.Is(err, io.EOF), errors.Is(err, net.ErrClosed), errors.Is(err, io.ErrUnexpectedEOF):
+		return true
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	return false
 }
 
 // retireEdge clears c if it is still the link's edge and wakes the presenter.
