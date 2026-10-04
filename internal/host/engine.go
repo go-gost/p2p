@@ -746,7 +746,7 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 		go func() {
 			time.Sleep(goneProbeTimeout)
 			if e.isGone(peer) {
-				pc.killSession(errors.New("derp engine: peer gone probe timeout"), true, reasonKeepaliveTimeout)
+				pc.killSession(errors.New("derp engine: peer gone probe timeout"), true, reasonPeerGoneProbe)
 			}
 		}()
 	}
@@ -1143,12 +1143,14 @@ func (e *engine) pump(c *derpclient.Client) {
 		case <-pc.closeCh:
 			// session already dead; drop
 		default:
-			// Queue overflow: the session is unrecoverable (smux needs
-			// lossless delivery) — kill it and let the peer redial. Killing
-			// abandons the records still queued (smux's read loop stops without
-			// draining them), so those nonces are spent but never consumed: the
-			// kill drops the relay security session so both ends reset and
-			// realign instead of wedging on a permanent counter offset.
+			// Queue overflow: KCP repairs ordinary loss below, but a queue
+			// that stays full means this adapter is no longer draining, so
+			// kill it as a conservative recovery and let the peer redial.
+			// Killing abandons the records still queued (smux's read loop stops
+			// without draining them), so those nonces are spent but never
+			// consumed: the kill drops the relay security session so both ends
+			// reset and realign instead of wedging on a permanent counter
+			// offset.
 			pc.killSession(errors.New("derp engine: inbound queue overflow"), true, reasonQueueOverflow)
 		}
 	}
@@ -1899,9 +1901,9 @@ func (pc *peerConn) startAccept() {
 type sessionEndReason string
 
 const (
-	// reasonKeepaliveTimeout: the keepalive probe stopped being answered, so the
-	// session starved in place.
-	reasonKeepaliveTimeout sessionEndReason = "keepalive-timeout"
+	// reasonPeerGoneProbe: the bounded peer-gone probe expired with the peer
+	// still unreachable, so the session is failed rather than left hanging.
+	reasonPeerGoneProbe sessionEndReason = "peer-gone-probe"
 	// reasonLocalKill: torn down locally with nothing to say about the peer.
 	reasonLocalKill sessionEndReason = "local-kill"
 	// reasonQueueOverflow: the adapter's inbound queue overflowed, so packets
@@ -1934,7 +1936,7 @@ const (
 // adapter death — the pair's session runs on.
 func resetsPairKCP(reason sessionEndReason) bool {
 	switch reason {
-	case reasonKeepaliveTimeout, reasonLinkLost, reasonPeerGone, reasonPeerRekeyed, reasonSecureDesync, reasonEngineClosed:
+	case reasonPeerGoneProbe, reasonLinkLost, reasonPeerGone, reasonPeerRekeyed, reasonSecureDesync, reasonEngineClosed:
 		return true
 	}
 	return false

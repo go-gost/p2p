@@ -65,6 +65,8 @@ derp 包 ↔ relayPacketConn(per-peer net.PacketConn) ↔ KCP 会话
 
 3. **会话构建**（现 `sessionLocked` 中 `pc.secure.conn(pc)` 一步）：建 `relayPacketConn` → `kcp.NewConn4(relayConv(), dummyAddr{}, nil, 0, 0, false, adapter)` → `SetNoDelay(true,10,2,1)` / `SetMtu` / `SetWindowSize` → `pc.secure.conn(kcpConn)` → `faultConn` → `smux.Client/Server`（角色仍按公钥大小序）。`block=nil`（加密在上层）、无 FEC（shards 0,0），与直连一致。
 
+注：中继平面的数据故障实际注入在**数据报层**（出站 `peerConn.Write`、入站 pump 在投递 `pc.inbound` 前丢弃），即位于 KCP **之下**，而非通过图中的 `faultConn`。这样被丢的段由 KCP 重传、记录层与 smux 不受影响——丢包注入测试依赖的正是这一行为。
+
 ### 线格式
 
 - **复用 `frameData = 0x01`**，语义由"smux 字节流"变为"**一个 KCP 段**"。不新增帧类型。
