@@ -85,7 +85,7 @@ git commit -m "feat(p2p): datagram adapter and conv for the relay KCP layer"
 - Test: `internal/host/session_lock_test.go`（追加）
 
 **Interfaces:**
-- Consumes: `newRelayPacketConn`、`relayConv`（Task 1）、`kcp.NewConn4`、`pc.secure.conn`、`smux.Client/Server`、`directSmuxConfig`、`smuxKeepAliveInterval/Timeout`。
+- Consumes: `newRelayPacketConn`、`relayConv`（Task 1）、`kcp.NewConn4`、`pc.secure.conn`、`smux.Client/Server`、`smuxKeepAliveInterval/Timeout`。
 - Produces: `func (pc *peerConn) newRelayKCP() (*kcp.UDPSession, error)` —— 建适配器 → `kcp.NewConn4(relayConv(pc.e.pub, pc.peer), dummyAddr{}, nil, 0, 0, false, adapter)` → `SetNoDelay(true,10,2,1)` / `SetMtu(relayKCPMtu)` / `SetWindowSize(relayKCPSndWnd, relayKCPRcvWnd)`，并把会话存到 `pc.kcp`。常量 `relayKCPMtu = 1400`、`relayKCPSndWnd = 256`、`relayKCPRcvWnd = 256`。
 
 - [ ] **Step 1: 写失败测试**
@@ -115,29 +115,34 @@ git commit -m "feat(p2p): run the relay session over a KCP underlay"
 
 ---
 
-### Task 3: 重建时的陈旧段与在途数据报安全
+### Task 3: pair 级 KCP 会话 —— clean-kill epoch 复位与陈旧段安全
+
+> 修订依据：Task 2 实测发现，**单边 clean kill（保留密钥）会让重建侧的 KCP 会话从 sn=0 重启，而对端仍存活的旧会话继续发高序号段；kcp-go 把这些段当空洞缓存并 ACK，secure 计数器又让对端 smux 永不超时，于是 35s 内无法自愈（活锁）**。因此 KCP 会话必须与 adapter 解耦。
 
 **Files:**
-- Modify: `internal/host/engine.go`（`killSession`、`ensureSession`/`sessionLocked` 替换死会话分支、`abandonedLocked` 与 `dropRelaySecure` 的配合）
-- Test: `internal/host/session_lock_test.go`、`internal/host/secure_test.go`（追加）
+- Modify: `internal/host/engine.go`（KCP 会话从 `peerConn` 迁到 pair 级持有者；新 adapter 注册为当前端点；`killSession` 按 kill 原因决定是否关闭 KCP）
+- Modify: `internal/host/relaykcp.go`（可换端点的 `PacketConn` 代理：KCP 会话捕获代理，代理把 `ReadFrom`/`WriteTo` 转发到当前注册的 adapter）
+- Test: `internal/host/session_lock_test.go`（追加）
 
 **Interfaces:**
-- Consumes: `killSession`、`dropRelaySecure`、`pc.kcp`（Task 2）、`secureSession.desyncStreak`（既有）。
-- Produces: 无新公开签名；行为契约：本地 `killSession` 后重建必须重新握手（复用既有 `dropRelaySecure` 语义），且旧 KCP 会话被 `Close`、旧适配器入站被丢弃。
+- Consumes: `newRelayPacketConn`、`relayConv`（T1）、`newRelayKCP`/`pc.kcp`（T2）、`e.secure` 的 pair 级生命周期范式（"one per (peer, transport), outliving this adapter"）、`dropRelaySecure`、`sessionEndReason`。
+- Produces: KCP 会话与 conv 绑定在 **pair（peer, transport）级**，跨 adapter 替换存活；adapter 作为可换端点注册；`killSession` 仅在 rekey / desync / 失链 / 遗弃类 kill 时 `Close` KCP，clean kill 保留它，smux 与 crypto 记录层照旧在其上重建。
 
 - [ ] **Step 1: 写失败测试**
 
-- `TestRelayKCPRebuildRejectsStaleSegments`：建立 A/B relay 会话并推进若干 KCP 段；在 A 侧 `pc.inbound` 预置一个旧段（模拟在途）；`killSession` 后 `ensureSession`；断言新会话 `pc.kcp` 与旧的不同，且 A/B 能重新互通（新会话序号从 0 起，旧段被窗口拒绝）。钉住 Review Focus 1/4。
-- `TestRelayKCPRebuildConvergesOnce`：触发一次重建后计数 `relayRebuilds`（既有原子量）只加 1，断言不出现连续重建（钉住 Review Focus 2：KCP 超时与 smux keepalive 不得互相升级为风暴）。
+- `TestRelayCleanKillKeepsPairKCPAndRecovers`：复现 `TestInboundRecoversAfterAdapterClosed` 的形状（A 侧 clean kill、密钥保留、B 侧不动）；断言 A 的 KCP 会话跨 adapter 替换**存活**（会话标识未变），且 kill 后双方能重新互通并跑通新流（原失败测试必须转绿）。
+- `TestRelayKCPClosedOnRekeyAndLinkLoss`：rekey / 失链类 kill 后 KCP 会话被 `Close`，下一次 build 新建（conv 不变、两端序号从 0 对齐）。
+- `TestRelayKCPRebuildConvergesOnce`：一次 clean kill 只让 `relayRebuilds` +1，不出现连续重建或活锁（钉住 Review Focus 2）。
+- 若 Task 1 遗留的 closeCh drain/EOF 分支仍无覆盖，在本任务顺手补上（约 10 行）。
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `CGO_ENABLED=1 go test -race -count=1 -run 'TestRelayKCPRebuild' ./internal/host/`
-Expected: FAIL。
+Run: `CGO_ENABLED=1 go test -race -count=1 -run 'TestRelayCleanKill|TestRelayKCPClosed|TestRelayKCPRebuild' ./internal/host/`
+Expected: FAIL（KCP 仍随 adapter 一起死）。
 
 - [ ] **Step 3: 实现**
 
-在 `killSession` 与 `sessionLocked` 替换分支中：`Close` 旧 `pc.kcp`；沿用既有 `dropRelaySecure`（本地 kill 遗弃排队记录 → 重新握手）覆盖 KCP 适配器的在途段；确保重建换用新适配器/新入站消费。若 `abandonedLocked` 需纳入"适配器在途数据报"，一并处理。
+把 KCP 会话移到 pair 级持有者（与 `e.secure` 同构），并让 KCP 捕获一个**可换端点代理**而非具体 adapter：新 `peerConn` 建立会话时把自己注册为该 pair 的当前端点；`ReadFrom`/`WriteTo` 转发到当前端点（端点失效时按既有 closeCh/drain 语义退化为 EOF）。`killSession` 按 `sessionEndReason` 分类：仅 rekey / desync / 失链 / 遗弃类关闭 KCP 会话，clean kill 保留。pair 被移除或 engine 关闭时必须关闭 pair 级 KCP（不得泄漏 goroutine）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
