@@ -47,3 +47,26 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./internal/host/...
+
+      # The race gate only covers ./internal/host/... because the full ./...
+      # currently hangs in this module.
+      - name: Test
+        run: CGO_ENABLED=1 go test -race -count=1 -p 1 ./internal/host/...
