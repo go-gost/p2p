@@ -124,9 +124,19 @@ const (
 // segment that KCP retransmits — the same stack the direct plane already runs
 // (KCP -> cryptoConn(secure) -> smux).
 func newRelayKCPPair(e *engine, peer derpclient.PublicKey) *relayKCPPair {
-	p := &relayKCPPair{e: e, peer: peer, wake: make(chan struct{})}
-	p.cond = sync.NewCond(&p.mu)
-	return p
+	return &relayKCPPair{
+		e:    e,
+		peer: peer,
+		wake: make(chan struct{}),
+		idle: make(chan struct{}),
+	}
+}
+
+// signalIdleLocked wakes the retirement waits (see relayKCPStream.Close).
+// Caller must hold p.mu.
+func (p *relayKCPPair) signalIdleLocked() {
+	close(p.idle)
+	p.idle = make(chan struct{})
 }
 
 // relayKCPPair is one pair's relay KCP state: the KCP session, the adapter
@@ -138,15 +148,18 @@ type relayKCPPair struct {
 	e    *engine
 	peer derpclient.PublicKey
 
+	// claimMu serializes stream claims: each newStream retires its predecessor
+	// before installing itself, so builds racing from different adapter
+	// generations cannot both read the pair's stream.
+	claimMu sync.Mutex
 	mu      sync.Mutex
-	cond    *sync.Cond
 	sess    *kcp.UDPSession  // the pair's KCP session; built on first use
 	ep      *relayPacketConn // the current registered adapter endpoint
 	stream  *relayKCPStream  // the stream view the live mux session reads
-	reading bool             // a stream read is in flight (single reader)
 	pending []byte           // bytes a retired view read but could not deliver
 	closed  bool
 	wake    chan struct{} // closed and replaced on every endpoint/end change
+	idle    chan struct{} // closed and replaced on every read/write completion
 }
 
 // session returns the pair's KCP session, building it on first use. The conv is
@@ -202,9 +215,12 @@ func (p *relayKCPPair) register(pc *peerConn) {
 // secure.conn wraps: it dies with the mux session built on it (smux closes its
 // underlay), so a rebuilt mux session never reads alongside its predecessor,
 // while the pair's KCP session below keeps streaming. The retirement is
-// synchronous: by the time this returns, the previous view's reader is out of
-// the KCP session and any bytes it had read are queued in pending for this one.
+// synchronous and serialized (claimMu): by the time this returns, the previous
+// view's reader and writer are out of the KCP session and any bytes the reader
+// had drawn are queued in pending for this one.
 func (p *relayKCPPair) newStream() *relayKCPStream {
+	p.claimMu.Lock()
+	defer p.claimMu.Unlock()
 	p.mu.Lock()
 	old := p.stream
 	p.mu.Unlock()
@@ -244,17 +260,18 @@ func (p *relayKCPPair) shutdown() {
 //     the replacement has not built): wait for one. Surfacing io.EOF across the
 //     gap would end the KCP session's read loop for good — kcp-go exits the
 //     reader on ANY read error — so io.EOF is reserved for the pair's own end.
-//   - the pair is closing: io.EOF, once the last endpoint's queue is drained.
+//   - the pair is closing: the final endpoint is still drained to its end (its
+//     queued datagrams are delivered first, the same contract the endpoint
+//     itself follows) and only then does the pair report io.EOF.
 func (p *relayKCPPair) ReadFrom(b []byte) (int, net.Addr, error) {
 	for {
 		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			return 0, nil, io.EOF
-		}
-		ep, wake := p.ep, p.wake
+		ep, wake, closed := p.ep, p.wake, p.closed
 		p.mu.Unlock()
 		if ep == nil {
+			if closed {
+				return 0, nil, io.EOF
+			}
 			<-wake
 			continue
 		}
@@ -262,13 +279,12 @@ func (p *relayKCPPair) ReadFrom(b []byte) (int, net.Addr, error) {
 		if err == nil {
 			return n, addr, nil
 		}
-		// io.EOF: this endpoint is gone and drained, or was kicked because the
-		// pair swapped it out or closed.
+		// io.EOF: this endpoint is gone and drained (its closeCh or the kick
+		// fired, and both degrade only once the queue is empty).
 		p.mu.Lock()
 		if p.ep == ep {
 			p.ep = nil
 		}
-		closed := p.closed
 		p.mu.Unlock()
 		if closed {
 			return 0, nil, io.EOF
@@ -327,14 +343,37 @@ func (p *relayKCPPair) SetWriteDeadline(t time.Time) error { return nil }
 // for the race where the wake lands before the read parks.
 const relayKCPStreamReadTimeout = 100 * time.Millisecond
 
+// relayKCPStreamWriteTimeout bounds one parked write on the pair's KCP session:
+// a write parks when the send window is full, and it only unwinds on ACKs or a
+// deadline set before it parked (kcp-go re-reads a changed deadline only for a
+// write that parked with one). It is generous enough that a healthy path — the
+// window draining within milliseconds of ACKs — never sees it; a write that
+// does is on a path that stopped carrying anything.
+const relayKCPStreamWriteTimeout = 10 * time.Second
+
+// relayKCPStreamRetireTimeout bounds a retirement's wait for the view's
+// in-flight read and write. Both normally land promptly (their deadlines are
+// kicked into the past); the bound exists for the one race the kick can miss —
+// a write that parked behind it — where waiting forever would stall the pump.
+// A record that lands that late reorders the stream and the record layer's
+// desync backstop resets the pair; a stuck retirement would freeze every peer.
+const relayKCPStreamRetireTimeout = 500 * time.Millisecond
+
 // relayKCPStream is one mux session's view of the pair's KCP stream: the
 // per-build underlay handed to secure.conn. Closing a view retires exactly that
-// mux session's reader while the pair's session below survives — restoring the
-// invariant the per-adapter underlay had (a mux session's underlay dies with
-// it) without ending the pair's sequence epoch. It is a net.Conn.
+// mux session's reader and writer while the pair's session below survives —
+// restoring the invariant the per-adapter underlay had (a mux session's
+// underlay dies with it) without ending the pair's sequence epoch. It is a
+// net.Conn.
 type relayKCPStream struct {
 	pair   *relayKCPPair
 	closed atomic.Bool
+	// reading and writing track this view's in-flight I/O, guarded by the
+	// pair's mu (the idle signal lives there). Retirement waits for both: a
+	// write that reaches the pair's stream after its successor's would reorder
+	// the nonces the record stream is built on against its bytes.
+	reading bool
+	writing bool
 }
 
 // Read serves the pair's continuing byte stream. Exactly one view reads at a
@@ -356,7 +395,7 @@ func (s *relayKCPStream) Read(b []byte) (int, error) {
 			p.mu.Unlock()
 			return n, nil
 		}
-		p.reading = true
+		s.reading = true
 		sess := p.sess
 		p.mu.Unlock()
 
@@ -365,8 +404,8 @@ func (s *relayKCPStream) Read(b []byte) (int, error) {
 		n, err := sess.Read(b)
 
 		p.mu.Lock()
-		p.reading = false
-		p.cond.Broadcast()
+		s.reading = false
+		p.signalIdleLocked()
 		if s.closed.Load() || p.closed || p.stream != s {
 			// Retired mid-read: these bytes belong to the continuing stream, so
 			// hand them to the next reader instead of dropping them.
@@ -391,7 +430,9 @@ func (s *relayKCPStream) Read(b []byte) (int, error) {
 
 // Write appends to the pair's stream. A retired view writes nothing: a record
 // from a dead mux session landing after its successor's would reorder the nonce
-// sequence the pair's record stream is built on.
+// sequence the pair's record stream is built on. The write carries a deadline
+// so a write parked on a full send window can be kicked out at retirement (see
+// relayKCPStreamWriteTimeout).
 func (s *relayKCPStream) Write(b []byte) (int, error) {
 	p := s.pair
 	p.mu.Lock()
@@ -399,35 +440,69 @@ func (s *relayKCPStream) Write(b []byte) (int, error) {
 		p.mu.Unlock()
 		return 0, net.ErrClosed
 	}
+	s.writing = true
 	sess := p.sess
 	p.mu.Unlock()
-	return sess.Write(b)
+
+	sess.SetWriteDeadline(time.Now().Add(relayKCPStreamWriteTimeout))
+	n, err := sess.Write(b)
+
+	p.mu.Lock()
+	s.writing = false
+	p.signalIdleLocked()
+	p.mu.Unlock()
+	return n, err
 }
 
 // Close retires this view: a parked read is woken at once (its deadline is
-// moved into the past), and Close waits for any in-flight read to land before
-// returning, so the pair's next reader starts exactly where this one stopped.
+// moved into the past), and Close waits for this view's in-flight read and
+// write to land before returning, so the pair's next reader and writer start
+// exactly where this one stopped — a write that reached the stream after its
+// successor's would reorder the record stream's nonces against its bytes. The
+// wait is bounded (see relayKCPStreamRetireTimeout): a write parked against an
+// unresponsive peer's full window is terminated at the bound instead — it
+// returns an error and hands its nonce back (see cryptoConn.Write), so it can
+// never land after its successor's records — where waiting for ACKs that may
+// never come would stall the pump that called this.
 func (s *relayKCPStream) Close() error {
 	p := s.pair
 	p.mu.Lock()
-	if s.closed.Swap(true) {
-		p.mu.Unlock()
-		return net.ErrClosed
-	}
+	already := s.closed.Swap(true)
 	if p.stream == s {
 		p.stream = nil
 	}
-	p.cond.Broadcast()
+	p.signalIdleLocked()
 	sess := p.sess
+	idle := p.idle
 	p.mu.Unlock()
 	if sess != nil {
 		sess.SetReadDeadline(time.Now())
 	}
-	p.mu.Lock()
-	for p.reading {
-		p.cond.Wait()
+	deadline := time.Now().Add(relayKCPStreamRetireTimeout)
+	for {
+		p.mu.Lock()
+		busy := s.reading || s.writing
+		p.mu.Unlock()
+		if !busy {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			if sess != nil {
+				sess.SetWriteDeadline(time.Now())
+			}
+			break
+		}
+		select {
+		case <-idle:
+		case <-time.After(time.Until(deadline)):
+		}
+		p.mu.Lock()
+		idle = p.idle
+		p.mu.Unlock()
 	}
-	p.mu.Unlock()
+	if already {
+		return net.ErrClosed
+	}
 	return nil
 }
 

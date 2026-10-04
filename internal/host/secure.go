@@ -80,6 +80,18 @@ func (c *nonceCtr) next() [12]byte {
 	return nonce
 }
 
+// undo hands the most recently drawn nonce back to the sequence. It is only
+// safe while the caller serializes draws (the session write mutex) and the
+// record never left the underlay: the next record then reuses the nonce for
+// different plaintext, which must never reach a peer that saw the first one.
+func (c *nonceCtr) undo() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.n > 0 {
+		c.n--
+	}
+}
+
 // used reports whether any nonce has been drawn. Safe for concurrent use: a
 // cryptoConn holds this counter by pointer and may draw from it at any time.
 func (c *nonceCtr) used() bool {
@@ -99,8 +111,9 @@ type cryptoConn struct {
 	send, recv       cipher.AEAD
 	sendCtr, recvCtr *nonceCtr
 	// wmu is shared by every cryptoConn of one secureSession and held across a
-	// record's two underlying writes, so a rebuild that starts a second conn on
-	// the same underlay cannot interleave header and body into corrupt framing.
+	// record's draw, seal and write: a rebuild that starts a second conn on the
+	// same underlay must not reserve nonces in one order and reach the wire in
+	// the other.
 	wmu  *sync.Mutex
 	log  *slog.Logger // optional; the owning session's logger
 	peer derpclient.PublicKey
@@ -162,6 +175,12 @@ func (c *cryptoConn) Write(p []byte) (int, error) {
 	total := 0
 	for len(p) > 0 {
 		n := min(len(p), maxSecureRecord)
+		// The draw runs inside the session write mutex, together with the
+		// record's seal and write: two cryptoConns of one session (a rebuild's
+		// outgoing and incoming views) must not reserve nonces in one order and
+		// reach the wire in the other — each record's nonce would then describe
+		// the other's ciphertext and the pair would desync on the first record.
+		c.wmu.Lock()
 		nonce := c.sendCtr.next()
 		// Seal the ciphertext into a single buffer behind its 4-byte length
 		// prefix, so a whole record leaves in one underlay write. The relay
@@ -170,8 +189,15 @@ func (c *cryptoConn) Write(p []byte) (int, error) {
 		buf := make([]byte, 4, 4+len(p[:n])+c.send.Overhead())
 		buf = c.send.Seal(buf, nonce[:], p[:n], nil)
 		binary.BigEndian.PutUint32(buf[:4], uint32(len(buf)-4))
-		c.wmu.Lock()
 		err := writeFull(c.Conn, buf)
+		if err != nil {
+			// The record never left (the underlay rejects whole writes): hand
+			// the nonce back so the counter the peer consumes by still matches
+			// ours record for record. A future underlay that failed after a
+			// partial write would desync the framing regardless — a truncated
+			// record is unrecoverable — so the handback cannot make that worse.
+			c.sendCtr.undo()
+		}
 		c.wmu.Unlock()
 		if err != nil {
 			return total, err

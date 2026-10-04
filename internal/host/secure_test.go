@@ -667,3 +667,110 @@ func TestDesyncStreakNotInheritedByFreshSession(t *testing.T) {
 			"streak would re-handshake on every replacement and never settle", got)
 	}
 }
+
+// memConn is an in-memory net.Conn whose Write records what it is given (and
+// can be told to fail one whole write first). It stands in for the record
+// underlay in the nonce-sequence tests.
+type memConn struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	fail bool
+}
+
+func (c *memConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fail {
+		c.fail = false
+		return 0, net.ErrClosed
+	}
+	return c.buf.Write(p)
+}
+
+func (c *memConn) Read(p []byte) (int, error)         { return 0, io.EOF }
+func (c *memConn) Close() error                       { return nil }
+func (c *memConn) LocalAddr() net.Addr                { return dummyAddr{} }
+func (c *memConn) RemoteAddr() net.Addr               { return dummyAddr{} }
+func (c *memConn) SetDeadline(t time.Time) error      { return nil }
+func (c *memConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *memConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// recorded returns the bytes the underlay accepted, in order.
+func (c *memConn) recorded() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.buf.Bytes()...)
+}
+
+// TestCryptoConnNonceDrawHoldsWriteLock pins WHERE the send nonce is reserved:
+// under the session write mutex. Two cryptoConns of one session — a rebuild's
+// outgoing and incoming views — must not reserve nonces in one order and reach
+// the wire in the other: each record's nonce would then describe the other's
+// ciphertext and the pair would desync on the first record. While the mutex is
+// held, no record's nonce may be reserved yet.
+func TestCryptoConnNonceDrawHoldsWriteLock(t *testing.T) {
+	a, _ := settledSecurePair(t, secureTransportRelay)
+	conn, err := a.conn(&memConn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.wmu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.Write([]byte("record"))
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if a.sendCtr.used() {
+		a.wmu.Unlock()
+		t.Fatal("a nonce was reserved before the write mutex was acquired")
+	}
+	a.wmu.Unlock()
+	<-done
+}
+
+// TestCryptoConnFailedWriteHandsNonceBack pins the other half of the nonce
+// invariant: a record whose write fails never left the underlay, so its nonce
+// goes back to the sequence. The counter the peer consumes by must still match
+// ours record for record — otherwise the next record fails to open and the pair
+// desyncs over a write that carried nothing.
+func TestCryptoConnFailedWriteHandsNonceBack(t *testing.T) {
+	a, _ := settledSecurePair(t, secureTransportRelay)
+	underlay := &memConn{fail: true}
+	conn, err := a.conn(underlay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("lost")); err == nil {
+		t.Fatal("the failing underlay accepted the first write")
+	}
+	if _, err := conn.Write([]byte("kept")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The record that left must open with the sequence's FIRST nonce: the draw
+	// of the failed write was handed back.
+	send, _, ok := a.keys()
+	if !ok {
+		t.Fatal("session not settled")
+	}
+	aead, err := chacha20poly1305.New(send)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := underlay.recorded()
+	if len(rec) < 4 {
+		t.Fatalf("recorded %d bytes, want a length-prefixed record", len(rec))
+	}
+	if got := binary.BigEndian.Uint32(rec[:4]); got != uint32(len(rec)-4) {
+		t.Fatalf("record length prefix = %d, want %d", got, len(rec)-4)
+	}
+	nonce := make([]byte, aead.NonceSize()) // sequence counter 0
+	pt, err := aead.Open(nil, nonce, rec[4:], nil)
+	if err != nil {
+		t.Fatalf("the surviving record does not open with nonce 0 — the failed draw was not handed back: %v", err)
+	}
+	if string(pt) != "kept" {
+		t.Fatalf("the surviving record = %q, want %q", pt, "kept")
+	}
+}

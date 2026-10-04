@@ -965,6 +965,11 @@ func (e *engine) armDesyncRecovery(peer derpclient.PublicKey, secure *secureSess
 		e.log.Warn("p2p: relay secure desync, resetting",
 			"peer", keyName(peer), "streak", streak)
 		e.dropRelaySecure(peer, secure)
+		// The pair's KCP epoch resets with the keys — unconditionally, for the
+		// same reason as resetPeerSession: a reset that lands on a dead adapter
+		// must still reach the pair, or the mismatch survives the re-handshake
+		// this callback exists to force.
+		e.dropRelayKCP(peer, nil, errors.New("p2p: secure desync"))
 		// dropRelaySecure has released e.mu, so taking pc.mu here keeps the
 		// e.mu-before-pc.mu order.
 		if pc := e.livePeerConn(peer); pc != nil {
@@ -1253,6 +1258,14 @@ func (e *engine) resetPeerSession(peer derpclient.PublicKey) {
 	e.mu.Lock()
 	pc := e.peers[peer]
 	e.mu.Unlock()
+	// The pair's KCP epoch ends with the peer's, and this is the signal that
+	// says the peer's ended: drop it unconditionally, BEFORE the adapter kill
+	// below. killSession early-returns on an adapter that is already dead (a
+	// clean kill left the pair running in the gap between adapters), and a
+	// reset that no-ops leaves the pair's advanced sequence state in place to
+	// discard the peer's fresh session's segments — the epoch mismatch the
+	// coordination exists to prevent.
+	e.dropRelayKCP(peer, nil, errors.New("derp engine: peer rekeyed"))
 	if pc != nil {
 		// The one teardown a user cannot cause from either end: the peer changed
 		// its key. It tears the session down every time, so its rate is the one

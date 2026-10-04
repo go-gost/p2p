@@ -8,8 +8,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -189,6 +191,191 @@ func TestRelayPacketConnDrainsAfterClose(t *testing.T) {
 	}
 	if _, _, err := rpc.ReadFrom(buf); !errors.Is(err, io.EOF) {
 		t.Fatalf("ReadFrom on a drained adapter = %v, want io.EOF", err)
+	}
+}
+
+// TestRelayKCPPairDrainsFinalEndpoint pins the pair-level drain contract: a
+// pair shutdown does not cut the final endpoint short — its queued datagrams
+// are still served before the proxy degrades to io.EOF, the same
+// drain-once-then-EOF contract each endpoint follows. Queued datagrams dropped
+// at shutdown are segments the peer will have to retransmit at best, and lost
+// protocol state at worst.
+func TestRelayKCPPairDrainsFinalEndpoint(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{2}
+	pair := e.relayKCPPairFor(peer)
+	pc := &peerConn{
+		e:       e,
+		peer:    peer,
+		inbound: make(chan []byte, 2),
+		closeCh: make(chan struct{}),
+	}
+	pair.register(pc)
+	pc.inbound <- []byte("first")
+	pc.inbound <- []byte("second")
+
+	// The pair ends with datagrams still queued on its endpoint.
+	e.dropRelayKCP(peer, nil, errors.New("test: pair teardown"))
+
+	buf := make([]byte, 64)
+	for _, want := range []string{"first", "second"} {
+		n, _, err := pair.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom during the drain: %v", err)
+		}
+		if got := string(buf[:n]); got != want {
+			t.Fatalf("ReadFrom during the drain = %q, want %q", got, want)
+		}
+	}
+	if _, _, err := pair.ReadFrom(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadFrom after the drain = %v, want io.EOF", err)
+	}
+}
+
+// TestRelayKCPStreamRetiredViewWritesNothing pins the write half of the stream
+// handoff: once a view is retired, it writes nothing. A record from a dead mux
+// session landing after its successor's would reorder the nonce sequence the
+// pair's record stream is built on.
+func TestRelayKCPStreamRetiredViewWritesNothing(t *testing.T) {
+	e := newTestEngine(t)
+	e.faults.Store(&faults{since: time.Now()})
+	peer := derpclient.PublicKey{3}
+	pair := e.relayKCPPairFor(peer)
+	pc := &peerConn{
+		e:       e,
+		peer:    peer,
+		inbound: make(chan []byte, 1),
+		closeCh: make(chan struct{}),
+	}
+	pair.register(pc)
+	if _, err := pair.session(); err != nil {
+		t.Fatal(err)
+	}
+	s1 := pair.newStream()
+	s2 := pair.newStream() // retires s1
+	if _, err := s1.Write([]byte("from the retired view")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("retired view Write = %v, want net.ErrClosed", err)
+	}
+	if _, err := s2.Write([]byte("from the current view")); err != nil {
+		t.Fatalf("current view Write: %v", err)
+	}
+}
+
+// TestRelayKCPStreamRetirementWaitsForWrites pins that a claim cannot cross an
+// in-flight write: retiring a view waits for its outstanding write to land, so
+// a retired view's bytes can never reach the pair's stream after its
+// successor's. The parked write is real: with nothing ACKing the pair's
+// segments, a stream write blocks inside the KCP session once the send window
+// is full.
+func TestRelayKCPStreamRetirementWaitsForWrites(t *testing.T) {
+	e := newTestEngine(t)
+	e.faults.Store(&faults{since: time.Now()})
+	peer := derpclient.PublicKey{4}
+	pair := e.relayKCPPairFor(peer)
+	pc := &peerConn{
+		e:       e,
+		peer:    peer,
+		inbound: make(chan []byte, 1),
+		closeCh: make(chan struct{}),
+	}
+	pair.register(pc)
+	if _, err := pair.session(); err != nil {
+		t.Fatal(err)
+	}
+	s1 := pair.newStream()
+
+	// Fill the pair session's send window: nothing ACKs the segments, so a
+	// stream write eventually parks inside the KCP session — the in-flight
+	// write a retirement must cover. The writer stalls once the window is full.
+	buf := make([]byte, 4096)
+	var writes atomic.Int64
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for {
+			if _, err := s1.Write(buf); err != nil {
+				return
+			}
+			writes.Add(1)
+		}
+	}()
+	last, stalled := writes.Load(), 0
+	for stalled < 4 {
+		time.Sleep(50 * time.Millisecond)
+		if now := writes.Load(); now == last && now > 0 {
+			stalled++
+		} else {
+			last, stalled = writes.Load(), 0
+		}
+	}
+
+	// With the write in flight, retiring the view must not complete.
+	claimed := make(chan struct{})
+	go func() {
+		pair.newStream()
+		close(claimed)
+	}()
+	select {
+	case <-claimed:
+		t.Fatal("the claim completed while a write was still in flight")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Ending the pair releases the parked write, and the claim then completes.
+	pair.shutdown()
+	select {
+	case <-writerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the parked write never returned after the pair ended")
+	}
+	select {
+	case <-claimed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the claim never completed once the write landed")
+	}
+}
+
+// TestRelayKCPStreamConcurrentClaimsSerialize pins that builds racing from
+// different adapter generations cannot both hold the pair: every claim retires
+// its predecessor before installing, so exactly one view stays live.
+func TestRelayKCPStreamConcurrentClaimsSerialize(t *testing.T) {
+	e := newTestEngine(t)
+	e.faults.Store(&faults{since: time.Now()})
+	peer := derpclient.PublicKey{5}
+	pair := e.relayKCPPairFor(peer)
+	pc := &peerConn{
+		e:       e,
+		peer:    peer,
+		inbound: make(chan []byte, 1),
+		closeCh: make(chan struct{}),
+	}
+	pair.register(pc)
+	if _, err := pair.session(); err != nil {
+		t.Fatal(err)
+	}
+
+	views := make([]*relayKCPStream, 8)
+	var wg sync.WaitGroup
+	for i := range views {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			views[i] = pair.newStream()
+		}(i)
+	}
+	wg.Wait()
+
+	pair.mu.Lock()
+	cur := pair.stream
+	pair.mu.Unlock()
+	live := 0
+	for _, v := range views {
+		if v != nil && !v.closed.Load() {
+			live++
+		}
+	}
+	if live != 1 || cur == nil {
+		t.Fatalf("after concurrent claims: %d live views, pair.stream %v — want exactly one", live, cur != nil)
 	}
 }
 

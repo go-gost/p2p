@@ -611,6 +611,20 @@ func (c *logCapture) count(msg string) int {
 	return n
 }
 
+// pairKCPSession returns the pair's current KCP session from the pair store —
+// the epoch identity, independent of any adapter's view of it.
+func pairKCPSession(e *engine, peer derpclient.PublicKey) *kcp.UDPSession {
+	e.kcpMu.Lock()
+	pair := e.relayKCPs[peer]
+	e.kcpMu.Unlock()
+	if pair == nil {
+		return nil
+	}
+	pair.mu.Lock()
+	defer pair.mu.Unlock()
+	return pair.sess
+}
+
 // TestRelayCleanKillKeepsPairKCPAndRecovers pins the pair-level KCP session: a
 // clean kill (nothing abandoned, keys kept) must leave the pair's KCP session
 // running across the adapter swap, so the rebuilt mux session continues the
@@ -876,6 +890,119 @@ func TestRelayKCPRebuildConvergesOnce(t *testing.T) {
 	roundTrip(t, conn, "still up")
 	if got := pc2.relayRebuilds.Load(); got != 1 {
 		t.Fatalf("relayRebuilds = %d after the recovery window, want 1 (no rebuild storm)", got)
+	}
+}
+
+// TestRelayOneSidedEpochResetRecovers pins how a ONE-SIDED pair-epoch reset
+// coordinates with the peer. A resets its KCP epoch and its keys — an
+// abandoning kill, or the record-boundary desync backstop — while B is
+// untouched. The changed secure half is the reset signal: it rides control
+// frames, which no KCP epoch can affect, and B must end its own epoch when it
+// sees it (resetPeerSession), before its answer lets A build. The
+// peer-between-adapters shape is where that signal lands on an adapter that is
+// already dead: the reset must still reach the pair's KCP session there, or B
+// rebuilds on the advanced epoch and discards A's fresh session's segments (the
+// mismatch this task exists to kill).
+func TestRelayOneSidedEpochResetRecovers(t *testing.T) {
+	resets := []struct {
+		name  string
+		reset func(t *testing.T, eA, eB *engine)
+	}{
+		{"abandoning", func(t *testing.T, eA, eB *engine) {
+			pcA := eA.peerConn(eB.pub)
+			// Records the kill abandons: their nonces are spent at the peer and
+			// never consumed, so the pair re-handshakes — and the re-handshake
+			// is the reset signal. Enough of them that the pair's reader cannot
+			// drain the queue between the pushes and the kill.
+			stale := bytes.Repeat([]byte("x"), 200)
+			for i := 0; i < 8; i++ {
+				pcA.inbound <- stale
+			}
+			pcA.killSession(errors.New("test: one-sided abandoning kill"), true, reasonLocalKill)
+		}},
+		{"desync", func(t *testing.T, eA, eB *engine) {
+			pcA := eA.peerConn(eB.pub)
+			pcA.mu.Lock()
+			sec := pcA.secure
+			pcA.mu.Unlock()
+			for i := 0; i < secureDesyncThreshold; i++ {
+				sec.noteDesync()
+			}
+		}},
+	}
+	peerStates := []struct {
+		name string
+		prep func(t *testing.T, eB, eA *engine, rs *relayServer)
+	}{
+		{"peer-live", func(t *testing.T, eB, eA *engine, rs *relayServer) {}},
+		{"peer-between-adapters", func(t *testing.T, eB, eA *engine, rs *relayServer) {
+			// B's adapter is dead but its pair KCP session runs on (a clean
+			// kill leaves it): the peer's reset signal then lands on an adapter
+			// killSession early-returns from, and must still end the pair's
+			// epoch. The relay is muted so the kill is deterministically clean.
+			rs.setDropData(true)
+			time.Sleep(50 * time.Millisecond)
+			pcB := eB.peerConn(eA.pub)
+			pcB.killSession(errors.New("test: clean kill at B"), true, reasonLocalKill)
+			rs.setDropData(false)
+		}},
+	}
+	for _, r := range resets {
+		for _, ps := range peerStates {
+			t.Run(r.name+"/"+ps.name, func(t *testing.T) {
+				eA, eB, rs := newEncryptedPair(t)
+
+				// Traffic first: both epochs carry advanced sequence numbers
+				// when the one-sided reset hits.
+				conn, err := eA.OpenStream(eB.PublicKey())
+				if err != nil {
+					t.Fatal(err)
+				}
+				roundTrip(t, conn, "before")
+				conn.Close()
+
+				eA.peerConn(eB.pub)
+				kcpA1 := pairKCPSession(eA, eB.pub)
+				eB.peerConn(eA.pub)
+				kcpB1 := pairKCPSession(eB, eA.pub)
+				if kcpA1 == nil || kcpB1 == nil {
+					t.Fatal("a side was built without a KCP underlay")
+				}
+
+				ps.prep(t, eB, eA, rs)
+				r.reset(t, eA, eB)
+
+				// Recovery in the production retry shape: the first open can
+				// fail while the reset lands; the pair must converge promptly.
+				waitFor(t, 20*time.Second, func() bool {
+					conn, err := eA.OpenStream(eB.PublicKey())
+					if err != nil {
+						return false
+					}
+					defer conn.Close()
+					conn.SetDeadline(time.Now().Add(2 * time.Second))
+					if _, err := conn.Write([]byte("after")); err != nil {
+						return false
+					}
+					buf := make([]byte, 5)
+					if _, err := io.ReadFull(conn, buf); err != nil {
+						return false
+					}
+					return string(buf) == "after"
+				})
+
+				// Coordinated, not one-sided: both epochs were reset — each side
+				// rides a fresh KCP session, and the working stream above is
+				// what proves their sequence numbers aligned from 0. Read the
+				// pair store, not an adapter: the adapters were replaced too.
+				if kcpA2 := pairKCPSession(eA, eB.pub); kcpA2 == nil || kcpA2 == kcpA1 {
+					t.Fatal("A's epoch was not reset alongside its keys")
+				}
+				if kcpB2 := pairKCPSession(eB, eA.pub); kcpB2 == nil || kcpB2 == kcpB1 {
+					t.Fatal("B's epoch survived the peer's reset signal")
+				}
+			})
+		}
 	}
 }
 
