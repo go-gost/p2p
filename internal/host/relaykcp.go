@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
+	"github.com/xtaci/kcp-go/v5"
 )
 
 // relayConv deterministically derives the KCP conversation ID for the relay
@@ -79,3 +80,47 @@ func (rc *relayPacketConn) SetReadDeadline(t time.Time) error { return nil }
 
 // SetWriteDeadline is a no-op.
 func (rc *relayPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// Relay-plane KCP tuning. Internal constants, deliberately not configurable:
+// there is no trusted use case for a less reliable relay plane, so rollback
+// is a revert, not a switch (same posture as the direct plane).
+const (
+	// relayKCPMtu keeps one KCP segment inside a single DERP packet, so a
+	// relay drop costs exactly one segment's retransmission. Conservative
+	// for the TCP-based client-relay hop, where there is no IP fragmentation
+	// to account for.
+	relayKCPMtu = 1400
+	// relayKCPSndWnd bounds this side's segments in flight, so a bulk
+	// transfer cannot overflow the relay's bounded per-client send queue.
+	// relayKCPRcvWnd is the peer's ceiling on ours: a slow local reader now
+	// shrinks the advertised receive window instead of drowning the relay
+	// queue — the backpressure the raw byte-stream underlay never had.
+	relayKCPSndWnd = 256
+	relayKCPRcvWnd = 256
+)
+
+// newRelayKCP builds this peer's KCP session over the relay datagram adapter
+// and records it on pc.kcp. KCP is the reliability layer between the lossy
+// DERP packet path and the crypto record framing: one dropped relay packet
+// used to desync the record stream permanently ("bad secure record length"),
+// and now it is one lost segment that KCP retransmits — the same stack the
+// direct plane already runs (KCP -> cryptoConn(secure) -> smux). Caller must
+// hold pc.mu.
+func (pc *peerConn) newRelayKCP() (*kcp.UDPSession, error) {
+	adapter := newRelayPacketConn(pc)
+	// ownConn=false: a KCP Close must not close the adapter — killSession
+	// owns its lifecycle (the adapter shares the process-wide relay client).
+	kcpConn, err := kcp.NewConn4(relayConv(pc.e.pub, pc.peer), dummyAddr{}, nil, 0, 0, false, adapter)
+	if err != nil {
+		return nil, err
+	}
+	// nodelay=1 (on), 10ms interval, fast retransmit on the 2nd duplicate
+	// ACK, congestion control off: a relay drop is a bounded-queue overflow,
+	// not a congestion signal, so halving the window on loss would only
+	// starve a healthy path.
+	kcpConn.SetNoDelay(1, 10, 2, 1)
+	kcpConn.SetMtu(relayKCPMtu)
+	kcpConn.SetWindowSize(relayKCPSndWnd, relayKCPRcvWnd)
+	pc.kcp = kcpConn
+	return kcpConn, nil
+}

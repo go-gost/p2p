@@ -596,3 +596,56 @@ func TestRelayRebuildLogFiresOnFreshAdapter(t *testing.T) {
 		t.Fatalf("secureReuse = %q, want \"false\": an abandoning kill dropped the keys", got)
 	}
 }
+
+// TestRelaySessionRunsOverKCP pins the relay session's underlay: the smux
+// session must ride a KCP session over the datagram adapter (derp packet ->
+// adapter -> KCP -> secure record -> smux), mirroring the direct plane's
+// KCP -> cryptoConn(secure) -> smux stack, instead of the raw peerConn byte
+// stream that one dropped relay packet desyncs forever.
+func TestRelaySessionRunsOverKCP(t *testing.T) {
+	eA, eB, _ := newEncryptedPair(t)
+
+	// Build both sides explicitly: A's build settles B's keys but B's own
+	// session is otherwise built only by B's pump on the first inbound data
+	// packet, and both adapters' state is asserted right after.
+	pcA := eA.peerConn(eB.pub)
+	if _, err := pcA.ensureSession(false, true); err != nil {
+		t.Fatal(err)
+	}
+	pcB := eB.peerConn(eA.pub)
+	if _, err := pcB.ensureSession(false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, side := range []struct {
+		name string
+		pc   *peerConn
+	}{
+		{"A", pcA}, {"B", pcB},
+	} {
+		side.pc.mu.Lock()
+		kcpConn, sess := side.pc.kcp, side.pc.sess
+		side.pc.mu.Unlock()
+		if kcpConn == nil {
+			t.Fatalf("%s's relay session was built without a KCP underlay", side.name)
+		}
+		if sess == nil {
+			t.Fatalf("%s's relay session was not built", side.name)
+		}
+		// The pair's deterministic conv is what makes the two sides'
+		// sessions interoperate without a handshake (mirrors directConn.conv).
+		if got := kcpConn.GetConv(); got != relayConv(side.pc.e.pub, side.pc.peer) {
+			t.Fatalf("%s's KCP underlay conv = %#x, want the pair's relayConv", side.name, got)
+		}
+	}
+
+	// Bytes both ways through the pair's session: the stream rides A's smux
+	// session over its KCP underlay to B's echo bridge, and the reply rides
+	// B's back — the whole chain carries.
+	conn, err := eA.OpenStream(eB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn, "relay bytes over kcp")
+}

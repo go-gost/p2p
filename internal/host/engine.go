@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-gost/p2p"
 	"github.com/go-gost/p2p/internal/derpclient"
+	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 )
 
@@ -443,8 +444,14 @@ type peerConn struct {
 	relayRebuilds     atomic.Int64 // relay sessions built (first build excluded)
 	relayRebuildPeers atomic.Int64 // of those, the peer changed its secure half
 
-	mu        sync.Mutex
-	sess      *smux.Session
+	mu   sync.Mutex
+	sess *smux.Session
+	// kcp is the KCP session under sess (see newRelayKCP): the reliable
+	// datagram layer between the relay packet path and the crypto record
+	// framing, so a dropped relay packet is one retransmitted segment instead
+	// of a permanent record desync. Built with sess by sessionLocked, closed
+	// and cleared by killSession. Guarded by pc.mu.
+	kcp       *kcp.UDPSession
 	sessAt    time.Time     // when sess was established, for the stream-open log
 	accepting *smux.Session // the session whose inbound accept loop is running, if any
 	closed    bool
@@ -1649,8 +1656,21 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	cfg.KeepAliveInterval = smuxKeepAliveInterval
 	cfg.KeepAliveTimeout = smuxKeepAliveTimeout
 	roleIsClient := bytes.Compare(pc.e.pub[:], pc.peer[:]) < 0
-	underlay, err := pc.secure.conn(pc)
+	// KCP under the record layer, mirroring the direct plane's
+	// KCP -> secure -> smux stack: the relay is a lossy datagram path, and one
+	// dropped packet desyncs the crypto record framing permanently ("bad
+	// secure record length"). Over KCP it is one lost segment, retransmitted.
+	kcpConn, err := pc.newRelayKCP()
 	if err != nil {
+		return nil, err
+	}
+	underlay, err := pc.secure.conn(kcpConn)
+	if err != nil {
+		// Nothing rides this KCP session: close it here rather than leave a
+		// live session the next build would orphan (two KCP sessions racing
+		// on one peer).
+		kcpConn.Close()
+		pc.kcp = nil
 		return nil, err
 	}
 	// A session built while one was already there is a rebuild (the caller
@@ -1665,6 +1685,8 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 		pc.sess, _ = smux.Server(underlay, cfg)
 	}
 	if pc.sess == nil {
+		kcpConn.Close()
+		pc.kcp = nil
 		return nil, errors.New("derp engine: cannot establish mux session")
 	}
 	if rebuild {
@@ -1790,6 +1812,10 @@ const (
 // log is the EFFECTIVE value, not the request: it is what explains whether the
 // next rebuild reused its keys, so reporting the request would hide exactly the
 // case that matters — a kill that dropped nothing because nothing was abandoned.
+//
+// The session's KCP underlay is closed and pc.kcp cleared here as well:
+// killSession owns its lifecycle (newRelayKCP builds it with ownConn=false),
+// and a live leftover would race the rebuilt session's KCP on the same peer.
 func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndReason) {
 	pc.mu.Lock()
 	if pc.closed {
@@ -1799,6 +1825,8 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	pc.closed = true
 	close(pc.closeCh)
 	sess := pc.sess
+	kcpConn := pc.kcp
+	pc.kcp = nil
 	secure := pc.secure
 	abandoned := pc.abandonedLocked()
 	// An adapter that never built a session has a zero sessAt; without the guard
@@ -1815,6 +1843,13 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	}
 	if sess != nil {
 		sess.Close()
+	}
+	// The smux Close above already reaches the KCP underlay through the
+	// record conn; closing it again (idempotent) covers the builds that
+	// never got a mux session, and the field was cleared under the lock so
+	// the next build cannot orphan this one.
+	if kcpConn != nil {
+		kcpConn.Close()
 	}
 	pc.e.log.Debug("peer session killed",
 		"peer", keyName(pc.peer),
