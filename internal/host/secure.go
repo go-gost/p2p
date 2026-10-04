@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
@@ -107,11 +108,35 @@ type cryptoConn struct {
 	rmu  sync.Mutex
 	rbuf []byte
 
+	// id names this conn in the log. A (peer, transport) pair builds a new
+	// cryptoConn on every mux session rebuild, so the number of builds and the
+	// identity of each one is what tells a misaligned read apart from a stale
+	// conn still draining: both sides log the same id for the same record
+	// stream. at, recs and in are the conn's own lifetime counters, reported
+	// with a record-boundary failure so the log says how much of the stream was
+	// read cleanly before it broke.
+	id   uint64
+	at   time.Time
+	recs atomic.Uint64
+	in   atomic.Uint64
+	// reported guards the boundary-failure log: a conn that is desynced fails
+	// once per read attempt, and the stream is torn down by the caller anyway, so
+	// only the first one carries information. It is atomic and not guarded by
+	// rmu because Read calls reportDesync while already holding rmu; locking rmu
+	// again there would self-deadlock the reader (Go mutexes are not reentrant).
+	reported atomic.Bool
+
 	// session owns this conn's share of the security state; it counts the
 	// record-boundary failures this conn sees. It may be nil in tests that drive
 	// the framing directly.
 	session *secureSession
 }
+
+// secureConnSeq numbers the cryptoConns so the log can name one. A counter and
+// not a per-session number: the interesting question when a stream misaligns is
+// whether the reader and the writer are on the same conn, and only a process-wide
+// id answers that across a rebuild.
+var secureConnSeq atomic.Uint64
 
 // newCryptoConn wraps underlay with the directional AEADs and the session's
 // shared counters and write mutex. log and peer are used only to report a
@@ -128,6 +153,8 @@ func newCryptoConn(underlay net.Conn, send, recv cipher.AEAD, sendCtr, recvCtr *
 		log:     log,
 		peer:    peer,
 		session: session,
+		id:      secureConnSeq.Add(1),
+		at:      time.Now(),
 	}
 }
 
@@ -179,28 +206,64 @@ func (c *cryptoConn) Read(b []byte) (int, error) {
 func (c *cryptoConn) readRecord() ([]byte, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(c.Conn, hdr[:]); err != nil {
+		c.in.Add(4)
 		return nil, err
 	}
+	c.in.Add(4)
 	n := binary.BigEndian.Uint32(hdr[:])
 	if n == 0 || n > maxSecureRecord+16 {
 		c.noteDesync()
-		return nil, fmt.Errorf("p2p: bad secure record length %d", n)
+		err := fmt.Errorf("p2p: bad secure record length %d", n)
+		c.reportDesync(err)
+		return nil, err
 	}
 	ct := make([]byte, n)
 	if _, err := io.ReadFull(c.Conn, ct); err != nil {
+		c.in.Add(uint64(n))
 		return nil, err
 	}
+	c.in.Add(uint64(n))
 	nonce := c.recvCtr.next()
 	pt, err := c.recv.Open(nil, nonce[:], ct, nil)
 	if err != nil {
-		if c.log != nil {
-			c.log.Warn("secure record auth failed", "peer", keyName(c.peer), "error", err)
-		}
 		c.noteDesync()
-		return nil, fmt.Errorf("p2p: secure record auth failed: %w", err)
+		werr := fmt.Errorf("p2p: secure record auth failed: %w", err)
+		c.reportDesync(werr)
+		return nil, werr
 	}
+	c.recs.Add(1)
 	c.clearDesync()
 	return pt, nil
+}
+
+// reportDesync logs the first record-boundary failure this conn sees, with the
+// counters that locate it: the conn's id (which build of the (peer, transport)
+// pair this is), how long it lived, how many records opened cleanly, and how
+// many bytes came off the underlay in total. Without those, "bad secure record
+// length" is only observable as a number that could be a torn session or a
+// misaligned reader, and the two need opposite fixes.
+//
+// It logs the underlying failure as a field rather than folding it into the
+// message: the auth failure is already a first-class error, and duplicating it
+// inline made the record header and the reason indistinguishable in one string.
+func (c *cryptoConn) reportDesync(err error) {
+	if c.log == nil {
+		return
+	}
+	// Read calls this with rmu held (Read -> readRecord -> reportDesync), so the
+	// once-only flag must not take rmu: a second Lock here is a self-deadlock
+	// that hangs the reader forever on the first desync.
+	if c.reported.Swap(true) {
+		return
+	}
+	c.log.Warn("secure record desync",
+		"peer", keyName(c.peer),
+		"conn", c.id,
+		"age", time.Since(c.at).Round(time.Millisecond).String(),
+		"records", c.recs.Load(),
+		"bytes", c.in.Load(),
+		"recvNonceUsed", c.recvCtr.used(),
+		"error", err)
 }
 
 // noteDesync hands the session one record-boundary failure. Only the two
