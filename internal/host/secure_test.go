@@ -373,13 +373,14 @@ func TestSecureSessionUnderivableHalfDoesNotWake(t *testing.T) {
 }
 
 // TestKillSessionDropsRelaySecureUnlessRekeyed pins the dropSecure contract of
-// killSession: a kill that abandons records (queued, never-read packets whose
-// nonces the peer already spent) drops the pair's relay security session — but
-// never the direct one (that transport re-keys via rekeyIfUsed). A clean kill
-// abandons nothing and keeps the session (the nonce sequence is intact, so the
-// rebuild is transparent), and the peer-rekeyed teardown is the one kill that
-// must never drop it — respond already re-derived both halves, so dropping
-// would make the two ends swap halves forever.
+// killSession: a kill whose reason ends the pair's epoch (the relay link is
+// lost) drops the pair's relay security session — but never the direct one
+// (that transport re-keys via rekeyIfUsed). A clean kill keeps the session even
+// with a segment in flight (under the KCP underlay the segment is retransmitted,
+// not an abandoned record, so the nonce sequence stays intact), and the
+// peer-rekeyed teardown is the one epoch-ending kill that must never drop it —
+// respond already re-derived both halves, so dropping would make the two ends
+// swap halves forever.
 func TestKillSessionDropsRelaySecureUnlessRekeyed(t *testing.T) {
 	e := newTestEngine(t)
 	peer := derpclient.PublicKey{7}
@@ -389,7 +390,7 @@ func TestKillSessionDropsRelaySecureUnlessRekeyed(t *testing.T) {
 	}
 
 	// freshPC returns an adapter holding both cached sessions, optionally with
-	// one queued record — the packet the kill abandons.
+	// one queued segment — the packet in flight at kill time.
 	newPC := func(queued bool) *peerConn {
 		e.mu.Lock()
 		relay := newSecureSession(nil, secureTransportRelay, priv, peer)
@@ -399,7 +400,7 @@ func TestKillSessionDropsRelaySecureUnlessRekeyed(t *testing.T) {
 		e.mu.Unlock()
 		inbound := make(chan []byte, 1)
 		if queued {
-			inbound <- []byte("stale record queued at kill time")
+			inbound <- []byte("segment in flight at kill time")
 		}
 		return &peerConn{e: e, peer: peer, inbound: inbound, closeCh: make(chan struct{}), secure: relay}
 	}
@@ -411,19 +412,21 @@ func TestKillSessionDropsRelaySecureUnlessRekeyed(t *testing.T) {
 		return
 	}
 
-	// A kill that abandoned records drops the relay session, never the direct.
-	newPC(true).killSession(errors.New("test: local kill"), true, reasonLocalKill)
+	// A kill that ends the pair's epoch (the relay link was lost) drops the
+	// relay session, never the direct one.
+	newPC(true).killSession(errors.New("test: link lost"), true, reasonLinkLost)
 	if relay, direct := cached(); relay || !direct {
-		t.Fatalf("after an abandoning kill: relay kept=%v direct kept=%v, want false/true", relay, direct)
+		t.Fatalf("after a link-loss kill: relay kept=%v direct kept=%v, want false/true", relay, direct)
 	}
 
-	// A clean kill abandons nothing: the settled session is reused.
-	newPC(false).killSession(errors.New("test: local kill"), true, reasonLocalKill)
+	// A clean kill keeps the session even with a segment in flight: the segment
+	// is retransmitted, not abandoned, so the keys are intact.
+	newPC(true).killSession(errors.New("test: local kill"), true, reasonLocalKill)
 	if relay, direct := cached(); !relay || !direct {
-		t.Fatalf("after a clean kill: relay kept=%v direct kept=%v, want true/true", relay, direct)
+		t.Fatalf("after a clean kill with data in flight: relay kept=%v direct kept=%v, want true/true", relay, direct)
 	}
 
-	// The peer-rekeyed teardown keeps it even when records were abandoned.
+	// The peer-rekeyed teardown keeps it even though the epoch ends.
 	newPC(true).killSession(errors.New("derp engine: peer rekeyed"), false, reasonPeerRekeyed)
 	if relay, direct := cached(); !relay || !direct {
 		t.Fatalf("after the peer-rekeyed kill: relay kept=%v direct kept=%v, want true/true", relay, direct)

@@ -465,8 +465,6 @@ type peerConn struct {
 	accepting *smux.Session // the session whose inbound accept loop is running, if any
 	closed    bool
 	closeCh   chan struct{}
-	remainder []byte // partially consumed packet from inbound
-	current   []byte
 
 	// Relay-session churn for this peer: sessions built inside the current
 	// window, when that window opened, and whether its limit has been crossed.
@@ -847,14 +845,17 @@ func (e *engine) secureSessionFor(peer derpclient.PublicKey, transport byte) *se
 // rely on is that every nonce drawn is either delivered-and-consumed by the peer
 // or both sides reset; it breaks when the relay link is lost (derpclient reports
 // the write failure only after the nonce is spent, so sendCtr can be one ahead
-// of the peer's recvCtr) or when a local kill abandons records still queued in
-// the adapter (smux's read loop stops without draining them). Either way the
-// peer never consumes those nonces and can never realign, so the pair must
-// re-handshake: our next half carries a new ephemeral, the peer sees `changed`,
-// resets its counters and rebuilds — both converge. It must NOT be used on the
-// peer-restart path (resetPeerSession): there the peer already changed its half
-// and respond re-derived ours, so both counters already match and dropping would
-// send yet another fresh half, loop the two ends, and never settle.
+// of the peer's recvCtr) or when the record framing desyncs past the backstop
+// (see armDesyncRecovery). Under the KCP underlay a local clean kill no longer
+// breaks it: a queued packet is a segment KCP retransmits, never a consumed
+// record whose nonce the peer spent, so the pair realigns on the surviving KCP
+// session instead. Either way the peer never consumes those nonces and can
+// never realign, so the pair must re-handshake: our next half carries a new
+// ephemeral, the peer sees `changed`, resets its counters and rebuilds — both
+// converge. It must NOT be used on the peer-restart path (resetPeerSession):
+// there the peer already changed its half and respond re-derived ours, so both
+// counters already match and dropping would send yet another fresh half, loop
+// the two ends, and never settle.
 func (e *engine) dropRelaySecure(peer derpclient.PublicKey, expect *secureSession) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1131,11 +1132,11 @@ func (e *engine) pump(c *derpclient.Client) {
 		// consumed by smux (which then accepts streams) even when this host
 		// never opens a tunnel to the peer itself.
 		if _, err := pc.ensureSession(true, false); err != nil {
-			// The session could not be built, so records already queued for this
-			// peer are abandoned and their nonces never consumed: the kill drops
-			// the pair's relay security session so the rebuild re-handshakes
-			// (see dropRelaySecure).
-			pc.killSession(err, true, reasonBuildFailed)
+			// The session could not be built. Records already queued for this
+			// peer are KCP segments the peer will retransmit, not consumed
+			// records, so nothing is abandoned: the kill is a clean one that
+			// keeps the settled keys and the pair's KCP session.
+			pc.killSession(err, false, reasonBuildFailed)
 			continue
 		}
 		select {
@@ -1146,12 +1147,11 @@ func (e *engine) pump(c *derpclient.Client) {
 			// Queue overflow: KCP repairs ordinary loss below, but a queue
 			// that stays full means this adapter is no longer draining, so
 			// kill it as a conservative recovery and let the peer redial.
-			// Killing abandons the records still queued (smux's read loop stops
-			// without draining them), so those nonces are spent but never
-			// consumed: the kill drops the relay security session so both ends
-			// reset and realign instead of wedging on a permanent counter
-			// offset.
-			pc.killSession(errors.New("derp engine: inbound queue overflow"), true, reasonQueueOverflow)
+			// The dropped packets are KCP segments the peer retransmits, not
+			// consumed records, so the pair's nonce sequence stays aligned: the
+			// kill is a clean one that keeps the settled keys and the pair's
+			// KCP session.
+			pc.killSession(errors.New("derp engine: inbound queue overflow"), false, reasonQueueOverflow)
 		}
 	}
 }
@@ -1584,24 +1584,18 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	}
 	live := pc.liveSessionLocked()
 	// A dead session standing here is about to be replaced by sessionLocked.
-	// When the dead session left records nothing will read (its read loop is
-	// gone, so what the pump kept pushing is abandoned), the replacement must
-	// re-handshake: those records' nonces are spent at the peer and can never
-	// realign (see dropRelaySecure), and their bytes are discarded below so the
-	// fresh key starts on a clean record boundary. The drop runs here, before
-	// the handshake below and outside pc.mu — dropRelaySecure takes e.mu, which
-	// is taken before pc.mu elsewhere (see peerConn), so it cannot run inside
-	// sessionLocked's pc.mu section. A replacement that abandons nothing keeps
-	// the settled session: the nonce sequence is intact, so the rebuild is
-	// transparent and costs no handshake round trip.
+	// Under the KCP underlay this replacement is always transparent: the dead
+	// session's records ride the pair's KCP byte stream, which survives the
+	// rebuild, so the settled keys and nonce counters stay aligned and nothing
+	// is re-handshaken. The byte-queue abandonment that used to force a
+	// re-handshake here (a queued secure record whose nonce the peer had spent
+	// but this side never drew) no longer exists — the queue now holds KCP
+	// segments, which KCP retransmits, so a queued segment is still-to-be-read
+	// pipe content, not unrecoverable crypto state. The log below is the only
+	// record that the pair kept its keys; the streak is read off the session
+	// being replaced — the replacement starts at zero and would report nothing.
 	replaced := pc.sess != nil && pc.sess.IsClosed()
 	secure := pc.secure
-	dropSecure := replaced && pc.abandonedLocked()
-	// Snapshot what the replacement is about to decide, while the dead
-	// session's state is still in hand: the log below is the only record of
-	// whether the pair kept its keys, and the streak is read off the session
-	// being abandoned — the replacement starts at zero and would report
-	// nothing. Both must be read before pc.secure is replaced below.
 	var age time.Duration
 	streak := 0
 	if replaced {
@@ -1613,59 +1607,9 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	if replaced {
 		pc.e.log.Debug("relay session rebuilt",
 			"peer", keyName(pc.peer),
-			"secureReuse", !dropSecure,
+			"secureReuse", true,
 			"desyncStreak", streak,
 			"sessionAge", age.Round(time.Millisecond))
-	}
-
-	if dropSecure {
-		// The re-handshake resets the pair's KCP epoch too: our next half is a
-		// changed one, and the peer answers by resetting its own session — and
-		// its KCP session with it (resetPeerSession). One side keeping an
-		// advanced sequence state across that reset is the one-sided epoch
-		// livelock again, in mirror image. The pair's session under this
-		// adapter's dead mux session is what the decision was made about.
-		pc.mu.Lock()
-		pairSess := pc.kcp
-		pc.mu.Unlock()
-		pc.e.dropRelayKCP(pc.peer, pairSess, errors.New("relay records abandoned at session replacement"))
-		// Compare-and-delete, then install only if this caller is still the one
-		// holding the session it decided about: ensureSession runs from the pump
-		// AND from OpenStream, and it releases pc.mu for the handshake below, so
-		// two callers can reach this block for the same dead session. Without
-		// both guards the loser installs a session the winner has already
-		// discarded (or deletes the winner's), which diverges pc.secure from the
-		// keys the live mux session is using — Status then reports plaintext for
-		// a secure peer — and fails its own open with errEncryptionRequired.
-		stale := secure
-		pc.e.dropRelaySecure(pc.peer, stale)
-		secure = pc.e.secureSessionFor(pc.peer, secureTransportRelay)
-		pc.mu.Lock()
-		if pc.secure != stale {
-			// Another caller already replaced it; theirs is the live session.
-			secure = pc.secure
-			pc.mu.Unlock()
-			pc.e.armDesyncRecovery(pc.peer, secure)
-		} else {
-			pc.secure = secure
-			// Discard the abandoned stream bytes with the old session: they belong
-			// to the old key's record sequence, and the fresh session would
-			// misparse them as its first records. Only dead ciphertext is lost —
-			// the peer's respond resets its counters alongside ours.
-			pc.current, pc.remainder = nil, nil
-			for {
-				select {
-				case <-pc.inbound:
-					continue
-				default:
-				}
-				break
-			}
-			pc.mu.Unlock()
-		}
-		// The replacement is a fresh session object, so arm it as well: it is the
-		// one that will see the next record-boundary failure.
-		pc.e.armDesyncRecovery(pc.peer, secure)
 	}
 
 	// No live session: settle the handshake before building, so both ends agree
@@ -1946,17 +1890,17 @@ func resetsPairKCP(reason sessionEndReason) bool {
 // concurrent use and for already-dead adapters.
 //
 // dropSecure asks for the pair's relay security session to be dropped when the
-// kill abandons records: packets still queued (or partially consumed) whose
-// nonces the peer already spent and this side will never draw. A session
-// rebuilt over them can never realign (see dropRelaySecure), so the next build
-// must re-handshake. A kill that abandons nothing keeps the session: the dying
-// read loop drains what it still consumes (those nonces advance in step with
-// the peer's), so the leftover buffers are the exact abandoned set, and when
-// they are empty the nonce sequence is intact — the rebuild is the transparent
-// one secure.go documents. The one caller that passes false is resetPeerSession
-// (the peer rekeyed): there the peer already changed its half and respond
-// re-derived ours, so both counters already match and a drop would make the two
-// ends swap halves forever.
+// kill ends the pair's KCP epoch for a reason that also resets the keys (see
+// resetsPairKCP): a peer restart, a secure desync, a lost link, a gone peer or
+// the engine's end all end the epoch, and once it ends the peer's nonce state
+// can no longer align, so the pair must re-handshake (see dropRelaySecure). A
+// clean kill — any other reason — keeps the session: the pair's KCP underlay
+// survives the adapter swap and retransmits whatever segment is queued, so the
+// nonce sequence is intact and the rebuild is the transparent one secure.go
+// documents. The one caller that passes false is resetPeerSession (the peer
+// rekeyed): there the peer already changed its half and respond re-derived
+// ours, so both counters already match and a drop would make the two ends swap
+// halves forever.
 //
 // Only the caller that flips the adapter dead decides the secure session, and
 // it runs once: smux's session Close re-enters here through the underlay
@@ -1966,16 +1910,16 @@ func resetsPairKCP(reason sessionEndReason) bool {
 // reason names the cause for the log (see sessionEndReason). dropSecure in the
 // log is the EFFECTIVE value, not the request: it is what explains whether the
 // next rebuild reused its keys, so reporting the request would hide exactly the
-// case that matters — a kill that dropped nothing because nothing was abandoned.
+// case that matters — a kill that dropped nothing because its reason is clean.
 //
 // The session's KCP underlay is NOT closed here unconditionally: it is the
 // pair's session (see relayKCPPair), and a clean kill must leave it running so
 // the rebuild continues the pair's sequence epoch instead of restarting at sn=0
 // under a peer whose session is still running. It is closed exactly when the
-// pair's epoch must reset with the kill: the keys were dropped (the peer resets
-// alongside our changed half), the reason means the peer restarted or the pair
-// is ending (see resetsPairKCP), or the engine is going away. smux's Close
-// above reaches only the per-build stream view, never the pair's session.
+// pair's epoch must reset with the kill (see resetsPairKCP): the keys were
+// dropped (the peer resets alongside our changed half), the reason means the
+// peer restarted or the pair is ending, or the engine is going away. smux's
+// Close above reaches only the per-build stream view, never the pair's session.
 func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndReason) {
 	pc.mu.Lock()
 	if pc.closed {
@@ -1988,7 +1932,6 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	kcpConn := pc.kcp
 	pc.kcp = nil
 	secure := pc.secure
-	abandoned := pc.abandonedLocked()
 	// An adapter that never built a session has a zero sessAt; without the guard
 	// the log reported the time since year 1 (2562047h47m16s).
 	age := time.Duration(0)
@@ -1997,14 +1940,25 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	}
 	pc.mu.Unlock()
 
-	dropped := dropSecure && abandoned && pc.e != nil
+	// Under the KCP underlay a queued packet is a segment KCP will retransmit,
+	// not a secure record whose nonce is lost, so the queue no longer decides
+	// whether the pair re-handshakes. The re-handshake is driven by the kill
+	// reason alone: a reason that resets the pair's KCP epoch (see
+	// resetsPairKCP) ends the nonce alignment and must drop the secure half too
+	// — except the peer-rekeyed teardown, which keeps the re-derived keys (the
+	// caller passes dropSecure=false for exactly that reason).
+	dropped := dropSecure && resetsPairKCP(reason) && pc.e != nil
 	if dropped {
 		pc.e.dropRelaySecure(pc.peer, secure)
 	}
 	if sess != nil {
 		sess.Close()
 	}
-	if pc.e != nil && (dropped || resetsPairKCP(reason)) {
+	// The pair's KCP session ends exactly when the kill reason says the pair's
+	// epoch ends (see resetsPairKCP): a clean kill leaves it running so the
+	// rebuild continues the pair's sequence, while a rekey/desync/link-loss/
+	// gone/engine-close resets it alongside the keys.
+	if pc.e != nil && resetsPairKCP(reason) {
 		pc.e.dropRelayKCP(pc.peer, kcpConn, cause)
 	}
 	pc.e.log.Debug("peer session killed",
@@ -2013,51 +1967,6 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 		"dropSecure", dropped,
 		"sessionAge", age.Round(time.Millisecond),
 		"cause", cause)
-}
-
-// abandonedLocked reports whether the adapter still holds frame bytes nothing
-// will read: queued packets and partially consumed ones. Caller must hold
-// pc.mu, so pc.Read's bookkeeping and this snapshot cannot race.
-func (pc *peerConn) abandonedLocked() bool {
-	return len(pc.inbound) > 0 || len(pc.current) > 0 || len(pc.remainder) > 0
-}
-
-// Read implements net.Conn: drain queued packets, honoring partial reads. The
-// remainder/current bookkeeping runs under pc.mu (it is shared with
-// abandonedLocked's kill-time snapshot), never across a channel wait.
-func (pc *peerConn) Read(p []byte) (int, error) {
-	for {
-		pc.mu.Lock()
-		if len(pc.remainder) > 0 {
-			n := copy(p, pc.remainder)
-			pc.remainder = pc.remainder[n:]
-			pc.mu.Unlock()
-			return n, nil
-		}
-		if len(pc.current) > 0 {
-			n := copy(p, pc.current)
-			pc.current = pc.current[n:]
-			pc.mu.Unlock()
-			return n, nil
-		}
-		pc.mu.Unlock()
-		select {
-		case pkt := <-pc.inbound:
-			pc.mu.Lock()
-			pc.current = pkt
-			pc.mu.Unlock()
-		case <-pc.closeCh:
-			// drain remaining queued packets before reporting EOF
-			select {
-			case pkt := <-pc.inbound:
-				pc.mu.Lock()
-				pc.current = pkt
-				pc.mu.Unlock()
-			default:
-				return 0, io.EOF
-			}
-		}
-	}
 }
 
 // Write implements net.Conn: each write is one DERP SendPacket.
@@ -2100,7 +2009,7 @@ func (pc *peerConn) Write(p []byte) (int, error) {
 // Close implements net.Conn: closing the adapter kills the session (streams
 // and all). It does not touch the shared DERP transport.
 func (pc *peerConn) Close() error {
-	pc.killSession(errors.New("adapter closed"), true, reasonAdapterClosed)
+	pc.killSession(errors.New("adapter closed"), false, reasonAdapterClosed)
 	return nil
 }
 

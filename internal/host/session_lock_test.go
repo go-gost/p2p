@@ -179,17 +179,19 @@ func TestRelaySessionChurnReconnectsRelay(t *testing.T) {
 	}
 }
 
-// TestRelaySessionReplaceRehandshakes pins the local-kill half of the rule in
-// dropRelaySecure: a kill abandons records still queued in the adapter (their
-// nonces are spent at the peer and will never be consumed), so the replacement
+// TestRelaySessionReplaceRehandshakes pins the epoch-ending half of the rule in
+// dropRelaySecure: a kill whose reason ends the pair's epoch (here, the record
+// framing desynced past the backstop) drops the keys, so the replacement
 // adapter must re-handshake on a fresh secure session instead of reusing the
 // cached one. Reuse fails every rebuilt session's first record from then on —
-// the production loop that churned a new session every 15s until restart.
+// the production loop that churned a new session every 15s until restart. A
+// clean kill no longer re-handshakes (the KCP underlay retransmits a queued
+// segment), so the desync backstop is the local path that still does.
 func TestRelaySessionReplaceRehandshakes(t *testing.T) {
-	eA, eB, rs := newEncryptedPair(t)
+	eA, eB, _ := newEncryptedPair(t)
 
 	// A and B establish a relay session and carry traffic both ways, so the
-	// pair's key holds live counters when the kill hits.
+	// pair's key holds live counters when the reset hits.
 	conn, err := eA.OpenStream(eB.PublicKey())
 	if err != nil {
 		t.Fatal(err)
@@ -202,26 +204,19 @@ func TestRelaySessionReplaceRehandshakes(t *testing.T) {
 	old := pc.secure
 	pc.mu.Unlock()
 
-	// Mute data frames at the relay for the rebuild window: the peer's smux
-	// keepalive NOPs must not reach A's pump between the kill and the rebuild,
-	// or each one re-kills the freshly built adapter. Control frames (the
-	// secure halves) still flow. The pause lets frames already in flight land
-	// in the old adapter's queue before the kill, so none of the old key's
-	// records can leak into the rebuilt session's first reads — that would be
-	// the very desync under test, but caused by the test itself.
-	rs.setDropData(true)
-	time.Sleep(50 * time.Millisecond)
-
-	// Records still queued when the session is killed are abandoned: smux's
-	// read loop stops without draining them. Two oversized packets, so the
-	// abandonment is deterministic — the transport delivers one record as a
-	// length-prefix packet and a body packet, and a read loop that happens to
-	// be mid-record consumes at most one of these as that record's missing
-	// piece (no record here is anywhere near this large).
-	stale := bytes.Repeat([]byte("x"), 200)
-	pc.inbound <- stale
-	pc.inbound <- stale
-	pc.killSession(errors.New("test: local kill"), true, reasonLocalKill)
+	// The pair's record framing desyncs past the backstop: the callback drops
+	// the keys and kills the adapter (see armDesyncRecovery), so the replacement
+	// must re-handshake. This is the KCP-era successor to "a kill abandons
+	// queued records": the queue no longer carries unrecoverable nonce state, so
+	// a record-boundary failure is the local abandonment that is left.
+	for i := 0; i < secureDesyncThreshold; i++ {
+		old.noteDesync()
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		pc.mu.Lock()
+		defer pc.mu.Unlock()
+		return pc.closed
+	})
 
 	// The replacement adapter must borrow a fresh secure session: the cached
 	// one is dropped so the rebuild re-handshakes (see dropRelaySecure).
@@ -235,7 +230,6 @@ func TestRelaySessionReplaceRehandshakes(t *testing.T) {
 	if _, err := pc2.ensureSession(false, true); err != nil {
 		t.Fatal(err)
 	}
-	rs.setDropData(false)
 
 	// Both ends settle again on the fresh key within the handshake bound, and
 	// the pair carries data again.
@@ -260,12 +254,14 @@ func TestRelaySessionReplaceRehandshakes(t *testing.T) {
 	})
 }
 
-// TestRelaySessionReplaceDeadSessionRehandshakes pins the session-replacement
-// half of the same rule: when a dead mux session is replaced on a live adapter
-// (the smux keepalive timeout starved it and nothing killed the adapter), the
-// rebuild must re-handshake on a fresh secure session rather than reuse the
-// cached one. This is the path that does not pass through pc.kill.
-func TestRelaySessionReplaceDeadSessionRehandshakes(t *testing.T) {
+// TestRelaySessionReplaceDeadSessionKeepsKeys pins the session-replacement half
+// of the same rule under the KCP underlay: when a dead mux session is replaced
+// on a live adapter (the smux keepalive timeout starved it and nothing killed
+// the adapter), the rebuild keeps the settled keys — it is transparent. A
+// queued packet is a KCP segment the peer retransmits, not an abandoned record,
+// so nothing is re-handshaken. This is the path that does not pass through
+// pc.kill.
+func TestRelaySessionReplaceDeadSessionKeepsKeys(t *testing.T) {
 	eA, eB, _ := newEncryptedPair(t)
 
 	// B's adapter up front: the half exchange below settles B's security
@@ -278,8 +274,8 @@ func TestRelaySessionReplaceDeadSessionRehandshakes(t *testing.T) {
 	pc.mu.Unlock()
 
 	// Settle the pair's key with a plain half exchange with B, so the cached
-	// session is a settled one a rebuild could be tempted to reuse. No mux
-	// session exists yet, so the swap below has nothing else to displace.
+	// session is a settled one the rebuild reuses. No mux session exists yet, so
+	// the swap below has nothing else to displace.
 	if err := eA.sendSecureHalf(eB.pub, old); err != nil {
 		t.Fatal(err)
 	}
@@ -288,14 +284,14 @@ func TestRelaySessionReplaceDeadSessionRehandshakes(t *testing.T) {
 	// A dead smux session standing in for one that expired in place: closed,
 	// but built over its own pipe instead of this adapter's underlay, so the
 	// adapter stays live — exactly the state the replacement branch sees. The
-	// queued packet is what the dead session abandoned (its read loop is gone
-	// and the pump keeps pushing), which is what makes the replacement
-	// re-handshake instead of reusing the settled session.
+	// queued segment is in flight when the session dies, and under KCP it is
+	// retransmitted, not abandoned, so the replacement reuses the settled
+	// session.
 	dead := newTestSess(t)
 	if err := dead.Close(); err != nil {
 		t.Fatal(err)
 	}
-	pc.inbound <- []byte("stale record queued when the session died")
+	pc.inbound <- []byte("segment in flight when the session died")
 	pc.mu.Lock()
 	pc.sess, pc.sessAt = dead, time.Now()
 	pc.mu.Unlock()
@@ -307,15 +303,11 @@ func TestRelaySessionReplaceDeadSessionRehandshakes(t *testing.T) {
 	pc.mu.Lock()
 	rebuilt := pc.secure
 	pc.mu.Unlock()
-	if rebuilt == old {
-		t.Fatal("session replacement reused the old secure session instead of re-handshaking")
+	if rebuilt != old {
+		t.Fatal("session replacement re-handshook; the pair's settled keys must be reused")
 	}
 
-	// Both ends settle on the fresh key within the handshake bound, and the
-	// pair carries data.
-	waitFor(t, handshakeTimeout, func() bool {
-		return eA.peerSecureForTest(eB.pub) && eB.peerSecureForTest(eA.pub)
-	})
+	// The pair carries data again over the same keys.
 	waitFor(t, 10*time.Second, func() bool {
 		conn, err := eA.OpenStream(eB.PublicKey())
 		if err != nil {
@@ -398,24 +390,24 @@ func TestSessionDeathLogCarriesReasonAndSecureReuse(t *testing.T) {
 	e := newEngine("", "", priv, slog.New(capture))
 	t.Cleanup(e.Close)
 
-	// An abandoning kill: the queued packet is a record the peer already spent a
-	// nonce on, so the pair's security session must go with the session.
-	abandoning := derpclient.PublicKey{3}
+	// An epoch-ending kill (the relay link was lost) drops the keys, so the log
+	// reports the effective dropSecure=true.
+	dropping := derpclient.PublicKey{3}
 	inbound := make(chan []byte, 1)
-	inbound <- []byte("record abandoned by the kill")
-	pc := &peerConn{e: e, peer: abandoning, inbound: inbound, closeCh: make(chan struct{})}
+	inbound <- []byte("segment in flight at kill time")
+	pc := &peerConn{e: e, peer: dropping, inbound: inbound, closeCh: make(chan struct{})}
 	pc.sessAt = time.Now().Add(-3 * time.Second)
-	pc.killSession(errors.New("derp engine: inbound queue overflow"), true, reasonQueueOverflow)
+	pc.killSession(errors.New("test: link lost"), true, reasonLinkLost)
 
 	attrs := capture.nth("peer session killed", 0)
 	if attrs == nil {
 		t.Fatal("killSession logged no \"peer session killed\" record")
 	}
-	if got := attrs["relayReason"]; got != string(reasonQueueOverflow) {
-		t.Fatalf("relayReason = %q, want %q", got, reasonQueueOverflow)
+	if got := attrs["relayReason"]; got != string(reasonLinkLost) {
+		t.Fatalf("relayReason = %q, want %q", got, reasonLinkLost)
 	}
 	if got := attrs["dropSecure"]; got != "true" {
-		t.Fatalf("dropSecure = %q, want \"true\": the kill abandoned a queued record", got)
+		t.Fatalf("dropSecure = %q, want \"true\": the link-loss kill drops the keys", got)
 	}
 	if attrs["cause"] == "" {
 		t.Fatal("the kill log carries no cause")
@@ -424,14 +416,16 @@ func TestSessionDeathLogCarriesReasonAndSecureReuse(t *testing.T) {
 		t.Fatal("the kill log carries no sessionAge")
 	}
 
-	// A clean kill abandons nothing, and dropSecure is the EFFECTIVE value —
-	// it is what explains the next rebuild reusing its keys, so it must not
-	// report the caller's request.
+	// A clean kill keeps its keys even with a segment in flight, and dropSecure
+	// is the EFFECTIVE value — it is what explains the next rebuild reusing its
+	// keys, so it is the reason, not the queue, that decides.
 	clean := derpclient.PublicKey{4}
+	inbound2 := make(chan []byte, 1)
+	inbound2 <- []byte("segment in flight at kill time")
 	pc2 := &peerConn{
 		e:       e,
 		peer:    clean,
-		inbound: make(chan []byte, 1),
+		inbound: inbound2,
 		closeCh: make(chan struct{}),
 	}
 	pc2.sessAt = time.Now()
@@ -441,7 +435,7 @@ func TestSessionDeathLogCarriesReasonAndSecureReuse(t *testing.T) {
 		t.Fatalf("relayReason = %q, want %q", got, reasonLocalKill)
 	}
 	if got := attrs["dropSecure"]; got != "false" {
-		t.Fatalf("dropSecure = %q, want \"false\": a kill that abandoned nothing keeps its keys", got)
+		t.Fatalf("dropSecure = %q, want \"false\": a clean kill keeps its keys even with data in flight", got)
 	}
 }
 
@@ -488,8 +482,10 @@ func TestSessionRebuildLogReportsReuseAndStreak(t *testing.T) {
 		t.Fatal("the rebuild log carries no sessionAge")
 	}
 
-	// Dead session that abandoned a record, with a streak on the outgoing keys:
-	// the rebuild must re-handshake and say why it is resetting.
+	// Dead session with a streak on the outgoing keys: under the KCP underlay
+	// the replacement is still transparent (the pair's KCP stream survives, so
+	// the keys stay aligned), and the streak is reported as the diagnostic that
+	// explains the session's state. No re-handshake is forced.
 	desyncPeer := derpclient.PublicKey{6}
 	desyncSess := newSecureSession(nil, secureTransportRelay, priv, desyncPeer)
 	if got := desyncSess.noteDesync(); got != 1 {
@@ -503,7 +499,7 @@ func TestSessionRebuildLogReportsReuseAndStreak(t *testing.T) {
 		t.Fatal(err)
 	}
 	inbound := make(chan []byte, 1)
-	inbound <- []byte("record abandoned when the session died")
+	inbound <- []byte("segment in flight when the session died")
 	pc2 := &peerConn{
 		e:       e,
 		peer:    desyncPeer,
@@ -519,11 +515,11 @@ func TestSessionRebuildLogReportsReuseAndStreak(t *testing.T) {
 	if attrs == nil {
 		t.Fatal("a replaced session logged no \"relay session rebuilt\" record")
 	}
-	if got := attrs["secureReuse"]; got != "false" {
-		t.Fatalf("secureReuse = %q, want \"false\": a record was abandoned, so the pair re-handshakes", got)
+	if got := attrs["secureReuse"]; got != "true" {
+		t.Fatalf("secureReuse = %q, want \"true\": a replaced session keeps its keys under KCP", got)
 	}
 	if got := attrs["desyncStreak"]; got != "2" {
-		t.Fatalf("desyncStreak = %q, want \"2\": the abandoned session's streak is the evidence", got)
+		t.Fatalf("desyncStreak = %q, want \"2\": the replaced session's streak is the diagnostic", got)
 	}
 }
 
@@ -567,9 +563,11 @@ func TestRelayRebuildLogFiresOnFreshAdapter(t *testing.T) {
 	e := newEngine("", "", priv, slog.New(capture))
 	t.Cleanup(e.Close)
 
-	// A clean kill abandons nothing, so the replacement keeps the keys.
+	// A clean kill keeps the keys, so the replacement reuses them. The queued
+	// segment does not change that: it is retransmitted, not abandoned.
 	reused := derpclient.PublicKey{7}
 	pc1 := e.peerConn(reused)
+	pc1.inbound <- []byte("segment in flight at kill time")
 	pc1.killSession(errors.New("test: clean kill"), true, reasonLocalKill)
 	pc2 := e.peerConn(reused)
 	if pc2 == pc1 {
@@ -583,11 +581,10 @@ func TestRelayRebuildLogFiresOnFreshAdapter(t *testing.T) {
 		t.Fatalf("secureReuse = %q, want \"true\": a clean kill keeps the settled keys", got)
 	}
 
-	// An abandoning kill drops them, so the replacement must re-handshake.
+	// An epoch-ending kill drops them, so the replacement must re-handshake.
 	dropped := derpclient.PublicKey{8}
 	pc3 := e.peerConn(dropped)
-	pc3.inbound <- []byte("record abandoned by the kill")
-	pc3.killSession(errors.New("test: abandoning kill"), true, reasonLocalKill)
+	pc3.killSession(errors.New("test: link lost"), true, reasonLinkLost)
 	e.peerConn(dropped)
 
 	attrs = capture.nth("relay session rebuilt", 1)
@@ -595,7 +592,7 @@ func TestRelayRebuildLogFiresOnFreshAdapter(t *testing.T) {
 		t.Fatal("the second rebuild logged no \"relay session rebuilt\" record")
 	}
 	if got := attrs["secureReuse"]; got != "false" {
-		t.Fatalf("secureReuse = %q, want \"false\": an abandoning kill dropped the keys", got)
+		t.Fatalf("secureReuse = %q, want \"false\": an epoch-ending kill dropped the keys", got)
 	}
 }
 
@@ -729,6 +726,133 @@ func TestRelayCleanKillKeepsPairKCPAndRecovers(t *testing.T) {
 	if kcpB2 != kcpB1 {
 		t.Fatal("B's KCP session changed although B was never touched")
 	}
+}
+
+// TestRelayCleanKillWithDataInFlightKeepsSecureHalf pins the KCP-era
+// abandonment decision: a clean kill that happens with relay data in flight
+// (segments still queued in the adapter) must keep the pair's settled keys and
+// its KCP session, so the rebuild is transparent — no re-handshake, no epoch
+// reset, secureReuse=true in the accounting. Before the KCP underlay a queued
+// packet was a secure record whose nonce the peer had already spent, so a
+// non-empty queue forced the abandoning class (drop the secure half, pay a
+// re-handshake). Under KCP a queued packet is a segment the peer retransmits,
+// so the same kill is clean and the pair carries on — this test fails on the
+// byte-queue decision and passes on the reason-driven one.
+func TestRelayCleanKillWithDataInFlightKeepsSecureHalf(t *testing.T) {
+	capture := &logCapture{}
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, pubA, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, echo, privA, slog.New(capture)) // A answers inbound
+	engineB := newEngine(url, "", privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+	engineA.Connect()
+	engineB.Connect()
+
+	// First inbound stream: A builds its adapter from the packet pump alone.
+	s, err := engineB.OpenStream(keyName(pubA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+	waitFor(t, 5*time.Second, func() bool {
+		engineA.mu.Lock()
+		_, ok := engineA.peers[pubB]
+		engineA.mu.Unlock()
+		return ok
+	})
+
+	// Snapshot the pair state a clean kill must preserve.
+	pcA1 := engineA.livePeerConn(pubB)
+	pcA1.mu.Lock()
+	kcpA1, secureA1 := pcA1.kcp, pcA1.secure
+	pcA1.mu.Unlock()
+	if kcpA1 == nil {
+		t.Fatal("A's session was built without a KCP underlay")
+	}
+
+	// Queue relay segments in the adapter so the kill happens with data in
+	// flight: under the old byte-stream accounting a non-empty queue was the
+	// "abandoned records" signal that dropped the keys. The segments are
+	// garbage to the pair's KCP session (it drops a mismatched conversation
+	// id), which is exactly the "garbage belonging to the dying mux session"
+	// the clean path is allowed to discard.
+	rs.setDropData(true) // stop real traffic so the queue stays as we filled it
+	time.Sleep(50 * time.Millisecond)
+	seg := bytes.Repeat([]byte{0}, 32)
+	for i := 0; i < inboundQueueSize; i++ {
+		pcA1.inbound <- seg
+	}
+	if n := len(pcA1.inbound); n == 0 {
+		t.Fatal("the adapter's queue drained before the kill; the test needs data in flight")
+	}
+
+	pcA1.killSession(errors.New("test: clean kill"), true, reasonLocalKill)
+
+	// The kill was clean even with data in flight: the log reports no secure
+	// drop (the byte queue no longer decides the abandoning class).
+	if attrs := capture.nth("peer session killed", 0); attrs == nil || attrs["dropSecure"] != "false" {
+		t.Fatalf("dropSecure = %v, want \"false\": a clean kill with data in flight keeps its keys", logField(attrs, "dropSecure"))
+	}
+
+	// The pair's KCP session outlives the adapter it was built on.
+	engineA.kcpMu.Lock()
+	pairA := engineA.relayKCPs[pubB]
+	engineA.kcpMu.Unlock()
+	if pairA == nil {
+		t.Fatal("the clean kill dropped the pair's KCP holder")
+	}
+	pairA.mu.Lock()
+	pairSess := pairA.sess
+	pairA.mu.Unlock()
+	if pairSess != kcpA1 {
+		t.Fatal("the clean kill replaced the pair's KCP session, restarting its sequence epoch")
+	}
+
+	// The peer's next inbound stream is still served, over the same session.
+	rs.setDropData(false)
+	s2, err := engineB.OpenStream(keyName(pubA))
+	if err != nil {
+		t.Fatalf("inbound open after the clean kill: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "recovered")
+
+	// The replacement adapter continues the pair: same KCP session, same keys,
+	// and the rebuild accounting says the keys were reused.
+	pcA2 := engineA.livePeerConn(pubB)
+	if pcA2 == pcA1 {
+		t.Fatal("the killed adapter was handed back instead of a replacement")
+	}
+	pcA2.mu.Lock()
+	kcpA2, secureA2 := pcA2.kcp, pcA2.secure
+	pcA2.mu.Unlock()
+	if kcpA2 != kcpA1 {
+		t.Fatal("the rebuild did not continue the pair's KCP session")
+	}
+	if secureA2 != secureA1 {
+		t.Fatal("the clean kill dropped the pair's settled keys")
+	}
+	if attrs := capture.nth("relay session rebuilt", 0); attrs == nil || attrs["secureReuse"] != "true" {
+		t.Fatalf("secureReuse = %v, want \"true\": a clean kill with data in flight reuses its keys", logField(attrs, "secureReuse"))
+	}
+}
+
+// logField returns the named attribute's value, or "<absent>" for the failure
+// message when the attribute (or the record) is missing.
+func logField(attrs map[string]string, key string) string {
+	if attrs == nil {
+		return "<no record>"
+	}
+	if v, ok := attrs[key]; ok {
+		return v
+	}
+	return "<absent>"
 }
 
 // TestRelayKCPClosedOnRekeyAndLinkLoss pins the other half of the lifecycle: a
@@ -895,32 +1019,22 @@ func TestRelayKCPRebuildConvergesOnce(t *testing.T) {
 }
 
 // TestRelayOneSidedEpochResetRecovers pins how a ONE-SIDED pair-epoch reset
-// coordinates with the peer. A resets its KCP epoch and its keys — an
-// abandoning kill, or the record-boundary desync backstop — while B is
-// untouched. The changed secure half is the reset signal: it rides control
-// frames, which no KCP epoch can affect, and B must end its own epoch when it
-// sees it (resetPeerSession), before its answer lets A build. The
-// peer-between-adapters shape is where that signal lands on an adapter that is
-// already dead: the reset must still reach the pair's KCP session there, or B
-// rebuilds on the advanced epoch and discards A's fresh session's segments (the
-// mismatch this task exists to kill).
+// coordinates with the peer. A resets its KCP epoch and its keys — the
+// record-boundary desync backstop — while B is untouched. The changed secure
+// half is the reset signal: it rides control frames, which no KCP epoch can
+// affect, and B must end its own epoch when it sees it (resetPeerSession),
+// before its answer lets A build. The peer-between-adapters shape is where that
+// signal lands on an adapter that is already dead: the reset must still reach
+// the pair's KCP session there, or B rebuilds on the advanced epoch and
+// discards A's fresh session's segments (the mismatch this task exists to
+// kill). A clean kill is no longer a one-sided reset — under KCP it keeps both
+// the keys and the pair's epoch, so the desync backstop is the remaining
+// one-sided trigger.
 func TestRelayOneSidedEpochResetRecovers(t *testing.T) {
 	resets := []struct {
 		name  string
 		reset func(t *testing.T, eA, eB *engine)
 	}{
-		{"abandoning", func(t *testing.T, eA, eB *engine) {
-			pcA := eA.peerConn(eB.pub)
-			// Records the kill abandons: their nonces are spent at the peer and
-			// never consumed, so the pair re-handshakes — and the re-handshake
-			// is the reset signal. Enough of them that the pair's reader cannot
-			// drain the queue between the pushes and the kill.
-			stale := bytes.Repeat([]byte("x"), 200)
-			for i := 0; i < 8; i++ {
-				pcA.inbound <- stale
-			}
-			pcA.killSession(errors.New("test: one-sided abandoning kill"), true, reasonLocalKill)
-		}},
 		{"desync", func(t *testing.T, eA, eB *engine) {
 			pcA := eA.peerConn(eB.pub)
 			pcA.mu.Lock()
