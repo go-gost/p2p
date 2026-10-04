@@ -292,6 +292,15 @@ func (s *secureSession) clearDesync() {
 	s.mu.Unlock()
 }
 
+// desyncStreakValue reports the streak for logging, which runs outside s.mu.
+// It is read from the session that was abandoned, never from its replacement —
+// the replacement starts at zero and would report nothing.
+func (s *secureSession) desyncStreakValue() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.desyncStreak
+}
+
 func newSecureSession(log *slog.Logger, transport byte, local derpclient.PrivateKey, peer derpclient.PublicKey) *secureSession {
 	return &secureSession{
 		transport: transport,

@@ -351,19 +351,19 @@ func TestKillSessionDropsRelaySecureUnlessRekeyed(t *testing.T) {
 	}
 
 	// A kill that abandoned records drops the relay session, never the direct.
-	newPC(true).killSession(errors.New("test: local kill"), true)
+	newPC(true).killSession(errors.New("test: local kill"), true, reasonLocalKill)
 	if relay, direct := cached(); relay || !direct {
 		t.Fatalf("after an abandoning kill: relay kept=%v direct kept=%v, want false/true", relay, direct)
 	}
 
 	// A clean kill abandons nothing: the settled session is reused.
-	newPC(false).killSession(errors.New("test: local kill"), true)
+	newPC(false).killSession(errors.New("test: local kill"), true, reasonLocalKill)
 	if relay, direct := cached(); !relay || !direct {
 		t.Fatalf("after a clean kill: relay kept=%v direct kept=%v, want true/true", relay, direct)
 	}
 
 	// The peer-rekeyed teardown keeps it even when records were abandoned.
-	newPC(true).killSession(errors.New("derp engine: peer rekeyed"), false)
+	newPC(true).killSession(errors.New("derp engine: peer rekeyed"), false, reasonPeerRekeyed)
 	if relay, direct := cached(); !relay || !direct {
 		t.Fatalf("after the peer-rekeyed kill: relay kept=%v direct kept=%v, want true/true", relay, direct)
 	}

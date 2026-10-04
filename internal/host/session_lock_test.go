@@ -2,10 +2,12 @@ package host
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -217,7 +219,7 @@ func TestRelaySessionReplaceRehandshakes(t *testing.T) {
 	stale := bytes.Repeat([]byte("x"), 200)
 	pc.inbound <- stale
 	pc.inbound <- stale
-	pc.killSession(errors.New("test: local kill"), true)
+	pc.killSession(errors.New("test: local kill"), true, reasonLocalKill)
 
 	// The replacement adapter must borrow a fresh secure session: the cached
 	// one is dropped so the rebuild re-handshakes (see dropRelaySecure).
@@ -328,4 +330,197 @@ func TestRelaySessionReplaceDeadSessionRehandshakes(t *testing.T) {
 		}
 		return string(buf) == "after"
 	})
+}
+
+// logCapture is a slog.Handler that keeps every record, so a test can assert on
+// the structured fields the field diagnosis reads a session's death off.
+type logCapture struct {
+	mu       sync.Mutex
+	messages []string
+	attrs    [][]slog.Attr
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	attrs := make([]slog.Attr, 0, r.NumAttrs())
+	r.Attrs(func(a slog.Attr) bool {
+		attrs = append(attrs, a)
+		return true
+	})
+	c.mu.Lock()
+	c.messages = append(c.messages, r.Message)
+	c.attrs = append(c.attrs, attrs)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCapture) WithGroup(string) slog.Handler      { return c }
+
+// nth returns the attributes of the i-th record with the given message, or nil.
+// Indexed because the same message is emitted more than once across a scenario
+// (a second kill, a second rebuild) and each occurrence carries its own fields.
+func (c *logCapture) nth(msg string, i int) map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for n, m := range c.messages {
+		if m != msg {
+			continue
+		}
+		if i > 0 {
+			i--
+			continue
+		}
+		out := make(map[string]string, len(c.attrs[n]))
+		for _, a := range c.attrs[n] {
+			out[a.Key] = a.Value.String()
+		}
+		return out
+	}
+	return nil
+}
+
+// TestSessionDeathLogCarriesReasonAndSecureReuse pins the fields the field
+// diagnosis reads a session's death off. The production symptom was a session
+// rebuilt every 15s with no way to tell what killed it or whether it kept its
+// keys — so every kill names a reason from a closed set, and every replacement
+// states whether the pair re-handshaked. These are also the fields the e2e
+// regression greps, so they must not silently change shape.
+func TestSessionDeathLogCarriesReasonAndSecureReuse(t *testing.T) {
+	capture := &logCapture{}
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(capture))
+	t.Cleanup(e.Close)
+
+	// An abandoning kill: the queued packet is a record the peer already spent a
+	// nonce on, so the pair's security session must go with the session.
+	abandoning := derpclient.PublicKey{3}
+	inbound := make(chan []byte, 1)
+	inbound <- []byte("record abandoned by the kill")
+	pc := &peerConn{e: e, peer: abandoning, inbound: inbound, closeCh: make(chan struct{})}
+	pc.sessAt = time.Now().Add(-3 * time.Second)
+	pc.killSession(errors.New("derp engine: inbound queue overflow"), true, reasonQueueOverflow)
+
+	attrs := capture.nth("peer session killed", 0)
+	if attrs == nil {
+		t.Fatal("killSession logged no \"peer session killed\" record")
+	}
+	if got := attrs["relayReason"]; got != string(reasonQueueOverflow) {
+		t.Fatalf("relayReason = %q, want %q", got, reasonQueueOverflow)
+	}
+	if got := attrs["dropSecure"]; got != "true" {
+		t.Fatalf("dropSecure = %q, want \"true\": the kill abandoned a queued record", got)
+	}
+	if attrs["cause"] == "" {
+		t.Fatal("the kill log carries no cause")
+	}
+	if attrs["sessionAge"] == "" {
+		t.Fatal("the kill log carries no sessionAge")
+	}
+
+	// A clean kill abandons nothing, and dropSecure is the EFFECTIVE value —
+	// it is what explains the next rebuild reusing its keys, so it must not
+	// report the caller's request.
+	clean := derpclient.PublicKey{4}
+	pc2 := &peerConn{
+		e:       e,
+		peer:    clean,
+		inbound: make(chan []byte, 1),
+		closeCh: make(chan struct{}),
+	}
+	pc2.sessAt = time.Now()
+	pc2.killSession(errors.New("test: clean kill"), true, reasonLocalKill)
+	attrs = capture.nth("peer session killed", 1)
+	if got := attrs["relayReason"]; got != string(reasonLocalKill) {
+		t.Fatalf("relayReason = %q, want %q", got, reasonLocalKill)
+	}
+	if got := attrs["dropSecure"]; got != "false" {
+		t.Fatalf("dropSecure = %q, want \"false\": a kill that abandoned nothing keeps its keys", got)
+	}
+}
+
+// TestSessionRebuildLogReportsReuseAndStreak pins the rebuild half of the same
+// diagnostic: a replacement that abandoned nothing reuses the settled security
+// session (secureReuse=true — what a healthy rebuild looks like), and one that
+// abandoned records re-handshakes (secureReuse=false), reporting the streak
+// that explains why.
+func TestSessionRebuildLogReportsReuseAndStreak(t *testing.T) {
+	capture := &logCapture{}
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(capture))
+	t.Cleanup(e.Close)
+
+	// Dead session, nothing abandoned: the rebuild keeps its keys.
+	reusedPeer := derpclient.PublicKey{5}
+	reusedSess := newSecureSession(nil, secureTransportRelay, priv, reusedPeer)
+	dead := newTestSess(t)
+	if err := dead.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pc := &peerConn{
+		e:       e,
+		peer:    reusedPeer,
+		inbound: make(chan []byte, 1),
+		closeCh: make(chan struct{}),
+		secure:  reusedSess,
+		sess:    dead,
+		sessAt:  time.Now().Add(-2 * time.Second),
+	}
+	pc.ensureSession(false, false) // the log line is emitted before the build
+
+	attrs := capture.nth("relay session rebuilt", 0)
+	if attrs == nil {
+		t.Fatal("a replaced session logged no \"relay session rebuilt\" record")
+	}
+	if got := attrs["secureReuse"]; got != "true" {
+		t.Fatalf("secureReuse = %q, want \"true\": nothing was abandoned, so the keys are intact", got)
+	}
+	if attrs["sessionAge"] == "" {
+		t.Fatal("the rebuild log carries no sessionAge")
+	}
+
+	// Dead session that abandoned a record, with a streak on the outgoing keys:
+	// the rebuild must re-handshake and say why it is resetting.
+	desyncPeer := derpclient.PublicKey{6}
+	desyncSess := newSecureSession(nil, secureTransportRelay, priv, desyncPeer)
+	if got := desyncSess.noteDesync(); got != 1 {
+		t.Fatalf("priming the streak: got %d, want 1", got)
+	}
+	if got := desyncSess.noteDesync(); got != 2 {
+		t.Fatalf("priming the streak: got %d, want 2", got)
+	}
+	dead2 := newTestSess(t)
+	if err := dead2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	inbound := make(chan []byte, 1)
+	inbound <- []byte("record abandoned when the session died")
+	pc2 := &peerConn{
+		e:       e,
+		peer:    desyncPeer,
+		inbound: inbound,
+		closeCh: make(chan struct{}),
+		secure:  desyncSess,
+		sess:    dead2,
+		sessAt:  time.Now().Add(-2 * time.Second),
+	}
+	pc2.ensureSession(false, false)
+
+	attrs = capture.nth("relay session rebuilt", 1)
+	if attrs == nil {
+		t.Fatal("a replaced session logged no \"relay session rebuilt\" record")
+	}
+	if got := attrs["secureReuse"]; got != "false" {
+		t.Fatalf("secureReuse = %q, want \"false\": a record was abandoned, so the pair re-handshakes", got)
+	}
+	if got := attrs["desyncStreak"]; got != "2" {
+		t.Fatalf("desyncStreak = %q, want \"2\": the abandoned session's streak is the evidence", got)
+	}
 }

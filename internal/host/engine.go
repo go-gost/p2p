@@ -729,7 +729,7 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 		go func() {
 			time.Sleep(goneProbeTimeout)
 			if e.isGone(peer) {
-				pc.killSession(errors.New("derp engine: peer gone probe timeout"), true)
+				pc.killSession(errors.New("derp engine: peer gone probe timeout"), true, reasonKeepaliveTimeout)
 			}
 		}()
 	}
@@ -868,7 +868,7 @@ func (e *engine) armDesyncRecovery(peer derpclient.PublicKey, secure *secureSess
 		// dropRelaySecure has released e.mu, so taking pc.mu here keeps the
 		// e.mu-before-pc.mu order.
 		if pc := e.livePeerConn(peer); pc != nil {
-			pc.killSession(errors.New("p2p: secure desync"), true)
+			pc.killSession(errors.New("p2p: secure desync"), true, reasonSecureDesync)
 		}
 	}
 }
@@ -993,7 +993,7 @@ func (e *engine) pump(c *derpclient.Client) {
 			// peer are abandoned and their nonces never consumed: the kill drops
 			// the pair's relay security session so the rebuild re-handshakes
 			// (see dropRelaySecure).
-			pc.killSession(err, true)
+			pc.killSession(err, true, reasonBuildFailed)
 			continue
 		}
 		select {
@@ -1007,7 +1007,7 @@ func (e *engine) pump(c *derpclient.Client) {
 			// draining them), so those nonces are spent but never consumed: the
 			// kill drops the relay security session so both ends reset and
 			// realign instead of wedging on a permanent counter offset.
-			pc.killSession(errors.New("derp engine: inbound queue overflow"), true)
+			pc.killSession(errors.New("derp engine: inbound queue overflow"), true, reasonQueueOverflow)
 		}
 	}
 }
@@ -1125,7 +1125,7 @@ func (e *engine) resetPeerSession(peer derpclient.PublicKey) {
 		// the peer changed its half and respond re-derived ours, so both
 		// counters already match — re-handshaking would make the two ends swap
 		// halves forever (see dropRelaySecure).
-		pc.killSession(errors.New("derp engine: peer rekeyed"), false)
+		pc.killSession(errors.New("derp engine: peer rekeyed"), false, reasonPeerRekeyed)
 	}
 }
 
@@ -1285,7 +1285,7 @@ func (e *engine) peerGone(peer derpclient.PublicKey) {
 		built := pc.sess != nil
 		pc.mu.Unlock()
 		if built {
-			pc.killSession(errors.New("derp engine: peer gone"), true)
+			pc.killSession(errors.New("derp engine: peer gone"), true, reasonPeerGone)
 		}
 	}
 	e.log.Debug("derp peer gone", "peer", keyName(peer))
@@ -1340,7 +1340,7 @@ func (e *engine) teardown(c *derpclient.Client, cause error) {
 	e.log.Error("derp connection lost", "error", cause)
 	c.Close()
 	for _, pc := range peers {
-		pc.killSession(cause, true)
+		pc.killSession(cause, true, reasonLinkLost)
 	}
 }
 
@@ -1371,7 +1371,7 @@ func (e *engine) Close() {
 	e.links = make(map[derpclient.PublicKey][]*link)
 	e.mu.Unlock()
 	for _, pc := range peers {
-		pc.killSession(errors.New("engine closed"), true)
+		pc.killSession(errors.New("engine closed"), true, reasonEngineClosed)
 	}
 	for _, dc := range directs {
 		dc.teardown()
@@ -1434,7 +1434,26 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	replaced := pc.sess != nil && pc.sess.IsClosed()
 	secure := pc.secure
 	dropSecure := replaced && pc.abandonedLocked()
+	// Snapshot what the replacement is about to decide, while the dead
+	// session's state is still in hand: the log below is the only record of
+	// whether the pair kept its keys, and the streak is read off the session
+	// being abandoned — the replacement starts at zero and would report
+	// nothing. Both must be read before pc.secure is replaced below.
+	var age time.Duration
+	streak := 0
+	if replaced {
+		age = time.Since(pc.sessAt)
+		streak = secure.desyncStreakValue()
+	}
 	pc.mu.Unlock()
+
+	if replaced {
+		pc.e.log.Debug("relay session rebuilt",
+			"peer", keyName(pc.peer),
+			"secureReuse", !dropSecure,
+			"desyncStreak", streak,
+			"sessionAge", age.Round(time.Millisecond))
+	}
 
 	if dropSecure {
 		pc.e.dropRelaySecure(pc.peer)
@@ -1656,6 +1675,39 @@ func (pc *peerConn) startAccept() {
 	}()
 }
 
+// sessionEndReason is the structured cause of a relay session's end. The
+// production symptom this exists for was a session rebuilt every 15s with
+// nothing saying what killed it, so log aggregation groups on these values: a
+// new death path picks the closest one rather than inventing a string at the
+// call site. Keep it a closed set — a new value is a diagnosability change.
+type sessionEndReason string
+
+const (
+	// reasonKeepaliveTimeout: the keepalive probe stopped being answered, so the
+	// session starved in place.
+	reasonKeepaliveTimeout sessionEndReason = "keepalive-timeout"
+	// reasonLocalKill: torn down locally with nothing to say about the peer.
+	reasonLocalKill sessionEndReason = "local-kill"
+	// reasonQueueOverflow: the adapter's inbound queue overflowed, so packets
+	// (and their nonces) were dropped.
+	reasonQueueOverflow sessionEndReason = "queue-overflow"
+	// reasonLinkLost: the relay link carrying it went down.
+	reasonLinkLost sessionEndReason = "link-lost"
+	// reasonPeerGone: the relay reported the peer is gone.
+	reasonPeerGone sessionEndReason = "peer-gone"
+	// reasonPeerRekeyed: the peer's identity changed under us (a restarted peer).
+	reasonPeerRekeyed sessionEndReason = "peer-rekeyed"
+	// reasonBuildFailed: the replacement session could not be built.
+	reasonBuildFailed sessionEndReason = "build-failed"
+	// reasonSecureDesync: the record framing could not realign, so the pair
+	// re-handshakes (see noteDesync).
+	reasonSecureDesync sessionEndReason = "secure-desync"
+	// reasonEngineClosed: this process is shutting down.
+	reasonEngineClosed sessionEndReason = "engine-closed"
+	// reasonAdapterClosed: the adapter's underlay is gone.
+	reasonAdapterClosed sessionEndReason = "adapter-closed"
+)
+
 // killSession marks the adapter dead and tears down its session. Safe for
 // concurrent use and for already-dead adapters.
 //
@@ -1676,7 +1728,12 @@ func (pc *peerConn) startAccept() {
 // it runs once: smux's session Close re-enters here through the underlay
 // (Close), and a re-entry must not re-decide — it would drop what a
 // killSession(cause, false) deliberately kept.
-func (pc *peerConn) killSession(cause error, dropSecure bool) {
+//
+// reason names the cause for the log (see sessionEndReason). dropSecure in the
+// log is the EFFECTIVE value, not the request: it is what explains whether the
+// next rebuild reused its keys, so reporting the request would hide exactly the
+// case that matters — a kill that dropped nothing because nothing was abandoned.
+func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndReason) {
 	pc.mu.Lock()
 	if pc.closed {
 		pc.mu.Unlock()
@@ -1686,15 +1743,22 @@ func (pc *peerConn) killSession(cause error, dropSecure bool) {
 	close(pc.closeCh)
 	sess := pc.sess
 	abandoned := pc.abandonedLocked()
+	age := time.Since(pc.sessAt)
 	pc.mu.Unlock()
 
-	if dropSecure && abandoned && pc.e != nil {
+	dropped := dropSecure && abandoned && pc.e != nil
+	if dropped {
 		pc.e.dropRelaySecure(pc.peer)
 	}
 	if sess != nil {
 		sess.Close()
 	}
-	pc.e.log.Debug("peer session killed", "peer", keyName(pc.peer), "cause", cause)
+	pc.e.log.Debug("peer session killed",
+		"peer", keyName(pc.peer),
+		"relayReason", reason,
+		"dropSecure", dropped,
+		"sessionAge", age.Round(time.Millisecond),
+		"cause", cause)
 }
 
 // abandonedLocked reports whether the adapter still holds frame bytes nothing
@@ -1776,7 +1840,7 @@ func (pc *peerConn) Write(p []byte) (int, error) {
 // Close implements net.Conn: closing the adapter kills the session (streams
 // and all). It does not touch the shared DERP transport.
 func (pc *peerConn) Close() error {
-	pc.killSession(errors.New("adapter closed"), true)
+	pc.killSession(errors.New("adapter closed"), true, reasonAdapterClosed)
 	return nil
 }
 
