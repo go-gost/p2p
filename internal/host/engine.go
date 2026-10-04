@@ -903,6 +903,7 @@ func (e *engine) livePeerConn(peer derpclient.PublicKey) *peerConn {
 func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	var dead *peerConn
 	if pc, ok := e.peers[peer]; ok {
 		pc.mu.Lock()
 		closed := pc.closed
@@ -910,6 +911,7 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		if !closed {
 			return pc
 		}
+		dead = pc
 		delete(e.peers, peer) // drop the dead adapter
 	}
 	e.ensureClientLocked()
@@ -922,6 +924,32 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 	}
 	e.peers[peer] = pc
 	e.armDesyncRecovery(peer, pc.secure)
+	if dead != nil {
+		// killSession closes the adapter, so recovering from a killed session
+		// lands HERE — the replacement is a brand-new peerConn whose sess is nil,
+		// and the in-place branch in ensureSession never runs. Logging the
+		// rebuild only there reported nothing at all: a full e2e run showed
+		// "relay session rebuilt" = 0 against "peer session killed" = 4, leaving
+		// secureReuse unreported and nothing for the e2e to grep.
+		dead.mu.Lock()
+		prev, at := dead.secure, dead.sessAt
+		dead.mu.Unlock()
+		// The new session starts at a zero streak, so the count that explains
+		// the rebuild has to come off the session being replaced.
+		var streak int
+		var age time.Duration
+		if prev != nil {
+			streak = prev.desyncStreakValue()
+		}
+		if !at.IsZero() {
+			age = time.Since(at)
+		}
+		e.log.Debug("relay session rebuilt",
+			"peer", keyName(peer),
+			"secureReuse", prev == pc.secure,
+			"desyncStreak", streak,
+			"sessionAge", age.Round(time.Millisecond))
+	}
 	return pc
 }
 
@@ -1773,7 +1801,12 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	sess := pc.sess
 	secure := pc.secure
 	abandoned := pc.abandonedLocked()
-	age := time.Since(pc.sessAt)
+	// An adapter that never built a session has a zero sessAt; without the guard
+	// the log reported the time since year 1 (2562047h47m16s).
+	age := time.Duration(0)
+	if !pc.sessAt.IsZero() {
+		age = time.Since(pc.sessAt)
+	}
 	pc.mu.Unlock()
 
 	dropped := dropSecure && abandoned && pc.e != nil

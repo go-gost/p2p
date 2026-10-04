@@ -524,3 +524,75 @@ func TestSessionRebuildLogReportsReuseAndStreak(t *testing.T) {
 		t.Fatalf("desyncStreak = %q, want \"2\": the abandoned session's streak is the evidence", got)
 	}
 }
+
+// TestKillLogSessionAgeZeroForUnbuiltAdapter pins that a kill on an adapter that
+// never built a session reports a zero age. time.Since on a zero sessAt is the
+// time since year 1, which is what the e2e showed:
+// sessionAge=2562047h47m16.854775807s.
+func TestKillLogSessionAgeZeroForUnbuiltAdapter(t *testing.T) {
+	capture := &logCapture{}
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(capture))
+	t.Cleanup(e.Close)
+
+	pc := e.peerConn(derpclient.PublicKey{9})
+	pc.killSession(errors.New("test: kill before any session"), true, reasonLocalKill)
+
+	attrs := capture.nth("peer session killed", 0)
+	if attrs == nil {
+		t.Fatal("killSession logged no \"peer session killed\" record")
+	}
+	if got := attrs["sessionAge"]; got != "0s" {
+		t.Fatalf("sessionAge = %q, want \"0s\" for an adapter that never built a session", got)
+	}
+}
+
+// TestRelayRebuildLogFiresOnFreshAdapter pins WHERE a rebuild is logged.
+// killSession CLOSES the adapter, so the next build is a brand-new peerConn
+// whose pc.sess is nil — the in-place branch in ensureSession never runs on that
+// path. Logging the rebuild only there emitted nothing: a full e2e run showed
+// `relay session rebuilt = 0` against `peer session killed = 4`, so secureReuse
+// was never reported and the e2e gate had no field to grep.
+func TestRelayRebuildLogFiresOnFreshAdapter(t *testing.T) {
+	capture := &logCapture{}
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(capture))
+	t.Cleanup(e.Close)
+
+	// A clean kill abandons nothing, so the replacement keeps the keys.
+	reused := derpclient.PublicKey{7}
+	pc1 := e.peerConn(reused)
+	pc1.killSession(errors.New("test: clean kill"), true, reasonLocalKill)
+	pc2 := e.peerConn(reused)
+	if pc2 == pc1 {
+		t.Fatal("a closed adapter was handed back instead of a replacement")
+	}
+	attrs := capture.nth("relay session rebuilt", 0)
+	if attrs == nil {
+		t.Fatal("replacing a killed adapter logged no \"relay session rebuilt\" record")
+	}
+	if got := attrs["secureReuse"]; got != "true" {
+		t.Fatalf("secureReuse = %q, want \"true\": a clean kill keeps the settled keys", got)
+	}
+
+	// An abandoning kill drops them, so the replacement must re-handshake.
+	dropped := derpclient.PublicKey{8}
+	pc3 := e.peerConn(dropped)
+	pc3.inbound <- []byte("record abandoned by the kill")
+	pc3.killSession(errors.New("test: abandoning kill"), true, reasonLocalKill)
+	e.peerConn(dropped)
+
+	attrs = capture.nth("relay session rebuilt", 1)
+	if attrs == nil {
+		t.Fatal("the second rebuild logged no \"relay session rebuilt\" record")
+	}
+	if got := attrs["secureReuse"]; got != "false" {
+		t.Fatalf("secureReuse = %q, want \"false\": an abandoning kill dropped the keys", got)
+	}
+}
