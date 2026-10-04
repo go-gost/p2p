@@ -1,7 +1,9 @@
 package host
 
 import (
+	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -22,6 +24,14 @@ import (
 type faults struct {
 	dropCtrl, dropData, dropPong atomic.Bool
 
+	// dropDataRate is the configured ratio, logged at startup. dropDataPeriod
+	// is the precomputed drop interval (0 when disabled); dropDataSeq counts
+	// calls on the hot path. The whole state is immutable after construction,
+	// except for the counter which is bumped by dropDataPacket without a lock.
+	dropDataRate   float64
+	dropDataPeriod uint64
+	dropDataSeq    atomic.Uint64
+
 	// The timed mute's shape and its origin. The origin is the instant the fault
 	// was built, so a host configured with silence starts muted and then sends
 	// for SilenceEvery-SilenceFor before muting again. silenceEvery>0 is
@@ -39,10 +49,22 @@ func newFaults(cfg *p2p.FaultsConfig) *faults {
 	if cfg == nil {
 		return &faults{since: time.Now()}
 	}
-	f := &faults{silenceFor: cfg.SilenceFor, silenceEvery: cfg.SilenceEvery, since: time.Now()}
+	f := &faults{
+		silenceFor:   cfg.SilenceFor,
+		silenceEvery: cfg.SilenceEvery,
+		since:        time.Now(),
+		dropDataRate: cfg.DropDataRate,
+	}
 	f.dropCtrl.Store(cfg.DropCtrl)
 	f.dropData.Store(cfg.DropData)
 	f.dropPong.Store(cfg.DropPong)
+	if cfg.DropDataRate > 0 {
+		period := uint64(math.Round(1 / cfg.DropDataRate))
+		if period < 1 {
+			period = 1
+		}
+		f.dropDataPeriod = period
+	}
 	return f
 }
 
@@ -60,6 +82,9 @@ func (f *faults) warn(log *slog.Logger) {
 	}
 	if f.dropData.Load() {
 		on = append(on, "dropData")
+	}
+	if f.dropDataPeriod > 0 {
+		on = append(on, fmt.Sprintf("dropDataRate(%g)", f.dropDataRate))
 	}
 	if f.dropPong.Load() {
 		on = append(on, "dropPong")
@@ -102,4 +127,14 @@ func (f *faults) muteCtrl(now time.Time) bool {
 // silence is a mute on the whole peer link, not a data-only one.
 func (f *faults) muteData(now time.Time) bool {
 	return f != nil && (f.dropData.Load() || f.silenced(now))
+}
+
+// dropDataPacket reports whether this relay data frame must be dropped now.
+// It is deterministic: a configured rate of r drops every round(1/r)th frame.
+// The counter is per-faults state, so a rebuilt faults resets the sequence.
+func (f *faults) dropDataPacket() bool {
+	if f == nil || f.dropDataPeriod == 0 {
+		return false
+	}
+	return f.dropDataSeq.Add(1)%f.dropDataPeriod == 0
 }

@@ -46,6 +46,12 @@ type FaultsConfig struct {
 	// ping and the stamp that feeds the relay-silence watchdog, so a live relay
 	// reads as a dead one.
 	DropPong bool `yaml:"dropPong" json:"dropPong"`
+	// DropDataRate drops one in every round(1/rate) relay data frames on the
+	// relay send path, deterministically. This is the loss injector used to
+	// exercise KCP retransmission: dropped segments must be repaired by the
+	// underlay rather than desyncing the record framing above it. Zero disables
+	// the injector.
+	DropDataRate float64 `yaml:"dropDataRate" json:"dropDataRate"`
 	// Silence stops sending *anything* to the peer for SilenceFor, every
 	// SilenceEvery, while SilenceEvery > 0. This is the measured field failure:
 	// the session's peer-side frames stop arriving without the path dying, and

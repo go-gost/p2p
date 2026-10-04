@@ -70,10 +70,11 @@ func TestFaultsWarnNamesTheKnobs(t *testing.T) {
 
 	newFaults(&p2p.FaultsConfig{
 		DropData:     true,
+		DropDataRate: 0.25,
 		SilenceFor:   time.Second,
 		SilenceEvery: time.Minute,
 	}).warn(log)
-	for _, want := range []string{"fault injection", "dropData", "silence(1s every 1m0s)"} {
+	for _, want := range []string{"fault injection", "dropData", "dropDataRate(0.25)", "silence(1s every 1m0s)"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Fatalf("warning %q does not name %q", buf.String(), want)
 		}
@@ -213,6 +214,42 @@ func TestDropDataStarvesADirectSession(t *testing.T) {
 	// 1-2x the direct timeout plus a tick: the bound is what separates a starved
 	// session from one that is merely idle.
 	waitFor(t, 8*time.Second, func() bool { return sessB.IsClosed() })
+}
+
+// TestFaultsDropDataRate pins the probabilistic data-frame loss injector: a
+// configured ratio drops every round(1/rate)th relay data frame exactly, so a
+// test can assert counts rather than a statistical band. A zero ratio is off.
+func TestFaultsDropDataRate(t *testing.T) {
+	// Zero means off: no frames are dropped.
+	f := newFaults(&p2p.FaultsConfig{DropDataRate: 0})
+	for i := 0; i < 100; i++ {
+		if f.dropDataPacket() {
+			t.Fatal("zero rate must not drop any packet")
+		}
+	}
+
+	// 0.25 => one packet in four is dropped, deterministically.
+	f = newFaults(&p2p.FaultsConfig{DropDataRate: 0.25})
+	var drops int
+	for i := 0; i < 100; i++ {
+		if f.dropDataPacket() {
+			drops++
+		}
+	}
+	if drops != 25 {
+		t.Fatalf("rate 0.25 over 100 packets dropped %d, want 25", drops)
+	}
+
+	// The first three calls pass, the fourth is dropped.
+	f = newFaults(&p2p.FaultsConfig{DropDataRate: 0.25})
+	for i := 0; i < 3; i++ {
+		if f.dropDataPacket() {
+			t.Fatalf("packet %d should pass", i+1)
+		}
+	}
+	if !f.dropDataPacket() {
+		t.Fatal("packet 4 should drop")
+	}
 }
 
 // TestSilenceShorterThanTimeoutIsSurvived: the measured field failure — a

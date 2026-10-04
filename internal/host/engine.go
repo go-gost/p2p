@@ -2062,7 +2062,13 @@ func (pc *peerConn) Read(p []byte) (int, error) {
 func (pc *peerConn) Write(p []byte) (int, error) {
 	// Fault injection (see faults): the frame never reaches the relay, and the
 	// write reports success — smux cannot tell this from a path that ate it.
-	if pc.e.faults.Load().muteData(time.Now()) {
+	faults := pc.e.faults.Load()
+	if faults.muteData(time.Now()) {
+		return len(p), nil
+	}
+	// Probabilistic loss on the relay data path only: KCP must retransmit the
+	// dropped segment instead of the record framing above it desyncing.
+	if faults.dropDataPacket() {
 		return len(p), nil
 	}
 	pc.mu.Lock()
