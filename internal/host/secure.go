@@ -29,6 +29,15 @@ var errEncryptionRequired = errors.New("p2p: encryption required but the session
 // length prefix and the 16-byte tag at ~0.1% overhead.
 const maxSecureRecord = 16 * 1024
 
+// secureDesyncThreshold is how many consecutive record-boundary failures force
+// the pair to re-handshake. A rebuilt session reuses its keys and nonce
+// counters (see secureSession), so one boundary failure can be a stale read
+// racing a teardown — but a run of them means the reuse assumption is broken
+// for good and the counters can never realign. Three is past anything a single
+// rebuild race can explain, and low enough that the pair recovers in seconds
+// rather than churning until the process restarts.
+const secureDesyncThreshold = 3
+
 // secureHalfLen is the ctrlSecure payload length: [transport 1B][ephemeral
 // public key 32B][want 1B].
 const secureHalfLen = 1 + 32 + 1
@@ -97,12 +106,18 @@ type cryptoConn struct {
 
 	rmu  sync.Mutex
 	rbuf []byte
+
+	// session owns this conn's share of the security state; it counts the
+	// record-boundary failures this conn sees. It may be nil in tests that drive
+	// the framing directly.
+	session *secureSession
 }
 
 // newCryptoConn wraps underlay with the directional AEADs and the session's
 // shared counters and write mutex. log and peer are used only to report a
-// record-auth failure; both may be zero in tests.
-func newCryptoConn(underlay net.Conn, send, recv cipher.AEAD, sendCtr, recvCtr *nonceCtr, wmu *sync.Mutex, log *slog.Logger, peer derpclient.PublicKey) *cryptoConn {
+// record-auth failure; both may be zero in tests. session reports the
+// record-boundary failures readRecord sees, and may be nil.
+func newCryptoConn(underlay net.Conn, send, recv cipher.AEAD, sendCtr, recvCtr *nonceCtr, wmu *sync.Mutex, log *slog.Logger, peer derpclient.PublicKey, session *secureSession) *cryptoConn {
 	return &cryptoConn{
 		Conn:    underlay,
 		send:    send,
@@ -112,6 +127,7 @@ func newCryptoConn(underlay net.Conn, send, recv cipher.AEAD, sendCtr, recvCtr *
 		wmu:     wmu,
 		log:     log,
 		peer:    peer,
+		session: session,
 	}
 }
 
@@ -167,6 +183,7 @@ func (c *cryptoConn) readRecord() ([]byte, error) {
 	}
 	n := binary.BigEndian.Uint32(hdr[:])
 	if n == 0 || n > maxSecureRecord+16 {
+		c.noteDesync()
 		return nil, fmt.Errorf("p2p: bad secure record length %d", n)
 	}
 	ct := make([]byte, n)
@@ -179,9 +196,27 @@ func (c *cryptoConn) readRecord() ([]byte, error) {
 		if c.log != nil {
 			c.log.Warn("secure record auth failed", "peer", keyName(c.peer), "error", err)
 		}
+		c.noteDesync()
 		return nil, fmt.Errorf("p2p: secure record auth failed: %w", err)
 	}
+	c.clearDesync()
 	return pt, nil
+}
+
+// noteDesync hands the session one record-boundary failure. Only the two
+// failures above the record boundary count: a short read or an orderly end of
+// stream is a torn-down session, not a misaligned pair.
+func (c *cryptoConn) noteDesync() {
+	if c.session != nil {
+		c.session.noteDesync()
+	}
+}
+
+// clearDesync tells the session a record opened cleanly.
+func (c *cryptoConn) clearDesync() {
+	if c.session != nil {
+		c.session.clearDesync()
+	}
 }
 
 // handshakeTimeout bounds waiting for the peer's handshake half. Both peers
@@ -192,10 +227,13 @@ var handshakeTimeout = 3 * time.Second
 // secureSession drives one (peer, transport) handshake and owns its keys. It
 // outlives any one smux session: a rebuilt mux session reuses the same keys and
 // the same nonce counters, so a one-sided rebuild is transparent and the nonce
-// sequence never restarts. It holds no I/O: the caller seals/sends the half
-// returned by start and feeds the peer's opened half to respond. Once both
-// halves are present the directional AEAD keys are derived; until then the
-// session is plaintext.
+// sequence never restarts. That reuse holds only while the pair stays aligned —
+// a replacement that abandoned records re-handshakes on a fresh session instead
+// (see dropRelaySecure), and a session that sees repeated record-boundary
+// failures asks to be dropped (see noteDesync). It holds no I/O: the caller
+// seals/sends the half returned by start and feeds the peer's opened half to
+// respond. Once both halves are present the directional AEAD keys are derived;
+// until then the session is plaintext.
 type secureSession struct {
 	transport byte
 	local     derpclient.PrivateKey
@@ -214,6 +252,44 @@ type secureSession struct {
 	sendCtr *nonceCtr
 	recvCtr *nonceCtr
 	peerCh  chan struct{}
+
+	// desyncStreak counts consecutive record-boundary failures seen by any
+	// cryptoConn of this session. It is deliberately not carried across a
+	// rebuild: a fresh session starts clean, so the reset it triggers cannot
+	// compound into a handshake storm.
+	desyncStreak int
+	// onDesync asks the owner to drop this session and rebuild the pair. It is
+	// wired by the engine for relay sessions only, and may be nil.
+	onDesync func(streak int)
+}
+
+// noteDesync records one record-boundary failure and returns the running streak.
+// The first time the streak reaches secureDesyncThreshold it dispatches onDesync
+// on its own goroutine: the callback drops the security session and kills the
+// adapter, neither of which may run on the read path (this is called under
+// cryptoConn.rmu, and the engine takes e.mu before pc.mu). It fires exactly once
+// per session — at the threshold, not on every failure past it — because a later
+// failure can belong to a session that has already been replaced, and resetting
+// that one would restart the churn the backstop exists to end.
+func (s *secureSession) noteDesync() int {
+	s.mu.Lock()
+	s.desyncStreak++
+	n := s.desyncStreak
+	cb := s.onDesync
+	fire := n == secureDesyncThreshold && cb != nil
+	s.mu.Unlock()
+	if fire {
+		go cb(n)
+	}
+	return n
+}
+
+// clearDesync resets the streak: the count is of consecutive failures, so one
+// record that opens cleanly proves the pair is still aligned.
+func (s *secureSession) clearDesync() {
+	s.mu.Lock()
+	s.desyncStreak = 0
+	s.mu.Unlock()
 }
 
 func newSecureSession(log *slog.Logger, transport byte, local derpclient.PrivateKey, peer derpclient.PublicKey) *secureSession {
@@ -463,5 +539,5 @@ func (s *secureSession) conn(underlay net.Conn) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newCryptoConn(underlay, sa, ra, sendCtr, recvCtr, &s.wmu, s.log, s.peer), nil
+	return newCryptoConn(underlay, sa, ra, sendCtr, recvCtr, &s.wmu, s.log, s.peer, s), nil
 }

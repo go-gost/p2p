@@ -844,6 +844,42 @@ func (e *engine) dropRelaySecure(peer derpclient.PublicKey) {
 	e.mu.Unlock()
 }
 
+// armDesyncRecovery wires a relay security session's record-boundary self-heal:
+// secureDesyncThreshold consecutive failures mean the pair's framing can never
+// realign (see dropRelaySecure), so the session is dropped and the adapter
+// rebuilt on a fresh ephemeral. Direct sessions are left unarmed — that
+// transport re-keys via rekeyIfUsed on every punch, and a reset there would
+// fight it. Arming twice is a no-op, so every site that hands a session to an
+// adapter may call it.
+//
+// The callback resolves the live adapter when it fires instead of capturing one:
+// a clean kill hands the same settled session to the replacement adapter, and a
+// captured adapter would be dead by then.
+func (e *engine) armDesyncRecovery(peer derpclient.PublicKey, secure *secureSession) {
+	secure.mu.Lock()
+	defer secure.mu.Unlock()
+	if secure.onDesync != nil || secure.transport != secureTransportRelay {
+		return
+	}
+	secure.onDesync = func(streak int) {
+		e.log.Warn("p2p: relay secure desync, resetting",
+			"peer", keyName(peer), "streak", streak)
+		e.dropRelaySecure(peer)
+		// dropRelaySecure has released e.mu, so taking pc.mu here keeps the
+		// e.mu-before-pc.mu order.
+		if pc := e.livePeerConn(peer); pc != nil {
+			pc.killSession(errors.New("p2p: secure desync"), true)
+		}
+	}
+}
+
+// livePeerConn returns the peer's current adapter, or nil when it has none.
+func (e *engine) livePeerConn(peer derpclient.PublicKey) *peerConn {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.peers[peer]
+}
+
 // peerConn returns (creating if needed) the adapter for peer, dialing the
 // DERP server and starting the pump on first use. A cached adapter that was
 // closed (e.g. the peer process died and its relay session broke) is replaced
@@ -872,6 +908,7 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		secure:  e.secureSessionLocked(peer, secureTransportRelay),
 	}
 	e.peers[peer] = pc
+	e.armDesyncRecovery(peer, pc.secure)
 	return pc
 }
 
@@ -1418,6 +1455,9 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 			break
 		}
 		pc.mu.Unlock()
+		// The replacement is a fresh session object, so arm it as well: it is the
+		// one that will see the next record-boundary failure.
+		pc.e.armDesyncRecovery(pc.peer, secure)
 	}
 
 	// No live session: settle the handshake before building, so both ends agree
