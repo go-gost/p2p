@@ -107,6 +107,7 @@ secure 握手改在 KCP 之上进行（可靠流），因此握手本身也不�
 - **丢包**：KCP 段重传吸收；上层只见可靠有序流，正常情况下不再出现 record desync。
 - 记录层失配路径保留为最后防线（含既有 deadlock 修复、一帧一写、短写处理），不再是预期路径。
 - **KCP 会话死亡**（对端消失/长时间无 ACK）：KCP 超时 `Close` → 映射到现有 `killSession` → 重建 presentation。
+- relay 的 secure 半仅在 reason 分类的 kill（rekey / desync / link loss / peer-gone）时丢弃，不因 inbound 队列非空而丢弃——队列里是 KCP 段、会重传，不构成"已花 nonce 的 secure 记录"。
 - **derp 客户端整体掉线**：沿用现有 engine 的 stale 检测与重建逻辑，KCP 只是 underlay。
 - 需测试 KCP 超时与 smux 3s/15s keepalive 的先后关系，确保重建后不被 smux 立即判死。
 

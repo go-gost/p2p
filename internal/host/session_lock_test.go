@@ -155,9 +155,9 @@ func TestRelaySessionChurnReconnectsRelay(t *testing.T) {
 			// Exactly what sessionLocked leaves behind when it finds the
 			// session dead. Closing the live session directly hangs here: smux
 			// retires a session by handing its error to the read loop, and that
-			// loop is parked in peerConn.Read, which nothing has woken (see the
-			// note on retireSession). This test is about the churn accounting,
-			// not that path.
+			// loop is parked reading pc.inbound through the KCP underlay
+			// (relayPacketConn.ReadFrom), which nothing has woken. This test is
+			// about the churn accounting, not that path.
 			pc.mu.Lock()
 			pc.sess = nil
 			pc.mu.Unlock()

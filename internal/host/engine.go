@@ -355,8 +355,8 @@ func (e *engine) peerEncryptions() map[string]string {
 func encryptionState(pc *peerConn, dc *directConn) string {
 	considered, allSecure := false, true
 	if pc != nil {
-		// pc.secure is reassigned when a replaced session re-handshakes, so the
-		// field is read under pc.mu like sessionLocked's reads.
+		// pc.secure is fixed at adapter creation (see peerConn) and read under
+		// pc.mu for consistency with sessionLocked's and killSession's reads.
 		pc.mu.Lock()
 		secure := pc.secure
 		pc.mu.Unlock()
@@ -427,9 +427,10 @@ func (e *engine) transportCounts() (direct, derp int) {
 	return
 }
 
-// peerConn is the per-peer packet adapter: smux sees it as a net.Conn, whose
-// writes become DERP SendPackets and whose reads drain packets routed by the
-// connection pump.
+// peerConn is the per-peer derp adapter the relay packet layer sits on: its
+// inbound channel is drained one datagram at a time by relayPacketConn.ReadFrom
+// (feeding KCP), and its Write turns one datagram into a single DERP
+// SendPacket.
 type peerConn struct {
 	e       *engine
 	peer    derpclient.PublicKey
@@ -895,10 +896,10 @@ func (e *engine) relayKCPPairFor(peer derpclient.PublicKey) *relayKCPPair {
 // dropRelayKCP ends and forgets the pair's relay KCP session, so the next build
 // starts a fresh epoch. It runs only where the pair's sequence state can no
 // longer align with the peer's: the peer restarted (its session starts over),
-// the pair re-handshakes after abandoning records or desyncing (the peer resets
-// alongside our changed half, see resetPeerSession), the relay link carrying it
-// is gone, or the engine is closing. A clean kill — nothing abandoned, keys
-// kept — must NOT call it: the rebuilt mux session continues the pair's session
+// the pair re-handshakes after a secure desync or a dropped key (the peer
+// resets alongside our changed half, see resetPeerSession), the relay link
+// carrying it is gone, or the engine is closing. A clean kill — keys kept —
+// must NOT call it: the rebuilt mux session continues the pair's session
 // instead of restarting at sn=0 under a peer whose session is still running.
 //
 // Compare-and-delete like dropRelaySecure: the decision is taken under pc.mu
@@ -1615,8 +1616,7 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	// No live session: settle the handshake before building, so both ends agree
 	// on encrypted-vs-plaintext for this session. A settled security session
 	// needs none of this: its keys outlive the mux session, so a rebuild just
-	// reuses them — except a replaced session, which re-handshakes above — and
-	// a peer restart arrives as a changed half, not here. The
+	// reuses them, and a peer restart arrives as a changed half, not here. The
 	// send and the wait run OUTSIDE pc.mu: sendControl takes e.mu, which pc.mu
 	// is taken under elsewhere, so holding pc.mu here would invert the two.
 	if !live && !secure.settled() && !wait {
@@ -1710,12 +1710,13 @@ func (e *engine) reconnectRelay(cause error) {
 // session per pair. Caller must hold pc.mu.
 func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	if pc.sess != nil && pc.sess.IsClosed() {
-		// A replacement that abandoned records re-handshakes: ensureSession
-		// dropped the pair's relay security session and settled a fresh one
-		// before calling in here (see dropRelaySecure); one that abandoned
-		// nothing keeps the settled session. The drop cannot happen in this
-		// pc.mu section — dropRelaySecure takes e.mu, which is taken before
-		// pc.mu elsewhere (see peerConn).
+		// The dead session died on its own — any kill closes the adapter too
+		// (killSession), so a killed session rebuilds through peerConn, not
+		// here. Its keys were therefore kept, and the rebuild is transparent
+		// over the surviving pair KCP session. The reason-driven key drop lives
+		// in killSession (see resetsPairKCP) and could not run here anyway:
+		// dropRelaySecure takes e.mu, which is taken before pc.mu elsewhere
+		// (see peerConn).
 		pc.sess = nil
 	}
 	if pc.sess != nil {
@@ -1850,8 +1851,9 @@ const (
 	reasonPeerGoneProbe sessionEndReason = "peer-gone-probe"
 	// reasonLocalKill: torn down locally with nothing to say about the peer.
 	reasonLocalKill sessionEndReason = "local-kill"
-	// reasonQueueOverflow: the adapter's inbound queue overflowed, so packets
-	// (and their nonces) were dropped.
+	// reasonQueueOverflow: the adapter's inbound queue overflowed, meaning it
+	// stopped draining. The kill is a conservative recovery; KCP repairs the
+	// dropped segments below.
 	reasonQueueOverflow sessionEndReason = "queue-overflow"
 	// reasonLinkLost: the relay link carrying it went down.
 	reasonLinkLost sessionEndReason = "link-lost"
@@ -1969,7 +1971,7 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 		"cause", cause)
 }
 
-// Write implements net.Conn: each write is one DERP SendPacket.
+// Write sends one datagram as a single DERP SendPacket.
 func (pc *peerConn) Write(p []byte) (int, error) {
 	// Fault injection (see faults): the frame never reaches the relay, and the
 	// write reports success — smux cannot tell this from a path that ate it.
@@ -2006,18 +2008,12 @@ func (pc *peerConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Close implements net.Conn: closing the adapter kills the session (streams
-// and all). It does not touch the shared DERP transport.
+// Close closes the adapter, killing the session (streams and all). It does not
+// touch the shared DERP transport.
 func (pc *peerConn) Close() error {
 	pc.killSession(errors.New("adapter closed"), false, reasonAdapterClosed)
 	return nil
 }
-
-func (pc *peerConn) LocalAddr() net.Addr                { return dummyAddr{} }
-func (pc *peerConn) RemoteAddr() net.Addr               { return dummyAddr{pc.peer} }
-func (pc *peerConn) SetDeadline(t time.Time) error      { return nil }
-func (pc *peerConn) SetReadDeadline(t time.Time) error  { return nil }
-func (pc *peerConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // dummyAddr is a placeholder net.Addr for the adapter.
 type dummyAddr struct{ peer any }

@@ -338,9 +338,10 @@ var handshakeTimeout = 3 * time.Second
 // outlives any one smux session: a rebuilt mux session reuses the same keys and
 // the same nonce counters, so a one-sided rebuild is transparent and the nonce
 // sequence never restarts. That reuse holds only while the pair stays aligned —
-// a replacement that abandoned records re-handshakes on a fresh session instead
-// (see dropRelaySecure), and a session that sees repeated record-boundary
-// failures asks to be dropped (see noteDesync). It holds no I/O: the caller
+// a replacement whose keys were dropped by an epoch-ending kill re-handshakes
+// on a fresh session instead (see dropRelaySecure), and a session that sees
+// repeated record-boundary failures asks to be dropped (see noteDesync). It
+// holds no I/O: the caller
 // seals/sends the half returned by start and feeds the peer's opened half to
 // respond. Once both halves are present the directional AEAD keys are derived;
 // until then the session is plaintext.
@@ -403,8 +404,9 @@ func (s *secureSession) clearDesync() {
 }
 
 // desyncStreakValue reports the streak for logging, which runs outside s.mu.
-// It is read from the session that was abandoned, never from its replacement —
-// the replacement starts at zero and would report nothing.
+// It is read from the session that accumulated the streak (the one in place
+// before the rebuild), never from a fresh one — a fresh session starts at zero
+// and would report nothing.
 func (s *secureSession) desyncStreakValue() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

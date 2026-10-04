@@ -44,11 +44,10 @@ func newRelayPacketConn(pc *peerConn) *relayPacketConn {
 	return &relayPacketConn{pc: pc}
 }
 
-// ReadFrom returns one queued datagram. It mirrors peerConn.Read's drain-once
-// semantics after closeCh is closed: any remaining queued packet is returned
-// before io.EOF. The kick channel degrades the same way. If the caller's buffer
-// is smaller than the datagram, the copy is truncated to len(p) exactly like
-// UDP.
+// ReadFrom returns one queued datagram. Once closeCh is closed it drains one
+// final queued packet before reporting io.EOF; the kick channel degrades the
+// same way. If the caller's buffer is smaller than the datagram, the copy is
+// truncated to len(p) exactly like UDP.
 func (rc *relayPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	var pkt []byte
 	select {
