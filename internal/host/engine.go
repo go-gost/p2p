@@ -838,10 +838,23 @@ func (e *engine) secureSessionFor(peer derpclient.PublicKey, transport byte) *se
 // peer-restart path (resetPeerSession): there the peer already changed its half
 // and respond re-derived ours, so both counters already match and dropping would
 // send yet another fresh half, loop the two ends, and never settle.
-func (e *engine) dropRelaySecure(peer derpclient.PublicKey) {
+func (e *engine) dropRelaySecure(peer derpclient.PublicKey, expect *secureSession) {
 	e.mu.Lock()
-	delete(e.secure, secureKey{peer: peer, transport: secureTransportRelay})
-	e.mu.Unlock()
+	defer e.mu.Unlock()
+	k := secureKey{peer: peer, transport: secureTransportRelay}
+	// Compare-and-delete. The decision to drop is taken under pc.mu but runs
+	// after pc.mu is released, and by then the key may already hold a different
+	// session — a replacement adapter's, or one a concurrent ensureSession
+	// installed. Deleting that one would evict a LIVE pair's keys and force a
+	// needless handshake, and would leave the session the peer is actually
+	// holding stranded in the cache under a key nobody reads. Dropping only the
+	// session the decision was made about makes the delete idempotent: teardown
+	// and peerGone already drop every relay session under e.mu, and the
+	// killSession that follows finds nothing of its own left to delete.
+	if expect != nil && e.secure[k] != expect {
+		return
+	}
+	delete(e.secure, k)
 }
 
 // armDesyncRecovery wires a relay security session's record-boundary self-heal:
@@ -864,7 +877,7 @@ func (e *engine) armDesyncRecovery(peer derpclient.PublicKey, secure *secureSess
 	secure.onDesync = func(streak int) {
 		e.log.Warn("p2p: relay secure desync, resetting",
 			"peer", keyName(peer), "streak", streak)
-		e.dropRelaySecure(peer)
+		e.dropRelaySecure(peer, secure)
 		// dropRelaySecure has released e.mu, so taking pc.mu here keeps the
 		// e.mu-before-pc.mu order.
 		if pc := e.livePeerConn(peer); pc != nil {
@@ -1456,24 +1469,40 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	}
 
 	if dropSecure {
-		pc.e.dropRelaySecure(pc.peer)
+		// Compare-and-delete, then install only if this caller is still the one
+		// holding the session it decided about: ensureSession runs from the pump
+		// AND from OpenStream, and it releases pc.mu for the handshake below, so
+		// two callers can reach this block for the same dead session. Without
+		// both guards the loser installs a session the winner has already
+		// discarded (or deletes the winner's), which diverges pc.secure from the
+		// keys the live mux session is using — Status then reports plaintext for
+		// a secure peer — and fails its own open with errEncryptionRequired.
+		stale := secure
+		pc.e.dropRelaySecure(pc.peer, stale)
 		secure = pc.e.secureSessionFor(pc.peer, secureTransportRelay)
 		pc.mu.Lock()
-		pc.secure = secure
-		// Discard the abandoned stream bytes with the old session: they belong
-		// to the old key's record sequence, and the fresh session would
-		// misparse them as its first records. Only dead ciphertext is lost —
-		// the peer's respond resets its counters alongside ours.
-		pc.current, pc.remainder = nil, nil
-		for {
-			select {
-			case <-pc.inbound:
-				continue
-			default:
+		if pc.secure != stale {
+			// Another caller already replaced it; theirs is the live session.
+			secure = pc.secure
+			pc.mu.Unlock()
+			pc.e.armDesyncRecovery(pc.peer, secure)
+		} else {
+			pc.secure = secure
+			// Discard the abandoned stream bytes with the old session: they belong
+			// to the old key's record sequence, and the fresh session would
+			// misparse them as its first records. Only dead ciphertext is lost —
+			// the peer's respond resets its counters alongside ours.
+			pc.current, pc.remainder = nil, nil
+			for {
+				select {
+				case <-pc.inbound:
+					continue
+				default:
+				}
+				break
 			}
-			break
+			pc.mu.Unlock()
 		}
-		pc.mu.Unlock()
 		// The replacement is a fresh session object, so arm it as well: it is the
 		// one that will see the next record-boundary failure.
 		pc.e.armDesyncRecovery(pc.peer, secure)
@@ -1742,13 +1771,14 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	pc.closed = true
 	close(pc.closeCh)
 	sess := pc.sess
+	secure := pc.secure
 	abandoned := pc.abandonedLocked()
 	age := time.Since(pc.sessAt)
 	pc.mu.Unlock()
 
 	dropped := dropSecure && abandoned && pc.e != nil
 	if dropped {
-		pc.e.dropRelaySecure(pc.peer)
+		pc.e.dropRelaySecure(pc.peer, secure)
 	}
 	if sess != nil {
 		sess.Close()

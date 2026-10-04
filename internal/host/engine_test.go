@@ -985,7 +985,12 @@ func (e *engine) peerSecureForTest(peer derpclient.PublicKey) bool {
 	if pc == nil {
 		return false
 	}
-	_, _, ok := pc.secure.keys()
+	// pc.secure is reassignable at runtime now (a replacement installs a fresh
+	// session), so read it under pc.mu like every production reader does.
+	pc.mu.Lock()
+	secure := pc.secure
+	pc.mu.Unlock()
+	_, _, ok := secure.keys()
 	return ok
 }
 
