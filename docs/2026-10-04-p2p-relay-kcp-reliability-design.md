@@ -140,3 +140,39 @@ cd /root/code/go-gost/p2p && export PATH="$PATH:/root/.local/go/bin:/root/go/bin
 - CPU 开销：按"吞吐优先"接受。
 - **未决（暂缓）**：是否将 smux 升到 protocol v2（`smux.Config.Version=2`，同一 v1.5.57 已支持）。评估结论：v2 不能修复丢包，但与 KCP 正交；v2 的每流窗口可消除 v1 全会话桶的队头阻塞。决定：**先只做 KCP，v2 另议**（若 KCP 落地后 v1 实测干净，可按 YAGNI 推迟）。
 - 与既有 `2026-10-04-p2p-relay-session-desync-plan.md` 的关系：本设计**推进**其 Task 4（e2e 回归）并**取代**其"不定位 datagram link 根因"的边界；Task 1–3 已落地（提交 `cdfb8d1`/`057f07b`/`0c99783`/`2075288`）。
+
+## 实测结果
+
+实测环境：`/tmp/wisper-cnt.sh`（`direct:false`，仅中继路径；hub→spoke iperf3 TCP，`DUR=30`）。二进制由 `/root/code/go-gost/wisper` 经 `go.work` 链接本地 `p2p`（`relay-kcp-reliability` @ `5710fe4`）。基线：修复前仅传 ~2 MB 即 `secure record desync` + `datagram link down`，且不再恢复。
+
+### 运行 1：无丢包基线
+
+| 指标 | 值 |
+|---|---|
+| iperf3 sender | 354,025,472 B，94.4 Mbit/s，retransmits=0 |
+| iperf3 receiver | 354,025,472 B，93.4 Mbit/s |
+| 时长 | 30.004 s（30 个 interval，完整跑满） |
+| spoke `secure record desync` | 0 |
+| spoke `datagram link up` | 1 |
+| spoke `datagram link down` | 0 |
+| spoke `link: edge failed` | 0 |
+| spoke `relay session rebuilt` | 0 |
+| spoke `relay kcp pair reset` | 0 |
+
+传输完整跑满 30s，spoke 日志全程无 `secure record desync`、无 `datagram link down`、无 `link: edge failed`；唯一的 `datagram link up` 是会话建立时的一次（`20:06:08.523Z`）。端到端 TCP 层 `retransmits=0`：中继若有丢包由 KCP 在更底层吸收，iperf3 的 TCP 看不到任何重传。本次传输 354 MB，远超基线崩溃点 ~2 MB。
+
+### 运行 2：丢包注入（未能执行）
+
+本应使用 Task 4 的 `DropDataRate` 注入 ~5% 丢包，但**无法在给定 harness 上注入**：
+
+- `p2p.FaultsConfig`（含 `DropDataRate`）只能经 `p2p.Config.Faults` 传入 `host.New`；它是 config-file only（无 RPC / 无 env / 无 flag），只有 `cmd/p2p` 二进制的配置文件会读取它。
+- harness `/tmp/wisper-cnt.sh` 运行的是 **wisper**（另一个程序）：`tunnel/p2p_host.go` 的 `acquire()` 构造 `p2p.Config` 时只填 `Derp/Key/Stun/Direct/TLS`，**不填 `Faults`**；wisper 的 `config.P2PSettings` 与 `/api/config` 的 `P2PSettingsResp` 均无 `faults` 字段。
+- 因此 hub 侧无法注入 `dropDataRate`。在不修改 Go 源码、不改 harness 的前提下（本任务约束），丢包场景无法完成。
+- 替代方案（netem）也不忠实：client↔derper 是 wss/TCP，IP 层丢包由 TCP 重传吸收，不会产生 derp frame 级丢包，无法触发 KCP 重传。
+
+跟进建议：把 `faults` 透传到 wisper 的 `P2PSettings` 与 `acquire()`（或改用 `cmd/p2p` + 含 `faults` 的配置文件做丢包 e2e），再补运行 2。
+
+### KCP 调优是否需要后续
+
+- 无丢包下可持续 94 Mbit/s 且 TCP 0 重传，`relayKCPMtu=1400`、`SndWnd=RcvWnd=256`、`SetNoDelay(1,10,2,1)` 的保守默认值未暴露瓶颈，暂无需暴露调参开关。
+- 5% 丢包场景的吞吐/重传开销因注入缺口未能实测，KCP 在丢包下的表现仍待补测后才能定论。
