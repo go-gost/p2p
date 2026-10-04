@@ -317,7 +317,7 @@ func (p *relayKCPPair) WriteTo(b []byte, _ net.Addr) (int, error) {
 // with the session. kcp-go never calls it (ownConn=false); it completes the
 // net.PacketConn interface.
 func (p *relayKCPPair) Close() error {
-	p.e.dropRelayKCP(p.peer, nil, errors.New("relay kcp pair closed"))
+	p.e.dropRelayKCP(p.peer, nil, errors.New("relay kcp pair closed"), 0)
 	return nil
 }
 

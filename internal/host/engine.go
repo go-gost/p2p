@@ -21,6 +21,14 @@ import (
 	"github.com/xtaci/smux"
 )
 
+// sessionGenSeq numbers every relay session built across the whole process, so
+// a session's generation is globally unique within a process: a rebuild, a
+// desync, a kill and a pair-KCP epoch reset on the same peer all carry the same
+// number, and two peers' generations never collide. It is deliberately
+// package-level, not per-engine, so two engines in one process (tests, a host
+// with multiple relays) still produce distinct generations.
+var sessionGenSeq atomic.Uint64
+
 // engine connects the host to a DERP rendezvous/relay server and turns
 // relayed packets into one smux session per peer. The peer address is the
 // base64 (raw URL) encoding of its 32-byte curve25519 public key — the same
@@ -453,6 +461,13 @@ type peerConn struct {
 	relayRebuilds     atomic.Int64 // relay sessions built (first build excluded)
 	relayRebuildPeers atomic.Int64 // of those, the peer changed its secure half
 
+	// sessionGen is the generation of the most recently built relay session,
+	// assigned from sessionGenSeq on every build (first included) in
+	// sessionLocked. It ties a rebuild, a desync, a kill and the pair-KCP epoch
+	// reset on this peer to one number in the log. An atomic so the kill and
+	// desync paths can read it without pc.mu.
+	sessionGen atomic.Uint64
+
 	mu   sync.Mutex
 	sess *smux.Session
 	// kcp is this adapter's view of the pair's KCP session under sess (see
@@ -467,6 +482,12 @@ type peerConn struct {
 	closed    bool
 	closeCh   chan struct{}
 
+	// lastEndReason is the reason the previous relay session ended with, set by
+	// killSession and consumed by the next rebuild's storm check (in
+	// sessionLocked). The zero value means the session died on its own, with no
+	// kill. Guarded by pc.mu.
+	lastEndReason sessionEndReason
+
 	// Relay-session churn for this peer: sessions built inside the current
 	// window, when that window opened, and whether its limit has been crossed.
 	// The crossing is acted on by the next caller, out of pc.mu (the reconnect
@@ -474,6 +495,108 @@ type peerConn struct {
 	churnFrom    time.Time
 	churn        int
 	churnTripped bool
+
+	// storm tracks this peer's recent rebuilds so a rebuild storm — far more
+	// rebuilds than a working session ever produces — is flagged exactly once
+	// per window. Self-contained (its own lock and an injectable clock); it is
+	// only touched on the rebuild path, which is rare.
+	storm rebuildStorm
+}
+
+const (
+	// rebuildStormWindow is the span over which one peer's relay-session
+	// rebuilds are counted for the storm check. It is far tighter than the
+	// churn window (relayChurnWindow): churn ends in a relay reconnect, while a
+	// storm is only flagged, so it must not fire on a single network change
+	// (which costs a rebuild or two) but must catch the livelock this diagnoses
+	// (rebuilds every few seconds).
+	rebuildStormWindow = 30 * time.Second
+	// rebuildStormThreshold is how many rebuilds inside rebuildStormWindow may
+	// pass before the storm WARN fires. "More than 3 within 30 seconds" means
+	// the 4th rebuild trips it.
+	rebuildStormThreshold = 3
+)
+
+// rebuildStorm tracks one peer's recent relay-session rebuilds so a rebuild
+// storm — far more rebuilds than a working session ever produces — is flagged
+// exactly once per window instead of only by reading the log timeline. The
+// clock is injectable (now) so the window logic is testable with a fake clock
+// and no sleeps; the zero value uses time.Now. Guarded by its own mutex: a
+// rebuild and a status read can race, but rebuilds are rare, so it is never
+// contended.
+type rebuildStorm struct {
+	now func() time.Time
+	mu  sync.Mutex
+	// events is the oldest-first list of rebuilds still inside the window. Each
+	// rebuild carries the reason its previous session ended with ("" when the
+	// session died on its own). Bounded by the window and the rebuild rate;
+	// rebuilds are rare, so it stays short.
+	events []rebuildEvent
+	// warned is set when the window's threshold is crossed and cleared once the
+	// count falls back to the threshold, so a fresh burst after a quiet window
+	// warns again.
+	warned bool
+}
+
+// rebuildEvent is one rebuild: when it happened and why (the reason the
+// previous session ended with).
+type rebuildEvent struct {
+	at     time.Time
+	reason sessionEndReason
+}
+
+// note records one rebuild and reports whether the WARN should be emitted now:
+// true the first time the window holds more than rebuildStormThreshold rebuilds,
+// together with the count and the oldest-first sequence of their reasons. It
+// never allocates on the data path — it is only called on the rebuild path, and
+// the reasons slice is built only on the call that warns.
+func (s *rebuildStorm) note(reason sessionEndReason) (count int, reasons []sessionEndReason, warn bool) {
+	now := time.Now
+	if s.now != nil {
+		now = s.now
+	}
+	at := now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := at.Add(-rebuildStormWindow)
+	kept := s.events[:0]
+	for _, e := range s.events {
+		if !e.at.Before(cutoff) {
+			kept = append(kept, e)
+		}
+	}
+	s.events = append(kept, rebuildEvent{at: at, reason: reason})
+	if len(s.events) <= rebuildStormThreshold {
+		s.warned = false
+		return 0, nil, false
+	}
+	if s.warned {
+		return 0, nil, false
+	}
+	s.warned = true
+	reasons = make([]sessionEndReason, len(s.events))
+	for i, e := range s.events {
+		reasons[i] = e.reason
+	}
+	return len(s.events), reasons, true
+}
+
+// recordRebuild feeds one rebuild to the storm check and emits the WARN the
+// first time the window's threshold is crossed. reason is the reason the
+// previous session ended with. It runs on the rebuild path only (sessionLocked,
+// under pc.mu): the storm lock is a leaf taken under pc.mu, and the WARN is a
+// plain log, so it neither blocks nor allocates on any data path.
+func (pc *peerConn) recordRebuild(reason sessionEndReason) {
+	count, reasons, warn := pc.storm.note(reason)
+	if !warn || pc.e == nil || pc.e.log == nil {
+		return
+	}
+	pc.e.log.Warn("derp: peer relay rebuild storm",
+		"peer", keyName(pc.peer),
+		"gen", pc.sessionGen.Load(),
+		"count", count,
+		"window", rebuildStormWindow.String(),
+		"reasons", reasons)
 }
 
 const (
@@ -906,8 +1029,11 @@ func (e *engine) relayKCPPairFor(peer derpclient.PublicKey) *relayKCPPair {
 // (or outside any lock) and runs after, and by then the key may already hold a
 // replacement pair's session — evicting that one would kill a LIVE session's
 // epoch. expect names the session the decision was made about; nil forces the
-// drop (teardown paths, and kills of adapters that never built).
-func (e *engine) dropRelayKCP(peer derpclient.PublicKey, expect *kcp.UDPSession, cause error) {
+// drop (teardown paths, and kills of adapters that never built). gen is the
+// relay-session generation whose epoch is being reset (0 when there is no
+// specific built session, e.g. the pair's own Close), carried on the log line so
+// a reset correlates with the kill or desync that caused it.
+func (e *engine) dropRelayKCP(peer derpclient.PublicKey, expect *kcp.UDPSession, cause error, gen uint64) {
 	e.kcpMu.Lock()
 	pair := e.relayKCPs[peer]
 	if pair == nil {
@@ -924,7 +1050,7 @@ func (e *engine) dropRelayKCP(peer derpclient.PublicKey, expect *kcp.UDPSession,
 	delete(e.relayKCPs, peer)
 	e.kcpMu.Unlock()
 	pair.shutdown()
-	e.log.Debug("relay kcp pair reset", "peer", keyName(peer), "cause", cause)
+	e.log.Debug("relay kcp pair reset", "peer", keyName(peer), "cause", cause, "gen", gen)
 }
 
 // closeRelayKCPs ends every pair's relay KCP session: the relay connection
@@ -964,17 +1090,24 @@ func (e *engine) armDesyncRecovery(peer derpclient.PublicKey, secure *secureSess
 		return
 	}
 	secure.onDesync = func(streak int) {
+		// Resolve the live adapter once, before any teardown: its generation is
+		// the desyncing session's, and it is the adapter the kill below closes.
+		pc := e.livePeerConn(peer)
+		gen := uint64(0)
+		if pc != nil {
+			gen = pc.sessionGen.Load()
+		}
 		e.log.Warn("p2p: relay secure desync, resetting",
-			"peer", keyName(peer), "streak", streak)
+			"peer", keyName(peer), "streak", streak, "gen", gen)
 		e.dropRelaySecure(peer, secure)
 		// The pair's KCP epoch resets with the keys — unconditionally, for the
 		// same reason as resetPeerSession: a reset that lands on a dead adapter
 		// must still reach the pair, or the mismatch survives the re-handshake
 		// this callback exists to force.
-		e.dropRelayKCP(peer, nil, errors.New("p2p: secure desync"))
+		e.dropRelayKCP(peer, nil, errors.New("p2p: secure desync"), gen)
 		// dropRelaySecure has released e.mu, so taking pc.mu here keeps the
 		// e.mu-before-pc.mu order.
-		if pc := e.livePeerConn(peer); pc != nil {
+		if pc != nil {
 			pc.killSession(errors.New("p2p: secure desync"), true, reasonSecureDesync)
 		}
 	}
@@ -1027,6 +1160,8 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		// secureReuse unreported and nothing for the e2e to grep.
 		dead.mu.Lock()
 		prev, at := dead.secure, dead.sessAt
+		gen := dead.sessionGen.Load()
+		reason := dead.lastEndReason
 		dead.mu.Unlock()
 		// The rebuild counters are the pair's, not the adapter's: the
 		// replacement continues them — and the pair's build timestamp with
@@ -1037,6 +1172,9 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		pc.sessAt = at
 		pc.relayRebuilds.Store(dead.relayRebuilds.Load())
 		pc.relayRebuildPeers.Store(dead.relayRebuildPeers.Load())
+		// The reason the killed session ended with is what the replacement's
+		// first build will feed to the rebuild-storm check (see sessionLocked).
+		pc.lastEndReason = reason
 		// The new session starts at a zero streak, so the count that explains
 		// the rebuild has to come off the session being replaced.
 		var streak int
@@ -1051,7 +1189,8 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 			"peer", keyName(peer),
 			"secureReuse", prev == pc.secure,
 			"desyncStreak", streak,
-			"sessionAge", age.Round(time.Millisecond))
+			"sessionAge", age.Round(time.Millisecond),
+			"gen", gen)
 	}
 	return pc
 }
@@ -1268,7 +1407,11 @@ func (e *engine) resetPeerSession(peer derpclient.PublicKey) {
 	// reset that no-ops leaves the pair's advanced sequence state in place to
 	// discard the peer's fresh session's segments — the epoch mismatch the
 	// coordination exists to prevent.
-	e.dropRelayKCP(peer, nil, errors.New("derp engine: peer rekeyed"))
+	gen := uint64(0)
+	if pc != nil {
+		gen = pc.sessionGen.Load()
+	}
+	e.dropRelayKCP(peer, nil, errors.New("derp engine: peer rekeyed"), gen)
 	if pc != nil {
 		// The one teardown a user cannot cause from either end: the peer changed
 		// its key. It tears the session down every time, so its rate is the one
@@ -1433,7 +1576,11 @@ func (e *engine) peerGone(peer derpclient.PublicKey) {
 	// The pair's KCP session goes with the peer: its sequence state is with a
 	// peer that is gone (or restarted), and a session left running would leak
 	// its read loop.
-	e.dropRelayKCP(peer, nil, errors.New("derp engine: peer gone"))
+	gen := uint64(0)
+	if pc != nil {
+		gen = pc.sessionGen.Load()
+	}
+	e.dropRelayKCP(peer, nil, errors.New("derp engine: peer gone"), gen)
 	if pc != nil {
 		// A session-less adapter is a handshake in flight: killing it would fail
 		// that open before its bounded wait can decide, and the peer may already
@@ -1599,9 +1746,14 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	secure := pc.secure
 	var age time.Duration
 	streak := 0
+	gen := uint64(0)
 	if replaced {
 		age = time.Since(pc.sessAt)
 		streak = secure.desyncStreakValue()
+		// The generation of the session being replaced: the rebuild log
+		// describes the old session, and this is the number that correlates it
+		// with that session's kill (or, here, its own end).
+		gen = pc.sessionGen.Load()
 	}
 	pc.mu.Unlock()
 
@@ -1610,7 +1762,8 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 			"peer", keyName(pc.peer),
 			"secureReuse", true,
 			"desyncStreak", streak,
-			"sessionAge", age.Round(time.Millisecond))
+			"sessionAge", age.Round(time.Millisecond),
+			"gen", gen)
 	}
 
 	// No live session: settle the handshake before building, so both ends agree
@@ -1777,9 +1930,21 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	// it): what the build rode, for the kill path and the KCP-underlay probes.
 	pc.kcp = kcpConn
 	pc.sessAt = time.Now()
+	// Every build — first included — gets a fresh, process-unique generation so
+	// the up line, and a later kill/desync/KCP-reset on this session, all share
+	// one number.
+	pc.sessionGen.Store(sessionGenSeq.Add(1))
+	if rebuild {
+		// The rebuild-storm check runs only here, on the rebuild path: it
+		// consumes the reason the previous session ended with (set by
+		// killSession, copied across the adapter swap in peerConn) and warns
+		// once per window when a peer rebuilds far too often.
+		pc.recordRebuild(pc.lastEndReason)
+		pc.lastEndReason = ""
+	}
 	pc.noteBuildLocked(pc.sessAt)
 	_, _, enc := pc.secure.keys()
-	pc.e.log.Debug("peer relay session up", "peer", keyName(pc.peer), "client", roleIsClient, "secure", enc)
+	pc.e.log.Debug("peer relay session up", "peer", keyName(pc.peer), "client", roleIsClient, "secure", enc, "gen", pc.sessionGen.Load())
 	pc.startAccept()
 	return pc.sess, nil
 }
@@ -1929,11 +2094,13 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 		return
 	}
 	pc.closed = true
+	pc.lastEndReason = reason
 	close(pc.closeCh)
 	sess := pc.sess
 	kcpConn := pc.kcp
 	pc.kcp = nil
 	secure := pc.secure
+	gen := pc.sessionGen.Load()
 	// An adapter that never built a session has a zero sessAt; without the guard
 	// the log reported the time since year 1 (2562047h47m16s).
 	age := time.Duration(0)
@@ -1961,14 +2128,15 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	// rebuild continues the pair's sequence, while a rekey/desync/link-loss/
 	// gone/engine-close resets it alongside the keys.
 	if pc.e != nil && resetsPairKCP(reason) {
-		pc.e.dropRelayKCP(pc.peer, kcpConn, cause)
+		pc.e.dropRelayKCP(pc.peer, kcpConn, cause, gen)
 	}
 	pc.e.log.Debug("peer session killed",
 		"peer", keyName(pc.peer),
 		"relayReason", reason,
 		"dropSecure", dropped,
 		"sessionAge", age.Round(time.Millisecond),
-		"cause", cause)
+		"cause", cause,
+		"gen", gen)
 }
 
 // Write sends one datagram as a single DERP SendPacket.

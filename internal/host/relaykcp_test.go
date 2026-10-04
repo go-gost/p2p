@@ -215,7 +215,7 @@ func TestRelayKCPPairDrainsFinalEndpoint(t *testing.T) {
 	pc.inbound <- []byte("second")
 
 	// The pair ends with datagrams still queued on its endpoint.
-	e.dropRelayKCP(peer, nil, errors.New("test: pair teardown"))
+	e.dropRelayKCP(peer, nil, errors.New("test: pair teardown"), 0)
 
 	buf := make([]byte, 64)
 	for _, want := range []string{"first", "second"} {
