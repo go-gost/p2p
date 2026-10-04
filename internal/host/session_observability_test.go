@@ -115,12 +115,84 @@ func TestRebuildStormWarnOncePerWindow(t *testing.T) {
 	if attrs["window"] == "" {
 		t.Fatal("the storm WARN carries no window")
 	}
+	if got := attrs["reasons"]; got != "[peer-rekeyed secure-desync link-lost queue-overflow]" {
+		t.Fatalf("storm WARN reasons = %q, want the four reasons in order", got)
+	}
 
 	// A 5th rebuild inside the same window must not add a second WARN.
 	now = now.Add(time.Second)
 	pc.recordRebuild(reasonPeerRekeyed)
 	if got := capture.count("derp: peer relay rebuild storm"); got != 1 {
 		t.Fatalf("storm WARNs after the 5th rebuild = %d, want still 1", got)
+	}
+}
+
+// TestRebuildStormFiresAcrossAdapterSwaps pins that the storm accumulates over
+// kill-driven rebuilds. Every killSession closes the adapter, so the next build
+// goes through peerConn — a fresh peerConn — which must carry the storm state
+// over (like the rebuild counters), or the ring restarts at one event per swap
+// and the WARN never fires. Four kill -> fresh-adapter -> rebuild cycles inside
+// the window must produce exactly one WARN with count=4.
+func TestRebuildStormFiresAcrossAdapterSwaps(t *testing.T) {
+	capture := &logCapture{}
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(capture))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{9}
+	// A settled security session installed as the engine's cached relay session,
+	// so every adapter — original and replacement — builds over settled keys and
+	// a clean kill keeps them across the swap.
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	e.mu.Lock()
+	e.secure[secureKey{peer: peer, transport: secureTransportRelay}] = settled
+	e.mu.Unlock()
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := base
+
+	pc := e.peerConn(peer)
+	// The storm's clock is carried across the swap too (see peerConn), so
+	// setting it once on the first adapter drives every replacement.
+	pc.storm.now = func() time.Time { return now }
+
+	build := func() {
+		pc.mu.Lock()
+		if _, err := pc.sessionLocked(); err != nil {
+			pc.mu.Unlock()
+			t.Fatalf("build: %v", err)
+		}
+		pc.mu.Unlock()
+		now = now.Add(time.Second)
+	}
+
+	// The first build is not a rebuild, so it records no storm event.
+	build()
+
+	// Four kill-driven rebuilds, each through a fresh adapter. The reason value
+	// is incidental (any clean kill exercises the same swap); it is the
+	// kill -> fresh-peerConn -> rebuild path under test.
+	for i := 0; i < 4; i++ {
+		pc.killSession(errors.New("test: kill"), true, reasonLocalKill)
+		pc = e.peerConn(peer)
+		build()
+	}
+
+	if got := capture.count("derp: peer relay rebuild storm"); got != 1 {
+		t.Fatalf("storm WARNs = %d, want exactly 1", got)
+	}
+	attrs := capture.nth("derp: peer relay rebuild storm", 0)
+	if attrs == nil {
+		t.Fatal("the storm WARN was not captured")
+	}
+	if got := attrs["count"]; got != "4" {
+		t.Fatalf("storm WARN count = %q, want 4", got)
+	}
+	if got := attrs["reasons"]; got != "[local-kill local-kill local-kill local-kill]" {
+		t.Fatalf("storm WARN reasons = %q, want four local-kill entries in order", got)
 	}
 }
 

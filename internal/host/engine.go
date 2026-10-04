@@ -515,22 +515,25 @@ const (
 	// pass before the storm WARN fires. "More than 3 within 30 seconds" means
 	// the 4th rebuild trips it.
 	rebuildStormThreshold = 3
+	// rebuildStormMaxEvents caps the storm ring so a pathological in-process
+	// storm cannot grow it without bound. It is far above the threshold, so the
+	// count and reasons are exact for any storm the WARN is meant to flag.
+	rebuildStormMaxEvents = 16
 )
 
 // rebuildStorm tracks one peer's recent relay-session rebuilds so a rebuild
 // storm — far more rebuilds than a working session ever produces — is flagged
 // exactly once per window instead of only by reading the log timeline. The
 // clock is injectable (now) so the window logic is testable with a fake clock
-// and no sleeps; the zero value uses time.Now. Guarded by its own mutex: a
-// rebuild and a status read can race, but rebuilds are rare, so it is never
-// contended.
+// and no sleeps; the zero value uses time.Now. Guarded by its own mutex;
+// rebuilds are rare, so it is never contended.
 type rebuildStorm struct {
 	now func() time.Time
 	mu  sync.Mutex
-	// events is the oldest-first list of rebuilds still inside the window. Each
-	// rebuild carries the reason its previous session ended with ("" when the
-	// session died on its own). Bounded by the window and the rebuild rate;
-	// rebuilds are rare, so it stays short.
+	// events is the oldest-first list of the most recent rebuilds still inside
+	// the window, capped at rebuildStormMaxEvents. Each rebuild carries the
+	// reason its previous session ended with ("" when the session died on its
+	// own).
 	events []rebuildEvent
 	// warned is set when the window's threshold is crossed and cleared once the
 	// count falls back to the threshold, so a fresh burst after a quiet window
@@ -566,6 +569,9 @@ func (s *rebuildStorm) note(reason sessionEndReason) (count int, reasons []sessi
 		}
 	}
 	s.events = append(kept, rebuildEvent{at: at, reason: reason})
+	if n := len(s.events); n > rebuildStormMaxEvents {
+		s.events = s.events[n-rebuildStormMaxEvents:]
+	}
 	if len(s.events) <= rebuildStormThreshold {
 		s.warned = false
 		return 0, nil, false
@@ -581,6 +587,19 @@ func (s *rebuildStorm) note(reason sessionEndReason) (count int, reasons []sessi
 	return len(s.events), reasons, true
 }
 
+// carryTo hands this storm's window state to dst — the events still inside the
+// window, the warned flag, and the injected clock — so a replacement adapter
+// continues the pair's storm instead of restarting it on every swap. It does not
+// copy the mutex (dst keeps its own); the caller (peerConn, under e.mu) installs
+// dst before any other goroutine can reach it, so dst needs no lock here.
+func (s *rebuildStorm) carryTo(dst *rebuildStorm) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dst.events = append(dst.events[:0], s.events...)
+	dst.warned = s.warned
+	dst.now = s.now
+}
+
 // recordRebuild feeds one rebuild to the storm check and emits the WARN the
 // first time the window's threshold is crossed. reason is the reason the
 // previous session ended with. It runs on the rebuild path only (sessionLocked,
@@ -591,6 +610,9 @@ func (pc *peerConn) recordRebuild(reason sessionEndReason) {
 	if !warn || pc.e == nil || pc.e.log == nil {
 		return
 	}
+	// gen is the generation of the session whose build just tripped the storm —
+	// the same number the "peer relay session up" line logs right after this —
+	// while reasons are the ends of the sessions that were rebuilt away.
 	pc.e.log.Warn("derp: peer relay rebuild storm",
 		"peer", keyName(pc.peer),
 		"gen", pc.sessionGen.Load(),
@@ -1175,6 +1197,12 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		// The reason the killed session ended with is what the replacement's
 		// first build will feed to the rebuild-storm check (see sessionLocked).
 		pc.lastEndReason = reason
+		// The storm is pair-scoped like the counters: a kill-driven rebuild that
+		// landed here would otherwise restart the ring on every swap and never
+		// accumulate (each fresh adapter would hold a single event). Carrying the
+		// window state — events, warned, and the injected clock — keeps the
+		// "exactly one WARN per window" guarantee across the swap.
+		dead.storm.carryTo(&pc.storm)
 		// The new session starts at a zero streak, so the count that explains
 		// the rebuild has to come off the session being replaced.
 		var streak int
