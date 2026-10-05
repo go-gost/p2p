@@ -193,6 +193,33 @@ cd /root/code/go-gost/p2p && export PATH="$PATH:/root/.local/go/bin:/root/go/bin
 
 - 无丢包下可持续 94 Mbit/s 且 TCP 0 重传，`relayKCPMtu=1400`、`SndWnd=RcvWnd=256`、`SetNoDelay(1,10,2,1)` 的保守默认值未暴露瓶颈，暂无需暴露调参开关。
 - 5% 丢包场景的吞吐/重传开销因注入缺口未能实测，KCP 在丢包下的表现仍待补测后才能定论。丢包下的**正确性**（字节流完整、无 record desync、无重建）已由仓库内 `TestRelayToleratesDroppedDataFrames` 覆盖（见上文"运行 2 补充"）。
+- 空闲 CPU 成本已实测（见下文「空闲中继的 CPU 成本」）：默认值在空闲方向上同样没有暴露问题，无需调参。
+
+## 空闲中继的 CPU 成本
+
+中继 KCP 会话即使不传任何字节也不是零成本：`relayKCPStreamRead` 以
+`relayKCPStreamReadTimeout`（100ms）为死锁兜底反复挂起/唤醒，另有一个 parked reader
+per mux session；kcp-go 自身还有 10ms 的 `update` 定时器在跑。二者必须分开算，因此按三段
+等长（各 20s）同进程窗口测量（`getrusage(RUSAGE_SELF)` 的 utime+stime）：w1 = KCP 会话存活
+且两侧各有 parked reader（生产空闲形态）；w2 = clean kill 掉 smux session 后（parked reader
+退出，而 pair 级 KCP 会话按设计存活，故 w2 只剩 KCP 自身）；w3 = `dropRelayKCP` 后的对照。
+
+| 窗口 | CPU | 占单核 |
+|---|---|---|
+| w1：KCP 存活 + parked reader（两侧） | 22.5 ms/s | 2.26% |
+| w2：KCP 存活，无 parked reader（两侧） | 21.2 ms/s | 2.12% |
+| w3：对照，无 KCP 会话 | 6.0 ms/s | 0.60% |
+| **差：parked read 轮询（两侧）** | **1.37 ms/s** | **0.14%** |
+| **差：kcp-go 自身空闲（两侧）** | **15.2 ms/s** | **1.52%** |
+
+结论：**100ms 的停放读轮询不是瓶颈，每个 parked reader 仅 685 µs/s（0.069% 单核，10 次
+唤醒/秒 ≈ 68 µs/次）**，比 kcp-go 自身的空闲开销小一个数量级（2.2% vs 0.14%），因此
+`relayKCPStreamReadTimeout` 保持 100ms 不动——它存在的理由是让被 retire 的 view 能及时退出读
+循环，加大它只会用真实的重建延迟换 CPU，而换不到大头。w1 与 w2+w3 之和的差额（约 6 ms/s）
+是 smux keepalive（3s）与引擎定时器，不计入上表两项。每 peer 空闲总成本约 1.1% 单核
+（一侧 = 一个 KCP 会话 + 一个 parked reader），按 p2p 每主机个位数 peer 的实际形态可忽略。
+kcp-go 的 10ms `update` 循环不可配置，且空闲时关掉 pair 的 KCP 会话会触发 epoch 重置——正是
+本设计要避免的事——故不作为优化方向。
 
 ## 中继 KCP 可观测性
 
