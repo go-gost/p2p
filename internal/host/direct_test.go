@@ -30,6 +30,9 @@ func TestMain(m *testing.M) {
 	punchTimeout = 2 * time.Second
 	punchWaitTimeout = 2 * time.Second
 	backoffPeriod = 500 * time.Millisecond
+	// The silent-peer growth doubles from backoffPeriod and stops here, so a
+	// test can reach the cap in a few rounds instead of minutes.
+	deadPeerWaitCap = 4 * time.Second
 	stunTimeout = 500 * time.Millisecond
 	// The direct session's keepalive is the thing TestDirectSilentPeerIsNoticed
 	// measures, so it runs at test speed here (production is 2s/6s).
@@ -1510,6 +1513,131 @@ func TestBackoffContinuesForALivePeer(t *testing.T) {
 	if a, _, _ := dc.punchCounters(); a == 0 {
 		t.Error("attempts = 0, want a retry to have run for a peer that can answer")
 	}
+}
+
+// lastBackoffWait reads the wait the most recent backoff scheduled, out of the
+// punch trace ("backoff 30s") that retry records.
+func lastBackoffWait(t *testing.T, dc *directConn) time.Duration {
+	t.Helper()
+	lines := dc.traceLines()
+	for i := len(lines) - 1; i >= 0; i-- {
+		rest, ok := strings.CutPrefix(lines[i], "backoff ")
+		if !ok {
+			continue
+		}
+		d, err := time.ParseDuration(rest)
+		if err != nil {
+			t.Fatalf("trace line %q: %v", lines[i], err)
+		}
+		return d
+	}
+	t.Fatalf("no backoff in the punch trace: %q", lines)
+	return 0
+}
+
+// TestSilentPeerWaitGrows covers the wait a punch hands out for a peer that
+// shows no live path. Two cases, and the asymmetry between them is the whole
+// point:
+//
+//   - The peer has a path. The wait is the one asked for, every time. A round
+//     here is probing a path that blipped — a phone's Wi-Fi ↔ cellular switch —
+//     and giving it a growing wait would strand that peer when it returns.
+//   - The peer has no path, which for a host that never dialed it is forever:
+//     peerGoneForPunch needs a relay session this side built, and there is
+//     none to die, so nothing ever skips the round. Without growth it is a
+//     STUN lookup, a broadcast and a timeout every backoffPeriod for as long as
+//     the peer stays away. The wait doubles, and stops at the cap.
+//
+// It also covers the reset: a peer that gets a path again must not inherit the
+// wait its absence earned.
+func TestSilentPeerWaitGrows(t *testing.T) {
+	t.Run("grows while the peer is silent", func(t *testing.T) {
+		dc := newSlotConn(t)
+		// No peerConn for this peer at all: the accepting side of a pair that
+		// only ever had a direct path, which no amount of waiting proves gone.
+		dc.e.client = &derpclient.Client{}
+
+		var got []time.Duration
+		for i := 0; i < 6; i++ {
+			got = append(got, dc.silentPeerWait(backoffPeriod))
+		}
+		// Monotonic up to the cap, and flat at it: reaching the cap is the point,
+		// so the tail of the sequence must not keep climbing.
+		for i := 1; i < len(got); i++ {
+			if got[i] < got[i-1] {
+				t.Errorf("wait %d = %v, want at least %v", i, got[i], got[i-1])
+			}
+			if got[i] != deadPeerWaitCap && got[i] <= got[i-1] {
+				t.Errorf("wait %d = %v, want more than %v below the cap %v",
+					i, got[i], got[i-1], deadPeerWaitCap)
+			}
+			if got[i] > deadPeerWaitCap {
+				t.Errorf("wait %d = %v, over the cap %v", i, got[i], deadPeerWaitCap)
+			}
+		}
+		if last := got[len(got)-1]; last != deadPeerWaitCap {
+			t.Errorf("wait = %v after 6 silent rounds, want the cap %v", last, deadPeerWaitCap)
+		}
+	})
+
+	t.Run("grows from the wait asked for, not from zero", func(t *testing.T) {
+		dc := newSlotConn(t)
+		dc.e.client = &derpclient.Client{}
+
+		// A gate re-arm passes the previous wait, not backoffPeriod: growth has
+		// to continue from it or the two paths would fight over the value.
+		first := dc.silentPeerWait(backoffPeriod)
+		second := dc.silentPeerWait(first)
+		if second <= first {
+			t.Errorf("re-armed wait = %v, want more than the %v it was given", second, first)
+		}
+	})
+
+	// The unit subtests above pin the arithmetic; this one drives the production
+	// path — backoff() is what a failed round actually calls — and reads the
+	// waits back out of the punch trace, so what is asserted is the delay the
+	// next round is really scheduled with and not the helper's return value.
+	t.Run("grows through backoff", func(t *testing.T) {
+		dc := newSlotConn(t)
+		dc.e.client = &derpclient.Client{}
+
+		dc.backoff()
+		first := lastBackoffWait(t, dc)
+		for i := 0; i < 3; i++ {
+			dc.backoff()
+		}
+		last := lastBackoffWait(t, dc)
+
+		if last <= first {
+			t.Errorf("scheduled backoff %v after four rounds, want more than the %v of the first",
+				last, first)
+		}
+		if last > deadPeerWaitCap {
+			t.Errorf("scheduled backoff %v, over the cap %v", last, deadPeerWaitCap)
+		}
+	})
+
+	t.Run("resets when the peer has a path", func(t *testing.T) {
+		dc := newSlotConn(t)
+		dc.e.client = &derpclient.Client{}
+		dc.e.peers[dc.peer] = &peerConn{peer: dc.peer, sess: newTestSess(t)}
+
+		for i := 0; i < 4; i++ {
+			dc.silentPeerWait(backoffPeriod)
+		}
+
+		// The peer comes back. Its wait is the one asked for, and the growth a
+		// returning peer would otherwise inherit is gone.
+		if got := dc.silentPeerWait(50 * time.Millisecond); got != 50*time.Millisecond {
+			t.Errorf("wait = %v for a peer with a live path, want the 50ms asked for", got)
+		}
+		dc.mu.Lock()
+		left := dc.silentFor
+		dc.mu.Unlock()
+		if left != 0 {
+			t.Errorf("silentFor = %v after the peer returned, want 0", left)
+		}
+	})
 }
 
 // TestDirectPunchStaggeredStart covers the late-start case: A punches while B

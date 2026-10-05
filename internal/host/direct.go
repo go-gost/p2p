@@ -114,6 +114,9 @@ var (
 	// case, so that open keeps the full relay timeout.
 	directOpenTimeout = 3 * time.Second
 	backoffPeriod     = 30 * time.Second
+	// deadPeerWaitCap bounds how long a punch waits for a peer that shows no
+	// live path at all. See silentPeerWait.
+	deadPeerWaitCap = 5 * time.Minute
 	// relayWaitRetry is how long a punch waits for the relay to come back
 	// before trying again; it is short because the relay is usually back
 	// within the reconnect ticker's period.
@@ -175,6 +178,12 @@ type directConn struct {
 	peerCaps uint8          // capability bits the peer advertised via ctrlCaps
 	lastErr  string         // the last punch failure's reason, cleared when one succeeds
 	sessAt   time.Time      // when the live direct session came up (zero when none)
+
+	// silentFor is the wait silentPeerWait last handed out, carried so the
+	// growth survives across rounds while the peer stays silent. Zero means no
+	// growth has been earned yet, and it resets the moment the peer has a path
+	// again. Guarded by mu like the rest of the round's state.
+	silentFor time.Duration
 
 	// secure is this pair's direct security session, borrowed from e.secure (one
 	// per (peer, transport), outliving any one smux session). The AEAD record
@@ -827,8 +836,47 @@ func (dc *directConn) peerAddrString() string {
 	return dc.peerAddr.String()
 }
 
+// silentPeerWait returns how long to wait before the next punch round, given
+// the wait the caller asked for.
+//
+// A peer that shows no live path at all has nothing to answer a round, and one
+// that has no relay session to this host — the accepting side of a pair that
+// only ever had a direct path — can never produce the positive evidence
+// peerGoneForPunch looks for, so it is re-punched at backoffPeriod for as long
+// as it stays away: a STUN lookup, a broadcast and a timeout every 30s, the
+// field case the gate above was written to stop (a killed phone re-punched every
+// 30s for over an hour). So while the peer shows no path the wait grows
+// geometrically, capped at deadPeerWaitCap, which keeps a phone that comes back
+// reachable within minutes instead of never.
+//
+// Growth is confined to that case. A peer with a live path keeps the wait the
+// caller asked for, because there the round is probing a path that blipped —
+// the phone's Wi-Fi ↔ cellular switch — and must be re-probed promptly. The
+// growth resets as soon as a path is there again, so a peer that returns does
+// not inherit the wait its absence earned.
+func (dc *directConn) silentPeerWait(d time.Duration) time.Duration {
+	if dc.e.peerLive(dc.peer) {
+		dc.mu.Lock()
+		dc.silentFor = 0
+		dc.mu.Unlock()
+		return d
+	}
+	dc.mu.Lock()
+	next := dc.silentFor
+	if next < d {
+		next = d
+	}
+	next *= 2
+	if next > deadPeerWaitCap {
+		next = deadPeerWaitCap
+	}
+	dc.silentFor = next
+	dc.mu.Unlock()
+	return next
+}
+
 // backoff marks a failed punch and schedules a retry.
-func (dc *directConn) backoff() { dc.retry(backoffPeriod, true) }
+func (dc *directConn) backoff() { dc.retry(dc.silentPeerWait(backoffPeriod), true) }
 
 // retry reschedules the punch after d. failed says a *round* failed — the relay
 // being away is not a failure, it is a reason to wait: nothing can be exchanged
@@ -871,7 +919,7 @@ func (dc *directConn) retry(d time.Duration, failed bool) {
 		// the first symptom being that an endless "punch failed" keeps coming
 		// from a peer that said it was never going to answer.
 		if dc.e.peerGoneForPunch(dc.peer) || dc.peerDirectOff() {
-			dc.retry(d, false)
+			dc.retry(dc.silentPeerWait(d), false)
 			return
 		}
 		dc.mu.Lock()
