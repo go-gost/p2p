@@ -194,14 +194,6 @@ cd /root/code/go-gost/p2p && export PATH="$PATH:/root/.local/go/bin:/root/go/bin
 - 无丢包下可持续 94 Mbit/s 且 TCP 0 重传，`relayKCPMtu=1400`、`SndWnd=RcvWnd=256`、`SetNoDelay(1,10,2,1)` 的保守默认值未暴露瓶颈，暂无需暴露调参开关。
 - 5% 丢包场景的吞吐/重传开销因注入缺口未能实测，KCP 在丢包下的表现仍待补测后才能定论。丢包下的**正确性**（字节流完整、无 record desync、无重建）已由仓库内 `TestRelayToleratesDroppedDataFrames` 覆盖（见上文"运行 2 补充"）。
 
-## Known flake
+## 已知 flake
 
-`TestDirectRepunchAfterMissedPeerGone` (`internal/host/direct_test.go`) is a known
-pre-existing flake: its final `roundTrip` intermittently times out
-(`direct_test.go:671: timeout`) — ~30% of non-`-race` runs at `main` HEAD and
-~17% at `d2eff96`, so it predates this design's relay work. It never reproduces
-under `-race`, which is why the `-race` gate stays green. The two contributors —
-an environmental `sendmmsg` EPERM denial (sandbox-only, absent in CI) and a
-pre-existing direct re-punch timing race whose exact interleaving is still
-uncharacterized — are documented on the test itself. This design does not touch
-the direct plane's re-punch path, so the flake is unrelated to it.
+`TestDirectRepunchAfterMissedPeerGone`（`internal/host/direct_test.go`）是一个已知的、预先存在的 flake：其最后的 `roundTrip` 会间歇性超时（`direct_test.go:671: timeout`）——在 `main` HEAD 的非 `-race` 运行中约 30%，在 `d2eff96` 约 17%，因此先于本设计的中继工作存在。它在 `-race` 下从未复现，这也是 `-race` 门禁一直为绿的原因。两个成因已记录在测试本身：其一为环境性——本沙箱在负载下会间歇性拒绝 `sendmmsg` 系统调用（`EPERM`），破坏 seed 握手，CI/正常环境中不存在、也不相关；其二为直连平面 re-punch 路径上预先存在的产品竞态——一次陈旧候选的拨号可能耗尽 5s 的 `seedTimeout`，而接受侧的 `peerLive` 假阴性使其重新武装而非重新打洞，导致 re-punch 可能超过 2s 的 `punchWaitTimeout`，进而回退到数据帧刚被测试切断的中继；该竞态的精确交错仍未被刻画。本设计不触及直连平面的 re-punch 路径，故此 flake 与之无关。
