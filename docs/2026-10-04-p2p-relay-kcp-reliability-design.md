@@ -119,7 +119,7 @@ secure 握手改在 KCP 之上进行（可靠流），因此握手本身也不�
 2. **故障注入**（复用 `faults`）
    - 新增"按比例丢 `frameData`（KCP 段）"的注入（现有 `dropData` 为永久丢，需概率丢）。
    - 在 5%/10% 丢包下端到端字节流仍完整、无 record desync。
-   - 可用 netem 在 netns 上对 derp 链路丢包做集成。
+   - 注入器现已可从手工 harness 触达：wisper 设置 `settings.p2p.faults`（配置 API `{"p2p":{"faults":{"dropDataRate":0.05}}}`）→ `acquire()` 填入 `p2p.Config.Faults` → `engine.faults`；仓库内 `TestRelayToleratesDroppedDataFrames` 亦走同一注入路径。netem 仍可作 netns 集成备选。
 3. **集成**：现有 `/tmp/wisper-cnt.sh`，`direct:false`，hub→spoke iperf3 30s——期望无 `secure record desync`、链路不降、传输完成。再跑丢包场景。
 4. **回归**：`internal/host` 全量测试（smux 重建、keepalive、churn、直连平面、e2e 加密）必须通过；直连平面行为不变。
 5. **重建**：模拟 KCP 会话被替换，验证陈旧段不破坏新会话。

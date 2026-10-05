@@ -84,6 +84,11 @@ func New(cfg *p2p.Config, opts ...Option) (*Host, error) {
 		f := newFaults(cfg.Faults)
 		h.engine.faults.Store(f)
 		f.warn(h.log)
+	} else {
+		// Stub mode (no relay) has no engine to hold the fault state, so a
+		// faults config cannot take effect. Say so rather than let a user read
+		// the silence as "injection is on".
+		warnIgnoredFaults(cfg.Faults, h.log)
 	}
 
 	h.server = newServer(h.engine)

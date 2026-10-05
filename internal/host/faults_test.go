@@ -285,3 +285,69 @@ func TestSilenceShorterThanTimeoutIsSurvived(t *testing.T) {
 	}))
 	waitFor(t, 3*3*directSmuxKeepAliveTimeout, func() bool { return sessB.IsClosed() })
 }
+
+// TestHostAppliesFaultsToEngine pins the config→engine wiring the embedder path
+// (wisper's acquire) depends on: a Faults block on p2p.Config must not merely be
+// copied — it must land on the engine's atomic faults pointer with the drop
+// decision actually active. A config that reaches the field but not the engine
+// would pass a struct-copy check and still inject nothing.
+func TestHostAppliesFaultsToEngine(t *testing.T) {
+	h, err := New(&p2p.Config{
+		Derp:   "wss://127.0.0.1:1/derp",
+		KeyHex: strings.Repeat("cc", 32),
+		Faults: &p2p.FaultsConfig{DropDataRate: 0.5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	if h.engine == nil {
+		t.Fatal("a relay-configured host built no engine")
+	}
+	f := h.engine.faults.Load()
+	if f == nil {
+		t.Fatal("the engine holds no faults state")
+	}
+	// rate 0.5 => drop every round(1/0.5)=2nd frame: the first call passes, the
+	// second drops. This is the engine's drop decision, not a config echo.
+	if f.dropDataPacket() {
+		t.Fatal("the first relay data frame must pass")
+	}
+	if !f.dropDataPacket() {
+		t.Fatal("the second relay data frame must be dropped (rate 0.5)")
+	}
+}
+
+// TestHostIgnoresFaultsInStubMode: a host with no relay has no engine, so a
+// faults config cannot take effect. It must say so — a silent no-op would read
+// as "injection is on" and waste exactly the debugging the config exists to
+// avoid.
+func TestHostIgnoresFaultsInStubMode(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	h, err := New(&p2p.Config{Faults: &p2p.FaultsConfig{DropData: true}}, WithLogger(log))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	if h.engine != nil {
+		t.Fatal("stub mode built an engine; faults would not be ignored")
+	}
+	if got := buf.String(); !strings.Contains(got, "fault injection configured but ignored") {
+		t.Fatalf("stub mode did not warn about the ignored faults config: %q", got)
+	}
+
+	// A faults config with every knob off is not an error: no warning, no engine.
+	buf.Reset()
+	h2, err := New(&p2p.Config{Faults: &p2p.FaultsConfig{}}, WithLogger(log))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h2.Close()
+	if buf.Len() != 0 {
+		t.Fatalf("a zero faults config must not warn: %q", buf.String())
+	}
+}

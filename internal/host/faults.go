@@ -40,6 +40,11 @@ type faults struct {
 	silenceFor   time.Duration
 	silenceEvery time.Duration
 	since        time.Time
+
+	// knobs names the enabled faults, computed once from the config. It feeds
+	// only the startup announcement (warn) and the stub-mode "ignored" warning,
+	// never the hot path.
+	knobs []string
 }
 
 // newFaults builds the state and stamps the silence window's origin. cfg may be
@@ -54,6 +59,7 @@ func newFaults(cfg *p2p.FaultsConfig) *faults {
 		silenceEvery: cfg.SilenceEvery,
 		since:        time.Now(),
 		dropDataRate: cfg.DropDataRate,
+		knobs:        faultKnobs(cfg),
 	}
 	f.dropCtrl.Store(cfg.DropCtrl)
 	f.dropData.Store(cfg.DropData)
@@ -73,29 +79,49 @@ func newFaults(cfg *p2p.FaultsConfig) *faults {
 // the feature and the reason this line exists: a fault-injected host must never
 // be read as a broken one.
 func (f *faults) warn(log *slog.Logger) {
-	if f == nil || log == nil {
-		return
-	}
-	var on []string
-	if f.dropCtrl.Load() {
-		on = append(on, "dropCtrl")
-	}
-	if f.dropData.Load() {
-		on = append(on, "dropData")
-	}
-	if f.dropDataPeriod > 0 {
-		on = append(on, fmt.Sprintf("dropDataRate(%g)", f.dropDataRate))
-	}
-	if f.dropPong.Load() {
-		on = append(on, "dropPong")
-	}
-	if f.silenceFor > 0 && f.silenceEvery > 0 {
-		on = append(on, "silence("+f.silenceFor.String()+" every "+f.silenceEvery.String()+")")
-	}
-	if len(on) == 0 {
+	if f == nil || log == nil || len(f.knobs) == 0 {
 		return
 	}
 	log.Warn("p2p: fault injection is on — this host is deliberately dropping traffic",
+		"faults", strings.Join(f.knobs, ","))
+}
+
+// faultKnobs names the enabled faults of a config, in the order warn reports
+// them. It reads the config directly (not the built state) so the stub-mode
+// path — which builds no state — can list what it is ignoring.
+func faultKnobs(cfg *p2p.FaultsConfig) []string {
+	if cfg == nil {
+		return nil
+	}
+	var on []string
+	if cfg.DropCtrl {
+		on = append(on, "dropCtrl")
+	}
+	if cfg.DropData {
+		on = append(on, "dropData")
+	}
+	if cfg.DropDataRate > 0 {
+		on = append(on, fmt.Sprintf("dropDataRate(%g)", cfg.DropDataRate))
+	}
+	if cfg.DropPong {
+		on = append(on, "dropPong")
+	}
+	if cfg.SilenceFor > 0 && cfg.SilenceEvery > 0 {
+		on = append(on, "silence("+cfg.SilenceFor.String()+" every "+cfg.SilenceEvery.String()+")")
+	}
+	return on
+}
+
+// warnIgnoredFaults logs, once at startup, that a faults config cannot take
+// effect because the host is in stub mode (no relay configured, so no engine to
+// hold the state). A silent no-op here would read as "injection is on" and cost
+// the same debugging the silent acceptance already did.
+func warnIgnoredFaults(cfg *p2p.FaultsConfig, log *slog.Logger) {
+	on := faultKnobs(cfg)
+	if len(on) == 0 || log == nil {
+		return
+	}
+	log.Warn("p2p: fault injection configured but ignored: no relay (derp) configured, so there is no plane to break",
 		"faults", strings.Join(on, ","))
 }
 
