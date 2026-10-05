@@ -167,9 +167,16 @@ type directConn struct {
 
 	cand chan []candidate // peer candidates (buffered)
 
-	mu       sync.Mutex
-	state    directState
-	failed   bool           // a punch round has failed at least once (sticky)
+	mu     sync.Mutex
+	state  directState
+	failed bool // a punch round has failed at least once (sticky)
+	// failGen counts punch rounds that have failed. failed alone cannot tell a
+	// failure that happened while a caller was waiting for a punch from one that
+	// happened long before it: failed is sticky for the life of the peer, so a
+	// caller arriving after any historical failure would read it as "direct is
+	// broken" and never wait again. failGen lets such a caller snapshot the
+	// count and see only the failures that are actually its own.
+	failGen  uint64
 	sess     *smux.Session  // direct smux session when up
 	socket   *net.UDPConn   // punch socket; kcp closes it with the session (ownConn=true)
 	peerAddr netip.AddrPort // peer's dialed endpoint (public cross-NAT, local same-NAT)
@@ -358,13 +365,12 @@ func (e *engine) announceDirect(peer derpclient.PublicKey) {
 // control channel, so it needs only the DERP connection — not a relay mux
 // session — and completes well under the timeout.
 //
-// Only the call that starts the punch waits for it. A punch already in flight
-// is unaffected by blocking here, and one that failed and is backing off cannot
-// come up within the wait at all — so waiting would charge every stream the
-// full timeout on a peer that cannot punch (symmetric NAT, STUN blocked),
-// turning a relay-only path into a per-connection stall. For the same reason
-// the wait ends as soon as the round it started has failed, rather than
-// running out the clock on a session that is no longer coming.
+// Every caller waits for the punch, whether this call started the round or
+// found one already running: a round already in flight is the common case, not
+// the exceptional one (see the note on start() below). The wait is bounded two
+// ways so it cannot turn into a per-connection stall on a peer that cannot
+// punch — it ends as soon as a round fails while we are waiting, and otherwise
+// at punchWaitTimeout.
 func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 	if !e.directEnabled() {
 		return nil
@@ -377,16 +383,35 @@ func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 		dc.noteRound("peer has the direct path off")
 		return nil
 	}
-	if !dc.start() {
+	// start() reports false both when a round is already running and when none
+	// can start (the peer is in backoff, so its next round is a full backoffPeriod
+	// away, or a session is already up). Only the second kind may return
+	// immediately: waiting there would charge the caller the whole timeout for a
+	// session that is not coming.
+	//
+	// A round already in flight is the common case, not the exceptional one, and
+	// it is why this distinction matters. The candidate exchange that starts a
+	// round rides the DERP control channel, so in the ordinary ordering the round
+	// is already running by the time a stream is opened. Reading that as "no
+	// direct path available" sent every tunnel stream to the relay while the
+	// direct session came up a couple of hundred milliseconds later — and since
+	// the transport is chosen once, at stream open, it rode the relay for the
+	// whole life of the tunnel.
+	if !dc.start() && !dc.punching() {
 		return nil
 	}
+	// Snapshot the failure count so the wait ends when a round fails while we are
+	// waiting, without being silenced by a round that failed before we arrived:
+	// failed is sticky for the life of the peer, so one old failure would
+	// otherwise veto every stream this host ever opens.
+	waitsFrom := dc.punchFailures()
 	deadline := time.Now().Add(punchWaitTimeout)
 	for time.Now().Before(deadline) {
 		if sess := dc.session(); sess != nil {
 			return sess
 		}
-		if dc.hasFailed() {
-			return nil // a round already failed for this peer: the relay is the answer
+		if dc.punchFailures() != waitsFrom {
+			return nil // the round we waited on failed: the relay is the answer
 		}
 		select {
 		case <-e.stop:
@@ -495,10 +520,29 @@ func (dc *directConn) stateOf() directState {
 // direct path does not work, and reporting "punching" for it would hide that
 // (the peer's own re-announcements restart rounds often enough that the state
 // alone is no guide).
+// punching reports whether a punch round is running for this peer right now. It
+// is what separates "a round is in flight, wait for it" from "no round is
+// coming, do not wait" when start() reports false for either.
+func (dc *directConn) punching() bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.state == directAttempting
+}
+
 func (dc *directConn) hasFailed() bool {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	return dc.failed
+}
+
+// punchFailures returns the count of punch rounds that have failed for this
+// peer. A caller waiting for a punch snapshots it and compares, so it can end
+// its wait when a round fails but is not silenced by one that failed before it
+// arrived.
+func (dc *directConn) punchFailures() uint64 {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.failGen
 }
 
 // live reports whether a usable direct session exists, without side effects.
@@ -886,6 +930,9 @@ func (dc *directConn) retry(d time.Duration, failed bool) {
 	dc.mu.Lock()
 	dc.state = directBackoff
 	dc.failed = dc.failed || failed
+	if failed {
+		dc.failGen++
+	}
 	// The round's sockets are gone, so its candidate list is not ours to offer
 	// any more: onCandidates answers a peer's announcement with dc.mine, and
 	// echoing a dead endpoint races the peer's own fresh list into its slot.

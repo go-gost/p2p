@@ -976,18 +976,70 @@ func TestPunchAndWaitDoesNotStallWhenPunchCannotStart(t *testing.T) {
 		t.Fatal("punchAndWait did not start a punch from directNone")
 	}
 
-	// A peer whose punch already failed does not make a later caller wait:
-	// the round is started again for the background, and the caller goes on.
+	// A failure from before this call no longer vetoes the wait. That veto is
+	// what stopped a direct session — which came up milliseconds later in the
+	// field — from ever being used, so it is deliberately gone. What is kept is
+	// the anti-stall bound: the round this call starts still ends the wait when
+	// it fails, so the cost is that round's own failure latency (one STUN
+	// timeout here) and never the whole punchWaitTimeout.
 	dc.mu.Lock()
 	dc.state = directNone
 	dc.failed = true
+	dc.failGen = 0
 	dc.mu.Unlock()
 	start := time.Now()
 	if sess := engineA.punchAndWait(pubB); sess != nil {
 		t.Fatal("punchAndWait returned a session after a failed round")
 	}
-	if d := time.Since(start); d > punchWaitTimeout/4 {
-		t.Fatalf("punchAndWait waited %v after a failed round; want an immediate nil", d)
+	if d := time.Since(start); d > punchWaitTimeout/2 {
+		t.Fatalf("punchAndWait waited %v after a failed round; want the round's own failure latency, not the timeout", d)
+	}
+	if d := time.Since(start); d >= punchWaitTimeout {
+		t.Fatalf("punchAndWait waited the full punchWaitTimeout (%v)", d)
+	}
+}
+
+// TestPunchAndWaitWaitsForARoundInFlight is the case the field run turned on:
+// the candidate exchange rides the DERP control channel, so by the time a
+// stream is opened the punch is normally already running. Declining direct
+// there sent every tunnel stream to the relay while the direct session came up
+// a couple of hundred milliseconds later — and since the transport is chosen
+// once, at stream open, the tunnel never left the relay.
+//
+// It is set up by state rather than by a real round on purpose: the state is
+// what punchAndWait branches on, and a real round would make the assertion a
+// race with a punch that may or may not have completed yet.
+func TestPunchAndWaitWaitsForARoundInFlight(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+
+	privA, _, _ := derpclient.Generate()
+	_, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineA.stunAddr = "192.0.2.1:9"
+	defer engineA.Close()
+	engineA.Connect()
+
+	dc := engineA.directConn(pubB)
+	dc.mu.Lock()
+	dc.state = directAttempting // a round is running; start() will report false
+	dc.failGen = 0
+	dc.mu.Unlock()
+
+	if dc.start() {
+		t.Fatal("start() claimed to launch a round while one was already in flight")
+	}
+
+	// Nothing will come up, so this returns nil — but only after waiting, which
+	// is the whole point: the wait is what lets the round that is already
+	// running deliver its session to this caller.
+	start := time.Now()
+	if sess := engineA.punchAndWait(pubB); sess != nil {
+		sess.Close()
+		t.Fatal("punchAndWait returned a session for a round that never came up")
+	}
+	if d := time.Since(start); d < punchWaitTimeout/4 {
+		t.Fatalf("punchAndWait returned in %v for a round in flight; it must wait for the round rather than fall back to the relay", d)
 	}
 }
 
