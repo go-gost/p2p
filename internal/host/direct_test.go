@@ -628,6 +628,24 @@ func TestDirectRepunchAfterSessionDeath(t *testing.T) {
 // its PeerGone is missed (the other side still holds a stale directUp
 // session), the re-punch still succeeds: the stale side must reset on fresh
 // candidates instead of ignoring them.
+//
+// Known flake (pre-existing, not a regression): the final roundTrip fails
+// intermittently with "direct_test.go:671: timeout". Measured ~30% at main
+// HEAD without -race (9 failures in 30 runs) and ~17% at d2eff96 (5 in 30, the
+// last commit before the relay KCP reliability work) — so it predates both the
+// relay work and the shared cryptoConn nonce draw-under-lock change in
+// secure.go. It never reproduces under -race, which is why the -race gate and
+// CI stay green while a plain non-race run fails roughly one time in five. Two
+// contributors: (1) environmental — this sandbox intermittently denies the
+// sendmmsg syscall (EPERM) under load, breaking the seed handshake; absent in
+// CI/normal environments and irrelevant there. (2) A genuine pre-existing race
+// in the direct plane's re-punch path: a stale-candidate dial can burn the 5s
+// seedTimeout, and a peerLive false-negative on the accepting side re-arms
+// instead of re-punching, so the re-punch exceeds the 2s punchWaitTimeout and
+// OpenStream falls back to the relay — whose data frames this test has just
+// cut. The exact interleaving of (2) is still uncharacterized; instrumentation
+// shifted the timing and made it rarer. Hitting this failure: it is not your
+// change, and -race hides it.
 func TestDirectRepunchAfterMissedPeerGone(t *testing.T) {
 	rs := &relayServer{}
 	url := rs.start(t)

@@ -193,3 +193,15 @@ cd /root/code/go-gost/p2p && export PATH="$PATH:/root/.local/go/bin:/root/go/bin
 
 - 无丢包下可持续 94 Mbit/s 且 TCP 0 重传，`relayKCPMtu=1400`、`SndWnd=RcvWnd=256`、`SetNoDelay(1,10,2,1)` 的保守默认值未暴露瓶颈，暂无需暴露调参开关。
 - 5% 丢包场景的吞吐/重传开销因注入缺口未能实测，KCP 在丢包下的表现仍待补测后才能定论。丢包下的**正确性**（字节流完整、无 record desync、无重建）已由仓库内 `TestRelayToleratesDroppedDataFrames` 覆盖（见上文"运行 2 补充"）。
+
+## Known flake
+
+`TestDirectRepunchAfterMissedPeerGone` (`internal/host/direct_test.go`) is a known
+pre-existing flake: its final `roundTrip` intermittently times out
+(`direct_test.go:671: timeout`) — ~30% of non-`-race` runs at `main` HEAD and
+~17% at `d2eff96`, so it predates this design's relay work. It never reproduces
+under `-race`, which is why the `-race` gate stays green. The two contributors —
+an environmental `sendmmsg` EPERM denial (sandbox-only, absent in CI) and a
+pre-existing direct re-punch timing race whose exact interleaving is still
+uncharacterized — are documented on the test itself. This design does not touch
+the direct plane's re-punch path, so the flake is unrelated to it.
