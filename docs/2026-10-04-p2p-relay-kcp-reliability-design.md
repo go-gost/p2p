@@ -227,8 +227,20 @@ kcp-go 的 10ms `update` 循环不可配置，且空闲时关掉 pair 的 KCP �
 
 **局限**：kcp-go v5.6.72 不提供 per-session 的重传计数、cwnd、rwnd——这些要么只在进程全局 `DefaultSnmp` 里（且混入直连平面的 KCP 会话，不可作为单 pair 指标），要么是未导出的 `KCP` 内部字段。因此 `relayKCPMtu` 与窗口值仍是**未实测的默认值**，应当对照上述 SRTT 与数据报字节计数来调参；本文不把"尚未测量"当作"已经测量"呈现。
 
-## 已知 flake（已修复其产品竞态）
+## 已知 flake（其产品竞态已修复，但未证明已消除）
 
 `TestDirectRepunchAfterMissedPeerGone`（`internal/host/direct_test.go`）最后的 `roundTrip` 曾间歇性超时（`direct_test.go:671: timeout`），在 `main` HEAD 的非 `-race` 运行中约 30%，在 `d2eff96` 约 17%。该竞态已被定位并修复（提交 `fix(p2p): …`），成因是直连平面 re-punch 路径的两处缺陷：其一，`onCandidates` 会用 `dc.mine`——即刚被对方新通告作废的那条会话的候选列表——去应答，对方拨向该已废弃 socket，其 KCP 会话按源地址过滤拒绝新源，seed 握手因此挂满 `seedTimeout`（5s），远超 `punchWaitTimeout`（2s），`OpenStream` 回退到数据帧刚被测试切断的中继；修复后 `onCandidates` 仅在 `directAttempting`（在途回合，候选是新鲜的）时应答，其触发的 re-punch 会发布新鲜列表。其二，`retry` 的 re-punch 门用 `peerLive` 判断，而 `peerLive` 把「没有中继会话」（从未拨号过对方的被动侧——即本测试里的 B）当作「对方已死」，使接受侧无限重新武装而非重新打洞；修复后改用 `peerGoneForPunch`——以「本侧建过的中继会话已死且无直连会话在服务」作为对方已死的正向证据，被动侧永不误判。
 
-修复后该竞态不再复现：40 次分类复现中 0 次因 seed 超时（陈旧候选的 `seed failed: timeout` 模式已消失）。该测试在非 `-race` 下仍可能因**环境性**原因间歇失败——本沙箱在负载下会间歇拒绝直连打洞 socket 上的 `sendmmsg` 系统调用（`EPERM`），破坏 seed 握手；这在 CI/正常环境中不存在，`-race` 下也不复现，且非产品竞态，重跑并报告即可。本设计不触及直连平面的 re-punch 路径，故与本设计无关。
+修复后该竞态**未被证明已消失**。按采样条件分列的全部数据（`-race`，`TestDirectRepunchAfterMissedPeerGone`，失败点均为 `direct_test.go` 末尾那次 `roundTrip` 的超时）：
+
+| 条件 | 轮次 | 失败 |
+| --- | --- | --- |
+| 修前 · `main` HEAD | 10/30、9/30 | 约 30% |
+| 修前 · `d2eff96` | 5/30 | 约 17% |
+| 修后 · 空载（单独运行） | **0/100** | 0% |
+| 修后 · 空载 | 5/30 | 约 17% |
+| 修后 · 与带宽压测并发 | 21/100 | 约 21% |
+
+结论只能是：该 flake **对机器负载高度敏感**，而样本量与轮间噪声都不足以把修后（0–21%）与修前（17–30%）区分开。陈旧候选的 `seed failed: timeout` 模式确实未再出现，但"0/100"与"5/30"并存，本身就否证了任何"不再复现"的断言。因此本文**不宣称**该竞态已消除；判定标准仍是「每次失败都必须归因为产品缺陷或环境性 `sendmmsg` `EPERM` 二者之一」。
+
+环境性 `EPERM` 仍然存在且需与之区分：本沙箱在负载下会间歇拒绝直连打洞 socket 上的 `sendmmsg` 系统调用（`EPERM`），破坏 seed 握手；这在 CI/正常环境中不存在，重跑并报告即可。但它**不是**上述失败的成因——上述各轮中 `EPERM` 出现 0 次。本设计不触及直连平面的 re-punch 路径，故与本设计无关。
