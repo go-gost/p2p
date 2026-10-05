@@ -269,9 +269,12 @@ func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 
 // peerLive reports whether the peer currently has a live data path: a built
 // relay session or a live direct one — the same definition of "connected" the
-// status surfaces use (see peerTransports). A punch gets nowhere without it: the
-// candidate exchange rides the relay's control channel to the peer, so a peer
-// with no live path can neither announce nor answer.
+// status surfaces use (see peerTransports). It is NOT the gate for whether a
+// punch can reach the peer: candidates ride the relay's *control* channel
+// (sendControl, a DERP SendPacket), which needs only the relay connection, not
+// a relay smux session. A host that never dialed the peer has no relay session
+// to it, so peerLive reads that peer as dead the moment its direct session
+// dies — which is why the re-punch gate uses peerGoneForPunch instead.
 func (e *engine) peerLive(peer derpclient.PublicKey) bool {
 	e.mu.Lock()
 	pc, dc := e.peers[peer], e.directs[peer]
@@ -280,6 +283,23 @@ func (e *engine) peerLive(peer derpclient.PublicKey) bool {
 		return true
 	}
 	return dc != nil && dc.live()
+}
+
+// peerGoneForPunch reports positive evidence that the peer can no longer be
+// punched: a relay session this side built has died, and no direct session is
+// serving. It is the re-punch gate's predicate (see retry), deliberately
+// narrower than peerLive. A peer with no relay session at all — a host that
+// never dialed it, so it only ever had a direct path — is not reported gone: it
+// has no session to die, so its liveness is unknown and a punch is the only
+// probe there is. peerLive would read that peer as disconnected (no relay
+// session, no live direct one) and stop the accepting side from re-punching a
+// peer whose direct session died, leaving the pair stuck until the other side
+// re-announces.
+func (e *engine) peerGoneForPunch(peer derpclient.PublicKey) bool {
+	e.mu.Lock()
+	pc, dc := e.peers[peer], e.directs[peer]
+	e.mu.Unlock()
+	return pc != nil && !pc.liveSession() && (dc == nil || !dc.live())
 }
 
 // warm brings up the peer's relay session (a smux session over the DERP
@@ -592,6 +612,17 @@ func (dc *directConn) onCandidates(cands []candidate) {
 	}
 	dc.lastPeer = cands
 	mine := dc.mine
+	if dc.state != directAttempting {
+		// mine names the socket of a round that has already ended: a live
+		// session (directUp) the peer's re-announcement just made stale, or a
+		// backoff/teardown that already cleared it. Answering with it lets the
+		// peer dial a socket we are about to abandon, whose KCP session rejects
+		// the peer's new source address — the seed handshake then hangs until
+		// seedTimeout and the round blows the punch budget. Only a round still in
+		// flight (directAttempting) has fresh candidates worth answering with;
+		// the re-punch started below publishes the fresh list instead.
+		mine = nil
+	}
 	dc.mu.Unlock()
 
 	dc.e.log.Debug("direct punch: peer candidates via relay", "peer", keyName(dc.peer), "candidates", candAddrs(cands))
@@ -820,12 +851,15 @@ func (dc *directConn) retry(d time.Duration, failed bool) {
 			return
 		case <-time.After(d):
 		}
-		// A peer with no live data path cannot answer a round — candidates are
-		// exchanged over the relay's control channel to it — so skip it: running
-		// one only burns a STUN lookup, a broadcast and a timeout, forever (the
-		// field case: a killed phone re-punched every 30s for over an hour).
-		// Nothing announces that: an open relay sends no PeerGone, and only the
-		// relay keepalive's silence shows the session died.
+		// A peer that is gone cannot answer a round, so skip it: running one only
+		// burns a STUN lookup, a broadcast and a timeout, forever (the field
+		// case: a killed phone re-punched every 30s for over an hour). The gate
+		// is peerGoneForPunch — positive evidence of death, a relay session that
+		// died with no direct session serving — not peerLive, which would also
+		// skip a peer this side never dialed (no relay session) whose direct
+		// session just died, and so strand the accepting side of a re-punch.
+		// Nothing announces a dead peer: an open relay sends no PeerGone, and
+		// only the relay keepalive's silence shows the session died.
 		//
 		// Re-arm rather than stop. Stopping would leave the state in
 		// directBackoff with no timer, and start() refuses to run from there —
@@ -836,7 +870,7 @@ func (dc *directConn) retry(d time.Duration, failed bool) {
 		// a round armed before that advertisement does not run behind its back —
 		// the first symptom being that an endless "punch failed" keeps coming
 		// from a peer that said it was never going to answer.
-		if !dc.e.peerLive(dc.peer) || dc.peerDirectOff() {
+		if dc.e.peerGoneForPunch(dc.peer) || dc.peerDirectOff() {
 			dc.retry(d, false)
 			return
 		}
