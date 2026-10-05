@@ -1208,14 +1208,21 @@ func (e *engine) livePeerConn(peer derpclient.PublicKey) *peerConn {
 // replacement adapter keeps the settled keys, unless the kill that closed the
 // old one dropped them (killSession) — then the next build re-handshakes.
 func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
+	// Deliberately not deferred: the rebuild log below has to run with e.mu
+	// released. It reads the pair's relay KCP health, which takes e.kcpMu and
+	// then the KCP session's own lock, so logging it here would hold the
+	// engine's global lock across a KCP call — the exact inversion
+	// relayKCPPairFor's contract forbids, and it would park every other peer's
+	// lookup behind one session's RTT sample. Same shape as ensureSession,
+	// which builds its rebuild attrs after dropping pc.mu.
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	var dead *peerConn
 	if pc, ok := e.peers[peer]; ok {
 		pc.mu.Lock()
 		closed := pc.closed
 		pc.mu.Unlock()
 		if !closed {
+			e.mu.Unlock()
 			return pc
 		}
 		dead = pc
@@ -1231,59 +1238,66 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 	}
 	e.peers[peer] = pc
 	e.armDesyncRecovery(peer, pc.secure)
-	if dead != nil {
-		// killSession closes the adapter, so recovering from a killed session
-		// lands HERE — the replacement is a brand-new peerConn whose sess is nil,
-		// and the in-place branch in ensureSession never runs. Logging the
-		// rebuild only there reported nothing at all: a full e2e run showed
-		// "relay session rebuilt" = 0 against "peer session killed" = 4, leaving
-		// secureReuse unreported and nothing for the e2e to grep.
-		dead.mu.Lock()
-		prev, at := dead.secure, dead.sessAt
-		gen := dead.sessionGen.Load()
-		reason := dead.lastEndReason
-		dead.mu.Unlock()
-		// The rebuild counters are the pair's, not the adapter's: the
-		// replacement continues them — and the pair's build timestamp with
-		// them, which is what makes the replacement's first build count as a
-		// rebuild (see sessionLocked's rebuild flag). One clean kill then shows
-		// as exactly one rebuild, and Status keeps reporting the pair's count
-		// across adapter swaps.
-		pc.sessAt = at
-		pc.relayRebuilds.Store(dead.relayRebuilds.Load())
-		pc.relayRebuildPeers.Store(dead.relayRebuildPeers.Load())
-		// The reason the killed session ended with is what the replacement's
-		// first build will feed to the rebuild-storm check (see sessionLocked).
-		pc.lastEndReason = reason
-		// The storm is pair-scoped like the counters: a kill-driven rebuild that
-		// landed here would otherwise restart the ring on every swap and never
-		// accumulate (each fresh adapter would hold a single event). Carrying the
-		// window state — events, warned, and the injected clock — keeps the
-		// "exactly one WARN per window" guarantee across the swap.
-		dead.storm.carryTo(&pc.storm)
-		// The new session starts at a zero streak, so the count that explains
-		// the rebuild has to come off the session being replaced.
-		var streak int
-		var age time.Duration
-		if prev != nil {
-			streak = prev.desyncStreakValue()
-		}
-		if !at.IsZero() {
-			age = time.Since(at)
-		}
-		// The pair's KCP session survives a clean kill (it is what the rebuild
-		// continues on), so its health rides the same line; a kill whose reason
-		// reset the pair already dropped it, and then there are no KCP attrs.
-		rebuildAttrs := []any{
-			"peer", keyName(peer),
-			"secureReuse", prev == pc.secure,
-			"desyncStreak", streak,
-			"sessionAge", age.Round(time.Millisecond),
-			"gen", gen,
-		}
-		rebuildAttrs = append(rebuildAttrs, e.relayKCPLogAttrs(peer)...)
-		e.log.Debug("relay session rebuilt", rebuildAttrs...)
+	if dead == nil {
+		e.mu.Unlock()
+		return pc
 	}
+	// killSession closes the adapter, so recovering from a killed session
+	// lands HERE — the replacement is a brand-new peerConn whose sess is nil,
+	// and the in-place branch in ensureSession never runs. Logging the
+	// rebuild only there reported nothing at all: a full e2e run showed
+	// "relay session rebuilt" = 0 against "peer session killed" = 4, leaving
+	// secureReuse unreported and nothing for the e2e to grep.
+	dead.mu.Lock()
+	prev, at := dead.secure, dead.sessAt
+	gen := dead.sessionGen.Load()
+	reason := dead.lastEndReason
+	dead.mu.Unlock()
+	// The rebuild counters are the pair's, not the adapter's: the
+	// replacement continues them — and the pair's build timestamp with
+	// them, which is what makes the replacement's first build count as a
+	// rebuild (see sessionLocked's rebuild flag). One clean kill then shows
+	// as exactly one rebuild, and Status keeps reporting the pair's count
+	// across adapter swaps.
+	pc.sessAt = at
+	pc.relayRebuilds.Store(dead.relayRebuilds.Load())
+	pc.relayRebuildPeers.Store(dead.relayRebuildPeers.Load())
+	// The reason the killed session ended with is what the replacement's
+	// first build will feed to the rebuild-storm check (see sessionLocked).
+	pc.lastEndReason = reason
+	// The storm is pair-scoped like the counters: a kill-driven rebuild that
+	// landed here would otherwise restart the ring on every swap and never
+	// accumulate (each fresh adapter would hold a single event). Carrying the
+	// window state — events, warned, and the injected clock — keeps the
+	// "exactly one WARN per window" guarantee across the swap.
+	dead.storm.carryTo(&pc.storm)
+	// The new session starts at a zero streak, so the count that explains
+	// the rebuild has to come off the session being replaced.
+	var streak int
+	var age time.Duration
+	if prev != nil {
+		streak = prev.desyncStreakValue()
+	}
+	if !at.IsZero() {
+		age = time.Since(at)
+	}
+	rebuildAttrs := []any{
+		"peer", keyName(peer),
+		"secureReuse", prev == pc.secure,
+		"desyncStreak", streak,
+		"sessionAge", age.Round(time.Millisecond),
+		"gen", gen,
+	}
+	e.mu.Unlock()
+
+	// The pair's KCP session survives a clean kill (it is what the rebuild
+	// continues on), so its health rides the same line; a kill whose reason
+	// reset the pair already dropped it, and then there are no KCP attrs.
+	// Read outside e.mu because that is where reading it belongs — and a
+	// concurrent epoch reset in that window may retire the pair first, which
+	// costs these attrs, not the rebuild this line records.
+	rebuildAttrs = append(rebuildAttrs, e.relayKCPLogAttrs(peer)...)
+	e.log.Debug("relay session rebuilt", rebuildAttrs...)
 	return pc
 }
 
