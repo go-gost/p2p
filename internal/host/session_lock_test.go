@@ -3,6 +3,7 @@ package host
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -1221,12 +1222,17 @@ func TestRelayToleratesDroppedDataFrames(t *testing.T) {
 	// A payload well past the KCP receive window (256 packets * 1400 B ≈ 350
 	// KiB): 2 MiB forces the send window to cycle ~6 times, so retransmitted
 	// segments land in a window that has already moved on — the case that must
-	// not desync the record stream. A position-dependent pattern so reordering,
-	// truncation or corruption is caught by the byte-for-byte check below.
+	// not desync the record stream.
 	const payloadSize = 2 << 20 // 2 MiB
 	payload := make([]byte, payloadSize)
-	for i := range payload {
-		payload[i] = byte(i)
+	// Stamp each 8-byte lane with a position-derived 64-bit value (big-endian
+	// uint64(i/8)) so every lane is distinct. A plain byte(i) repeats every 256
+	// bytes, so a block moved by an exact multiple of 256 bytes would compare
+	// equal and reordering would slip through; lane uniqueness makes any swap of
+	// two lanes — across a KCP segment or a 16 KiB crypto record boundary —
+	// change the payload, which the byte-for-byte check below catches.
+	for i := 0; i < payloadSize; i += 8 {
+		binary.BigEndian.PutUint64(payload[i:], uint64(i/8))
 	}
 
 	conn, err := eA.OpenStream(eB.PublicKey())
