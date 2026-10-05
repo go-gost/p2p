@@ -43,7 +43,7 @@ DERPER_BIN="${DERPER_BIN:-}"
 # Scenario registry: --list, --scenario validation and the runner all read this
 # single list, so a new scenario just needs an entry here and a scenario_<name>
 # function below.
-SCENARIOS=(stub derp-relay relay-peer-restart derp-direct forward inner-matrix udp-tun udp-outlet ipv6-direct)
+SCENARIOS=(stub derp-relay relay-peer-restart derp-direct forward inner-matrix udp-tun udp-tun-loss udp-outlet ipv6-direct)
 
 usage() {
 	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
@@ -625,6 +625,74 @@ scenario_udp_tun() {
 	if p=$(ns_run B ping -c1 -W4 10.10.0.1 2>&1); then ok "tun link: B pings A (10.10.0.1)"; else fail "tun link ping failed: $p"; fi
 	check_grep "datagram link is live on A" 'datagram link up' "$LOGDIR/p2p-tun-a.log"
 	check_grep "datagram link is live on B" 'datagram link up' "$LOGDIR/p2p-tun-b.log"
+}
+
+# scenario_udp_tun_loss: the point-to-point tun link again, with tc netem packet
+# loss on the veths, to pin how the datagram link behaves on a lossy path.
+# Moderate loss must not tear the link down (the smux keepalive, sent every few
+# seconds, still gets through and the session only gives up after 15s of
+# silence); a blackout past that timeout must end the link, and the presenter
+# must rebuild it once the path is clear. This is the shape a network switch
+# leaves behind, and the bound the tun's re-registration rides on.
+scenario_udp_tun_loss() {
+	step "datagram link under packet loss (netem)"
+	local dir="$RUNDIR/tun-loss"
+	start_derp_pair tun-loss off false "" || return
+	local akey bkey
+	akey=$(cat "$dir/a.pub"); bkey=$(cat "$dir/b.pub")
+
+	write_tun_client() { # file p2paddr peer net name
+		cat >"$1" <<-YAML
+			p2ps:
+			  - name: p2p-1
+			    plugin: {type: grpc, addr: $2}
+			services:
+			  - name: tun-0
+			    addr: :0
+			    handler: {type: tun, chain: chain-0}
+			    listener:
+			      type: tun
+			      metadata: {name: $5, net: $4, mtu: 1420}
+			chains:
+			  - name: chain-0
+			    hops:
+			      - name: hop-0
+			        nodes:
+			          - name: node-0
+			            addr: $3
+			            dialer: {type: udp}
+			            connector: {type: forward}
+			            metadata: {p2p: p2p-1}
+			log: {level: debug}
+		YAML
+	}
+	write_tun_client "$dir/a.yaml" 127.0.0.1:8003 "$bkey" 10.10.0.1/30 p2pa
+	write_tun_client "$dir/b.yaml" 127.0.0.1:8003 "$akey" 10.10.0.2/30 p2pb
+	start_gost A gost-tun-a -C "$dir/a.yaml"
+	start_gost B gost-tun-b -C "$dir/b.yaml"
+
+	sleep 3
+	if ns_run A ping -c1 -W4 10.10.0.2 >/dev/null 2>&1; then ok "tun link up before loss"; else fail "tun link down before loss"; fi
+
+	# Moderate loss: the session survives, so the link stays up and traffic
+	# still flows.
+	tc qdisc add dev v-A root netem loss 30% 2>/dev/null || fail "netem on v-A"
+	tc qdisc add dev v-B root netem loss 30% 2>/dev/null || fail "netem on v-B"
+	sleep 20
+	if ns_run A ping -c2 -W8 10.10.0.2 >/dev/null 2>&1; then ok "tun link survives 30% loss"; else fail "tun link broke under 30% loss"; fi
+
+	# Blackout past the keepalive timeout: the session gives up and the link
+	# ends.
+	tc qdisc change dev v-A root netem loss 100%
+	tc qdisc change dev v-B root netem loss 100%
+	sleep 25
+	check_grep "datagram link ended under a blackout" 'datagram link down' "$LOGDIR/p2p-tun-loss-a.log"
+
+	# Clear the path: the presenter reopens and the link is rebuilt.
+	tc qdisc del dev v-A root 2>/dev/null
+	tc qdisc del dev v-B root 2>/dev/null
+	sleep 20
+	if ns_run A ping -c2 -W8 10.10.0.2 >/dev/null 2>&1; then ok "tun link restored after the blackout"; else fail "tun link did not restore"; fi
 }
 
 scenario_udp_outlet() {
