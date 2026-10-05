@@ -61,7 +61,7 @@ func TestSpokeReachesTargetOutlet(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			l := newLink(spoke, pubH)
+			l := newLink(spoke, pubH, false)
 			spoke.addLink(l)
 			defer func() {
 				spoke.removeLink(l)
@@ -129,13 +129,13 @@ func tunToTunRoundTrip(t *testing.T, smallerA bool) {
 		t.Fatal(err)
 	}
 
-	la := newLink(engineA, pubB)
+	la := newLink(engineA, pubB, false)
 	engineA.addLink(la)
 	defer func() {
 		engineA.removeLink(la)
 		la.close()
 	}()
-	lb := newLink(engineB, pubA)
+	lb := newLink(engineB, pubA, false)
 	engineB.addLink(lb)
 	defer func() {
 		engineB.removeLink(lb)

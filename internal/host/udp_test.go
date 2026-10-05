@@ -32,8 +32,16 @@ func failOpen(string) (net.Conn, error) { return nil, errors.New("test: no opene
 // newTestLink creates a registered link whose presentation is driven by open.
 func newTestLink(t *testing.T, e *engine, peer derpclient.PublicKey, open func(string) (net.Conn, error)) *link {
 	t.Helper()
+	return newScopedTestLink(t, e, peer, open, false)
+}
+
+// newScopedTestLink is newTestLink with the sessionScoped flag exposed: true
+// builds the "ip" (tun) link, which ends rather than re-presenting when a peer
+// session is lost.
+func newScopedTestLink(t *testing.T, e *engine, peer derpclient.PublicKey, open func(string) (net.Conn, error), sessionScoped bool) *link {
+	t.Helper()
 	e.openStream = open
-	l := newLink(e, peer)
+	l := newLink(e, peer, sessionScoped)
 	e.addLink(l)
 	t.Cleanup(func() {
 		e.removeLink(l)
@@ -267,6 +275,52 @@ func TestLinkRepresentsAfterEdgeDeath(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the presenter did not re-present after the edge died")
+	}
+}
+
+// TestScopedLinkEndsOnEdgeDeath is the counterpart for the session-scoped "ip"
+// (tun) link: it does NOT re-present a lost peer edge, because the far tun
+// server registered this side's addresses per session and a fresh session needs
+// a fresh registration — which only the consumer re-dialing sends. So the link
+// ends — the local edge is closed and the presenter stops — instead of riding a
+// stale session over a new edge. Regression test for the tun hub losing a
+// spoke's route after a hub restart.
+func TestScopedLinkEndsOnEdgeDeath(t *testing.T) {
+	e := newTestEngine(t)
+	_, peerKey, _ := derpclient.Generate()
+
+	peerSides := make(chan net.Conn, 4)
+	open := func(string) (net.Conn, error) {
+		edge, side := net.Pipe()
+		go func() {
+			io.ReadFull(side, make([]byte, len(channelTag)))
+		}()
+		peerSides <- side
+		return edge, nil
+	}
+	l := newScopedTestLink(t, e, peerKey, open, true)
+	local := attachLocal(t, l)
+
+	first := <-peerSides
+	waitFor(t, 3*time.Second, l.hasEdge)
+
+	first.Close() // the peer session is lost (the hub restarted)
+
+	select {
+	case <-l.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a session-scoped link did not end when its peer edge was lost")
+	}
+	// It ended instead of re-presenting: no second edge was opened.
+	select {
+	case <-peerSides:
+		t.Fatal("the session-scoped link opened a new peer edge after the session was lost")
+	default:
+	}
+	// The local edge is closed with the link, so the consumer re-dials.
+	local.SetWriteDeadline(time.Now().Add(time.Second))
+	if _, err := local.Write([]byte("x")); err == nil {
+		t.Fatal("the local edge survived the session-scoped link")
 	}
 }
 

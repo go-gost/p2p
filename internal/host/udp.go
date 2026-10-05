@@ -38,6 +38,12 @@ type link struct {
 	e    *engine
 	peer derpclient.PublicKey
 
+	// sessionScoped: once a peer edge has been established, losing it ends the
+	// link instead of re-presenting (see retireEdge). Set for an "ip" (tun)
+	// link, whose peer-side state — the addresses this side registered — is tied
+	// to the peer session and must be re-registered on a fresh one.
+	sessionScoped bool
+
 	stop     chan struct{} // closed by close(); ends the presenter and the pumps
 	stopOnce sync.Once
 	done     chan struct{} // closed when the link is torn down; the carrier parks here
@@ -55,6 +61,7 @@ type link struct {
 	local    net.Conn // this dial's tunnel stream; nil until the carrier attaches
 	peerEdge net.Conn // current peer edge: our presentation or an adopted one
 	own      net.Conn // our presentation edge; nil once adopted or when it dies
+	hadEdge  bool     // a peer edge has been established at least once
 	closed   bool
 }
 
@@ -94,15 +101,18 @@ func channelRetryDelay(prev time.Duration, openFailed bool) time.Duration {
 	return channelRetryMin
 }
 
-// newLink creates the datagram link of one udp dial and starts its presenter.
-// The caller registers it on the engine so inbound edges can find it.
-func newLink(e *engine, peer derpclient.PublicKey) *link {
+// newLink creates the datagram link of one datagram dial and starts its
+// presenter. The caller registers it on the engine so inbound edges can find it.
+// sessionScoped marks an "ip" (tun) link: it ends on a lost peer session rather
+// than re-presenting, so the consumer re-dials (see retireEdge).
+func newLink(e *engine, peer derpclient.PublicKey, sessionScoped bool) *link {
 	l := &link{
-		e:        e,
-		peer:     peer,
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
-		edgeGone: make(chan struct{}, 1),
+		e:             e,
+		peer:          peer,
+		sessionScoped: sessionScoped,
+		stop:          make(chan struct{}),
+		done:          make(chan struct{}),
+		edgeGone:      make(chan struct{}, 1),
 	}
 	go l.presentLoop()
 	return l
@@ -219,7 +229,7 @@ func (l *link) publishOwn(c net.Conn) bool {
 		l.mu.Unlock()
 		return false
 	}
-	l.own, l.peerEdge = c, c
+	l.own, l.peerEdge, l.hadEdge = c, c, true
 	l.mu.Unlock()
 	go l.serveEdge(c)
 	// Asynchronous: a flush can block on a peer that is not reading yet, and
@@ -246,7 +256,7 @@ func (l *link) adopt(c net.Conn, transport string) bool {
 		return false
 	}
 	old, own := l.peerEdge, l.own
-	l.peerEdge, l.own = c, nil
+	l.peerEdge, l.own, l.hadEdge = c, nil, true
 	l.mu.Unlock()
 	// Our presentation is superseded; its reader retires it.
 	if own != nil && own != c {
@@ -378,8 +388,18 @@ func (l *link) retireEdge(c net.Conn) {
 		l.own = nil
 	}
 	closed := l.closed
+	// A session-scoped link (an "ip"/tun link) does not re-present: once a peer
+	// session existed and is gone, the state this side registered with the peer
+	// — the tun addresses — went with it, so end the link and let the consumer
+	// re-dial, which re-registers. Before the first edge the presenter still
+	// reopens, so a peer that starts late still converges.
+	end := current && l.sessionScoped && l.hadEdge
 	l.mu.Unlock()
 	if closed {
+		return
+	}
+	if end {
+		l.close()
 		return
 	}
 	select {

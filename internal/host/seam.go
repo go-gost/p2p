@@ -98,8 +98,8 @@ func (h *Host) Dial(ctx context.Context, network, peer string) (net.Conn, error)
 	// LocalAddr/RemoteAddr and call String on them.
 	conn.local = streamAddr{network: network, addr: "p2p"}
 	conn.remote = streamAddr{network: network, addr: peer}
-	if network == "udp" {
-		// A udp tunnel carries datagrams, so the GOST-side conn owns the
+	if datagramNetwork(network) {
+		// A datagram tunnel carries datagrams, so the GOST-side conn owns the
 		// 2-byte framing (frame.go) exactly as x/p2p/streamconn's conn does on
 		// the gRPC carrier: both carriers then hand the inner dialer the same
 		// conn shape. Without it the outlet's frame parser never sees a frame.
@@ -153,7 +153,20 @@ func normalizeNetwork(network string) string {
 	switch network {
 	case "udp", "udp4", "udp6":
 		return "udp"
+	case "ip":
+		return "ip"
 	default:
 		return "tcp"
 	}
+}
+
+// datagramNetwork reports whether network selects a datagram ("udp"-shaped)
+// link. "udp" is the transparent datagram link; "ip" is the same datagram shape
+// but session-scoped: the link does not re-present after a peer session is lost
+// (see link.retireEdge), so the consumer's conn ends and it re-dials. It is the
+// tun link — a tun peer's addresses are registered with the far tun server per
+// session, so a fresh peer session needs a fresh registration, and only a
+// re-dial resends it.
+func datagramNetwork(network string) bool {
+	return network == "udp" || network == "ip"
 }

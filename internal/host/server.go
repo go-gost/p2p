@@ -140,11 +140,11 @@ func (s *server) allocateTunnel(network, peer string, attached bool) (*tunnelRec
 	if network == "" {
 		network = "tcp"
 	}
-	if network != "tcp" && network != "udp" {
+	if network != "tcp" && !datagramNetwork(network) {
 		return nil, fmt.Errorf("%w %q", p2p.ErrInvalidNetwork, network)
 	}
-	if network == "udp" && s.engine == nil {
-		return nil, fmt.Errorf("%w %q: udp tunnel requires derp mode (peer key)", p2p.ErrInvalidNetwork, network)
+	if datagramNetwork(network) && s.engine == nil {
+		return nil, fmt.Errorf("%w %q: a datagram tunnel requires derp mode (peer key)", p2p.ErrInvalidNetwork, network)
 	}
 	if s.engine != nil {
 		// DERP mode: the peer is a public key; validate its shape now and
@@ -153,22 +153,24 @@ func (s *server) allocateTunnel(network, peer string, attached bool) (*tunnelRec
 		if err != nil {
 			return nil, fmt.Errorf("%w %q: %v", p2p.ErrInvalidPeer, peer, err)
 		}
-		if network == "udp" {
+		if datagramNetwork(network) {
 			// A datagram link is per dial: this record owns one, and the dialing
 			// side always presents an edge (see link), so a one-sided link works
 			// whatever the key order and concurrent dials never share an edge.
 			// A dial is the intent to connect: start the punch now instead of
 			// only once a stream is opened (which never happens for the
-			// responder half of the key orders).
+			// responder half of the key orders). An "ip" link is session-scoped:
+			// it ends rather than re-presenting when a peer session is lost, so
+			// the consumer re-dials (see link.retireEdge).
 			s.engine.maybeStartDirect(key)
-			lnk := newLink(s.engine, key)
+			lnk := newLink(s.engine, key, network == "ip")
 			s.engine.addLink(lnk)
 			t := &tunnelRecord{
 				id:        newTunnelID(),
 				target:    peer,
 				peer:      peer,
 				engine:    s.engine,
-				network:   "udp",
+				network:   network,
 				link:      lnk,
 				createdAt: time.Now(),
 				conns:     make(map[net.Conn]struct{}),

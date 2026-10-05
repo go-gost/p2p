@@ -47,11 +47,11 @@ func (s *server) attach(t *tunnelRecord, stream Stream, abort func()) error {
 func (s *server) serveTunnel(t *tunnelRecord, stream Stream, abort func()) error {
 	conn := newStreamConn(stream, abort)
 
-	if t.network == "udp" {
-		// A udp tunnel's stream is its link's local edge: the link pumps bytes
-		// between it and the peer edge. The handler parks until the link is
-		// torn down — the local pump's exit (the gost closed the stream) closes
-		// it, and so does the record's drop.
+	if datagramNetwork(t.network) {
+		// A datagram tunnel's stream is its link's local edge: the link pumps
+		// bytes between it and the peer edge. The handler parks until the link
+		// is torn down — the local pump's exit (the gost closed the stream)
+		// closes it, and so does the record's drop.
 		<-t.link.attach(conn)
 		return nil
 	}
