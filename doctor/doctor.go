@@ -150,6 +150,16 @@ func peerBlock(b *strings.Builder, key string, d p2p.PeerDiagnostic) {
 		field(b, "    relay churn", fmt.Sprintf("%d rebuilds, %d peer rekeys",
 			d.RelayRebuilds, d.PeerRekeys))
 	}
+	// The pair's relay KCP health: what kcp-go exposes per session
+	// (SRTT/RTO/RTTVar), the configured MTU/window, and the pair's own datagram
+	// byte counters. Shown only when a session exists (a direct-only peer has
+	// none), so zeros never read as a healthy idle session.
+	if d.RelayKCP.Live {
+		field(b, "    relay kcp", fmt.Sprintf("srtt=%dms rto=%dms rttvar=%dms conv=%d mtu=%d sndwnd=%d rcvwnd=%d sent=%dB rcvd=%dB",
+			d.RelayKCP.SRTT, d.RelayKCP.RTO, d.RelayKCP.RTTVar, d.RelayKCP.Conv,
+			d.RelayKCP.Mtu, d.RelayKCP.SndWnd, d.RelayKCP.RcvWnd,
+			d.RelayKCP.BytesSent, d.RelayKCP.BytesRcvd))
+	}
 	field(b, "    peer addr", orNone(d.PeerAddr))
 	field(b, "    candidates", fmt.Sprintf("%d", d.Candidates))
 	field(b, "    caps", orNone(strings.Join(d.Caps, ", ")))

@@ -159,6 +159,29 @@ type relayKCPPair struct {
 	closed  bool
 	wake    chan struct{} // closed and replaced on every endpoint/end change
 	idle    chan struct{} // closed and replaced on every read/write completion
+
+	// bytesSent/bytesRcvd count the pair's relay datagrams in bytes, on the
+	// paths the pair already walks (WriteTo/ReadFrom). They are this pair's own
+	// counters — deliberately NOT kcp-go's process-global DefaultSnmp, which
+	// aggregates every KCP session including the direct plane. Atomic rather
+	// than under p.mu: these sit on the pair's data path, and a status read must
+	// never contend with it. The increment is one lock-free Add per datagram,
+	// negligible next to the channel send/receive already on those paths.
+	bytesSent atomic.Uint64
+	bytesRcvd atomic.Uint64
+}
+
+// relayKCPSnapshot is a point-in-time read of the pair's KCP session stats and
+// datagram counters. present reports whether a KCP session actually exists, so
+// a caller can tell "no session" from "a session with nothing measured yet".
+type relayKCPSnapshot struct {
+	conv      uint32
+	srtt      int32
+	rto       uint32
+	rttVar    int32
+	bytesSent uint64
+	bytesRcvd uint64
+	present   bool
 }
 
 // session returns the pair's KCP session, building it on first use. The conv is
@@ -251,6 +274,56 @@ func (p *relayKCPPair) shutdown() {
 	}
 }
 
+// snapshot returns the pair's KCP session stats and its datagram counters. The
+// session pointer is captured under p.mu and the getters are called after p.mu
+// is released: GetSRTT/GetRTO/GetSRTTVar take the KCP session's own lock
+// (s.mu), and the only lock order in this file is p.mu -> s.mu (session()
+// holds p.mu while SetMtu/SetWindowSize/SetNoDelay take s.mu). KCP never takes
+// p.mu while holding s.mu — its readLoop/postProcess call into the pair without
+// s.mu, and update() holds s.mu only to do a non-blocking channel send — so
+// this read follows the one established order and cannot invert. GetConv takes
+// no lock; the getters read only integer fields, so a session being torn down
+// concurrently still yields a well-defined (last observed) value.
+func (p *relayKCPPair) snapshot() relayKCPSnapshot {
+	p.mu.Lock()
+	sess := p.sess
+	p.mu.Unlock()
+	s := relayKCPSnapshot{
+		bytesSent: p.bytesSent.Load(),
+		bytesRcvd: p.bytesRcvd.Load(),
+	}
+	if sess == nil {
+		return s
+	}
+	s.conv = sess.GetConv()
+	s.srtt = sess.GetSRTT()
+	s.rto = sess.GetRTO()
+	s.rttVar = sess.GetSRTTVar()
+	s.present = true
+	return s
+}
+
+// relayKCPSnapshotAttrs renders a pair's KCP snapshot as stable slog attrs, or
+// nil when there is no session (present=false). The configured MTU/window are
+// included so a log reader can compare configured against observed SRTT/RTO;
+// the names are stable and greppable.
+func relayKCPSnapshotAttrs(s relayKCPSnapshot) []any {
+	if !s.present {
+		return nil
+	}
+	return []any{
+		"kcpConv", s.conv,
+		"kcpSrtt", s.srtt,
+		"kcpRto", s.rto,
+		"kcpRttVar", s.rttVar,
+		"kcpMtu", relayKCPMtu,
+		"kcpSndWnd", relayKCPSndWnd,
+		"kcpRcvWnd", relayKCPRcvWnd,
+		"kcpBytesSent", s.bytesSent,
+		"kcpBytesRcvd", s.bytesRcvd,
+	}
+}
+
 // ReadFrom forwards one datagram from the current registered adapter to KCP.
 // Each endpoint degrades per relayPacketConn's drain-once-then-EOF contract;
 // the forwarding adds the swap awareness the pair needs on top:
@@ -276,6 +349,7 @@ func (p *relayKCPPair) ReadFrom(b []byte) (int, net.Addr, error) {
 		}
 		n, addr, err := ep.ReadFrom(b)
 		if err == nil {
+			p.bytesRcvd.Add(uint64(n))
 			return n, addr, nil
 		}
 		// io.EOF: this endpoint is gone and drained (its closeCh or the kick
@@ -298,6 +372,7 @@ func (p *relayKCPPair) ReadFrom(b []byte) (int, net.Addr, error) {
 // fatal in the other direction: kcp-go turns any WriteTo error into a permanent
 // write failure for the session.
 func (p *relayKCPPair) WriteTo(b []byte, _ net.Addr) (int, error) {
+	p.bytesSent.Add(uint64(len(b)))
 	p.mu.Lock()
 	ep, closed := p.ep, p.closed
 	p.mu.Unlock()

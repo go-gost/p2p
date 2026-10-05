@@ -265,6 +265,9 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 			// such in the report instead of only in the log.
 			RelayRebuilds: pc.relayRebuilds.Load(),
 			PeerRekeys:    pc.relayRebuildPeers.Load(),
+			// The pair's relay KCP session health, read through the pair (not the
+			// adapter) so a clean adapter swap still reports the surviving session.
+			RelayKCP: e.relayKCPStats(pc.peer),
 		}
 	}
 	for _, dc := range directs {
@@ -1038,6 +1041,54 @@ func (e *engine) relayKCPPairFor(peer derpclient.PublicKey) *relayKCPPair {
 	return pair
 }
 
+// relayKCPPairGet returns the pair's relay KCP holder, or nil when none exists.
+// Unlike relayKCPPairFor it never creates: Status reads the pair's stats through
+// this so a status query cannot build a session as a side effect.
+func (e *engine) relayKCPPairGet(peer derpclient.PublicKey) *relayKCPPair {
+	e.kcpMu.Lock()
+	defer e.kcpMu.Unlock()
+	return e.relayKCPs[peer]
+}
+
+// relayKCPLogAttrs returns the slog attrs describing the pair's relay KCP
+// session, or nil when the pair holds no session. It is appended (additively)
+// to the lifecycle lines that carry gen=, so a reader sees the session's health
+// at exactly the moment of a rebuild or epoch reset.
+func (e *engine) relayKCPLogAttrs(peer derpclient.PublicKey) []any {
+	pair := e.relayKCPPairGet(peer)
+	if pair == nil {
+		return nil
+	}
+	return relayKCPSnapshotAttrs(pair.snapshot())
+}
+
+// relayKCPStats snapshots the pair's relay KCP session for Status, filled with
+// the configured constants so a reader can compare configured against observed
+// SRTT/RTO. Live is false when the pair holds no session; Status reports only
+// peers with a live data path, whose pair normally exists, but a peer
+// mid-rebuild can have none yet, and Live marks that instead of reading a zero
+// SRTT as a healthy idle session.
+func (e *engine) relayKCPStats(peer derpclient.PublicKey) p2p.RelayKCPStats {
+	out := p2p.RelayKCPStats{
+		Mtu:    relayKCPMtu,
+		SndWnd: relayKCPSndWnd,
+		RcvWnd: relayKCPRcvWnd,
+	}
+	pair := e.relayKCPPairGet(peer)
+	if pair == nil {
+		return out
+	}
+	s := pair.snapshot()
+	out.SRTT = int64(s.srtt)
+	out.RTO = int64(s.rto)
+	out.RTTVar = int64(s.rttVar)
+	out.Conv = s.conv
+	out.BytesSent = s.bytesSent
+	out.BytesRcvd = s.bytesRcvd
+	out.Live = s.present
+	return out
+}
+
 // dropRelayKCP ends and forgets the pair's relay KCP session, so the next build
 // starts a fresh epoch. It runs only where the pair's sequence state can no
 // longer align with the peer's: the peer restarted (its session starts over),
@@ -1071,8 +1122,15 @@ func (e *engine) dropRelayKCP(peer derpclient.PublicKey, expect *kcp.UDPSession,
 	}
 	delete(e.relayKCPs, peer)
 	e.kcpMu.Unlock()
+	// Snapshot before shutdown drops the session: these are its last observed
+	// values, not zeros (a zero would read as a healthy idle session). When the
+	// pair never built a session there are no attrs, and the line stays as it
+	// was.
+	stats := pair.snapshot()
 	pair.shutdown()
-	e.log.Debug("relay kcp pair reset", "peer", keyName(peer), "cause", cause, "gen", gen)
+	resetAttrs := []any{"peer", keyName(peer), "cause", cause, "gen", gen}
+	resetAttrs = append(resetAttrs, relayKCPSnapshotAttrs(stats)...)
+	e.log.Debug("relay kcp pair reset", resetAttrs...)
 }
 
 // closeRelayKCPs ends every pair's relay KCP session: the relay connection
@@ -1213,12 +1271,18 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		if !at.IsZero() {
 			age = time.Since(at)
 		}
-		e.log.Debug("relay session rebuilt",
+		// The pair's KCP session survives a clean kill (it is what the rebuild
+		// continues on), so its health rides the same line; a kill whose reason
+		// reset the pair already dropped it, and then there are no KCP attrs.
+		rebuildAttrs := []any{
 			"peer", keyName(peer),
 			"secureReuse", prev == pc.secure,
 			"desyncStreak", streak,
 			"sessionAge", age.Round(time.Millisecond),
-			"gen", gen)
+			"gen", gen,
+		}
+		rebuildAttrs = append(rebuildAttrs, e.relayKCPLogAttrs(peer)...)
+		e.log.Debug("relay session rebuilt", rebuildAttrs...)
 	}
 	return pc
 }
@@ -1786,12 +1850,17 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	pc.mu.Unlock()
 
 	if replaced {
-		pc.e.log.Debug("relay session rebuilt",
+		replacedAttrs := []any{
 			"peer", keyName(pc.peer),
 			"secureReuse", true,
 			"desyncStreak", streak,
 			"sessionAge", age.Round(time.Millisecond),
-			"gen", gen)
+			"gen", gen,
+		}
+		// The dead session died on its own (a clean end), so the pair's KCP
+		// session survives and its health rides the rebuild line.
+		replacedAttrs = append(replacedAttrs, pc.e.relayKCPLogAttrs(pc.peer)...)
+		pc.e.log.Debug("relay session rebuilt", replacedAttrs...)
 	}
 
 	// No live session: settle the handshake before building, so both ends agree

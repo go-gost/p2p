@@ -48,10 +48,38 @@ type PeerDiagnostic struct {
 	// only by grepping the log.
 	RelayRebuilds int64
 	PeerRekeys    int64
+	// RelayKCP is this peer's relay-plane KCP session health (see
+	// RelayKCPStats). In-process only: the gRPC proto is frozen and does not
+	// carry it, like RelayRebuilds.
+	RelayKCP RelayKCPStats
 	// Trace is the peer's recent punch history: short human-readable lines, the
 	// oldest first, capped at the ring's size (the newest are kept). Nil for a
 	// peer with no direct punch state (a relay-only peer).
 	Trace []string
+}
+
+// RelayKCPStats is one peer's relay-plane KCP session health, as far as
+// kcp-go v5.6.72 lets us see it per session. SRTT/RTO/RTTVar are milliseconds
+// (GetSRTT/GetRTO/GetSRTTVar); Conv is the pair's deterministic conversation id
+// (GetConv). Mtu/SndWnd/RcvWnd are the CONFIGURED constants, not observed
+// values: kcp-go does not expose the live cwnd/rwnd per session, so a reader can
+// compare SRTT/RTO against the configured window only, never against a measured
+// window. BytesSent/BytesRcvd are this pair's own datagram-byte counters, kept
+// in relayKCPPair on the paths it already walks — not kcp-go's process-global
+// DefaultSnmp, which would mix the direct plane in. Live reports whether a KCP
+// session actually exists, so a zero SRTT reads as "no RTT measured yet", not as
+// a healthy idle session.
+type RelayKCPStats struct {
+	SRTT      int64  // smoothed RTT (ms); 0 when no session or none measured yet
+	RTO       int64  // retransmit timeout (ms); 0 when no session
+	RTTVar    int64  // RTT variance (ms); 0 when no session
+	Conv      uint32 // KCP conversation id; 0 when no session
+	Mtu       int    // configured relayKCPMtu
+	SndWnd    int    // configured relayKCPSndWnd
+	RcvWnd    int    // configured relayKCPRcvWnd
+	BytesSent uint64 // datagram bytes this pair's KCP offered to the relay hop
+	BytesRcvd uint64 // datagram bytes this pair's KCP read from the relay hop
+	Live      bool   // whether the pair holds a live KCP session
 }
 
 // DirectConfig is the direct path a host is running with. It answers "why is

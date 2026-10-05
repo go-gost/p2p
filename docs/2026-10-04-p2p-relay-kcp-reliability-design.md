@@ -194,6 +194,12 @@ cd /root/code/go-gost/p2p && export PATH="$PATH:/root/.local/go/bin:/root/go/bin
 - 无丢包下可持续 94 Mbit/s 且 TCP 0 重传，`relayKCPMtu=1400`、`SndWnd=RcvWnd=256`、`SetNoDelay(1,10,2,1)` 的保守默认值未暴露瓶颈，暂无需暴露调参开关。
 - 5% 丢包场景的吞吐/重传开销因注入缺口未能实测，KCP 在丢包下的表现仍待补测后才能定论。丢包下的**正确性**（字节流完整、无 record desync、无重建）已由仓库内 `TestRelayToleratesDroppedDataFrames` 覆盖（见上文"运行 2 补充"）。
 
+## 中继 KCP 可观测性
+
+为判断上述保守默认值是否健康，中继 pair 的 KCP 会话新增可观测面（提交 `feat(p2p): expose relay KCP session statistics`），通过 `Status.PeerDiagnostics[peer].RelayKCP` 与生命周期日志暴露：`SRTT`/`RTO`/`RTTVar`（毫秒，来自 kcp-go 的 `GetSRTT`/`GetRTO`/`GetSRTTVar`）、`Conv`（pair 的确定性会话 id）、`Mtu`/`SndWnd`/`RcvWnd`（**配置值** `relayKCPMtu`/`relayKCPSndWnd`/`relayKCPRcvWnd`，非观测值）、`BytesSent`/`BytesRcvd`（pair 自有数据报字节计数，见 `relayKCPPair`），以及 `Live`（会话是否存在，区分"无会话"与"尚未测得 RTT 的空闲会话"）。日志里对应字段为 `kcpConv`/`kcpSrtt`/`kcpRto`/`kcpRttVar`/`kcpMtu`/`kcpSndWnd`/`kcpRcvWnd`/`kcpBytesSent`/`kcpBytesRcvd`，只出现在 pair 会话存在的重建（`relay session rebuilt`）与重置（`relay kcp pair reset`）行；重置行在会话被关闭**之前**读取，是最后观测值而非零值。一个健康的中继：SRTT 稳定、贴近链路真实 RTT，字节计数随流量单调增长，重建/重置计数不持续攀升；反之若 `kcpSrtt` 显著偏高或字节计数停滞而 SRTT 升高，提示窗口饥饿或丢包重传。
+
+**局限**：kcp-go v5.6.72 不提供 per-session 的重传计数、cwnd、rwnd——这些要么只在进程全局 `DefaultSnmp` 里（且混入直连平面的 KCP 会话，不可作为单 pair 指标），要么是未导出的 `KCP` 内部字段。因此 `relayKCPMtu` 与窗口值仍是**未实测的默认值**，应当对照上述 SRTT 与数据报字节计数来调参；本文不把"尚未测量"当作"已经测量"呈现。
+
 ## 已知 flake
 
 `TestDirectRepunchAfterMissedPeerGone`（`internal/host/direct_test.go`）是一个已知的、预先存在的 flake：其最后的 `roundTrip` 会间歇性超时（`direct_test.go:671: timeout`）——在 `main` HEAD 的非 `-race` 运行中约 30%，在 `d2eff96` 约 17%，因此先于本设计的中继工作存在。它在 `-race` 下从未复现，这也是 `-race` 门禁一直为绿的原因。两个成因已记录在测试本身：其一为环境性——本沙箱在负载下会间歇性拒绝 `sendmmsg` 系统调用（`EPERM`），破坏 seed 握手，CI/正常环境中不存在、也不相关；其二为直连平面 re-punch 路径上预先存在的产品竞态——一次陈旧候选的拨号可能耗尽 5s 的 `seedTimeout`，而接受侧的 `peerLive` 假阴性使其重新武装而非重新打洞，导致 re-punch 可能超过 2s 的 `punchWaitTimeout`，进而回退到数据帧刚被测试切断的中继；该竞态的精确交错仍未被刻画。本设计不触及直连平面的 re-punch 路径，故此 flake 与之无关。
