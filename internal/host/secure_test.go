@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -112,6 +113,63 @@ func TestCryptoConnWriteRetriesShortWrites(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("short-write round trip mismatch: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
+// discardConn is a net.Conn whose Write absorbs everything without allocating,
+// so an allocation count taken through it reflects the layer above it alone.
+// A net.Pipe would allocate per Write and hide the number being measured.
+type discardConn struct{}
+
+func (discardConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (discardConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (discardConn) Close() error                     { return nil }
+func (discardConn) LocalAddr() net.Addr              { return dummyAddr{} }
+func (discardConn) RemoteAddr() net.Addr             { return dummyAddr{} }
+func (discardConn) SetDeadline(time.Time) error      { return nil }
+func (discardConn) SetReadDeadline(time.Time) error  { return nil }
+func (discardConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestCryptoConnWriteReusesRecordBuffer: a bulk tunnel writes records back to
+// back for as long as the connection lives, so the ciphertext buffer must come
+// from a pool rather than be allocated per record. The profiler showed this
+// buffer as the host's single largest source of garbage, measured in bytes
+// allocated, so the assertion is on bytes rather than allocation count: a
+// per-record buffer costs roughly one payload per record, and reuse should
+// leave only the nonce and small bookkeeping.
+func TestCryptoConnWriteReusesRecordBuffer(t *testing.T) {
+	const writes = 200
+	payload := bytes.Repeat([]byte("z"), 1024)
+	send, _ := chacha20poly1305.New(bytes.Repeat([]byte{1}, 32))
+	recv, _ := chacha20poly1305.New(bytes.Repeat([]byte{2}, 32))
+	var sc, rc nonceCtr
+	c := newCryptoConn(discardConn{}, send, recv, &sc, &rc, &sync.Mutex{}, nil, derpclient.PublicKey{}, nil)
+
+	// Warm the pool so the measured window is steady state, not the first
+	// buffer's construction.
+	for i := 0; i < writes; i++ {
+		if _, err := c.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < writes; i++ {
+		if _, err := c.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+
+	perRecord := float64(after.TotalAlloc-before.TotalAlloc) / writes
+	// A fresh record buffer is len(payload)+overhead+4 (~1044 B) per write. The
+	// bound sits under that but above the race detector's own per-write
+	// allocation, which inflates this measurement under -race without being
+	// able to hide a per-record buffer.
+	if limit := float64(len(payload)) * 3 / 4; perRecord > limit {
+		t.Fatalf("Write allocated %.0f bytes per record; want <%.0f (buffer reuse)", perRecord, limit)
 	}
 }
 

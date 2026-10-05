@@ -58,6 +58,15 @@ type frameConn struct {
 	rbuf []byte // frame bytes read from the conn, held until one frame is whole
 }
 
+// frameBufPool recycles the buffer one frame's length prefix and payload are
+// assembled into. frameConn.Write runs once per tunnel datagram for the life
+// of the connection, and the buffer is dead once the underlay write returns.
+// Stored as a *[]byte so the pooled value does not box a slice header into an
+// any on every Put, which would allocate in place of the buffer just saved.
+var frameBufPool = sync.Pool{
+	New: func() any { return new([]byte) },
+}
+
 // newFrameConn wraps a raw tunnel conn for a udp tunnel.
 func newFrameConn(c net.Conn) *frameConn { return &frameConn{Conn: c} }
 
@@ -65,7 +74,12 @@ func (c *frameConn) Write(p []byte) (int, error) {
 	if len(p) > maxFrame {
 		return 0, errDatagramTooLarge
 	}
-	if _, err := c.Conn.Write(appendFrame(nil, p)); err != nil {
+	bp := frameBufPool.Get().(*[]byte)
+	buf := appendFrame((*bp)[:0], p)
+	_, err := c.Conn.Write(buf)
+	*bp = buf[:0]
+	frameBufPool.Put(bp)
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil

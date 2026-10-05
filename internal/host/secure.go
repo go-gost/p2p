@@ -30,6 +30,18 @@ var errEncryptionRequired = errors.New("p2p: encryption required but the session
 // length prefix and the 16-byte tag at ~0.1% overhead.
 const maxSecureRecord = 16 * 1024
 
+// recordBufPool recycles one secure record's seal buffer. A bulk tunnel emits
+// records back to back for the life of the connection, and allocating the
+// ciphertext buffer per record was the host's single largest source of
+// garbage; the buffer is dead as soon as writeFull returns, so it goes back.
+//
+// The pool stores a *[]byte rather than a []byte: a slice held in an any is a
+// 24-byte header that escapes and is heap-allocated on every Put, which would
+// replace one allocation per record with another.
+var recordBufPool = sync.Pool{
+	New: func() any { return new([]byte) },
+}
+
 // secureDesyncThreshold is how many consecutive record-boundary failures force
 // the pair to re-handshake. A rebuilt session reuses its keys and nonce
 // counters (see secureSession), so one boundary failure can be a stale read
@@ -185,11 +197,21 @@ func (c *cryptoConn) Write(p []byte) (int, error) {
 		// Seal the ciphertext into a single buffer behind its 4-byte length
 		// prefix, so a whole record leaves in one underlay write. The relay
 		// turns each write into one packet, and a header and body split across
-		// two packets is one more way a drop can land mid-record.
-		buf := make([]byte, 4, 4+len(p[:n])+c.send.Overhead())
+		// two packets is one more way a drop can land mid-record. The buffer is
+		// recycled: a bulk tunnel seals records back to back, and the buffer is
+		// dead once writeFull returns.
+		bp := recordBufPool.Get().(*[]byte)
+		buf := *bp
+		if need := 4 + len(p[:n]) + c.send.Overhead(); cap(buf) < need {
+			buf = make([]byte, 4, need)
+		} else {
+			buf = buf[:4]
+		}
 		buf = c.send.Seal(buf, nonce[:], p[:n], nil)
 		binary.BigEndian.PutUint32(buf[:4], uint32(len(buf)-4))
 		err := writeFull(c.Conn, buf)
+		*bp = buf[:0]
+		recordBufPool.Put(bp)
 		if err != nil {
 			// The record never left (the underlay rejects whole writes): hand
 			// the nonce back so the counter the peer consumes by still matches

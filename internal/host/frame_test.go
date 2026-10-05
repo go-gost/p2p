@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"runtime"
 	"testing"
 )
 
@@ -103,6 +104,41 @@ func TestFrameAtMaxPayload(t *testing.T) {
 	}
 	if !bytes.Equal(buf[2:total], p) {
 		t.Fatal("max-size payload mismatch")
+	}
+}
+
+// TestFrameConnWriteReusesFrameBuffer: frameConn.Write runs once per tunnel
+// datagram for the life of a connection, so the buffer holding the length
+// prefix and payload must come from a pool rather than be allocated per write.
+// The assertion is on bytes allocated, matching what the profiler measured.
+func TestFrameConnWriteReusesFrameBuffer(t *testing.T) {
+	const writes = 200
+	payload := bytes.Repeat([]byte("q"), 1024)
+	w := newFrameConn(discardConn{})
+
+	for i := 0; i < writes; i++ {
+		if _, err := w.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < writes; i++ {
+		if _, err := w.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+
+	perWrite := float64(after.TotalAlloc-before.TotalAlloc) / writes
+	// A fresh frame buffer is len(payload)+2 (~1026 B) per write. The bound
+	// sits under that but above the race detector's own per-write allocation,
+	// which inflates this measurement under -race without being able to hide a
+	// per-write buffer.
+	if limit := float64(len(payload)) * 3 / 4; perWrite > limit {
+		t.Fatalf("frameConn.Write allocated %.0f bytes per write; want <%.0f (frame reuse)", perWrite, limit)
 	}
 }
 
