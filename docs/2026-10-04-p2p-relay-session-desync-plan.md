@@ -130,7 +130,7 @@ git commit -am "fix(p2p): force secure re-handshake after repeated record-bounda
 
 **Interfaces:**
 - Consumes: `pc.sessAt`、`killSession(cause, dropSecure)`、既有 `e.log.Debug("peer session killed", …)`（`engine.go:1561` 附近）。
-- Produces: 统一日志字段 `relayReason`（会话重建原因字符串：`keepalive-timeout` / `local-kill` / `queue-overflow` / `link-lost` / `peer-rekeyed`）、`secureReuse`（bool：本次重建是否复用了 secure 会话）、`desyncStreak`。字段名在 Task 1/2 的日志里也统一使用。
+- Produces: 统一日志字段 `relayReason`（会话重建原因字符串：`peer-gone-probe` / `local-kill` / `queue-overflow` / `link-lost` / `peer-rekeyed`）、`secureReuse`（bool：本次重建是否复用了 secure 会话）、`desyncStreak`。字段名在 Task 1/2 的日志里也统一使用。
 
 - [ ] **Step 1: 在 `killSession` 补齐原因与 secure 处置**
 
