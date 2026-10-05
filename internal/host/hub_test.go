@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-gost/p2p"
 	"github.com/go-gost/p2p/internal/derpclient"
 )
 
@@ -75,6 +76,97 @@ func TestSpokeReachesTargetOutlet(t *testing.T) {
 				t.Fatalf("target got %q, %v; want hello", got, err)
 			}
 		})
+	}
+}
+
+// linkToHubStub builds a spoke -> hub pair over the test relay, the hub holding
+// a udp target stub and the spoke holding one link to the hub (scoped or
+// transparent) attached to a local edge, with the edge already established by
+// one datagram. Shared by the fault-injection tests below.
+func linkToHubStub(t *testing.T, scoped bool) (l *link, hub, spoke *engine) {
+	t.Helper()
+	rs := &relayServer{}
+	url := rs.start(t)
+
+	var privH, privS derpclient.PrivateKey
+	var pubH, pubS derpclient.PublicKey
+	for {
+		privH, pubH, _ = derpclient.Generate()
+		privS, pubS, _ = derpclient.Generate()
+		if bytes.Compare(pubS[:], pubH[:]) < 0 {
+			break
+		}
+	}
+	hub = newEngine(url, "", privH, slog.Default())
+	spoke = newEngine(url, "", privS, slog.Default())
+	t.Cleanup(func() { hub.Close(); spoke.Close() })
+	if err := hub.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := spoke.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	stub, spec := startHubStub(t)
+	if err := hub.addTargets([]string{spec}); err != nil {
+		t.Fatal(err)
+	}
+	l = newLink(spoke, pubH, scoped)
+	spoke.addLink(l)
+	t.Cleanup(func() { spoke.removeLink(l); l.close() })
+	local := attachLocal(t, l)
+
+	// Establish the edge: one datagram through to the hub's target.
+	go local.Write(appendFrame(nil, []byte("hello")))
+	if _, err := recvDatagram(t, stub); err != nil {
+		t.Fatalf("establish edge: %v", err)
+	}
+	waitFor(t, 10*time.Second, l.hasEdge)
+	return l, hub, spoke
+}
+
+// TestScopedLinkEndsUnderBlackhole pins the tun fix's liveness bound: a
+// session-scoped link ends when the peer path goes dead in both directions —
+// the "network switch / blackhole" shape, where no frame gets through and the
+// smux keepalive is dropped too — because the session's own liveness gives up.
+// That end is what makes the tun consumer re-dial and re-register. The
+// transparent link does the opposite: it re-presents and stays up, which is why
+// it lost the registration. The bound logged here is the smux keepalive timeout.
+func TestScopedLinkEndsUnderBlackhole(t *testing.T) {
+	l, hub, spoke := linkToHubStub(t, true)
+
+	// Blackhole both directions: no data frame either way, smux keepalives
+	// included. This is the shape a network switch (or a silent path) leaves
+	// behind, and what the relay's own watchdog cannot see.
+	hub.faults.Store(newFaults(&p2p.FaultsConfig{DropData: true}))
+	spoke.faults.Store(newFaults(&p2p.FaultsConfig{DropData: true}))
+
+	start := time.Now()
+	select {
+	case <-l.done:
+		t.Logf("session-scoped link ended %s after the path went dead (the smux keepalive bound)",
+			time.Since(start).Round(time.Second))
+	case <-time.After(90 * time.Second):
+		t.Fatal("a session-scoped link never ended under a blackhole — the tun would not re-register")
+	}
+}
+
+// TestScopedLinkSurvivesPacketLoss: under a lossy path that still carries the
+// session's own keepalive, a session-scoped link does NOT end — the tun keeps
+// its established session and its (still-valid) registration rather than
+// flapping. The fault drops one in every two relay data frames (50% loss); the
+// smux keepalive, sent every few seconds, still gets through, so the session
+// survives and the link stays up.
+func TestScopedLinkSurvivesPacketLoss(t *testing.T) {
+	l, hub, spoke := linkToHubStub(t, true)
+
+	hub.faults.Store(newFaults(&p2p.FaultsConfig{DropDataRate: 0.5}))
+	spoke.faults.Store(newFaults(&p2p.FaultsConfig{DropDataRate: 0.5}))
+
+	select {
+	case <-l.done:
+		t.Fatal("a session-scoped link ended under 50% frame loss — the tun would flap on a lossy path")
+	case <-time.After(30 * time.Second):
+		// survived: the session rode through the loss.
 	}
 }
 
