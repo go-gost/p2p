@@ -47,6 +47,8 @@ import (
 	"github.com/coder/websocket"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
+
+	"github.com/go-gost/p2p/internal/clock"
 )
 
 // ErrPeerGone is returned by Recv when the DERP server reports that a peer we
@@ -93,6 +95,14 @@ type PrivateKey [keyLen]byte
 // that is gone, not to police a slow one — a healthy frame write is
 // sub-millisecond, and the DERP server's own keepalives keep a live path busy.
 var writeTimeout = 10 * time.Second
+
+// writeDeadlineMargin is how far past the current time an armed write deadline
+// must still reach. A frame re-arms when the armed deadline falls inside it, so
+// every write is bounded by at least this much — half of writeTimeout, which
+// keeps the bound materially the same as arming per write while paying for the
+// clock read and the deadline update twice per timeout instead of per frame. It
+// is a var to follow writeTimeout when a test shortens it.
+var writeDeadlineMargin = writeTimeout / 2
 
 // PublicKey is a curve25519 public key; its base64 form is the peer address.
 type PublicKey [keyLen]byte
@@ -171,6 +181,11 @@ type Client struct {
 	serverKey PublicKey
 
 	wmu sync.Mutex // serializes all frame writes (including pong replies from Recv)
+
+	// writeDeadlineAt is when the write deadline currently armed on conn
+	// expires. Guarded by wmu, like the arming it describes, so a writer either
+	// sees the deadline it left or arms a new one.
+	writeDeadlineAt time.Time
 
 	// recvAt (unix nanos) and recvN are stamped by Recv on every frame read, and
 	// recvAt once more when the handshake completes (a completed handshake is
@@ -369,7 +384,7 @@ func (c *Client) Recv() (src PublicKey, pkt []byte, err error) {
 		if err != nil {
 			return PublicKey{}, nil, err
 		}
-		c.recvAt.Store(time.Now().UnixNano())
+		c.recvAt.Store(clock.UnixNano())
 		c.recvN.Add(1)
 		switch t {
 		case frameRecvPacket:
@@ -436,10 +451,22 @@ func (c *Client) writeFrame(t byte, body []byte) error {
 	// where TCP still looks open and writes sink into the kernel buffer — must
 	// surface here as an error, or the write parks inside wmu and every other
 	// writer (the engine's keepalive, the pong replies) waits on it: the engine
-	// then never sees a failure and never reconnects. The deadline is per write,
-	// so a live but slow path is not penalised.
-	c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
+	// then never sees a failure and never reconnects.
+	//
+	// The deadline covers every write, but it is armed once per writeTimeout
+	// rather than once per frame. Arming costs a clock read plus two deadline
+	// updates on the connection, which on a busy relay costs several times what
+	// the write itself does. A frame that inherits the armed deadline is bounded
+	// as before: the deadline always reaches at least writeDeadlineMargin past
+	// the current coarse time, so no write can meet an expired one, and a write
+	// that did time out re-arms on the next frame because the spent deadline no
+	// longer reaches. The bound stays per write, so a live but slow path is not
+	// penalised.
+	now := clock.Now()
+	if now.Add(writeDeadlineMargin).After(c.writeDeadlineAt) {
+		c.writeDeadlineAt = now.Add(writeTimeout)
+		c.conn.SetWriteDeadline(c.writeDeadlineAt)
+	}
 	var hdr [frameHeaderLen]byte
 	hdr[0] = t
 	binary.BigEndian.PutUint32(hdr[1:], uint32(len(body)))

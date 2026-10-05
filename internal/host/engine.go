@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/go-gost/p2p"
+	"github.com/go-gost/p2p/internal/clock"
 	"github.com/go-gost/p2p/internal/derpclient"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
@@ -1363,7 +1364,7 @@ func (e *engine) pump(c *derpclient.Client) {
 		// Fault injection (see faults): an inbound data frame is dropped before
 		// delivery, as indistinguishable from a path loss as the outbound one —
 		// which is what starves a session whose peer looks healthy.
-		if e.faults.Load().muteData(time.Now()) {
+		if fs := e.faults.Load(); fs.muteDataArmed() && fs.muteData(clock.Now()) {
 			continue
 		}
 
@@ -1373,7 +1374,7 @@ func (e *engine) pump(c *derpclient.Client) {
 		// place, so every later packet failed against it and the peer had no
 		// inbound path at all until some outbound open happened to replace it.
 		pc := e.peerConn(src)
-		pc.lastFrameAt.Store(time.Now().UnixNano())
+		pc.lastFrameAt.Store(clock.UnixNano())
 		// Ensure a session exists on this side too: inbound packets must be
 		// consumed by smux (which then accepts streams) even when this host
 		// never opens a tunnel to the peer itself.
@@ -2255,7 +2256,7 @@ func (pc *peerConn) Write(p []byte) (int, error) {
 	// Fault injection (see faults): the frame never reaches the relay, and the
 	// write reports success — smux cannot tell this from a path that ate it.
 	faults := pc.e.faults.Load()
-	if faults.muteData(time.Now()) {
+	if faults.muteDataArmed() && faults.muteData(clock.Now()) {
 		return len(p), nil
 	}
 	// Probabilistic loss on the relay data path only: KCP must retransmit the

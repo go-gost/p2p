@@ -155,6 +155,22 @@ func (f *faults) muteData(now time.Time) bool {
 	return f != nil && (f.dropData.Load() || f.silenced(now))
 }
 
+// muteDataArmed reports whether muteData can drop anything at all. Every packet
+// path asks before building the timestamp muteData needs: with no fault
+// configured — the shipping case — muteData is false whatever the time is, so
+// the stamp would be pure per-packet overhead, and a clock read is expensive
+// enough on a host without a TSC to show up in a profile of the relay.
+func (f *faults) muteDataArmed() bool {
+	return f != nil && (f.dropData.Load() || f.silencedArmed())
+}
+
+// silencedArmed reports whether any silence window is configured. It is the
+// cheap half of silenced: the window arithmetic needs a timestamp, the
+// configuration alone does not.
+func (f *faults) silencedArmed() bool {
+	return f != nil && f.silenceFor > 0 && f.silenceEvery > 0
+}
+
 // dropDataPacket reports whether this relay data frame must be dropped now.
 // It is deterministic: a configured rate of r drops every round(1/r)th frame.
 // The counter is per-faults state, so a rebuilt faults resets the sequence.
