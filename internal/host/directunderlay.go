@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 )
@@ -16,7 +17,9 @@ import (
 var seedProbeMagic = [4]byte{0x50, 0x32, 0x50, 0x53} // "P2PS"
 
 // directUnderlayReadTimeout bounds a single ReadFromUDP so the read loop wakes
-// periodically to observe close.
+// periodically to observe close and to surface silence: on the deadline readFrom
+// returns os.ErrDeadlineExceeded, which the pair's direct pump reads as an idle
+// tick rather than a failure. It is the watchdog's granularity.
 const directUnderlayReadTimeout = time.Second
 
 // directUnderlay is one direct (raw UDP) path of a pair: it owns the punched
@@ -48,8 +51,10 @@ func (u *directUnderlay) name() string { return "direct" }
 // readFrom blocks for the next datagram from the punched peer. Datagrams from
 // any other source are dropped (kcp-go's own source lock cannot apply because
 // the pair reports dummyAddr{}). A packet prefixed with seedProbeMagic is
-// echoed back to the peer and skipped, never returned to KCP. It returns io.EOF
-// after close.
+// echoed back to the peer and skipped, never returned to KCP. It returns
+// os.ErrDeadlineExceeded when no datagram arrived within
+// directUnderlayReadTimeout — the pair's direct pump reads that as an idle tick,
+// not a failure — and io.EOF after close.
 func (u *directUnderlay) readFrom(p []byte) (int, error) {
 	for {
 		select {
@@ -70,7 +75,9 @@ func (u *directUnderlay) readFrom(p []byte) (int, error) {
 				return 0, io.EOF
 			}
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
+				// Silence, not failure: hand the tick to the direct pump so it
+				// can run the idle watchdog.
+				return 0, os.ErrDeadlineExceeded
 			}
 			return 0, err
 		}

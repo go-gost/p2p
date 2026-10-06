@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -123,8 +124,10 @@ const (
 // interval (3s): a healthy but momentarily quiet direct path — an idle smux
 // session still exchanges a keepalive every 3s — survives one missed keepalive,
 // while a genuinely silent socket is demoted within a keepalive period of the
-// second miss. The same bound is the H1 "live direct" predicate (Task 0).
-const directUnderlayIdle = 6 * time.Second
+// second miss. The same bound is the H1 "live direct" predicate (Task 0) and the
+// watchdog's fire threshold (Task 4). It is a var so tests can shorten it; the
+// production default is 6s.
+var directUnderlayIdle = 6 * time.Second
 
 // newRelayKCPPair builds the pair-level KCP holder for peer: the KCP session
 // lives on the pair (like the pair's secure session — "one per (peer,
@@ -207,6 +210,13 @@ type relayKCPPair struct {
 	direct         *directUnderlay
 	directStop     chan struct{}
 	lastDirectRecv time.Time
+
+	// onDirectIdle, when set by the engine (Task 7), is invoked once per idle
+	// episode when the direct pump observes the underlay silent past
+	// directUnderlayIdle. It is read under mu and called outside it, from its own
+	// goroutine, so the engine's retirement (clearDirectUnderlay) can never join
+	// the pump that reported the idle. Guarded by mu.
+	onDirectIdle func(*directUnderlay)
 
 	// bytesSent/bytesRcvd count the pair's datagrams in bytes, on the paths the
 	// pair already walks: bytesSent in WriteTo (whichever path it picks), and
@@ -516,16 +526,43 @@ func (p *relayKCPPair) clearDirectUnderlay() {
 // Like pumpRelay, a datagram already drained is preferred over stop/done on the
 // fast path, and done is consulted only when recv is full, where the pump must
 // not outlive the pair waiting for a consumer that is gone.
+//
+// readFrom surfaces a silent socket as os.ErrDeadlineExceeded on its
+// directUnderlayReadTimeout deadline (it is otherwise parked in the kernel and
+// could never notice silence). This pump reads that tick as the idle watchdog:
+// once the underlay has been silent past directUnderlayIdle it reports it to the
+// engine through onDirectIdle, once per idle episode, and a fresh datagram
+// re-arms it. The pump never clears the underlay itself — the engine decides.
 func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 	buf := make([]byte, relayKCPMtu)
+	// idleFired is the episode latch: set when the watchdog reports this
+	// underlay silent, cleared the moment a datagram arrives, so each
+	// uninterrupted silence fires onDirectIdle exactly once. It lives on the
+	// pump's own goroutine and needs no lock.
+	idleFired := false
 	for {
 		n, err := u.readFrom(buf)
 		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				// Silence tick: consult the watchdog bound. On the first
+				// silent tick of an episode, hand the underlay to the engine
+				// outside p.mu.
+				if p.directIdle(u) {
+					if !idleFired && p.fireDirectIdle(u) {
+						idleFired = true
+					}
+				} else {
+					idleFired = false
+				}
+				continue
+			}
 			return
 		}
 		if n <= 0 {
 			continue
 		}
+		// A datagram re-arms the watchdog and re-seeds the recency stamp.
+		idleFired = false
 		p.bytesRcvd.Add(uint64(n))
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
@@ -546,6 +583,31 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 			}
 		}
 	}
+}
+
+// directIdle reports whether u is still the pair's installed direct underlay and
+// has gone silent past directUnderlayIdle. It re-checks u's identity so a tick
+// from a pump retired by a replacement cannot report the replacement idle.
+func (p *relayKCPPair) directIdle(u *directUnderlay) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.direct == u && time.Since(p.lastDirectRecv) >= directUnderlayIdle
+}
+
+// fireDirectIdle hands a silent direct underlay to the engine's callback (Task
+// 7), if one is set, and reports whether a callback was invoked. It captures the
+// callback under p.mu and runs it in its own goroutine: the callback retires the
+// underlay and re-punches, and the pump that observed the idle must never block
+// on a clear that could join it (H4).
+func (p *relayKCPPair) fireDirectIdle(u *directUnderlay) bool {
+	p.mu.Lock()
+	cb := p.onDirectIdle
+	p.mu.Unlock()
+	if cb == nil {
+		return false
+	}
+	go cb(u)
+	return true
 }
 
 // preferredDirect reports whether the direct underlay is the path WriteTo should

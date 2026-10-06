@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -470,6 +471,177 @@ func TestPairDirectPumpStopsOnShutdown(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ReadFrom did not return io.EOF after shutdown")
+	}
+}
+
+// TestPairDirectIdleFiresCallbackOnce pins the idle watchdog's callback
+// contract: pumpDirect surfaces a silent direct underlay to onDirectIdle exactly
+// once per idle episode, and a fresh inbound datagram re-arms it. The callback
+// is invoked outside p.mu, so the test's callback may perform the engine's
+// retirement (clearDirectUnderlay) synchronously; doing so must not deadlock the
+// pump that invoked it (H4). The guard is the callback's second fire clearing
+// the underlay: if clear self-joined the invoking pump, the callback would never
+// signal and the test would time out.
+func TestPairDirectIdleFiresCallbackOnce(t *testing.T) {
+	oldIdle := directUnderlayIdle
+	directUnderlayIdle = 150 * time.Millisecond
+	defer func() { directUnderlayIdle = oldIdle }()
+
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{11}
+	pair := e.relayKCPPairFor(peer)
+	defer pair.shutdown()
+
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	defer b.Close()
+	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
+
+	before := runtime.NumGoroutine()
+
+	var fires atomic.Int64
+	fired := make(chan int64, 8)
+	pair.mu.Lock()
+	pair.onDirectIdle = func(u *directUnderlay) {
+		n := fires.Add(1)
+		if n == 2 {
+			// The engine's response to a dead direct: clear it (signal-only,
+			// so this cannot join the pump that invoked us) and re-punch. The
+			// callback runs in its own goroutine, so even a joining clear could
+			// not deadlock the pump.
+			pair.clearDirectUnderlay()
+		}
+		fired <- n
+	}
+	pair.mu.Unlock()
+
+	// Deliver one packet, then go silent. Reading it back through the pair
+	// proves the pump stamped lastDirectRecv before the idle clock starts.
+	if _, err := b.WriteToUDP([]byte("alive"), a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("peer write: %v", err)
+	}
+	buf := make([]byte, 64)
+	if n, _, err := pair.ReadFrom(buf); err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	} else if got := string(buf[:n]); got != "alive" {
+		t.Fatalf("ReadFrom = %q, want %q", got, "alive")
+	}
+
+	// First idle episode: the callback fires once.
+	select {
+	case n := <-fired:
+		if n != 1 {
+			t.Fatalf("first callback fire = %d, want 1", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("onDirectIdle did not fire after the direct went silent")
+	}
+
+	// Still silent across another read tick: no second fire for one episode.
+	time.Sleep(1500 * time.Millisecond)
+	if got := fires.Load(); got != 1 {
+		t.Fatalf("onDirectIdle fired %d times in one idle episode, want 1", got)
+	}
+
+	// A fresh datagram re-arms the watchdog.
+	if _, err := b.WriteToUDP([]byte("again"), a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("peer write: %v", err)
+	}
+	if n, _, err := pair.ReadFrom(buf); err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	} else if got := string(buf[:n]); got != "again" {
+		t.Fatalf("ReadFrom = %q, want %q", got, "again")
+	}
+	select {
+	case n := <-fired:
+		if n != 2 {
+			t.Fatalf("second callback fire = %d, want 2", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("onDirectIdle did not re-arm after a fresh datagram")
+	}
+
+	// H4: the callback cleared the underlay; the pump it ran from must exit.
+	pair.mu.Lock()
+	directDone := pair.directPumpDone
+	pair.mu.Unlock()
+	select {
+	case <-directDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the direct pump did not exit after its callback cleared the underlay")
+	}
+
+	// No goroutine leak: the direct pump and the callback goroutine are gone.
+	settleGoroutines(t, before)
+}
+
+// TestPairCloseReturnsEOF pins the pair-end contract: with both underlays
+// installed, shutdown closes p.done and a blocked ReadFrom returns io.EOF after
+// draining, so kcp-go's read loop ends and smux sees the pair end. It also
+// guards the leak the watchdog could introduce: the direct pump must exit and
+// the goroutine count must settle back.
+func TestPairCloseReturnsEOF(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{12}
+	pair := e.relayKCPPairFor(peer)
+
+	pc := &peerConn{
+		e:       e,
+		peer:    peer,
+		inbound: make(chan []byte, 1),
+		closeCh: make(chan struct{}),
+	}
+	pair.register(pc)
+
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	defer b.Close()
+	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
+
+	pair.mu.Lock()
+	directDone := pair.directPumpDone
+	pair.mu.Unlock()
+
+	before := runtime.NumGoroutine()
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		_, _, err := pair.ReadFrom(buf)
+		readErr <- err
+	}()
+
+	pair.shutdown()
+
+	select {
+	case err := <-readErr:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("ReadFrom after shutdown = %v, want io.EOF", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a blocked ReadFrom did not return io.EOF after shutdown")
+	}
+
+	select {
+	case <-directDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the direct pump did not exit after shutdown")
+	}
+
+	// No goroutine leak: the reader and both pumps have exited.
+	settleGoroutines(t, before)
+}
+
+// settleGoroutines waits (bounded) for the live goroutine count to fall back to
+// the baseline captured before the test started its readers/pumps, and fails if
+// it stays above it. The bound absorbs transient runtime goroutines.
+func settleGoroutines(t *testing.T, before int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > before {
+		t.Fatalf("goroutine leak: %d before, %d after settle", before, got)
 	}
 }
 
