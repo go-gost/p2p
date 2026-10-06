@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,13 +31,35 @@ type directUnderlay struct {
 	sock *net.UDPConn
 	peer netip.AddrPort
 
+	// localToken is this side's raw-UDP seed token (Task 6), set by
+	// newDirectUnderlayToken when the punch threads it through. A seed packet
+	// carrying it is this side's own probe coming back as the peer's echo, not
+	// the peer's probe, and must never be echoed again. hasToken says whether
+	// localToken is meaningful (a bare newDirectUnderlay leaves it unset).
+	localToken [seedTokenLen]byte
+	hasToken   bool
+
+	// echoed remembers the peer token this side already echoed, so a peer token
+	// arriving again (the echo of our echo) is dropped even when localToken is
+	// unknown. A handshake carries one peer token, so one slot is enough. It is
+	// read and written only on the single readFrom goroutine.
+	echoed     [seedTokenLen]byte
+	haveEchoed bool
+
+	// seedEchoes counts seed probes this underlay has echoed. Diagnostic, and
+	// the two-underlay quiesce test's observable: a ping-pong would keep it
+	// climbing. Atomic so a status/test read never contends with readFrom.
+	seedEchoes atomic.Int64
+
 	done chan struct{}
 	once sync.Once
 	err  error
 }
 
 // newDirectUnderlay wraps an already-punched UDP socket for peer. The underlay
-// takes ownership of sock: close closes it.
+// takes ownership of sock: close closes it. The seed echo is deduped but not
+// token-aware (localToken is unset); use newDirectUnderlayToken when the seed
+// handshake's token is known.
 func newDirectUnderlay(sock *net.UDPConn, peer netip.AddrPort) *directUnderlay {
 	return &directUnderlay{
 		sock: sock,
@@ -45,14 +68,48 @@ func newDirectUnderlay(sock *net.UDPConn, peer netip.AddrPort) *directUnderlay {
 	}
 }
 
+// newDirectUnderlayToken is newDirectUnderlay with this side's raw-UDP seed
+// token (Task 6). Knowing it lets the underlay drop its own returning echo
+// instead of echoing it back, so two registered underlays cannot ping-pong
+// (the parked H2 ruling). The punch tail calls this after seedHandshakeUDPToken.
+func newDirectUnderlayToken(sock *net.UDPConn, peer netip.AddrPort, token [seedTokenLen]byte) *directUnderlay {
+	u := newDirectUnderlay(sock, peer)
+	u.localToken = token
+	u.hasToken = true
+	return u
+}
+
+// echoSeed consumes one datagram known to carry seedProbeMagic and at least a
+// full token, echoing the peer's probe back to it once. It reports whether it
+// echoed. A packet carrying this side's own token (its echo coming back) or a
+// peer token already echoed is dropped, never echoed again: that is what keeps
+// the echo from ping-ponging between two registered underlays. pkt is echoed
+// verbatim, so a peer whose own echo was lost still sees its probe returned.
+func (u *directUnderlay) echoSeed(pkt []byte) bool {
+	var tok [seedTokenLen]byte
+	copy(tok[:], pkt[len(seedProbeMagic):len(seedProbeMagic)+seedTokenLen])
+	if u.hasToken && tok == u.localToken {
+		return false // our own probe, echoed back by the peer: never re-echo
+	}
+	if u.haveEchoed && tok == u.echoed {
+		return false // already echoed this peer token once
+	}
+	u.echoed = tok
+	u.haveEchoed = true
+	_, _ = u.sock.WriteToUDP(pkt, net.UDPAddrFromAddrPort(u.peer))
+	u.seedEchoes.Add(1)
+	return true
+}
+
 // name identifies the underlay for stats and preferred-path selection.
 func (u *directUnderlay) name() string { return "direct" }
 
 // readFrom blocks for the next datagram from the punched peer. Datagrams from
 // any other source are dropped (kcp-go's own source lock cannot apply because
 // the pair reports dummyAddr{}). A packet prefixed with seedProbeMagic is
-// echoed back to the peer and skipped, never returned to KCP. It returns
-// os.ErrDeadlineExceeded when no datagram arrived within
+// echoed back to the peer and skipped, never returned to KCP; the echo is
+// token-aware (see echoSeed) so two registered underlays cannot ping-pong. It
+// returns os.ErrDeadlineExceeded when no datagram arrived within
 // directUnderlayReadTimeout — the pair's direct pump reads that as an idle tick,
 // not a failure — and io.EOF after close.
 func (u *directUnderlay) readFrom(p []byte) (int, error) {
@@ -85,10 +142,13 @@ func (u *directUnderlay) readFrom(p []byte) (int, error) {
 			continue
 		}
 		if bytes.HasPrefix(p[:n], seedProbeMagic[:]) {
-			// Late seed responder: echo the probe back so a peer whose own
-			// echo was lost can still complete its seed. Errors are ignored;
-			// the peer retransmits its probe.
-			_, _ = u.sock.WriteToUDP(p[:n], net.UDPAddrFromAddrPort(u.peer))
+			// Late seed responder: echo the peer's probe so a peer whose own
+			// echo was lost can still complete its seed. A malformed packet
+			// (magic without a full token) is dropped; it is never surfaced to
+			// KCP either way. echoSeed decides whether to echo (token-aware).
+			if n >= len(seedProbeMagic)+seedTokenLen {
+				u.echoSeed(p[:n])
+			}
 			continue
 		}
 		return n, nil

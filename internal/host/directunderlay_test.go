@@ -82,17 +82,21 @@ func TestDirectUnderlayFiltersForeignSource(t *testing.T) {
 	}
 }
 
-// TestDirectUnderlayEchoesSeedMagic: a seed magic packet is echoed back to the
-// peer (late seed responder) and never handed to KCP.
+// TestDirectUnderlayEchoesSeedMagic: a peer's seed probe is echoed back to the
+// peer (late seed responder) and never handed to KCP, while this side's own
+// token coming back is dropped, not echoed again — the H2 loop guard.
 func TestDirectUnderlayEchoesSeedMagic(t *testing.T) {
 	a := mustListenUDP(t)
 	b := mustListenUDP(t)
-	u := newDirectUnderlay(a, udpAddrPort(t, b))
+	var mine [seedTokenLen]byte
+	mine[0] = 1
+	u := newDirectUnderlayToken(a, udpAddrPort(t, b), mine)
 	defer u.close()
 	defer b.Close()
 
-	seed := append(append([]byte(nil), seedProbeMagic[:]...), 'x')
-	if _, err := b.WriteToUDP(seed, a.LocalAddr().(*net.UDPAddr)); err != nil {
+	peerProbe := append(append([]byte(nil), seedProbeMagic[:]...), make([]byte, seedTokenLen)...)
+	peerProbe[len(seedProbeMagic)] = 2 // a peer token, distinct from ours
+	if _, err := b.WriteToUDP(peerProbe, a.LocalAddr().(*net.UDPAddr)); err != nil {
 		t.Fatalf("b seed write: %v", err)
 	}
 	if _, err := b.WriteToUDP([]byte("kcp"), a.LocalAddr().(*net.UDPAddr)); err != nil {
@@ -115,8 +119,31 @@ func TestDirectUnderlayEchoesSeedMagic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("peer did not receive the seed echo: %v", err)
 	}
-	if !bytes.Equal(buf[:n], seed) {
-		t.Fatalf("seed echo = %q, want %q", buf[:n], seed)
+	if !bytes.Equal(buf[:n], peerProbe) {
+		t.Fatalf("seed echo = %q, want %q", buf[:n], peerProbe)
+	}
+
+	// Our own token coming back is our echo of the peer's probe: it must be
+	// dropped, never re-echoed (or two registered underlays ping-pong).
+	own := append(append([]byte(nil), seedProbeMagic[:]...), mine[:]...)
+	if _, err := b.WriteToUDP(own, a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("b own-token write: %v", err)
+	}
+	if _, err := b.WriteToUDP([]byte("kcp2"), a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("b kcp2 write: %v", err)
+	}
+	second := readOne(u)
+	select {
+	case got := <-second:
+		if got != "kcp2" {
+			t.Fatalf("second read = %q, want %q", got, "kcp2")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the second KCP datagram")
+	}
+	b.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, _, err := b.ReadFromUDP(buf); err == nil {
+		t.Fatalf("own-token seed packet was echoed back: %q", buf[:n])
 	}
 }
 

@@ -130,6 +130,20 @@ var (
 	seedTimeout = 5 * time.Second
 )
 
+// seedRetransmit is how often seedHandshakeUDP resends its probe while it waits
+// for its own token to come back. The read deadline between sends is the same
+// interval, so a retransmit and the wait for a reply interleave.
+const seedRetransmit = 200 * time.Millisecond
+
+// seedTokenLen is the per-side seed token length. Long enough that two peers
+// never collide by chance, short enough to keep the probe tiny. The underlay
+// uses it to tell a peer's probe from this side's own returning echo.
+const seedTokenLen = 8
+
+// errSeedTimeout reports that the raw-UDP seed handshake saw no echo of its own
+// token before the timeout.
+var errSeedTimeout = errors.New("host: seed handshake timeout")
+
 type directState int
 
 const (
@@ -1345,6 +1359,97 @@ func seedHandshake(c net.Conn, timeout time.Duration) error {
 		return errors.New("derp engine: seed echo mismatch")
 	}
 	return nil
+}
+
+// seedHandshakeUDP runs the raw-UDP token-echo seed handshake and discards the
+// token. Callers that will wrap the same socket in a directUnderlay must use
+// seedHandshakeUDPToken instead: the underlay needs the token to tell the
+// peer's probe from this side's own returning echo (the H2 loop guard).
+func seedHandshakeUDP(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) error {
+	_, err := seedHandshakeUDPToken(sock, peer, timeout)
+	return err
+}
+
+// seedHandshakeUDPToken runs the symmetric token echo over a raw UDP socket and
+// returns the local token it used. It mirrors seedHandshake's semantics without
+// a reliability layer: it writes its own token to peer every seedRetransmit
+// until it reads that same token back, and it echoes the peer's probe once so
+// the peer's own handshake can complete. A raw UDP socket has no retransmit, so
+// the resend loop stands in for KCP's send window; the read deadline between
+// sends is short so a retransmit interleaves with waiting for a reply.
+//
+// Only a datagram from peer and carrying seedProbeMagic with a full token is
+// considered. Success requires a full own->peer->own round trip, so a half-open
+// path (we receive but our bytes never arrive) times out instead of producing a
+// false direct session. A packet carrying our own token is our probe coming
+// back; a peer token already echoed is the echo of our echo, and neither is
+// echoed again — otherwise two registered underlays would loop forever (H2).
+func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) ([seedTokenLen]byte, error) {
+	var token [seedTokenLen]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return token, err
+	}
+	probe := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
+	probe = append(probe, seedProbeMagic[:]...)
+	probe = append(probe, token[:]...)
+	dst := net.UDPAddrFromAddrPort(peer)
+	// The underlay that later owns this socket sets its own read deadline per
+	// read, so this is only hygiene; clear it so no stale short deadline
+	// survives the handshake.
+	defer sock.SetReadDeadline(time.Time{})
+
+	deadline := time.Now().Add(timeout)
+	next := time.Now() // send immediately
+	buf := make([]byte, 2048)
+	var (
+		echoed     [seedTokenLen]byte // the peer token this side last echoed
+		haveEchoed bool
+	)
+	for {
+		now := time.Now()
+		if !now.Before(deadline) {
+			return token, errSeedTimeout
+		}
+		if !now.Before(next) {
+			if _, err := sock.WriteToUDP(probe, dst); err != nil {
+				return token, err
+			}
+			next = now.Add(seedRetransmit)
+		}
+		readBy := next
+		if readBy.After(deadline) {
+			readBy = deadline
+		}
+		if err := sock.SetReadDeadline(readBy); err != nil {
+			return token, err
+		}
+		n, src, err := sock.ReadFromUDP(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue // time to retransmit or to give up
+			}
+			return token, err
+		}
+		if !sameAddrPort(src.AddrPort(), peer) {
+			continue
+		}
+		if n < len(seedProbeMagic)+seedTokenLen || !bytes.Equal(buf[:len(seedProbeMagic)], seedProbeMagic[:]) {
+			continue
+		}
+		var got [seedTokenLen]byte
+		copy(got[:], buf[len(seedProbeMagic):len(seedProbeMagic)+seedTokenLen])
+		if got == token {
+			return token, nil // the peer echoed our probe
+		}
+		if !haveEchoed || got != echoed {
+			haveEchoed = true
+			echoed = got
+			echo := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
+			echo = append(echo, seedProbeMagic[:]...)
+			echo = append(echo, got[:]...)
+			_, _ = sock.WriteToUDP(echo, dst)
+		}
+	}
 }
 
 // fresherCandidates returns the newest candidate list to arrive within grace,

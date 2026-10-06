@@ -207,6 +207,187 @@ func TestSeedHandshake(t *testing.T) {
 	}
 }
 
+// TestSeedHandshakeUDPRoundTrip: two raw-UDP sockets run the token-echo
+// handshake at each other; both complete within the timeout. It is the raw-UDP
+// analogue of TestSeedHandshake, over the socket the punch actually owns.
+func TestSeedHandshakeUDPRoundTrip(t *testing.T) {
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	defer a.Close()
+	defer b.Close()
+	pa, pb := udpAddrPort(t, a), udpAddrPort(t, b)
+
+	seedHandshakeUDPRetry(t, a, b, pa, pb)
+}
+
+// TestSeedHandshakeUDPTimesOut: one side runs alone; nothing echoes its token,
+// so it returns an error once the timeout elapses.
+func TestSeedHandshakeUDPTimesOut(t *testing.T) {
+	a := mustListenUDP(t)
+	b := mustListenUDP(t) // a valid peer address that never answers
+	defer a.Close()
+	defer b.Close()
+
+	start := time.Now()
+	err := seedHandshakeUDP(a, udpAddrPort(t, b), 300*time.Millisecond)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("seedHandshakeUDP returned nil with no responder")
+	}
+	if elapsed < 250*time.Millisecond {
+		t.Fatalf("seedHandshakeUDP returned after %v, want the timeout to be waited out", elapsed)
+	}
+}
+
+// TestSeedHandshakeUDPIgnoresNoise: a datagram without the seed magic (from the
+// peer) and a seed-magic probe from a third socket (wrong source) must not
+// complete the handshake. Neither is an echo of this side's own token, so it
+// must time out. The send may fail with the sandbox's intermittent EPERM, which
+// is also a non-nil error: either way it never falsely succeeds.
+func TestSeedHandshakeUDPIgnoresNoise(t *testing.T) {
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	c := mustListenUDP(t) // foreign source
+	defer a.Close()
+	defer b.Close()
+	defer c.Close()
+
+	if _, err := b.WriteToUDP([]byte("hello"), a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+	noise := append(append([]byte(nil), seedProbeMagic[:]...), make([]byte, seedTokenLen)...)
+	if _, err := c.WriteToUDP(noise, a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedHandshakeUDP(a, udpAddrPort(t, b), 400*time.Millisecond); err == nil {
+		t.Fatal("seedHandshakeUDP completed on non-seed/foreign noise")
+	}
+}
+
+// drainUDP discards datagrams already queued on c until a short read window
+// elapses.
+func drainUDP(c *net.UDPConn) {
+	c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	buf := make([]byte, 2048)
+	for {
+		if _, _, err := c.ReadFromUDP(buf); err != nil {
+			return
+		}
+	}
+}
+
+// seedHandshakeUDPOnce runs seedHandshakeUDP at each end of the a/b pair.
+func seedHandshakeUDPOnce(a, b *net.UDPConn, pa, pb netip.AddrPort) (errA, errB error) {
+	ra, rb := make(chan error, 1), make(chan error, 1)
+	go func() { ra <- seedHandshakeUDP(a, pb, 2*time.Second) }()
+	go func() { rb <- seedHandshakeUDP(b, pa, 2*time.Second) }()
+	return <-ra, <-rb
+}
+
+// seedHandshakeUDPRetry runs seedHandshakeUDPOnce until both ends succeed. This
+// sandbox intermittently denies sendto (EPERM) under load — environmental, and
+// absent in CI (the same flake TestSeedHandshake documents) — so a transient
+// denial is retried; a real handshake defect fails every attempt.
+func seedHandshakeUDPRetry(t *testing.T, a, b *net.UDPConn, pa, pb netip.AddrPort) {
+	t.Helper()
+	var errA, errB error
+	for attempt := 0; attempt < 5; attempt++ {
+		errA, errB = seedHandshakeUDPOnce(a, b, pa, pb)
+		if errA == nil && errB == nil {
+			return
+		}
+		drainUDP(a)
+		drainUDP(b)
+	}
+	t.Fatalf("seedHandshakeUDP: A=%v B=%v", errA, errB)
+}
+
+// seedHandshakeUDPPair completes the token handshake at each end of the a/b
+// socket pair and returns both tokens. It retries for the same environmental
+// EPERM reason as seedHandshakeUDPRetry; here the handshake is setup for the
+// echo-quiesce test, which is what this returns the tokens for.
+func seedHandshakeUDPPair(t *testing.T, a, b *net.UDPConn, pa, pb netip.AddrPort) (ta, tb [seedTokenLen]byte) {
+	t.Helper()
+	var errA, errB error
+	for attempt := 0; attempt < 5; attempt++ {
+		type res struct {
+			tok [seedTokenLen]byte
+			err error
+		}
+		ra, rb := make(chan res, 1), make(chan res, 1)
+		go func() { tok, err := seedHandshakeUDPToken(a, pb, 2*time.Second); ra <- res{tok, err} }()
+		go func() { tok, err := seedHandshakeUDPToken(b, pa, 2*time.Second); rb <- res{tok, err} }()
+		x, y := <-ra, <-rb
+		ta, tb, errA, errB = x.tok, y.tok, x.err, y.err
+		if errA == nil && errB == nil {
+			return ta, tb
+		}
+		drainUDP(a)
+		drainUDP(b)
+	}
+	t.Fatalf("seed handshakes: A=%v B=%v", errA, errB)
+	return ta, tb
+}
+
+// TestDirectUnderlaySeedEchoQuiesces is the two-underlay quiesce test for the
+// parked H2 ping-pong ruling: with the seed echo made token-aware, two
+// registered underlays must not echo each other's echoes forever. Both seed
+// handshakes complete first (as the punch tail does), then both sides' probes
+// are delivered. Each side echoes the peer's probe exactly once; the returning
+// echo carries this side's own token and is dropped instead of echoed again, so
+// the exchange goes quiet.
+func TestDirectUnderlaySeedEchoQuiesces(t *testing.T) {
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	pa, pb := udpAddrPort(t, a), udpAddrPort(t, b)
+
+	tokA, tokB := seedHandshakeUDPPair(t, a, b, pa, pb)
+	// Drain any retransmitted probes still in flight after the handshakes, so
+	// the echo counts below start from a clean socket.
+	drainUDP(a)
+	drainUDP(b)
+
+	uA := newDirectUnderlayToken(a, pb, tokA)
+	uB := newDirectUnderlayToken(b, pa, tokB)
+	defer uA.close()
+	defer uB.close()
+
+	readLoop := func(u *directUnderlay) {
+		buf := make([]byte, 2048)
+		for {
+			if _, err := u.readFrom(buf); err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+				return
+			}
+		}
+	}
+	go readLoop(uA)
+	go readLoop(uB)
+
+	// Both sides still probing (the late-responder scenario): each sends its
+	// own-token probe to the peer.
+	probe := func(tok [seedTokenLen]byte) []byte {
+		p := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
+		p = append(p, seedProbeMagic[:]...)
+		p = append(p, tok[:]...)
+		return p
+	}
+	if _, err := uA.writeTo(probe(tokA)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := uB.writeTo(probe(tokB)); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		return uA.seedEchoes.Load() == 1 && uB.seedEchoes.Load() == 1
+	})
+	// Let any ping-pong play out: a looping echo would keep incrementing.
+	time.Sleep(3 * seedRetransmit)
+	if gotA, gotB := uA.seedEchoes.Load(), uB.seedEchoes.Load(); gotA != 1 || gotB != 1 {
+		t.Fatalf("seed echo ping-ponged: A echoed %d, B echoed %d, want exactly 1 each", gotA, gotB)
+	}
+}
+
 // TestMutualNewConn3Merge: two kcp.NewConn3 endpoints dialing each other's
 // address with the same conv merge into one working bidirectional session
 // without any listener — the transport-level property the mutual punch
