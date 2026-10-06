@@ -23,7 +23,7 @@ func TestFaultsOffByDefault(t *testing.T) {
 		"zero config": newFaults(&p2p.FaultsConfig{}),
 		"nil state":   nil,
 	} {
-		if f.muteCtrl(now) || f.muteData(now) || f.pong() || f.silenced(now) {
+		if f.muteCtrl(now) || f.muteData(now) || f.muteDirect() || f.pong() || f.silenced(now) {
 			t.Fatalf("%s must inject nothing", name)
 		}
 	}
@@ -69,11 +69,12 @@ func TestFaultsWarnNamesTheKnobs(t *testing.T) {
 
 	newFaults(&p2p.FaultsConfig{
 		DropData:     true,
+		DropDirect:   true,
 		DropDataRate: 0.25,
 		SilenceFor:   time.Second,
 		SilenceEvery: time.Minute,
 	}).warn(log)
-	for _, want := range []string{"fault injection", "dropData", "dropDataRate(0.25)", "silence(1s every 1m0s)"} {
+	for _, want := range []string{"fault injection", "dropData", "dropDirect", "dropDataRate(0.25)", "silence(1s every 1m0s)"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Fatalf("warning %q does not name %q", buf.String(), want)
 		}
@@ -211,6 +212,47 @@ func TestDropDataStarvesADirectSession(t *testing.T) {
 	// 1-2x the direct idle bound plus a tick: the bound is what separates a
 	// starved path from one that is merely idle.
 	waitFor(t, 2*directUnderlayIdle, func() bool { return dcB.drops.Load() >= 1 })
+}
+
+// TestFaultMuteDirectFallsBackToRelay pins the per-path mute (Task 12 / O7):
+// DropDirect silences the direct underlay alone, in both directions, while the
+// relay keeps working. A's direct goes silent, so both sides' direct paths
+// stale out and are retired; the pair falls back to the relay and a fresh stream
+// still completes byte-exact. That is "direct dies, relay recovers" — the
+// complement of the all-path mute, which retires direct without a relay to
+// recover onto.
+func TestFaultMuteDirectFallsBackToRelay(t *testing.T) {
+	a, b, _ := startPunchedPair(t)
+
+	dcB := watchDirect(t, b, a)
+	pairB := b.relayKCPPairFor(a.pub)
+	if !pairB.preferredDirect() {
+		t.Fatal("B must prefer direct before a direct-only mute")
+	}
+
+	// A mutes the direct underlay only: its relay control and data stay up.
+	a.faults.Store(newFaults(&p2p.FaultsConfig{DropDirect: true}))
+
+	// A stops sending on direct (so B stales) and drops what B sends (so A
+	// stales). B's direct underlay is retired by its idle watchdog while the
+	// relay stays up — "direct dies" without the relay going with it.
+	waitFor(t, 3*directUnderlayIdle, func() bool {
+		return dcB.drops.Load() >= 1 && !pairB.preferredDirect()
+	})
+	if !b.relayConnected() {
+		t.Fatal("the relay connection died with the direct-only mute")
+	}
+
+	// "Relay recovers": a stream opened now completes byte-exact. A opens
+	// because B holds the echo target in this harness (the base stream in
+	// startPunchedPair ran the same direction); A's pair has fallen back to the
+	// relay (its direct is stale, so not preferred), and B's has.
+	s, err := a.OpenStream(b.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	roundTrip(t, s, "direct is muted, relay carried this")
 }
 
 // TestFaultsDropDataRate pins the probabilistic data-frame loss injector: a

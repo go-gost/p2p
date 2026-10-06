@@ -23,6 +23,9 @@ import (
 // at startup and never changed again. See p2p.FaultsConfig.
 type faults struct {
 	dropCtrl, dropData, dropPong atomic.Bool
+	// dropDirect is the per-path mute: data on the direct underlay alone,
+	// both directions, while the relay keeps working.
+	dropDirect atomic.Bool
 
 	// dropDataRate is the configured ratio, logged at startup. dropDataPeriod
 	// is the precomputed drop interval (0 when disabled); dropDataSeq counts
@@ -64,6 +67,7 @@ func newFaults(cfg *p2p.FaultsConfig) *faults {
 	f.dropCtrl.Store(cfg.DropCtrl)
 	f.dropData.Store(cfg.DropData)
 	f.dropPong.Store(cfg.DropPong)
+	f.dropDirect.Store(cfg.DropDirect)
 	if cfg.DropDataRate > 0 {
 		period := uint64(math.Round(1 / cfg.DropDataRate))
 		if period < 1 {
@@ -99,6 +103,9 @@ func faultKnobs(cfg *p2p.FaultsConfig) []string {
 	}
 	if cfg.DropData {
 		on = append(on, "dropData")
+	}
+	if cfg.DropDirect {
+		on = append(on, "dropDirect")
 	}
 	if cfg.DropDataRate > 0 {
 		on = append(on, fmt.Sprintf("dropDataRate(%g)", cfg.DropDataRate))
@@ -153,6 +160,17 @@ func (f *faults) muteCtrl(now time.Time) bool {
 // silence is a mute on the whole peer link, not a data-only one.
 func (f *faults) muteData(now time.Time) bool {
 	return f != nil && (f.dropData.Load() || f.silenced(now))
+}
+
+// muteDirect reports whether data on the direct underlay must be dropped now, in
+// either direction. It is the per-path mute: unlike muteData it never touches
+// the relay path, so the pair can fall back to the relay and recover while the
+// fault and a test's assertions are both live. It is deliberately independent of
+// the silence window — that is a whole-link mute, which muteData (checked first)
+// already applies, so folding it in here would only add a branch to the direct
+// send path.
+func (f *faults) muteDirect() bool {
+	return f != nil && f.dropDirect.Load()
 }
 
 // muteDataArmed reports whether muteData can drop anything at all. Every packet

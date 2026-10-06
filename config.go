@@ -42,6 +42,12 @@ type FaultsConfig struct {
 	// DropData drops every data frame — tunnel payload and the smux keepalive
 	// NOP alike — on both the relay and the direct path, in both directions.
 	DropData bool `yaml:"dropData" json:"dropData"`
+	// DropDirect drops data on the direct underlay only, in both directions,
+	// while the relay path keeps working. It is the per-path mute: it forces
+	// "direct dies, relay recovers" so a test can watch the pair fall back
+	// without breaking the relay. Like the other faults it is built from the
+	// config at startup and never changes at runtime.
+	DropDirect bool `yaml:"dropDirect" json:"dropDirect"`
 	// DropPong swallows the relay's pong replies: our own answer to the relay's
 	// ping and the stamp that feeds the relay-silence watchdog, so a live relay
 	// reads as a dead one.

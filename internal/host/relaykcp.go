@@ -692,6 +692,13 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 		if n <= 0 {
 			continue
 		}
+		// Per-path mute (Task 12 / O7): an inbound direct datagram is swallowed
+		// before it re-arms the watchdog or re-seeds the recency, so a direct
+		// path that is still receiving traffic (KCP's own keepalives and ACKs)
+		// reads as silent and is retired — while the relay stays alive.
+		if p.e != nil && p.e.faults.Load().muteDirect() {
+			continue
+		}
 		// A datagram re-arms the watchdog, re-seeds the recency stamp, and
 		// re-elects the direct path — so the session's congestion control
 		// follows it back to direct.
@@ -1138,7 +1145,6 @@ func (p *relayKCPPair) WriteTo(b []byte, _ net.Addr) (int, error) {
 			return len(b), nil
 		}
 	}
-	p.bytesSent.Add(uint64(len(b)))
 	p.mu.Lock()
 	direct := p.direct
 	useDirect := p.preferredDirectLocked()
@@ -1147,6 +1153,15 @@ func (p *relayKCPPair) WriteTo(b []byte, _ net.Addr) (int, error) {
 	if closed {
 		return 0, io.ErrClosedPipe
 	}
+	// Per-path mute (Task 12 / O7): the direct underlay alone is silenced, so
+	// the pair can fall back to the relay and recover while the fault is live.
+	// It is checked after the all-path mute above and before the counters, so
+	// the two faults stay independent and the per-underlay counters remain a
+	// partition of the total — a dropped direct datagram is counted on neither.
+	if useDirect && p.e != nil && p.e.faults.Load().muteDirect() {
+		return len(b), nil
+	}
+	p.bytesSent.Add(uint64(len(b)))
 	if useDirect {
 		p.directBytesSent.Add(uint64(len(b)))
 		if _, err := direct.writeTo(b); err != nil {
