@@ -35,16 +35,11 @@ type directUnderlay struct {
 	// newDirectUnderlayToken when the punch threads it through. A seed packet
 	// carrying it is this side's own probe coming back as the peer's echo, not
 	// the peer's probe, and must never be echoed again. hasToken says whether
-	// localToken is meaningful (a bare newDirectUnderlay leaves it unset).
+	// localToken is meaningful: a bare newDirectUnderlay leaves it unset, and
+	// without it the underlay cannot tell the peer's probe from its own
+	// returning echo, so it drops seed magic rather than risk the H2 ping-pong.
 	localToken [seedTokenLen]byte
 	hasToken   bool
-
-	// echoed remembers the peer token this side already echoed, so a peer token
-	// arriving again (the echo of our echo) is dropped even when localToken is
-	// unknown. A handshake carries one peer token, so one slot is enough. It is
-	// read and written only on the single readFrom goroutine.
-	echoed     [seedTokenLen]byte
-	haveEchoed bool
 
 	// seedEchoes counts seed probes this underlay has echoed. Diagnostic, and
 	// the two-underlay quiesce test's observable: a ping-pong would keep it
@@ -57,9 +52,10 @@ type directUnderlay struct {
 }
 
 // newDirectUnderlay wraps an already-punched UDP socket for peer. The underlay
-// takes ownership of sock: close closes it. The seed echo is deduped but not
-// token-aware (localToken is unset); use newDirectUnderlayToken when the seed
-// handshake's token is known.
+// takes ownership of sock: close closes it. It has no seed token, so it cannot
+// tell a peer's probe from its own returning echo and does NOT echo seed magic
+// (it drops it) — echoing without a token is the H2 ping-pong. The token MUST
+// be threaded from the handshake to the underlay: use newDirectUnderlayToken.
 func newDirectUnderlay(sock *net.UDPConn, peer netip.AddrPort) *directUnderlay {
 	return &directUnderlay{
 		sock: sock,
@@ -69,9 +65,10 @@ func newDirectUnderlay(sock *net.UDPConn, peer netip.AddrPort) *directUnderlay {
 }
 
 // newDirectUnderlayToken is newDirectUnderlay with this side's raw-UDP seed
-// token (Task 6). Knowing it lets the underlay drop its own returning echo
-// instead of echoing it back, so two registered underlays cannot ping-pong
-// (the parked H2 ruling). The punch tail calls this after seedHandshakeUDPToken.
+// token (Task 6). Knowing it lets the underlay echo the peer's probes while
+// dropping its own returning echo, so two registered underlays cannot ping-pong
+// (the parked H2 ruling). The punch tail calls this after
+// seedHandshakeUDPToken and must thread the token through registration.
 func newDirectUnderlayToken(sock *net.UDPConn, peer netip.AddrPort, token [seedTokenLen]byte) *directUnderlay {
 	u := newDirectUnderlay(sock, peer)
 	u.localToken = token
@@ -80,22 +77,22 @@ func newDirectUnderlayToken(sock *net.UDPConn, peer netip.AddrPort, token [seedT
 }
 
 // echoSeed consumes one datagram known to carry seedProbeMagic and at least a
-// full token, echoing the peer's probe back to it once. It reports whether it
-// echoed. A packet carrying this side's own token (its echo coming back) or a
-// peer token already echoed is dropped, never echoed again: that is what keeps
-// the echo from ping-ponging between two registered underlays. pkt is echoed
-// verbatim, so a peer whose own echo was lost still sees its probe returned.
+// full token, echoing the peer's probe back to it and reporting whether it
+// echoed. It echoes iff the token is NOT this side's own: our own token is our
+// probe coming back as the peer's echo and must never be re-echoed, which is
+// what keeps two registered underlays from ping-ponging. There is deliberately
+// no per-token dedupe: a retransmitted probe carries the same token and must be
+// re-echoed, or a single lost echo would strand the peer. With no token the
+// underlay cannot make that distinction, so it does not echo at all.
 func (u *directUnderlay) echoSeed(pkt []byte) bool {
+	if !u.hasToken {
+		return false
+	}
 	var tok [seedTokenLen]byte
 	copy(tok[:], pkt[len(seedProbeMagic):len(seedProbeMagic)+seedTokenLen])
-	if u.hasToken && tok == u.localToken {
+	if tok == u.localToken {
 		return false // our own probe, echoed back by the peer: never re-echo
 	}
-	if u.haveEchoed && tok == u.echoed {
-		return false // already echoed this peer token once
-	}
-	u.echoed = tok
-	u.haveEchoed = true
 	_, _ = u.sock.WriteToUDP(pkt, net.UDPAddrFromAddrPort(u.peer))
 	u.seedEchoes.Add(1)
 	return true

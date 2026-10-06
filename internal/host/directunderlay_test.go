@@ -147,6 +147,92 @@ func TestDirectUnderlayEchoesSeedMagic(t *testing.T) {
 	}
 }
 
+// TestDirectUnderlayReechoesRetransmittedProbe is the I3 regression: a
+// token-aware underlay echoes every probe, not just the first. The peer's probe
+// token is constant across its retransmits, so a per-token dedupe would drop
+// the retries and strand a peer whose first echo was lost — exactly the late
+// responder the underlay exists to rescue.
+func TestDirectUnderlayReechoesRetransmittedProbe(t *testing.T) {
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	var mine [seedTokenLen]byte
+	mine[0] = 1
+	u := newDirectUnderlayToken(a, udpAddrPort(t, b), mine)
+	defer u.close()
+	defer b.Close()
+
+	peerProbe := append(append([]byte(nil), seedProbeMagic[:]...), make([]byte, seedTokenLen)...)
+	peerProbe[len(seedProbeMagic)] = 2
+	for i := 0; i < 2; i++ {
+		if _, err := b.WriteToUDP(peerProbe, a.LocalAddr().(*net.UDPAddr)); err != nil {
+			t.Fatalf("seed write %d: %v", i, err)
+		}
+	}
+	if _, err := b.WriteToUDP([]byte("kcp"), a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("kcp write: %v", err)
+	}
+
+	// readFrom consumes (and echoes) both probes, then returns the KCP datagram.
+	first := readOne(u)
+	select {
+	case got := <-first:
+		if got != "kcp" {
+			t.Fatalf("read = %q, want %q (seed must not reach KCP)", got, "kcp")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the KCP datagram")
+	}
+
+	b.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 64)
+	for i := 0; i < 2; i++ {
+		n, _, err := b.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatalf("echo %d: %v (a retransmitted probe was not re-echoed)", i, err)
+		}
+		if !bytes.Equal(buf[:n], peerProbe) {
+			t.Fatalf("echo %d = %q, want %q", i, buf[:n], peerProbe)
+		}
+	}
+}
+
+// TestDirectUnderlayNoTokenDropsSeed: an underlay built without a seed token
+// must not echo seed magic at all. Without its own token it cannot tell a
+// peer's probe from its own returning echo, so echoing could ping-pong forever
+// (H2); it drops the seed packet (never surfaces it to KCP) and stays quiet.
+func TestDirectUnderlayNoTokenDropsSeed(t *testing.T) {
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	u := newDirectUnderlay(a, udpAddrPort(t, b)) // no token
+	defer u.close()
+	defer b.Close()
+
+	probe := append(append([]byte(nil), seedProbeMagic[:]...), make([]byte, seedTokenLen)...)
+	if _, err := b.WriteToUDP(probe, a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("b seed write: %v", err)
+	}
+	if _, err := b.WriteToUDP([]byte("kcp"), a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("b kcp write: %v", err)
+	}
+
+	first := readOne(u)
+	select {
+	case got := <-first:
+		if got != "kcp" {
+			t.Fatalf("read = %q, want %q (seed must not reach KCP)", got, "kcp")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the KCP datagram")
+	}
+
+	// Nothing was echoed back, and nothing keeps arriving.
+	b.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	buf := make([]byte, 64)
+	if n, _, err := b.ReadFromUDP(buf); err == nil {
+		t.Fatalf("no-token underlay echoed seed magic: %q", buf[:n])
+	}
+}
+
 // TestDirectUnderlayWriteGoesToPeer: writeTo targets the punched peer address.
 func TestDirectUnderlayWriteGoesToPeer(t *testing.T) {
 	a := mustListenUDP(t)

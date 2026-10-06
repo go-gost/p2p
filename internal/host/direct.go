@@ -1373,17 +1373,19 @@ func seedHandshakeUDP(sock *net.UDPConn, peer netip.AddrPort, timeout time.Durat
 // seedHandshakeUDPToken runs the symmetric token echo over a raw UDP socket and
 // returns the local token it used. It mirrors seedHandshake's semantics without
 // a reliability layer: it writes its own token to peer every seedRetransmit
-// until it reads that same token back, and it echoes the peer's probe once so
-// the peer's own handshake can complete. A raw UDP socket has no retransmit, so
-// the resend loop stands in for KCP's send window; the read deadline between
+// until it reads that same token back, and it echoes each of the peer's probes
+// so the peer's own handshake can complete. A raw UDP socket has no retransmit,
+// so the resend loop stands in for KCP's send window; the read deadline between
 // sends is short so a retransmit interleaves with waiting for a reply.
 //
 // Only a datagram from peer and carrying seedProbeMagic with a full token is
 // considered. Success requires a full own->peer->own round trip, so a half-open
 // path (we receive but our bytes never arrive) times out instead of producing a
-// false direct session. A packet carrying our own token is our probe coming
-// back; a peer token already echoed is the echo of our echo, and neither is
-// echoed again — otherwise two registered underlays would loop forever (H2).
+// false direct session. A packet carrying our own token is the success case; a
+// peer's token is echoed back on every probe, with no dedupe, because our own
+// token is never echoed (an echo of our echo can only carry the peer's token,
+// which this side re-echoes to the peer, never back to itself). Termination is
+// the handshake deadline, not a per-token count.
 func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) ([seedTokenLen]byte, error) {
 	var token [seedTokenLen]byte
 	if _, err := rand.Read(token[:]); err != nil {
@@ -1401,10 +1403,6 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 	deadline := time.Now().Add(timeout)
 	next := time.Now() // send immediately
 	buf := make([]byte, 2048)
-	var (
-		echoed     [seedTokenLen]byte // the peer token this side last echoed
-		haveEchoed bool
-	)
 	for {
 		now := time.Now()
 		if !now.Before(deadline) {
@@ -1441,14 +1439,15 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 		if got == token {
 			return token, nil // the peer echoed our probe
 		}
-		if !haveEchoed || got != echoed {
-			haveEchoed = true
-			echoed = got
-			echo := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
-			echo = append(echo, seedProbeMagic[:]...)
-			echo = append(echo, got[:]...)
-			_, _ = sock.WriteToUDP(echo, dst)
-		}
+		// The peer's probe: echo it. Every retransmit is echoed again — raw UDP
+		// has no reliability, so an echo lost in flight must be recovered by
+		// the peer's next probe rather than dropped as a duplicate. An echo of
+		// our own token is never produced here (that is the success case), so
+		// two handshakes cannot loop.
+		echo := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
+		echo = append(echo, seedProbeMagic[:]...)
+		echo = append(echo, got[:]...)
+		_, _ = sock.WriteToUDP(echo, dst)
 	}
 }
 

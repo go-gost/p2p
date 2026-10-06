@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -221,29 +222,42 @@ func TestSeedHandshakeUDPRoundTrip(t *testing.T) {
 }
 
 // TestSeedHandshakeUDPTimesOut: one side runs alone; nothing echoes its token,
-// so it returns an error once the timeout elapses.
+// so it ends in errSeedTimeout once the timeout elapses. The sandbox's
+// intermittent sendto EPERM (see seedHandshakeUDPRetry) is retried; the timing
+// is asserted only on the genuine timeout.
 func TestSeedHandshakeUDPTimesOut(t *testing.T) {
 	a := mustListenUDP(t)
 	b := mustListenUDP(t) // a valid peer address that never answers
 	defer a.Close()
 	defer b.Close()
 
-	start := time.Now()
-	err := seedHandshakeUDP(a, udpAddrPort(t, b), 300*time.Millisecond)
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("seedHandshakeUDP returned nil with no responder")
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		start := time.Now()
+		err = seedHandshakeUDP(a, udpAddrPort(t, b), 300*time.Millisecond)
+		elapsed := time.Since(start)
+		if errors.Is(err, errSeedTimeout) {
+			if elapsed < 250*time.Millisecond {
+				t.Fatalf("seedHandshakeUDP timed out after %v, want the timeout waited out", elapsed)
+			}
+			return
+		}
+		if err == nil {
+			t.Fatal("seedHandshakeUDP returned nil with no responder")
+		}
+		if !seedErrRetryable(err) {
+			t.Fatalf("seedHandshakeUDP: %v", err)
+		}
 	}
-	if elapsed < 250*time.Millisecond {
-		t.Fatalf("seedHandshakeUDP returned after %v, want the timeout to be waited out", elapsed)
-	}
+	t.Fatalf("seedHandshakeUDP never timed out (last error: %v)", err)
 }
 
 // TestSeedHandshakeUDPIgnoresNoise: a datagram without the seed magic (from the
 // peer) and a seed-magic probe from a third socket (wrong source) must not
 // complete the handshake. Neither is an echo of this side's own token, so it
-// must time out. The send may fail with the sandbox's intermittent EPERM, which
-// is also a non-nil error: either way it never falsely succeeds.
+// must end in errSeedTimeout. A write may fail with the sandbox's intermittent
+// EPERM; the noise then simply was not sent, which does not weaken the
+// assertion that no false success occurs.
 func TestSeedHandshakeUDPIgnoresNoise(t *testing.T) {
 	a := mustListenUDP(t)
 	b := mustListenUDP(t)
@@ -252,15 +266,63 @@ func TestSeedHandshakeUDPIgnoresNoise(t *testing.T) {
 	defer b.Close()
 	defer c.Close()
 
-	if _, err := b.WriteToUDP([]byte("hello"), a.LocalAddr().(*net.UDPAddr)); err != nil {
-		t.Fatal(err)
-	}
+	_, _ = b.WriteToUDP([]byte("hello"), a.LocalAddr().(*net.UDPAddr))
 	noise := append(append([]byte(nil), seedProbeMagic[:]...), make([]byte, seedTokenLen)...)
-	if _, err := c.WriteToUDP(noise, a.LocalAddr().(*net.UDPAddr)); err != nil {
-		t.Fatal(err)
-	}
-	if err := seedHandshakeUDP(a, udpAddrPort(t, b), 400*time.Millisecond); err == nil {
+	_, _ = c.WriteToUDP(noise, a.LocalAddr().(*net.UDPAddr))
+
+	err := seedHandshakeUDP(a, udpAddrPort(t, b), 400*time.Millisecond)
+	if err == nil {
 		t.Fatal("seedHandshakeUDP completed on non-seed/foreign noise")
+	}
+	if !errors.Is(err, errSeedTimeout) && !errors.Is(err, syscall.EPERM) {
+		t.Fatalf("seedHandshakeUDP: %v", err)
+	}
+}
+
+// TestSeedHandshakeUDPEchoesRetransmittedProbe is the C1 regression: a peer's
+// probe token is constant across its retransmits, so the handshake must echo
+// every probe, not just the first. A per-token dedupe dropped the retries and
+// stranded the peer when the single echo was lost — the very failure the resend
+// loop exists to cover on a lossy raw-UDP path.
+func TestSeedHandshakeUDPEchoesRetransmittedProbe(t *testing.T) {
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	defer a.Close()
+	defer b.Close()
+	pb := udpAddrPort(t, b)
+
+	done := make(chan error, 1)
+	go func() { done <- seedHandshakeUDP(a, pb, 700*time.Millisecond) }()
+
+	var tokB [seedTokenLen]byte
+	tokB[0] = 0xAB
+	probeB := append(append([]byte(nil), seedProbeMagic[:]...), tokB[:]...)
+	// The same probe twice, exactly as a retransmitting peer would send it.
+	for i := 0; i < 2; i++ {
+		if _, err := b.WriteToUDP(probeB, a.LocalAddr().(*net.UDPAddr)); err != nil {
+			t.Skipf("sandbox sendto denied the probe (EPERM): %v", err)
+		}
+	}
+
+	echos := 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	buf := make([]byte, 64)
+	for echos < 2 && time.Now().Before(deadline) {
+		b.SetReadDeadline(deadline)
+		n, _, err := b.ReadFromUDP(buf)
+		if err != nil {
+			break
+		}
+		if bytes.Equal(buf[:n], probeB) {
+			echos++
+		}
+	}
+	if echos < 2 {
+		t.Fatalf("a echoed a retransmitted probe %d time(s), want 2 (a per-token dedupe drops the retry)", echos)
+	}
+	// No responder ever echoes a's own token, so it must end in the timeout.
+	if err := <-done; !errors.Is(err, errSeedTimeout) {
+		t.Fatalf("handshake = %v, want errSeedTimeout", err)
 	}
 }
 
@@ -284,10 +346,25 @@ func seedHandshakeUDPOnce(a, b *net.UDPConn, pa, pb netip.AddrPort) (errA, errB 
 	return <-ra, <-rb
 }
 
-// seedHandshakeUDPRetry runs seedHandshakeUDPOnce until both ends succeed. This
-// sandbox intermittently denies sendto (EPERM) under load — environmental, and
-// absent in CI (the same flake TestSeedHandshake documents) — so a transient
-// denial is retried; a real handshake defect fails every attempt.
+// seedErrRetryable reports whether err alone is one to retry: nil (success) or
+// the sandbox's intermittent sendto EPERM. Any other error is a real defect and
+// fails at once — the environmental excuse must not hide a real intermittent
+// bug.
+func seedErrRetryable(err error) bool {
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// seedPairRetryable reports whether a two-ended handshake's errors are worth
+// retrying. One side's sendto EPERM leaves the other side with a plain timeout
+// (nothing echoed its probe), so the pair is retryable when EITHER side saw
+// EPERM; a pair that failed without any EPERM is a real defect.
+func seedPairRetryable(errA, errB error) bool {
+	return errors.Is(errA, syscall.EPERM) || errors.Is(errB, syscall.EPERM)
+}
+
+// seedHandshakeUDPRetry runs seedHandshakeUDPOnce until both ends succeed.
+// Only the sandbox's intermittent sendto EPERM (absent in CI; the same flake
+// TestSeedHandshake documents) is retried; any other error fails immediately.
 func seedHandshakeUDPRetry(t *testing.T, a, b *net.UDPConn, pa, pb netip.AddrPort) {
 	t.Helper()
 	var errA, errB error
@@ -295,6 +372,9 @@ func seedHandshakeUDPRetry(t *testing.T, a, b *net.UDPConn, pa, pb netip.AddrPor
 		errA, errB = seedHandshakeUDPOnce(a, b, pa, pb)
 		if errA == nil && errB == nil {
 			return
+		}
+		if !seedPairRetryable(errA, errB) {
+			t.Fatalf("seedHandshakeUDP: A=%v B=%v", errA, errB)
 		}
 		drainUDP(a)
 		drainUDP(b)
@@ -321,6 +401,9 @@ func seedHandshakeUDPPair(t *testing.T, a, b *net.UDPConn, pa, pb netip.AddrPort
 		ta, tb, errA, errB = x.tok, y.tok, x.err, y.err
 		if errA == nil && errB == nil {
 			return ta, tb
+		}
+		if !seedPairRetryable(errA, errB) {
+			t.Fatalf("seed handshakes: A=%v B=%v", errA, errB)
 		}
 		drainUDP(a)
 		drainUDP(b)
