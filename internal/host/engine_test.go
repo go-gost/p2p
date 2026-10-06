@@ -62,6 +62,282 @@ func TestDirectLiveNoSideEffect(t *testing.T) {
 	}
 }
 
+// liveDirectFor installs a live direct path for peer, which is what
+// pairHasLiveDirect consults today (the per-peer directConn's live smux
+// session). It returns the directConn so a test can inspect or tear it down.
+func liveDirectFor(t *testing.T, e *engine, peer derpclient.PublicKey) *directConn {
+	t.Helper()
+	dc := e.directConn(peer)
+	dc.mu.Lock()
+	dc.sess = newTestSess(t)
+	dc.state = directUp
+	dc.mu.Unlock()
+	return dc
+}
+
+// relaySessionFor builds the state a peer has once a relay stream has been
+// served: a settled relay secure session installed on the engine and held by
+// the adapter, and a built pair KCP session. It returns the adapter whose kill
+// a relay loss performs.
+func relaySessionFor(t *testing.T, e *engine, peer derpclient.PublicKey, settled *secureSession) *peerConn {
+	t.Helper()
+	e.mu.Lock()
+	e.secure[secureKey{peer: peer, transport: secureTransportRelay}] = settled
+	e.mu.Unlock()
+	pc := e.peerConn(peer)
+	pc.mu.Lock()
+	pc.secure = settled
+	pc.mu.Unlock()
+	pc.mu.Lock()
+	if _, err := pc.sessionLocked(); err != nil {
+		pc.mu.Unlock()
+		t.Fatalf("build relay session: %v", err)
+	}
+	pc.mu.Unlock()
+	return pc
+}
+
+// TestRelayLossWithoutDirectResetsPair pins the safe baseline of the H1 guard:
+// with no direct path, a relay link-loss resets exactly as before — the pair's
+// KCP epoch ends and the relay secure session is dropped. The existing
+// relay-loss tests pin the log shape; this pins the two live objects.
+func TestRelayLossWithoutDirectResetsPair(t *testing.T) {
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{41}
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	pc := relaySessionFor(t, e, peer, settled)
+	if e.relayKCPPairGet(peer) == nil {
+		t.Fatal("no pair KCP session built")
+	}
+
+	pc.killSession(errors.New("test: link lost"), true, reasonLinkLost)
+
+	if got := e.relayKCPPairGet(peer); got != nil {
+		t.Fatal("the pair survived a relay loss with no direct path")
+	}
+	e.mu.Lock()
+	_, ok := e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
+	e.mu.Unlock()
+	if ok {
+		t.Fatal("the relay secure session survived a relay loss with no direct path")
+	}
+}
+
+// TestRelayLossWithLiveDirectKeepsPair pins the H1 guard itself: while the peer
+// has a live direct path, a relay link-loss must NOT end the pair's KCP epoch
+// and must NOT drop the relay secure session — a relay blip cannot be allowed
+// to tear down a path that does not run through the relay.
+//
+// The unified direct underlay (Tasks 1+) does not exist yet, so "live direct"
+// here is the existing directConn's live smux session; pairHasLiveDirect carries
+// a TODO to redefine it as the pair's direct-underlay recency once the underlay
+// lands. This test deliberately asserts the guard's observable effect (pair,
+// session, secure identity, nonce counter), not stream survival: killSession
+// still closes the adapter's mux session, which only the unification removes.
+func TestRelayLossWithLiveDirectKeepsPair(t *testing.T) {
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{42}
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	pc := relaySessionFor(t, e, peer, settled)
+	pair := e.relayKCPPairGet(peer)
+	if pair == nil {
+		t.Fatal("no pair KCP session built")
+	}
+	liveDirectFor(t, e, peer)
+
+	// Draw a nonce the peer has already been told about. If the kill dropped the
+	// session and re-handshook, this counter object would be replaced and the
+	// sequence would restart under the same key — the nonce-reuse hazard the
+	// guard exists to avoid.
+	settled.mu.Lock()
+	sendCtr := settled.sendCtr
+	settled.mu.Unlock()
+	sendCtr.next()
+
+	pc.killSession(errors.New("test: link lost"), true, reasonLinkLost)
+
+	if got := e.relayKCPPairGet(peer); got != pair {
+		t.Fatal("the pair was reset despite a live direct path")
+	}
+	pair.mu.Lock()
+	closed, sess := pair.closed, pair.sess
+	pair.mu.Unlock()
+	if closed {
+		t.Fatal("the pair was shut down despite a live direct path")
+	}
+	if sess == nil {
+		t.Fatal("the pair lost its KCP session despite a live direct path")
+	}
+	e.mu.Lock()
+	got, ok := e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
+	e.mu.Unlock()
+	if !ok || got != settled {
+		t.Fatal("the relay secure session was dropped or replaced despite a live direct path")
+	}
+	settled.mu.Lock()
+	gotCtr := settled.sendCtr
+	settled.mu.Unlock()
+	sendCtr.mu.Lock()
+	n := sendCtr.n
+	sendCtr.mu.Unlock()
+	if gotCtr != sendCtr || n != 1 {
+		t.Fatalf("nonce counter was replaced or reset: got %p n=%d, want %p n=1", gotCtr, n, sendCtr)
+	}
+}
+
+// TestPeerGoneWithLiveDirectKeepsPair pins the peer-gone half of H1 (plan
+// Review Focus #6): the relay's best-effort "peer gone" notice must not end a
+// pair a live direct path is serving, and must not drop its relay secure session.
+func TestPeerGoneWithLiveDirectKeepsPair(t *testing.T) {
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{43}
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	relaySessionFor(t, e, peer, settled)
+	pair := e.relayKCPPairGet(peer)
+	if pair == nil {
+		t.Fatal("no pair KCP session built")
+	}
+	liveDirectFor(t, e, peer)
+
+	e.peerGone(peer)
+
+	if got := e.relayKCPPairGet(peer); got != pair {
+		t.Fatal("peerGone dropped the pair despite a live direct path")
+	}
+	e.mu.Lock()
+	got, ok := e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
+	e.mu.Unlock()
+	if !ok || got != settled {
+		t.Fatal("peerGone dropped the relay secure session despite a live direct path")
+	}
+}
+
+// TestPeerGoneWithoutDirectResetsPair pins the safe baseline of the peer-gone
+// guard: with no direct path, the notice ends the pair and drops the relay
+// secure session exactly as before.
+func TestPeerGoneWithoutDirectResetsPair(t *testing.T) {
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{44}
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	relaySessionFor(t, e, peer, settled)
+	if e.relayKCPPairGet(peer) == nil {
+		t.Fatal("no pair KCP session built")
+	}
+
+	e.peerGone(peer)
+
+	if got := e.relayKCPPairGet(peer); got != nil {
+		t.Fatal("the pair survived peerGone with no direct path")
+	}
+	e.mu.Lock()
+	_, ok := e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
+	e.mu.Unlock()
+	if ok {
+		t.Fatal("the relay secure session survived peerGone with no direct path")
+	}
+}
+
+// TestRelayLinkLossKeepsLiveDirectPair drives the real relay-loss flow
+// (engine.teardown) with a live direct path: the pair's KCP epoch and the relay
+// secure session must survive so a relay blip cannot tear down a path that does
+// not run through the relay. This is the production site the unit tests above
+// only approximate through killSession.
+func TestRelayLinkLossKeepsLiveDirectPair(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	// Relay-only at first, so the relay secure session settles and the pair is
+	// built before the punch can win.
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+
+	if err := engineA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+
+	// Now allow the punch and wait for a live direct path.
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	engineA.maybeStartDirect(pubB)
+	engineB.maybeStartDirect(engineA.pub)
+	waitFor(t, 10*time.Second, func() bool { return hasDirect(engineA, pubB) })
+
+	pair := engineA.relayKCPPairGet(pubB)
+	if pair == nil {
+		t.Fatal("A built no relay pair for B")
+	}
+	engineA.mu.Lock()
+	secure := engineA.secure[secureKey{peer: pubB, transport: secureTransportRelay}]
+	engineA.mu.Unlock()
+	if secure == nil {
+		t.Fatal("A has no relay secure session for B")
+	}
+
+	// The relay link drops while the direct path is live.
+	engineA.mu.Lock()
+	c := engineA.client
+	engineA.mu.Unlock()
+	if c == nil {
+		t.Fatal("A has no relay connection to lose")
+	}
+	engineA.teardown(c, errors.New("test: relay link lost"))
+
+	if got := engineA.relayKCPPairGet(pubB); got != pair {
+		t.Fatal("teardown dropped the pair despite a live direct path")
+	}
+	pair.mu.Lock()
+	closed := pair.closed
+	pair.mu.Unlock()
+	if closed {
+		t.Fatal("teardown shut down the pair despite a live direct path")
+	}
+	engineA.mu.Lock()
+	got := engineA.secure[secureKey{peer: pubB, transport: secureTransportRelay}]
+	engineA.mu.Unlock()
+	if got != secure {
+		t.Fatal("teardown dropped the relay secure session despite a live direct path")
+	}
+}
+
 // TestTransportCounts covers the gauge classification: a peer with a live
 // direct session counts as direct and must not also be counted as derp; peers
 // on the relay alone count as derp.

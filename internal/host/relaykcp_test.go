@@ -232,6 +232,41 @@ func TestRelayKCPPairDrainsFinalEndpoint(t *testing.T) {
 	}
 }
 
+// TestCloseRelayKCPsKeepsLiveDirectPairs pins the pair-level half of the H1
+// guard: when the relay connection goes away, a pair kept alive by a live direct
+// path is left running (only its relay half is unregistered), while a pair with
+// no direct path is shut down as before.
+func TestCloseRelayKCPsKeepsLiveDirectPairs(t *testing.T) {
+	e := newTestEngine(t)
+	kept := derpclient.PublicKey{21}
+	closed := derpclient.PublicKey{22}
+
+	keptPair := e.relayKCPPairFor(kept)
+	closedPair := e.relayKCPPairFor(closed)
+	liveDirectFor(t, e, kept)
+
+	e.closeRelayKCPs(errors.New("test: relay lost"))
+
+	if got := e.relayKCPPairGet(kept); got != keptPair {
+		t.Fatal("a pair with a live direct path was dropped on relay loss")
+	}
+	keptPair.mu.Lock()
+	keptClosed := keptPair.closed
+	keptPair.mu.Unlock()
+	if keptClosed {
+		t.Fatal("a pair with a live direct path was shut down on relay loss")
+	}
+	if got := e.relayKCPPairGet(closed); got != nil {
+		t.Fatal("a pair with no direct path survived relay loss")
+	}
+	closedPair.mu.Lock()
+	closedWasClosed := closedPair.closed
+	closedPair.mu.Unlock()
+	if !closedWasClosed {
+		t.Fatal("a pair with no direct path was not shut down on relay loss")
+	}
+}
+
 // TestRelayKCPStreamRetiredViewWritesNothing pins the write half of the stream
 // handoff: once a view is retired, it writes nothing. A record from a dead mux
 // session landing after its successor's would reorder the nonce sequence the

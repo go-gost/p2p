@@ -1135,16 +1135,52 @@ func (e *engine) dropRelayKCP(peer derpclient.PublicKey, expect *kcp.UDPSession,
 }
 
 // closeRelayKCPs ends every pair's relay KCP session: the relay connection
-// carrying them all is gone, or the engine is closing. Pairs whose adapter is
-// already gone are included — a session left running would leak its read loop.
+// carrying them all is gone. Pairs whose adapter is already gone are included —
+// a session left running would leak its read loop — but a pair kept alive by a
+// live direct path is NOT: the relay half is merely unregistered, and the pair
+// (with its KCP epoch and secure session) keeps running (H1). The engine's own
+// shutdown uses closeAllRelayKCPs, which force-ends every pair.
 func (e *engine) closeRelayKCPs(cause error) {
+	e.closeRelayKCPsFor(cause, false)
+}
+
+// closeAllRelayKCPs ends every pair's relay KCP session regardless of a live
+// direct path: the engine is closing, so nothing is left to keep a pair alive.
+func (e *engine) closeAllRelayKCPs(cause error) {
+	e.closeRelayKCPsFor(cause, true)
+}
+
+// closeRelayKCPsFor is the shared body of closeRelayKCPs/closeAllRelayKCPs.
+// The live-direct decision is taken outside e.kcpMu: pairHasLiveDirect takes
+// e.mu, and relayKCPPairFor's contract keeps e.mu and kcpMu un-nested, so
+// consulting the check under kcpMu would nest the two locks. The pair is
+// compare-and-deleted so a concurrent lookup that replaced it is left alone.
+func (e *engine) closeRelayKCPsFor(cause error, force bool) {
+	type pairEntry struct {
+		peer derpclient.PublicKey
+		pair *relayKCPPair
+	}
 	e.kcpMu.Lock()
-	pairs := make([]*relayKCPPair, 0, len(e.relayKCPs))
+	entries := make([]pairEntry, 0, len(e.relayKCPs))
 	for peer, pair := range e.relayKCPs {
-		pairs = append(pairs, pair)
-		delete(e.relayKCPs, peer)
+		entries = append(entries, pairEntry{peer: peer, pair: pair})
 	}
 	e.kcpMu.Unlock()
+
+	pairs := make([]*relayKCPPair, 0, len(entries))
+	for _, en := range entries {
+		if !force && e.pairHasLiveDirect(en.peer) {
+			continue // a live direct path keeps the pair; only the relay half is gone
+		}
+		e.kcpMu.Lock()
+		if e.relayKCPs[en.peer] != en.pair {
+			e.kcpMu.Unlock()
+			continue // replaced or already dropped underneath us
+		}
+		delete(e.relayKCPs, en.peer)
+		e.kcpMu.Unlock()
+		pairs = append(pairs, en.pair)
+	}
 	for _, pair := range pairs {
 		pair.shutdown()
 	}
@@ -1669,25 +1705,42 @@ func (e *engine) keepalive(c *derpclient.Client) {
 // blipped. The direct session answers for itself through its own keepalive
 // (see directSmuxKeepAliveTimeout); dropIfGone reclaims the entry once that
 // session ends.
+//
+// For the same reason a live direct path keeps the pair (and its relay secure
+// session) alive across the notice (H1, see resetsPairKCPFor): the relay half is
+// merely unregistered. With no direct path the keys and the pair's KCP epoch go
+// with the peer's relay connection exactly as before.
 func (e *engine) peerGone(peer derpclient.PublicKey) {
 	e.mu.Lock()
 	e.gone[peer] = true
 	pc := e.peers[peer]
 	delete(e.peers, peer)
-	// The peer's relay connection dropped: forget its security session too. The
-	// peer may have restarted (a new ephemeral will arrive), and holding a stale
-	// key would leave the next rebuild mismatched. A peer that merely blipped
-	// re-handshakes once on its return.
-	delete(e.secure, secureKey{peer: peer, transport: secureTransportRelay})
+	dc := e.directs[peer]
 	e.mu.Unlock()
-	// The pair's KCP session goes with the peer: its sequence state is with a
-	// peer that is gone (or restarted), and a session left running would leak
-	// its read loop.
+
+	// Probed outside e.mu, like peerLive: dc.live takes dc.mu. A direct path
+	// that dies in the window is still dropped by the killSession below, which
+	// re-decides on the current paths.
+	liveDirect := dc != nil && dc.live()
+	if !liveDirect {
+		e.mu.Lock()
+		// The peer's relay connection dropped: forget its security session too.
+		// The peer may have restarted (a new ephemeral will arrive), and holding
+		// a stale key would leave the next rebuild mismatched. A peer that merely
+		// blipped re-handshakes once on its return.
+		delete(e.secure, secureKey{peer: peer, transport: secureTransportRelay})
+		e.mu.Unlock()
+	}
 	gen := uint64(0)
 	if pc != nil {
 		gen = pc.sessionGen.Load()
 	}
-	e.dropRelayKCP(peer, nil, errors.New("derp engine: peer gone"), gen)
+	if !liveDirect {
+		// The pair's KCP session goes with the peer: its sequence state is with
+		// a peer that is gone (or restarted), and a session left running would
+		// leak its read loop.
+		e.dropRelayKCP(peer, nil, errors.New("derp engine: peer gone"), gen)
+	}
 	if pc != nil {
 		// A session-less adapter is a handshake in flight: killing it would fail
 		// that open before its bounded wait can decide, and the peer may already
@@ -1737,8 +1790,34 @@ func (e *engine) teardown(c *derpclient.Client, cause error) {
 	}
 	e.client = nil
 	peers := make([]*peerConn, 0, len(e.peers))
+	directs := make(map[derpclient.PublicKey]*directConn, len(e.directs))
 	for _, pc := range e.peers {
 		peers = append(peers, pc)
+		if dc := e.directs[pc.peer]; dc != nil {
+			directs[pc.peer] = dc
+		}
+	}
+	e.peers = make(map[derpclient.PublicKey]*peerConn)
+	e.mu.Unlock()
+
+	// A live direct path keeps the pair — and with it these keys — alive across
+	// the relay loss (H1): the relay half is merely unregistered, and a
+	// reconnect re-registers it without a re-handshake. Dropping the keys here
+	// would force a needless re-handshake and could strand the live direct path.
+	// Liveness is probed outside e.mu (dc.live takes dc.mu; see peerLive). A
+	// direct path that dies in the window is still dropped by the killSession
+	// below, which re-decides on the current paths.
+	liveDirect := make(map[derpclient.PublicKey]bool, len(directs))
+	for peer, dc := range directs {
+		if dc.live() {
+			liveDirect[peer] = true
+		}
+	}
+	e.mu.Lock()
+	for _, pc := range peers {
+		if liveDirect[pc.peer] {
+			continue
+		}
 		// The relay link is gone: forget each peer's relay security session so a
 		// reconnect re-handshakes instead of reusing counters a lost record may
 		// have advanced (see dropRelaySecure). Without this a peer whose link
@@ -1746,7 +1825,6 @@ func (e *engine) teardown(c *derpclient.Client, cause error) {
 		// sendCtr one ahead of its recvCtr, with no way to realign.
 		delete(e.secure, secureKey{peer: pc.peer, transport: secureTransportRelay})
 	}
-	e.peers = make(map[derpclient.PublicKey]*peerConn)
 	e.mu.Unlock()
 	e.log.Error("derp connection lost", "error", cause)
 	c.Close()
@@ -1789,8 +1867,10 @@ func (e *engine) Close() {
 		pc.killSession(errors.New("engine closed"), true, reasonEngineClosed)
 	}
 	// As in teardown: pairs whose adapter is already gone are not in the loop
-	// above, and a KCP session left running would leak its read loop.
-	e.closeRelayKCPs(errors.New("engine closed"))
+	// above, and a KCP session left running would leak its read loop. The engine
+	// is closing, so force every pair down — a live direct path is about to be
+	// torn down too (see the directs loop below).
+	e.closeAllRelayKCPs(errors.New("engine closed"))
 	for _, dc := range directs {
 		dc.teardown()
 	}
@@ -2165,6 +2245,52 @@ func resetsPairKCP(reason sessionEndReason) bool {
 	return false
 }
 
+// relayChurnReason reports whether a kill reason describes the relay path going
+// away while the pair itself may still be served by another underlay. A live
+// direct path keeps the pair alive across these (H1); the other epoch-resetting
+// reasons (a peer restart, a secure desync, engine shutdown) are path-
+// independent and always reset.
+func relayChurnReason(reason sessionEndReason) bool {
+	switch reason {
+	case reasonLinkLost, reasonPeerGone, reasonPeerGoneProbe:
+		return true
+	}
+	return false
+}
+
+// pairHasLiveDirect reports whether the peer currently has a live direct path,
+// so a relay-only failure must not tear the pair down (H1: the pair lives while
+// any underlay lives).
+//
+// TODO(Task 3): redefine as the pair's direct-underlay recency
+// (directUnderlayIdle) once the unified direct underlay is installed on the
+// pair; today the liveness signal is the per-peer directConn's live smux
+// session, the same signal peerTransports and Status already trust.
+//
+// The live probe runs after e.mu is released, like peerLive: dc.live takes
+// dc.mu, and the engine keeps that lock out of e.mu's critical sections.
+func (e *engine) pairHasLiveDirect(peer derpclient.PublicKey) bool {
+	e.mu.Lock()
+	dc := e.directs[peer]
+	e.mu.Unlock()
+	return dc != nil && dc.live()
+}
+
+// resetsPairKCPFor reports whether a kill with this reason must end the pair's
+// KCP epoch (and drop its relay secure session) given the peer's current paths.
+// It is resetsPairKCP, except that a relay-churn reason no longer resets a pair
+// a live direct path is keeping alive (H1). Evaluated once per kill so the
+// secure drop and the KCP reset cannot disagree.
+func (e *engine) resetsPairKCPFor(peer derpclient.PublicKey, reason sessionEndReason) bool {
+	if !resetsPairKCP(reason) {
+		return false
+	}
+	if relayChurnReason(reason) && e.pairHasLiveDirect(peer) {
+		return false
+	}
+	return true
+}
+
 // killSession marks the adapter dead and tears down its session. Safe for
 // concurrent use and for already-dead adapters.
 //
@@ -2228,7 +2354,11 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	// resetsPairKCP) ends the nonce alignment and must drop the secure half too
 	// — except the peer-rekeyed teardown, which keeps the re-derived keys (the
 	// caller passes dropSecure=false for exactly that reason).
-	dropped := dropSecure && resetsPairKCP(reason) && pc.e != nil
+	// A relay-churn reason no longer ends the pair when a live direct path is
+	// keeping it alive (H1, see resetsPairKCPFor). Evaluated once so the secure
+	// drop and the KCP reset agree on the same snapshot of the peer's paths.
+	resetPair := pc.e != nil && pc.e.resetsPairKCPFor(pc.peer, reason)
+	dropped := dropSecure && resetPair
 	if dropped {
 		pc.e.dropRelaySecure(pc.peer, secure)
 	}
@@ -2238,8 +2368,9 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	// The pair's KCP session ends exactly when the kill reason says the pair's
 	// epoch ends (see resetsPairKCP): a clean kill leaves it running so the
 	// rebuild continues the pair's sequence, while a rekey/desync/link-loss/
-	// gone/engine-close resets it alongside the keys.
-	if pc.e != nil && resetsPairKCP(reason) {
+	// gone/engine-close resets it alongside the keys — unless a live direct path
+	// keeps the pair running across relay churn.
+	if resetPair {
 		pc.e.dropRelayKCP(pc.peer, kcpConn, cause, gen)
 	}
 	pc.e.log.Debug("peer session killed",
