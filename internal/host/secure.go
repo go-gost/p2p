@@ -55,12 +55,10 @@ const secureDesyncThreshold = 3
 // public key 32B][want 1B].
 const secureHalfLen = 1 + 32 + 1
 
-// Secure transport tags: the ctrlSecure frame's first byte, so the relay
-// session's handshake and the direct session's never collide.
-const (
-	secureTransportRelay  byte = 0x00
-	secureTransportDirect byte = 0x01
-)
+// secureTransportRelay is the ctrlSecure frame's transport tag. The pair
+// negotiates exactly one secure session, over the relay transport; the retired
+// direct transport (0x01) is no longer created or accepted.
+const secureTransportRelay byte = 0x00
 
 // The values p2p.Status.PeerEncryption reports, one per connected peer. Keep
 // them in sync with that field's doc.
@@ -575,9 +573,9 @@ func (s *secureSession) deriveFor(peerEph []byte) (send, recv []byte, ok bool) {
 
 // deriveLocked commits the keys for the currently stored peerEph, mixing the
 // two ephemerals. The salt is the ordered concatenation of both public halves
-// and the info binds the transport, so relay and direct sessions never share a
-// key. It reports whether keys were produced. It is re-runnable: respond clears
-// ready before calling it when the peer's ephemeral changed.
+// and the info binds the transport, so the relay session's key is domain-bound
+// to that transport. It reports whether keys were produced. It is re-runnable:
+// respond clears ready before calling it when the peer's ephemeral changed.
 func (s *secureSession) deriveLocked() bool {
 	send, recv, ok := s.deriveFor(s.peerEph)
 	if !ok {
@@ -598,47 +596,9 @@ func (s *secureSession) settled() bool {
 	return s.ready
 }
 
-// rekeyIfUsed rotates the ephemeral and nonce space when the current key has
-// already carried records. The direct session is rebuilt over a *new* KCP
-// underlay on every punch, and the old underlay's records can be lost in the
-// teardown — a peer that writes one last keepalive into the dying session
-// advances the shared counter for a record this side never reads, so continuing
-// the sequence across the rebuild would desync and fail authentication. (The
-// relay does not have this: its underlay is one continuous byte stream, so a
-// one-sided rebuild picks the sequence up where it left off.) Continuing the
-// counter under the *same* key would instead replay nonces, so the key is
-// rotated with it — a fresh ephemeral opens a fresh nonce space, and the peer
-// sees the changed half and re-derives in one exchange.
-//
-// It is a no-op while the key is fresh (no records sent or received), so that
-// two peers rebuilding at once — the normal case for a dead session — converge
-// on one exchange instead of rekeying each other in a loop.
-func (s *secureSession) rekeyIfUsed() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.started || (!s.sendCtr.used() && !s.recvCtr.used()) {
-		return
-	}
-	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		return
-	}
-	s.eph = eph
-	s.ephPub = eph.PublicKey().Bytes()
-	s.peerEph = nil
-	s.sendKey, s.recvKey = nil, nil
-	s.ready = false
-	s.sendCtr = &nonceCtr{}
-	s.recvCtr = &nonceCtr{}
-	// A fresh readiness channel: the old one is already closed (the previous key
-	// settled), so waitReady would return at once and the punch's settle loop
-	// would spin. A new channel makes it block for the new half.
-	s.peerCh = make(chan struct{})
-}
-
 // waitReady blocks until the peer's half arrives or the deadline d elapses, then
 // reports whether the session settled encrypted. The channel is read under the
-// lock because rekeyIfUsed replaces it on a rotation.
+// lock because it is replaced when the peer's ephemeral changes.
 func (s *secureSession) waitReady(d time.Duration) bool {
 	s.mu.Lock()
 	ch := s.peerCh

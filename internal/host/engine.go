@@ -1289,10 +1289,8 @@ func (e *engine) closeRelayKCPsFor(cause error, force bool) {
 // armDesyncRecovery wires a relay security session's record-boundary self-heal:
 // secureDesyncThreshold consecutive failures mean the pair's framing can never
 // realign (see dropRelaySecure), so the session is dropped and the adapter
-// rebuilt on a fresh ephemeral. Direct sessions are left unarmed — that
-// transport re-keys via rekeyIfUsed on every punch, and a reset there would
-// fight it. Arming twice is a no-op, so every site that hands a session to an
-// adapter may call it.
+// rebuilt on a fresh ephemeral. Arming twice is a no-op, so every site that
+// hands a session to an adapter may call it.
 //
 // The callback resolves the live adapter when it fires instead of capturing one:
 // a clean kill hands the same settled session to the replacement adapter, and a
@@ -1574,9 +1572,9 @@ func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
 			e.log.Debug("secure: bad box", "peer", keyName(src))
 			return
 		}
-		// Only the two known transports: a bogus tag must not create a cached
+		// Only the relay transport: a bogus tag must not create a cached
 		// session (respond would reject the half anyway).
-		if clear[0] != secureTransportRelay && clear[0] != secureTransportDirect {
+		if clear[0] != secureTransportRelay {
 			return
 		}
 		if len(clear) != secureHalfLen {
@@ -1606,18 +1604,11 @@ func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
 			}
 		}
 		if changed {
-			if clear[0] == secureTransportRelay {
-				// The peer restarted: its half changed. Tear the relay mux session
-				// down so it rebuilds over the new key (kill also unblocks the
-				// parked read loop; a session left reading would eat the new
-				// session's packets). The secure session itself is kept.
-				e.resetPeerSession(src)
-			} else {
-				// Same on the direct transport: tear the direct mux session down
-				// so the next punch rebuilds it over the new key. The session
-				// itself is kept (resetDirectSession only detaches the smux layer).
-				e.resetDirectSession(src)
-			}
+			// The peer restarted: its half changed. Tear the relay mux session
+			// down so it rebuilds over the new key (kill also unblocks the
+			// parked read loop; a session left reading would eat the new
+			// session's packets). The secure session itself is kept.
+			e.resetPeerSession(src)
 		}
 	}
 }
@@ -1662,25 +1653,6 @@ func (e *engine) resetPeerSession(peer derpclient.PublicKey) {
 		// counters already match — re-handshaking would make the two ends swap
 		// halves forever (see dropRelaySecure).
 		pc.killSession(errors.New("derp engine: peer rekeyed"), false, reasonPeerRekeyed)
-	}
-}
-
-// resetDirectSession retires the peer's direct underlay so a re-punch rebuilds
-// it. A peer restart arrives as a changed relay secure half; after the pair
-// migration there is no separate direct secure half, so this path is vestigial
-// (Task 9 removes it), but it stays correct for a caller that still triggers it:
-// the pair's current underlay is handed to directUnderlayDead, which clears it
-// and schedules the re-punch. The relay secure session is untouched.
-func (e *engine) resetDirectSession(peer derpclient.PublicKey) {
-	pair := e.relayKCPPairGet(peer)
-	if pair == nil {
-		return
-	}
-	pair.mu.Lock()
-	u := pair.direct
-	pair.mu.Unlock()
-	if u != nil {
-		e.directUnderlayDead(peer, u)
 	}
 }
 

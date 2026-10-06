@@ -241,15 +241,18 @@ func TestSecureSessionNegotiatesDeterministically(t *testing.T) {
 func TestSecureSessionRejectsWrongTransport(t *testing.T) {
 	privA, pubA, _ := derpclient.Generate()
 	privB, pubB, _ := derpclient.Generate()
-	a := newSecureSession(nil, secureTransportDirect, privA, pubB)
+	// The pair negotiates only the relay transport; any other tag is bogus and
+	// must not be accepted by a relay session.
+	const bogusTransport byte = 0x7f
+	a := newSecureSession(nil, bogusTransport, privA, pubB)
 	b := newSecureSession(nil, secureTransportRelay, privB, pubA)
-	pa, _ := a.start()                    // sealed by a, tagged direct
+	pa, _ := a.start()                    // sealed by a, tagged bogus
 	clear, ok := privB.OpenFrom(pubA, pa) // b opens it
 	if !ok {
 		t.Fatal("seal/open round trip failed")
 	}
 	if bOK, _ := b.respond(clear); bOK {
-		t.Fatal("accepted a direct half on a relay session")
+		t.Fatal("accepted a mismatched-transport half on a relay session")
 	}
 }
 
@@ -432,13 +435,12 @@ func TestSecureSessionUnderivableHalfDoesNotWake(t *testing.T) {
 
 // TestKillSessionDropsRelaySecureUnlessRekeyed pins the dropSecure contract of
 // killSession: a kill whose reason ends the pair's epoch (the relay link is
-// lost) drops the pair's relay security session — but never the direct one
-// (that transport re-keys via rekeyIfUsed). A clean kill keeps the session even
-// with a segment in flight (under the KCP underlay the segment is retransmitted,
-// not an abandoned record, so the nonce sequence stays intact), and the
-// peer-rekeyed teardown is the one epoch-ending kill that must never drop it —
-// respond already re-derived both halves, so dropping would make the two ends
-// swap halves forever.
+// lost) drops the pair's relay security session. A clean kill keeps the session
+// even with a segment in flight (under the KCP underlay the segment is
+// retransmitted, not an abandoned record, so the nonce sequence stays intact),
+// and the peer-rekeyed teardown is the one epoch-ending kill that must never
+// drop it — respond already re-derived both halves, so dropping would make the
+// two ends swap halves forever.
 func TestKillSessionDropsRelaySecureUnlessRekeyed(t *testing.T) {
 	e := newTestEngine(t)
 	peer := derpclient.PublicKey{7}
@@ -447,14 +449,12 @@ func TestKillSessionDropsRelaySecureUnlessRekeyed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// freshPC returns an adapter holding both cached sessions, optionally with
-	// one queued segment — the packet in flight at kill time.
+	// freshPC returns an adapter holding the cached relay session, optionally
+	// with one queued segment — the packet in flight at kill time.
 	newPC := func(queued bool) *peerConn {
 		e.mu.Lock()
 		relay := newSecureSession(nil, secureTransportRelay, priv, peer)
 		e.secure[secureKey{peer: peer, transport: secureTransportRelay}] = relay
-		e.secure[secureKey{peer: peer, transport: secureTransportDirect}] =
-			newSecureSession(nil, secureTransportDirect, priv, peer)
 		e.mu.Unlock()
 		inbound := make(chan []byte, 1)
 		if queued {
@@ -462,32 +462,31 @@ func TestKillSessionDropsRelaySecureUnlessRekeyed(t *testing.T) {
 		}
 		return &peerConn{e: e, peer: peer, inbound: inbound, closeCh: make(chan struct{}), secure: relay}
 	}
-	cached := func() (relay, direct bool) {
+	cached := func() bool {
 		e.mu.Lock()
 		defer e.mu.Unlock()
-		_, relay = e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
-		_, direct = e.secure[secureKey{peer: peer, transport: secureTransportDirect}]
-		return
+		_, relay := e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
+		return relay
 	}
 
 	// A kill that ends the pair's epoch (the relay link was lost) drops the
-	// relay session, never the direct one.
+	// relay session.
 	newPC(true).killSession(errors.New("test: link lost"), true, reasonLinkLost)
-	if relay, direct := cached(); relay || !direct {
-		t.Fatalf("after a link-loss kill: relay kept=%v direct kept=%v, want false/true", relay, direct)
+	if cached() {
+		t.Fatal("after a link-loss kill: relay session kept, want dropped")
 	}
 
 	// A clean kill keeps the session even with a segment in flight: the segment
 	// is retransmitted, not abandoned, so the keys are intact.
 	newPC(true).killSession(errors.New("test: local kill"), true, reasonLocalKill)
-	if relay, direct := cached(); !relay || !direct {
-		t.Fatalf("after a clean kill with data in flight: relay kept=%v direct kept=%v, want true/true", relay, direct)
+	if !cached() {
+		t.Fatal("after a clean kill with data in flight: relay session dropped, want kept")
 	}
 
 	// The peer-rekeyed teardown keeps it even though the epoch ends.
 	newPC(true).killSession(errors.New("derp engine: peer rekeyed"), false, reasonPeerRekeyed)
-	if relay, direct := cached(); !relay || !direct {
-		t.Fatalf("after the peer-rekeyed kill: relay kept=%v direct kept=%v, want true/true", relay, direct)
+	if !cached() {
+		t.Fatal("after the peer-rekeyed kill: relay session dropped, want kept")
 	}
 }
 
@@ -663,8 +662,7 @@ func TestSecureRecordAuthFailureStaysFatal(t *testing.T) {
 // the relay security session before the streak could reach the threshold, so
 // the session that replaces a dropped one must start clean: a session that
 // inherited a streak of three would re-handshake on every rebuild and never
-// settle. Direct sessions are never armed — they re-key via rekeyIfUsed on
-// every punch.
+// settle.
 func TestDesyncStreakNotInheritedByFreshSession(t *testing.T) {
 	e := newTestEngine(t)
 	peer := derpclient.PublicKey{9}
@@ -674,10 +672,8 @@ func TestDesyncStreakNotInheritedByFreshSession(t *testing.T) {
 	}
 
 	relay := newSecureSession(nil, secureTransportRelay, priv, peer)
-	direct := newSecureSession(nil, secureTransportDirect, priv, peer)
 	e.mu.Lock()
 	e.secure[secureKey{peer: peer, transport: secureTransportRelay}] = relay
-	e.secure[secureKey{peer: peer, transport: secureTransportDirect}] = direct
 	e.mu.Unlock()
 	pc := &peerConn{
 		e:       e,
@@ -693,10 +689,6 @@ func TestDesyncStreakNotInheritedByFreshSession(t *testing.T) {
 	e.armDesyncRecovery(peer, relay)
 	if relay.onDesync == nil {
 		t.Fatal("relay security session was not armed")
-	}
-	e.armDesyncRecovery(peer, direct)
-	if direct.onDesync != nil {
-		t.Fatal("direct security session was armed: rekeyIfUsed owns that path")
 	}
 
 	// Trip the backstop. Its callback runs on its own goroutine, so both effects
