@@ -92,7 +92,7 @@ Expected: FAIL / build error: `undefined: newDirectUnderlay`.
 
 - [ ] **Step 3: Implement `directUnderlay`**
 
-`readFrom` loops: set a 1s read deadline on `u.sock`; `n, src, err := u.sock.ReadFromUDP(p)`; on timeout continue (allows periodic `close` observation — also select on a `u.done` channel closed by `close`); if `!src.AddrPort().Addr().Unmap().Compare(u.peer.Addr().Unmap())` (or literal `src.AddrPort() != u.peer`, see note) continue; if `bytes.HasPrefix(p[:n], seedProbeMagic[:])` continue; return `n, nil`. On `close`, return `io.EOF`.
+`readFrom` loops: set a 1s read deadline on `u.sock`; `n, src, err := u.sock.ReadFromUDP(p)`; on timeout continue (allows periodic `close` observation — also select on a `u.done` channel closed by `close`); if `!src.AddrPort().Addr().Unmap().Compare(u.peer.Addr().Unmap())` (or literal `src.AddrPort() != u.peer`, see note) continue; if `bytes.HasPrefix(p[:n], seedProbeMagic[:])` echo it back (`u.sock.WriteToUDP(p[:n], u.peer)`, ignore the write error) and continue; return `n, nil`. On `close`, return `io.EOF`.
 
 Note: compare on `AddrPort` after `Unmap()` on both sides so a v4-mapped peer address matches.
 
@@ -686,7 +686,7 @@ git commit -m "test(p2p): cover relay-to-direct migration end to end"
 
 The 2026-10-06 spec review (spec §「复审修订」) added lifecycle/reliability requirements. **Where this section differs from a task above, this section wins.**
 
-### New Task 0 (P0 — do FIRST): Decouple the pair lifecycle from the relay (H1)
+### Task 0: Decouple the pair lifecycle from the relay (H1, P0 — do first)
 
 **Files:** Modify `p2p/internal/host/engine.go`; Test `p2p/internal/host/engine_test.go`, `p2p/internal/host/relaykcp_test.go`.
 
@@ -703,7 +703,7 @@ The 2026-10-06 spec review (spec §「复审修订」) added lifecycle/reliabili
 - [ ] Step 4: relay/secure/engine suites green.
 - [ ] Step 5: commit `fix(p2p): keep the pair alive across relay loss when direct is live`.
 
-### New Task 14 (after Task 4): per-path KCP congestion setting (H5)
+### Task 14: Per-path KCP congestion setting (after Task 4, H5)
 
 **Files:** Modify `p2p/internal/host/relaykcp.go`; Test `p2p/internal/host/relaykcp_test.go`.
 On each `preferred()` flip call `sess.SetNoDelay(1, 10, 2, nc)` with `nc=0` on direct and `nc=1` on relay. `SetMtu(1400)` / `SetWindowSize(256,256)` unchanged (window is per-session). Test: preferred direct ⇒ last `SetNoDelay` arg 0; relay ⇒ 1.
