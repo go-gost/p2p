@@ -432,6 +432,72 @@ func TestPairClearDirectUnderlayIdempotent(t *testing.T) {
 	}
 }
 
+// appliedNC reads the congestion-control flag the pair last applied to its KCP
+// session (the nc argument of SetNoDelay), under the pair's lock. It is the
+// deterministic seam Task 14's test asserts on.
+func appliedNC(p *relayKCPPair) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.appliedNC
+}
+
+// TestPairCongestionFollowsPreferredPath pins Task 14: the pair's KCP session
+// switches congestion control with the preferred path — off (nc=1) on the relay,
+// where a drop is a bounded-queue overflow rather than a congestion signal, and
+// on (nc=0) on the direct path, which rides the public Internet and can
+// genuinely congest. The test drives the real transition call sites (session
+// creation, underlay install, idle watchdog, a fresh datagram, underlay clear)
+// and asserts the nc last applied to the session. It is deterministic: it never
+// waits on a real idle clock — the watchdog is invoked directly after forcing
+// the recency stamp stale — and never asserts on window growth.
+func TestPairCongestionFollowsPreferredPath(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{30}
+	pair := e.relayKCPPairFor(peer)
+	defer pair.shutdown()
+
+	// A session built with no direct underlay starts on the relay: nc=1.
+	if _, err := pair.session(); err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	if got := appliedNC(pair); got != 1 {
+		t.Fatalf("initial applied nc = %d, want 1 (relay)", got)
+	}
+
+	// Installing a direct underlay flips the session to direct: nc=0.
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	defer b.Close()
+	u := newDirectUnderlay(a, udpAddrPort(t, b))
+	pair.setDirectUnderlay(u)
+	if got := appliedNC(pair); got != 0 {
+		t.Fatalf("applied nc after install = %d, want 0 (direct)", got)
+	}
+
+	// The idle watchdog observing the direct go stale flips it back to relay.
+	// The watchdog is invoked directly so the assertion does not depend on the
+	// 1s read-tick granularity.
+	pair.mu.Lock()
+	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
+	pair.mu.Unlock()
+	pair.reportDirectIdle(u)
+	if got := appliedNC(pair); got != 1 {
+		t.Fatalf("applied nc after idle = %d, want 1 (relay)", got)
+	}
+
+	// A fresh inbound datagram re-elects direct: nc=0 again.
+	if _, err := b.WriteToUDP([]byte("fresh"), a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("peer write: %v", err)
+	}
+	waitFor(t, time.Second, func() bool { return appliedNC(pair) == 0 })
+
+	// Clearing the underlay ends on the relay: nc=1.
+	pair.clearDirectUnderlay()
+	if got := appliedNC(pair); got != 1 {
+		t.Fatalf("applied nc after clear = %d, want 1 (relay)", got)
+	}
+}
+
 // TestPairDirectPumpStopsOnShutdown pins the symmetric pump-done contract: a
 // shutdown stops the direct pump (closing directPumpDone) and a subsequent
 // ReadFrom returns io.EOF instead of parking forever waiting on a pump that

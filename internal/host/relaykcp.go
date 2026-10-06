@@ -226,6 +226,15 @@ type relayKCPPair struct {
 	// goroutine) and must never be held across the callback itself.
 	directIdleFiring atomic.Bool
 
+	// appliedPath is the path whose KCP tuning is currently on p.sess ("direct"
+	// or "relay"), "" before any session has been tuned. appliedNC is the
+	// congestion-control flag last passed to SetNoDelay. Together they make the
+	// tuning idempotent — applyPathTuningLocked only calls SetNoDelay when the
+	// path changed — and appliedNC is the deterministic seam the Task 14 test
+	// reads. Guarded by mu.
+	appliedPath string
+	appliedNC   int
+
 	// bytesSent/bytesRcvd count the pair's datagrams in bytes, on the paths the
 	// pair already walks: bytesSent in WriteTo (whichever path it picks), and
 	// bytesRcvd where a pump drains an underlay (readRelay for the relay pump,
@@ -268,14 +277,19 @@ func (p *relayKCPPair) session() (*kcp.UDPSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	// nodelay=1 (on), 10ms interval, fast retransmit on the 2nd duplicate ACK,
-	// congestion control off: a relay drop is a bounded-queue overflow, not a
-	// congestion signal, so halving the window on loss would only starve a
-	// healthy path.
-	sess.SetNoDelay(1, 10, 2, 1)
+	// nodelay=1 (on), 10ms interval, fast retransmit on the 2nd duplicate ACK.
+	// Congestion control is per preferred path (see applyPathTuningLocked): off
+	// (nc=1) on the relay, where a drop is a bounded-queue overflow rather than
+	// a congestion signal, and on (nc=0) on the direct path, which rides the
+	// public Internet and can genuinely congest.
+	path := p.pathNameLocked()
+	nc := pathNC(path)
+	sess.SetNoDelay(1, 10, 2, nc)
 	sess.SetMtu(relayKCPMtu)
 	sess.SetWindowSize(relayKCPSndWnd, relayKCPRcvWnd)
 	p.sess = sess
+	p.appliedPath = path
+	p.appliedNC = nc
 	return sess, nil
 }
 
@@ -497,6 +511,9 @@ func (p *relayKCPPair) setDirectUnderlay(u *directUnderlay) {
 	p.directStop = stop
 	p.directPumpDone = done
 	p.lastDirectRecv = time.Now()
+	// A freshly installed direct path is preferred immediately, so the
+	// session's congestion control must follow it there.
+	p.applyPathTuningLocked()
 	p.mu.Unlock()
 
 	if old != nil {
@@ -518,6 +535,9 @@ func (p *relayKCPPair) clearDirectUnderlay() {
 	u, stop := p.direct, p.directStop
 	p.direct = nil
 	p.directStop = nil
+	// No underlay is preferred any more: fall the session's congestion control
+	// back to the relay.
+	p.applyPathTuningLocked()
 	p.mu.Unlock()
 	if u == nil {
 		return
@@ -566,7 +586,9 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 		if n <= 0 {
 			continue
 		}
-		// A datagram re-arms the watchdog and re-seeds the recency stamp.
+		// A datagram re-arms the watchdog, re-seeds the recency stamp, and
+		// re-elects the direct path — so the session's congestion control
+		// follows it back to direct.
 		idleFired = false
 		p.bytesRcvd.Add(uint64(n))
 		pkt := make([]byte, n)
@@ -574,6 +596,7 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 		p.mu.Lock()
 		if p.direct == u {
 			p.lastDirectRecv = time.Now()
+			p.applyPathTuningLocked()
 		}
 		p.mu.Unlock()
 		select {
@@ -603,17 +626,25 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 // across re-armed episodes. The callback runs in its own goroutine, outside
 // p.mu, so the pump that observed the idle never blocks on it and the engine's
 // retirement (clearDirectUnderlay) can never join that pump (H4).
+//
+// Observing staleness is also a preferred-path flip (direct -> relay), so the
+// session's congestion control is re-tuned in the same critical section. That
+// happens whether or not a callback is dispatched: a suppressed dispatch (an
+// in-flight callback) must not leave the session tuned for a path it is no
+// longer using.
 func (p *relayKCPPair) reportDirectIdle(u *directUnderlay) bool {
-	if !p.directIdleFiring.CompareAndSwap(false, true) {
-		// A callback is still in flight: suppress this episode's dispatch.
-		return false
-	}
 	p.mu.Lock()
-	cb := p.onDirectIdle
 	ok := p.direct == u && !p.closed && time.Since(p.lastDirectRecv) >= directUnderlayIdle
+	if ok {
+		p.applyPathTuningLocked()
+	}
+	cb := p.onDirectIdle
 	p.mu.Unlock()
 	if !ok || cb == nil {
-		p.directIdleFiring.Store(false)
+		return false
+	}
+	if !p.directIdleFiring.CompareAndSwap(false, true) {
+		// A callback is still in flight: suppress this episode's dispatch.
 		return false
 	}
 	go func() {
@@ -642,10 +673,53 @@ func (p *relayKCPPair) preferredDirectLocked() bool {
 // pathName names the pair's current preferred path for stats and diagnostics:
 // "direct" while preferredDirect, else "relay".
 func (p *relayKCPPair) pathName() string {
-	if p.preferredDirect() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pathNameLocked()
+}
+
+// pathNameLocked is pathName for callers already holding p.mu.
+func (p *relayKCPPair) pathNameLocked() string {
+	if p.preferredDirectLocked() {
 		return "direct"
 	}
 	return "relay"
+}
+
+// pathNC returns the KCP SetNoDelay congestion-control flag for path: 0
+// (control on) on the public direct path, 1 (control off) on the relay, whose
+// loss is bounded-queue overflow rather than congestion.
+func pathNC(path string) int {
+	if path == "direct" {
+		return 0
+	}
+	return 1
+}
+
+// applyPathTuningLocked keeps the pair's KCP session's congestion control in
+// step with the preferred path: nc=0 (control on) on direct, nc=1 (off) on
+// relay. SetMtu and SetWindowSize are per-session and deliberately stay put —
+// only the per-path flag moves. It is called wherever the preferred path can
+// flip (session creation, direct-underlay install and clear, a datagram
+// re-electing direct, and the idle watchdog observing direct go stale) and is
+// a no-op when the path is unchanged, so a per-datagram call costs nothing.
+// Caller must hold p.mu; a nil session is skipped because session() applies
+// the current path when it builds one. The only lock order in this file is
+// p.mu -> s.mu (session() already holds p.mu across SetNoDelay), so taking
+// s.mu here cannot invert.
+func (p *relayKCPPair) applyPathTuningLocked() {
+	sess := p.sess
+	if sess == nil {
+		return
+	}
+	path := p.pathNameLocked()
+	if path == p.appliedPath {
+		return
+	}
+	nc := pathNC(path)
+	sess.SetNoDelay(1, 10, 2, nc)
+	p.appliedPath = path
+	p.appliedNC = nc
 }
 
 // ReadFrom returns one datagram from the pair's fan-in channel: the relay and
