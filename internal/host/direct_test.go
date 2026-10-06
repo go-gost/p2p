@@ -1766,10 +1766,6 @@ func TestPeerDirectOffSkipsTheRound(t *testing.T) {
 	if !skip() {
 		t.Fatal("no round was skipped for a peer that advertised the direct path off")
 	}
-	// punchAndWait must not block for the full wait on the same peer either.
-	if sess := eng.punchAndWait(dc.peer); sess != nil {
-		t.Error("punchAndWait returned a session for a peer with direct off")
-	}
 
 	// The peer turns punching back on: the announcement revokes the bit and the
 	// next trigger starts a round again.

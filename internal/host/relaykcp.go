@@ -235,6 +235,14 @@ type relayKCPPair struct {
 	appliedPath string
 	appliedNC   int
 
+	// pathChanges counts preferred-path flips over the pair's lifetime: the
+	// cheap per-pair fallback for O6's stream-level "stream path-changed" log.
+	// It is bumped at the one place a flip is detected (applyPathTuningLocked,
+	// where the tuning actually changes), so it counts pair flips, not per-stream
+	// observations. A stream that never did I/O across a flip still leaves its
+	// mark here; a reader with logs can count the same event there instead.
+	pathChanges atomic.Uint64
+
 	// bytesSent/bytesRcvd count the pair's datagrams in bytes, on the paths the
 	// pair already walks: bytesSent in WriteTo (whichever path it picks), and
 	// bytesRcvd where a pump drains an underlay (readRelay for the relay pump,
@@ -735,6 +743,9 @@ func (p *relayKCPPair) applyPathTuningLocked() {
 	sess.SetNoDelay(1, 10, 2, nc)
 	p.appliedPath = path
 	p.appliedNC = nc
+	// A real flip (the early return above keeps this to flips only) is O6's
+	// per-pair pathChanges event.
+	p.pathChanges.Add(1)
 }
 
 // ReadFrom returns one datagram from the pair's fan-in channel: the relay and

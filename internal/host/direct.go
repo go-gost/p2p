@@ -97,10 +97,10 @@ type v6AnnounceFunc func(port uint16) netip.AddrPort
 // Direct timing. Vars so tests can shorten them.
 var (
 	punchTimeout = 10 * time.Second
-	// punchWaitTimeout bounds how long OpenStream blocks waiting for a hole
-	// punch before falling back to the relay. Punching is sub-second to ~2s,
-	// so the first connection rides the direct path instead of starting on
-	// the relay.
+	// punchWaitTimeout is retained as a configured knob (TimeoutsConfig.PunchWait)
+	// but no longer gates anything: since M3 OpenStream does not block on a punch
+	// (it opens on the pair and lets the stream migrate when the underlay lands),
+	// so there is no wait to bound.
 	punchWaitTimeout = 5 * time.Second
 	backoffPeriod    = 30 * time.Second
 	// directRepunchBackoffCap caps the H3 hysteresis: the re-punch wait for a
@@ -366,72 +366,6 @@ func (e *engine) announceDirect(peer derpclient.PublicKey) {
 	if err := e.sendCaps(peer, caps); err != nil {
 		e.log.Debug("direct: announce direct-off failed", "peer", keyName(peer), "error", err)
 	}
-}
-
-// punchAndWait triggers hole punching when a candidate source exists and blocks
-// until a direct session is up or punchWaitTimeout elapses. It returns nil so
-// the caller falls back to the relay. Candidate exchange rides the DERP
-// control channel, so it needs only the DERP connection — not a relay mux
-// session — and completes well under the timeout.
-//
-// Every caller waits for the punch, whether this call started the round or
-// found one already running: a round already in flight is the common case, not
-// the exceptional one (see the note on start() below). The wait is bounded two
-// ways so it cannot turn into a per-connection stall on a peer that cannot
-// punch — it ends as soon as a round fails while we are waiting, and otherwise
-// at punchWaitTimeout.
-func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
-	if !e.directEnabled() {
-		return nil
-	}
-	dc := e.directConn(peer)
-	if dc.peerDirectOff() {
-		// Same as maybeStartDirect: a round for a peer that advertised the
-		// switch off cannot be answered, and waiting for it would charge the
-		// caller the full punchWaitTimeout for nothing.
-		dc.noteRound("peer has the direct path off")
-		return nil
-	}
-	// start() reports false both when a round is already running and when none
-	// can start (the peer is in backoff, so its next round is a full backoffPeriod
-	// away, or a session is already up). Only the second kind may return
-	// immediately: waiting there would charge the caller the whole timeout for a
-	// session that is not coming.
-	//
-	// A round already in flight is the common case, not the exceptional one, and
-	// it is why this distinction matters. The candidate exchange that starts a
-	// round rides the DERP control channel, so in the ordinary ordering the round
-	// is already running by the time a stream is opened. Reading that as "no
-	// direct path available" sent every tunnel stream to the relay while the
-	// direct session came up a couple of hundred milliseconds later — and since
-	// the transport is chosen once, at stream open, it rode the relay for the
-	// whole life of the tunnel.
-	if !dc.start() && !dc.punching() {
-		return nil
-	}
-	// Snapshot the failure count so the wait ends when a round fails while we are
-	// waiting, without being silenced by a round that failed before we arrived:
-	// failed is sticky for the life of the peer, so one old failure would
-	// otherwise veto every stream this host ever opens.
-	waitsFrom := dc.punchFailures()
-	deadline := time.Now().Add(punchWaitTimeout)
-	for time.Now().Before(deadline) {
-		if dc.isUp() {
-			// A successful punch installs a direct underlay on the pair; there
-			// is no separate direct smux session to hand back, and the caller
-			// rides the pair session either way. Return nil.
-			return nil
-		}
-		if dc.punchFailures() != waitsFrom {
-			return nil // the round we waited on failed: the relay is the answer
-		}
-		select {
-		case <-e.stop:
-			return nil
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-	return nil
 }
 
 // start kicks off a punch when none is running, and reports whether this call

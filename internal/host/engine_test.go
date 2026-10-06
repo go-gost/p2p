@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -355,6 +356,153 @@ func TestRelayLinkLossKeepsLiveDirectPair(t *testing.T) {
 	engineA.mu.Unlock()
 	if got != secure {
 		t.Fatal("teardown dropped the relay secure session despite a live direct path")
+	}
+}
+
+// syncBuffer is a goroutine-safe bytes.Buffer for catching an engine's slog
+// output: the engine logs from pump/punch/keepalive goroutines while a test
+// reads the captured text.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestOpenStreamUsesPairAndReportsPath pins M3 + Task 10: every tunnel stream
+// opens on the one relay pair, and its transport label is the pair's path at
+// open time — "derp" before a direct underlay exists, "direct" once one is
+// installed. A stream opened before the punch no longer blocks on it.
+func TestOpenStreamUsesPairAndReportsPath(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+	if err := engineA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	// No punch has run (no STUN configured), so the pair is relay-only.
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	os, ok := s.(*openedStream)
+	if !ok {
+		t.Fatalf("OpenStream returned %T, want *openedStream", s)
+	}
+	if got := os.Transport(); got != "derp" {
+		t.Fatalf("transport before a direct underlay = %q, want derp", got)
+	}
+	roundTrip(t, s, "relay-before-punch")
+	s.Close()
+
+	// Install the pair-level state a punch leaves; a stream opened now reports
+	// the pair's new path. Its data would ride the fake underlay, so only the
+	// label is asserted here (byte-exactness across the flip is Task 5/13).
+	installDirectUnderlayFor(t, engineA, pubB)
+
+	s2, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.(*openedStream).Transport(); got != "direct" {
+		t.Fatalf("transport after a direct underlay = %q, want direct", got)
+	}
+	s2.Close()
+}
+
+// TestOpenStreamLogsStreamPathChange pins O6: a long-lived stream that was
+// opened on the relay and then rides the pair across a migration must leave a
+// reconstructable record — exactly one Info "stream path-changed" plus one bump
+// of the pair's pathChanges counter. transport stays the point-in-time label.
+func TestOpenStreamLogsStreamPathChange(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	logBuf := &syncBuffer{}
+	engineA := newEngine(url, "", privA, slog.New(slog.NewTextHandler(logBuf, nil)))
+	engineB := newEngine(url, echo, privB, slog.Default())
+	defer engineA.Close()
+	defer engineB.Close()
+	if err := engineA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open the stream on the relay and keep it across the migration.
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	os := s.(*openedStream)
+	if got := os.Transport(); got != "derp" {
+		t.Fatalf("transport at open = %q, want derp", got)
+	}
+	roundTrip(t, s, "before-migration")
+
+	pair := engineA.relayKCPPairGet(pubB)
+	if pair == nil {
+		t.Fatal("no pair for the peer")
+	}
+	if got := pair.pathChanges.Load(); got != 0 {
+		t.Fatalf("pathChanges before the migration = %d, want 0", got)
+	}
+
+	// The pair migrates to direct (what a punch installs on success).
+	installDirectUnderlayFor(t, engineA, pubB)
+	if got := pair.pathChanges.Load(); got != 1 {
+		t.Fatalf("pathChanges after the migration = %d, want 1", got)
+	}
+
+	// The already-open stream notices the flip on its next I/O. The fake direct
+	// socket carries nothing, so bound the read rather than round-tripping; the
+	// log is emitted after the first Read/Write either way.
+	s.SetDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, err := s.Write([]byte("after-migration")); err != nil {
+		t.Fatalf("write after migration: %v", err)
+	}
+	var buf [16]byte
+	s.Read(buf[:])
+	s.Close()
+
+	logs := logBuf.String()
+	if got := strings.Count(logs, "stream path-changed"); got != 1 {
+		t.Fatalf("stream path-changed logs = %d, want 1\nlog:\n%s", got, logs)
+	}
+	for _, want := range []string{"from=relay", "to=direct", "reason=first-direct-datagram"} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("stream path-changed log missing %q\nlog:\n%s", want, logs)
+		}
+	}
+	// The label is a snapshot, not a lifelong plane (M1/O6): it does not change
+	// just because the pair migrated underneath.
+	if got := os.Transport(); got != "derp" {
+		t.Fatalf("transport after migration = %q, want derp (snapshot at open)", got)
 	}
 }
 

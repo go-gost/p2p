@@ -883,7 +883,24 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 			peerAddr = dc.peerAddrString()
 		}
 	}
-	return &openedStream{Conn: conn, transport: path, peerAddr: peerAddr}, nil
+	// Capture the pair and its path now for O6: the stream reports a later
+	// migration on its I/O. lastPath uses the pair's own names ("relay"/"direct"),
+	// so it compares against pathName directly; transport above stays the public
+	// "derp"/"direct" label (M1).
+	pair := e.relayKCPPairGet(peer)
+	lastPath := ""
+	if pair != nil {
+		lastPath = pair.pathName()
+	}
+	return &openedStream{
+		Conn:      conn,
+		transport: path,
+		peerAddr:  peerAddr,
+		log:       e.log,
+		peer:      peerB64,
+		pair:      pair,
+		lastPath:  lastPath,
+	}, nil
 }
 
 // pairPath names the peer's current path for stream tagging and status:
@@ -917,10 +934,26 @@ func (c *stampConn) Read(p []byte) (int, error) {
 
 // openedStream is a tunnel stream tagged with the transport it uses, so the
 // opening side can log whether the tunnel rode the direct path or the relay.
+//
+// transport is a point-in-time snapshot of the pair's path at open time
+// (Task 10/M1), not a stream's lifelong plane: the pair migrates underneath a
+// long-lived stream. Read and Write watch for that migration and emit one Info
+// "stream path-changed" (O6) so a stream's history can be reconstructed from
+// logs; the pair's own pathChanges counter is the cheap fallback.
 type openedStream struct {
 	net.Conn
 	transport string
 	peerAddr  string // peer's dialed endpoint (direct only; empty for relay)
+
+	// Path-change observation (O6). Log and peer name the stream in the event;
+	// pair is polled for the pair's current path, and lastPath is the last path
+	// this stream saw on its own I/O. A nil pair (no pair built) makes this
+	// inert. pathMu guards lastPath: Read/Write run from both copy goroutines.
+	log      *slog.Logger
+	peer     string
+	pair     *relayKCPPair
+	pathMu   sync.Mutex
+	lastPath string
 }
 
 // Transport returns the path this stream used: "direct" or "derp".
@@ -928,6 +961,57 @@ func (c *openedStream) Transport() string { return c.transport }
 
 // PeerAddr returns the peer's dialed endpoint for direct streams (empty for relay).
 func (c *openedStream) PeerAddr() string { return c.peerAddr }
+
+// Read reads from the stream, then notes the pair's current path so a migration
+// that happened while this stream was idle is reported on the next transfer.
+func (c *openedStream) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.notePath()
+	return n, err
+}
+
+// Write writes to the stream, then notes the pair's current path (see Read).
+func (c *openedStream) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.notePath()
+	return n, err
+}
+
+// notePath records a stream path change when this stream's I/O first sees the
+// pair on a path other than the one it last saw. The pair migrates silently
+// beneath an open stream, so this is where a long-lived stream becomes
+// reconstructable from logs (O6): one Info "stream path-changed" per transition,
+// with a finite, greppable reason. from/to use the pair's own names
+// ("relay"/"direct"); transport keeps the public "derp" label.
+func (c *openedStream) notePath() {
+	if c.pair == nil {
+		return
+	}
+	cur := c.pair.pathName()
+	c.pathMu.Lock()
+	from := c.lastPath
+	c.lastPath = cur
+	c.pathMu.Unlock()
+	if cur == from {
+		return
+	}
+	if c.log != nil {
+		c.log.Info("stream path-changed", "peer", c.peer, "from", from, "to", cur,
+			"reason", streamPathChangeReason(cur))
+	}
+}
+
+// streamPathChangeReason maps the destination path of a stream path change to a
+// finite reason enum for the O6 log. A stream only sees the pair's current path,
+// not the cause the pair-level event (Task 11) carries, so this is a coarse
+// direction-derived name: direct is a fresh direct datagram re-electing the
+// path; relay is the direct path going silent past the idle bound.
+func streamPathChangeReason(to string) string {
+	if to == "direct" {
+		return "first-direct-datagram"
+	}
+	return "direct-idle"
+}
 
 // openStream opens a smux stream bounded by timeout (smux.OpenStream has no
 // context form; bound it externally).
