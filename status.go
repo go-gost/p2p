@@ -60,6 +60,33 @@ type PeerDiagnostic struct {
 	// oldest first, capped at the ring's size (the newest are kept). Nil for a
 	// peer with no direct punch state (a relay-only peer).
 	Trace []string
+	// PathTrace is this peer's recent pair path-change history (O5): short
+	// human-readable lines, oldest first, capped at the same ring size as
+	// Trace. It answers "how did this pair get where it is" — the flips a
+	// single snapshot cannot show. Nil for a pair that has never flipped.
+	PathTrace []string
+	// FallbackReason is why the pair most recently fell back from direct to
+	// relay (O4), a finite enum: "direct-idle" / "clear" / "relay-lost". Empty
+	// when the pair has never fallen back — the single most useful word for
+	// "why is this peer on the relay".
+	FallbackReason string
+	// NextPunchIn is how long until the next scheduled direct re-punch (H3's
+	// backoff), 0 while a round is in flight, the direct path is up, or none is
+	// scheduled.
+	NextPunchIn time.Duration
+	// PairMigrations/PairFallbacks and the counters below are this pair's
+	// migration history (O2): PairMigrations counts relay→direct flips,
+	// PairFallbacks direct→relay flips (DirectIdleEvictions is the idle
+	// subset), RepunchAfterIdle the idle evictions that scheduled a re-punch,
+	// SeedFailures failed seed handshakes, and RelayLossSuppressedByDirect the
+	// relay losses a live direct path kept from tearing the pair down (H1).
+	// They distinguish a healthy idle pair (all flat) from a flapping one.
+	PairMigrations              int64
+	PairFallbacks               int64
+	DirectIdleEvictions         int64
+	RepunchAfterIdle            int64
+	SeedFailures                int64
+	RelayLossSuppressedByDirect int64
 }
 
 // RelayKCPStats is one peer's relay-plane KCP session health, as far as
@@ -142,6 +169,20 @@ type Status struct {
 	PunchSuccess  int64 // counter: attempts that reached direct
 	StreamsDirect int64 // counter
 	StreamsDerp   int64 // counter
+	// PairMigrations/PairFallbacks and the counters below are the pair-level
+	// migration history (O2), summed over every pair the engine holds; the
+	// per-peer split is on PeerDiagnostic. PairMigrations counts relay→direct
+	// flips, PairFallbacks direct→relay flips (DirectIdleEvictions the idle
+	// subset), RepunchAfterIdle the idle evictions that scheduled a re-punch,
+	// SeedFailures failed seed handshakes, and RelayLossSuppressedByDirect the
+	// relay losses a live direct path kept from tearing a pair down (H1). In
+	// process only, like PeerTransports: the gRPC proto is frozen.
+	PairMigrations              int64
+	PairFallbacks               int64
+	DirectIdleEvictions         int64
+	RepunchAfterIdle            int64
+	SeedFailures                int64
+	RelayLossSuppressedByDirect int64
 	// PeerTransports names each connected peer's current path, keyed by base64
 	// public key. A peer with no session at all is absent: every value
 	// describes a peer that is reachable, and says whether it rides a

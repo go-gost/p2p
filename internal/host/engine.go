@@ -270,22 +270,27 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 		if path == "" {
 			continue // no live data path — not a connected peer (peerTransports)
 		}
-		out[name] = p2p.PeerDiagnostic{
-			Path:   path,
-			Reason: reasonFor(path),
-			// The snapshot's zero value must read the same everywhere: a peer with
-			// no directConn is in the same state as one whose directConn is in
-			// directNone.
-			State:       "none",
-			LastRecvAge: ageOf(now, pc.lastFrameAt.Load()),
-			// The peer's relay-session churn, so a pair that is flapping reads as
-			// such in the report instead of only in the log.
-			RelayRebuilds: pc.relayRebuilds.Load(),
-			PeerRekeys:    pc.relayRebuildPeers.Load(),
-			// The pair's relay KCP session health, read through the pair (not the
-			// adapter) so a clean adapter swap still reports the surviving session.
-			RelayKCP: e.relayKCPStats(pc.peer),
-		}
+		out[name] = func() p2p.PeerDiagnostic {
+			d := p2p.PeerDiagnostic{
+				Path:   path,
+				Reason: reasonFor(path),
+				// The snapshot's zero value must read the same everywhere: a peer with
+				// no directConn is in the same state as one whose directConn is in
+				// directNone.
+				State:       "none",
+				LastRecvAge: ageOf(now, pc.lastFrameAt.Load()),
+				// The peer's relay-session churn, so a pair that is flapping reads as
+				// such in the report instead of only in the log.
+				RelayRebuilds: pc.relayRebuilds.Load(),
+				PeerRekeys:    pc.relayRebuildPeers.Load(),
+				// The pair's relay KCP session health, read through the pair (not the
+				// adapter) so a clean adapter swap still reports the surviving session.
+				RelayKCP: e.relayKCPStats(pc.peer),
+			}
+			// The pair's O2/O4/O5 migration history (in-process only).
+			e.fillPairDiag(&d, pc.peer)
+			return d
+		}()
 	}
 	for _, dc := range directs {
 		name := keyName(dc.peer)
@@ -314,12 +319,33 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 		}
 		d.Attempts, d.Ups, d.Drops = dc.punchCounters()
 		d.Trace = dc.traceLines()
+		// The pair's O2/O4/O5 migration history and the punch backoff (O4).
+		e.fillPairDiag(&d, dc.peer)
+		d.NextPunchIn = dc.nextPunchIn()
 		out[name] = d
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// fillPairDiag copies the pair's O2/O4/O5 diagnostic view onto d (in-process
+// only: the gRPC proto is frozen). A peer with no pair leaves the fields zero.
+func (e *engine) fillPairDiag(d *p2p.PeerDiagnostic, peer derpclient.PublicKey) {
+	pair := e.relayKCPPairGet(peer)
+	if pair == nil {
+		return
+	}
+	pd := pair.diag()
+	d.PathTrace = pd.pathTrace
+	d.FallbackReason = pd.fallbackReason
+	d.PairMigrations = int64(pd.migrations)
+	d.PairFallbacks = int64(pd.fallbacks)
+	d.DirectIdleEvictions = int64(pd.directIdleEvictions)
+	d.RepunchAfterIdle = int64(pd.repunchAfterIdle)
+	d.SeedFailures = int64(pd.seedFailures)
+	d.RelayLossSuppressedByDirect = int64(pd.relayLossSuppressed)
 }
 
 // ageOf is the time since a UnixNano stamp, or 0 when unset.
@@ -1217,7 +1243,7 @@ func (e *engine) ensureDirectConsumer(peer derpclient.PublicKey, pair *relayKCPP
 			dc.noteRound("pair session not ready")
 		}
 	}
-	if pair.clearDirectUnderlayIf(u) {
+	if pair.clearDirectUnderlayIf(u, pathChangeClear) {
 		if dc := e.getDirect(peer); dc != nil {
 			dc.underlayDead(u)
 		}
@@ -1237,9 +1263,13 @@ func (e *engine) directUnderlayDead(peer derpclient.PublicKey, u *directUnderlay
 	if pair == nil {
 		return
 	}
-	if !pair.clearDirectUnderlayIf(u) {
+	if !pair.clearDirectUnderlayIf(u, pathChangeDirectIdle) {
 		return // a newer underlay replaced it: not ours to retire
 	}
+	// The idle eviction is what schedules the re-punch (dc.underlayDead,
+	// below): count it so Status can tell "idle and recovering" from
+	// "flapping" without reading logs.
+	pair.repunchAfterIdle.Add(1)
 	dc := e.getDirect(peer)
 	if dc == nil {
 		return
@@ -2471,10 +2501,18 @@ func (e *engine) resetsPairKCPFor(peer derpclient.PublicKey, reason sessionEndRe
 	if !resetsPairKCP(reason) {
 		return false
 	}
-	if relayChurnReason(reason) && e.pairHasLiveDirect(peer) {
-		return false
+	if !relayChurnReason(reason) {
+		return true
 	}
-	return true
+	// One lookup, so the suppression decision and the O1/O2 relay-loss signal
+	// cannot disagree. The pair, when it exists, records whether a live direct
+	// path kept this relay loss from resetting it — the explicit H1 signal.
+	pair := e.relayKCPPairGet(peer)
+	suppressed := pair != nil && pair.preferredDirect()
+	if pair != nil {
+		pair.noteRelayLoss(suppressed, string(reason))
+	}
+	return !suppressed
 }
 
 // killSession marks the adapter dead and tears down its session. Safe for

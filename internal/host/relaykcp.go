@@ -152,6 +152,10 @@ func newRelayKCPPair(e *engine, peer derpclient.PublicKey) *relayKCPPair {
 		directPumpDone: noDirect,
 		wake:           make(chan struct{}),
 		idle:           make(chan struct{}),
+		// A fresh pair has no direct underlay, so its path starts on the relay;
+		// recording that here makes the first direct install a real flip for the
+		// O1/O2 migration history even before a KCP session exists.
+		lastPath: "relay",
 	}
 	// The relay pump runs for the pair's lifetime: it parks until an endpoint
 	// is registered, follows the pair across endpoint swaps, and ends only when
@@ -268,6 +272,30 @@ type relayKCPPair struct {
 	// the relay half of the per-underlay recency (O3), the counterpart of
 	// lastDirectRecv. Guarded by mu.
 	lastRelayRecv time.Time
+
+	// lastPath is the last preferred path recorded for events/counters (O1/O2),
+	// distinct from appliedPath, which is only the KCP tuning state and stays ""
+	// until a session exists. It starts at "relay" (a fresh pair has no direct
+	// underlay) so the first direct install is a relay→direct migration even
+	// before the session is built. Guarded by mu.
+	lastPath string
+	// lastFallbackReason is the reason of the most recent direct→relay flip
+	// (O4), a finite enum; empty until one happens. Guarded by mu.
+	lastFallbackReason string
+	// pathTrace is the bounded ring of recent path-change lines (O5), oldest
+	// first, capped like directConn.trace. Allocated once, reused; guards by mu.
+	pathTraceRing [punchTraceCap]string
+	pathTracePos  int
+	pathTraceN    int
+
+	// Pair migration counters (O2), atomic because Status reads them without
+	// p.mu on a path that must not contend with the data plane.
+	migrations          atomic.Uint64 // relay->direct flips
+	fallbacks           atomic.Uint64 // direct->relay flips
+	directIdleEvictions atomic.Uint64 // the idle subset of fallbacks
+	repunchAfterIdle    atomic.Uint64 // idle evictions that scheduled a re-punch
+	seedFailures        atomic.Uint64 // failed seed handshakes
+	relayLossSuppressed atomic.Uint64 // relay losses kept from resetting by a live direct
 }
 
 // relayKCPSnapshot is a point-in-time read of the pair's KCP session stats and
@@ -559,12 +587,15 @@ func (p *relayKCPPair) setDirectUnderlay(u *directUnderlay) {
 	p.lastDirectRecv = time.Now()
 	// A freshly installed direct path is preferred immediately, so the
 	// session's congestion control must follow it there.
-	p.applyPathTuningLocked()
+	ev := p.applyPathTuningLocked(pathChangeFirstDirect)
 	p.mu.Unlock()
 
+	p.logPathChange(ev)
+	p.logUnderlayInstalled(u)
 	if old != nil {
 		close(oldStop)
 		old.close()
+		p.logUnderlayRetired(old, underlayReplaced)
 	}
 	go func() {
 		defer close(done)
@@ -576,7 +607,7 @@ func (p *relayKCPPair) setDirectUnderlay(u *directUnderlay) {
 // once. It is idempotent: a second call finds no underlay and returns. p.mu is
 // released before stop is closed and u.close() runs, so a caller that reached
 // here from inside the pump (an idle callback) cannot self-deadlock.
-func (p *relayKCPPair) clearDirectUnderlay() { p.clearDirectUnderlayIf(nil) }
+func (p *relayKCPPair) clearDirectUnderlay() { p.clearDirectUnderlayIf(nil, pathChangeClear) }
 
 // clearDirectUnderlayIf clears the pair's direct underlay only while it is still
 // want (want == nil means whatever is installed), testing and clearing in one
@@ -585,8 +616,9 @@ func (p *relayKCPPair) clearDirectUnderlay() { p.clearDirectUnderlayIf(nil) }
 // re-punch that replaces the underlay between the check and the clear, and would
 // retire the replacement — the new, good path (C1). p.mu is released before stop
 // is closed and u.close() runs, so a caller reached from inside the pump cannot
-// self-deadlock.
-func (p *relayKCPPair) clearDirectUnderlayIf(want *directUnderlay) bool {
+// self-deadlock. reason is the finite path-change enum the flip is attributed
+// to; it also picks the underlay's own retire reason (idle vs replaced).
+func (p *relayKCPPair) clearDirectUnderlayIf(want *directUnderlay, reason string) bool {
 	p.mu.Lock()
 	u, stop := p.direct, p.directStop
 	if want != nil && u != want {
@@ -597,14 +629,27 @@ func (p *relayKCPPair) clearDirectUnderlayIf(want *directUnderlay) bool {
 	p.directStop = nil
 	// No underlay is preferred any more: fall the session's congestion control
 	// back to the relay.
-	p.applyPathTuningLocked()
+	ev := p.applyPathTuningLocked(reason)
 	p.mu.Unlock()
 	if u == nil {
 		return false
 	}
+	p.logPathChange(ev)
+	p.logUnderlayRetired(u, underlayRetireReason(reason))
 	close(stop)
 	u.close()
 	return true
+}
+
+// underlayRetireReason maps a path-change reason to the finite
+// event=direct-underlay reason set (punch/idle/replaced): an idle fallback
+// retires the underlay as "idle", anything else (an engine clear or a
+// replacement) as "replaced".
+func underlayRetireReason(pathReason string) string {
+	if pathReason == pathChangeDirectIdle {
+		return underlayIdle
+	}
+	return underlayReplaced
 }
 
 // pumpDirect is the direct half of the pair's fan-in: it loops u.readFrom,
@@ -656,11 +701,13 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
 		p.mu.Lock()
+		var ev *pathChangeEvent
 		if p.direct == u {
 			p.lastDirectRecv = time.Now()
-			p.applyPathTuningLocked()
+			ev = p.applyPathTuningLocked(pathChangeFirstDirect)
 		}
 		p.mu.Unlock()
+		p.logPathChange(ev)
 		select {
 		case p.recv <- pkt:
 		default:
@@ -697,11 +744,13 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 func (p *relayKCPPair) reportDirectIdle(u *directUnderlay) bool {
 	p.mu.Lock()
 	ok := p.direct == u && !p.closed && time.Since(p.lastDirectRecv) >= directUnderlayIdle
+	var ev *pathChangeEvent
 	if ok {
-		p.applyPathTuningLocked()
+		ev = p.applyPathTuningLocked(pathChangeDirectIdle)
 	}
 	cb := p.onDirectIdle
 	p.mu.Unlock()
+	p.logPathChange(ev)
 	if !ok || cb == nil {
 		return false
 	}
@@ -758,33 +807,263 @@ func pathNC(path string) int {
 	return 1
 }
 
-// applyPathTuningLocked keeps the pair's KCP session's congestion control in
-// step with the preferred path: nc=0 (control on) on direct, nc=1 (off) on
-// relay. SetMtu and SetWindowSize are per-session and deliberately stay put —
-// only the per-path flag moves. It is called wherever the preferred path can
-// flip (session creation, direct-underlay install and clear, a datagram
-// re-electing direct, and the idle watchdog observing direct go stale) and is
-// a no-op when the path is unchanged, so a per-datagram call costs nothing.
-// Caller must hold p.mu; a nil session is skipped because session() applies
-// the current path when it builds one. The only lock order in this file is
-// p.mu -> s.mu (session() already holds p.mu across SetNoDelay), so taking
-// s.mu here cannot invert.
-func (p *relayKCPPair) applyPathTuningLocked() {
-	sess := p.sess
-	if sess == nil {
-		return
-	}
+// Path-change reasons (O1): a closed enum, never free text, so a reader can
+// group flips by reason without parsing prose. relay-lost and relay-restored are
+// part of the enum the design fixes and are reserved here, but the pair's
+// preference is driven by direct recency alone — a relay endpoint swap never
+// flips it (the event's relayAlive attr carries that state instead), so only the
+// three below are emitted today.
+const (
+	// pathChangeFirstDirect is a relay->direct flip: a direct underlay was
+	// installed, or a datagram re-elected one after a silence.
+	pathChangeFirstDirect = "first-direct-datagram"
+	// pathChangeDirectIdle is a direct->relay flip: the watchdog saw the direct
+	// underlay silent past directUnderlayIdle.
+	pathChangeDirectIdle = "direct-idle"
+	// pathChangeClear is a direct->relay flip: the underlay was retired.
+	pathChangeClear = "clear"
+	// pathChangeRelayLost / pathChangeRelayRestored are reserved by the O1 enum
+	// (see the note above); not emitted by the pair today.
+	pathChangeRelayLost     = "relay-lost"
+	pathChangeRelayRestored = "relay-restored"
+)
+
+// Direct-underlay event reasons (O1), a closed enum for event=direct-underlay.
+const (
+	underlayPunch    = "punch"
+	underlayIdle     = "idle"
+	underlayReplaced = "replaced"
+	underlayClear    = "clear"
+)
+
+// pathChangeEvent is one detected preferred-path flip, handed back from
+// applyPathTuningLocked so the caller can log it after releasing p.mu. The
+// counters are the post-bump values, so one log line carries the pair's whole
+// migration history.
+type pathChangeEvent struct {
+	from, to      string
+	reason        string
+	directRecvAge time.Duration
+	relayAlive    bool
+	nc            int
+	migrations    uint64
+	fallbacks     uint64
+}
+
+// line renders the event as a PathTrace line (O5) and the log message suffix:
+// "relay->direct first-direct-datagram".
+func (e pathChangeEvent) line() string {
+	return e.from + "->" + e.to + " " + e.reason
+}
+
+// applyPathTuningLocked records a preferred-path flip (O1/O2/O5) and keeps the
+// pair's KCP session's congestion control in step with the path: nc=0 (control
+// on) on direct, nc=1 (off) on relay. SetMtu and SetWindowSize are per-session
+// and deliberately stay put — only the per-path flag moves.
+//
+// Flip detection is independent of the session: it compares the current path
+// against lastPath, which starts "relay", so an install before a session exists
+// still counts and logs. Tuning happens only when a session is live (a nil
+// session is skipped because session() applies the current path when it builds
+// one), and stays idempotent through appliedPath, so a per-datagram call costs
+// nothing. reason is the finite enum above; the returned event is nil when the
+// path did not change. It is called wherever the preferred path can flip
+// (session creation, direct-underlay install and clear, a datagram re-electing
+// direct, and the idle watchdog observing direct go stale).
+//
+// Caller must hold p.mu. The only lock order in this file is p.mu -> s.mu
+// (session() already holds p.mu across SetNoDelay), so taking s.mu here cannot
+// invert.
+func (p *relayKCPPair) applyPathTuningLocked(reason string) *pathChangeEvent {
 	path := p.pathNameLocked()
-	if path == p.appliedPath {
+	var ev *pathChangeEvent
+	if path != p.lastPath {
+		from := p.lastPath
+		p.lastPath = path
+		if path == "direct" {
+			p.migrations.Add(1)
+		} else {
+			p.fallbacks.Add(1)
+			if reason == pathChangeDirectIdle {
+				p.directIdleEvictions.Add(1)
+			}
+			p.lastFallbackReason = reason
+		}
+		// O6's per-pair flip counter, bumped at the one place a flip is
+		// detected: a stream that never did I/O across a flip still leaves its
+		// mark here.
+		p.pathChanges.Add(1)
+		ev = &pathChangeEvent{
+			from:       from,
+			to:         path,
+			reason:     reason,
+			relayAlive: p.ep != nil,
+			nc:         pathNC(path),
+			migrations: p.migrations.Load(),
+			fallbacks:  p.fallbacks.Load(),
+		}
+		if !p.lastDirectRecv.IsZero() {
+			ev.directRecvAge = time.Since(p.lastDirectRecv)
+		}
+		p.notePathTraceLocked(ev)
+	}
+	if sess := p.sess; sess != nil {
+		if nc := pathNC(path); path != p.appliedPath {
+			sess.SetNoDelay(1, 10, 2, nc)
+			p.appliedPath = path
+			p.appliedNC = nc
+		}
+	}
+	return ev
+}
+
+// notePathTraceLocked appends one line to the pair's path-change ring (O5),
+// dropping the oldest once full. Caller must hold p.mu.
+func (p *relayKCPPair) notePathTraceLocked(ev *pathChangeEvent) {
+	p.pathTraceRing[p.pathTracePos] = ev.line()
+	p.pathTracePos = (p.pathTracePos + 1) % punchTraceCap
+	if p.pathTraceN < punchTraceCap {
+		p.pathTraceN++
+	}
+}
+
+// pathTraceLines returns the pair's path-change trace oldest-first, as a copy so
+// a caller (a status builder) never aliases the ring.
+func (p *relayKCPPair) pathTraceLines() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pathTraceN == 0 {
+		return nil
+	}
+	out := make([]string, p.pathTraceN)
+	start := (p.pathTracePos - p.pathTraceN + punchTraceCap) % punchTraceCap
+	for i := range out {
+		out[i] = p.pathTraceRing[(start+i)%punchTraceCap]
+	}
+	return out
+}
+
+// pairDiag is the pair's O2/O4 snapshot: the migration counters, the last
+// fallback reason, and the path-change trace. It is read without p.mu for the
+// counters (atomics) and with it only for the reason/trace.
+type pairDiag struct {
+	fallbackReason      string
+	migrations          uint64
+	fallbacks           uint64
+	directIdleEvictions uint64
+	repunchAfterIdle    uint64
+	seedFailures        uint64
+	relayLossSuppressed uint64
+	pathTrace           []string
+}
+
+// diag returns the pair's O2/O4/O5 diagnostic view for PeerDiagnostic/Status.
+func (p *relayKCPPair) diag() pairDiag {
+	p.mu.Lock()
+	reason := p.lastFallbackReason
+	p.mu.Unlock()
+	return pairDiag{
+		fallbackReason:      reason,
+		migrations:          p.migrations.Load(),
+		fallbacks:           p.fallbacks.Load(),
+		directIdleEvictions: p.directIdleEvictions.Load(),
+		repunchAfterIdle:    p.repunchAfterIdle.Load(),
+		seedFailures:        p.seedFailures.Load(),
+		relayLossSuppressed: p.relayLossSuppressed.Load(),
+		pathTrace:           p.pathTraceLines(),
+	}
+}
+
+// logPathChange emits the O1 path-change Info event. Called after p.mu is
+// released; the attrs are the stable, greppable set the design fixes.
+func (p *relayKCPPair) logPathChange(ev *pathChangeEvent) {
+	if ev == nil || p.e == nil || p.e.log == nil {
 		return
 	}
-	nc := pathNC(path)
-	sess.SetNoDelay(1, 10, 2, nc)
-	p.appliedPath = path
-	p.appliedNC = nc
-	// A real flip (the early return above keeps this to flips only) is O6's
-	// per-pair pathChanges event.
-	p.pathChanges.Add(1)
+	p.e.log.Info("pair path changed",
+		"event", "path-change",
+		"peer", keyName(p.peer),
+		"from", ev.from,
+		"to", ev.to,
+		"reason", ev.reason,
+		"directRecvAge", ev.directRecvAge.String(),
+		"relayAlive", ev.relayAlive,
+		"nc", ev.nc,
+		"migrations", ev.migrations,
+		"fallbacks", ev.fallbacks,
+	)
+}
+
+// logUnderlayInstalled emits the O1 direct-underlay installed Info event.
+func (p *relayKCPPair) logUnderlayInstalled(u *directUnderlay) {
+	if u == nil || p.e == nil || p.e.log == nil {
+		return
+	}
+	p.e.log.Info("direct underlay installed",
+		"event", "direct-underlay",
+		"peer", keyName(p.peer),
+		"state", "installed",
+		"reason", underlayPunch,
+		"peerAddr", u.peer.String(),
+	)
+}
+
+// logUnderlayRetired emits the O1 direct-underlay retired Info event, with the
+// underlay's lifetime and the finite retirement reason.
+func (p *relayKCPPair) logUnderlayRetired(u *directUnderlay, reason string) {
+	if u == nil || p.e == nil || p.e.log == nil {
+		return
+	}
+	p.e.log.Info("direct underlay retired",
+		"event", "direct-underlay",
+		"peer", keyName(p.peer),
+		"state", "retired",
+		"reason", reason,
+		"peerAddr", u.peer.String(),
+		"lifetime", time.Since(u.installedAt).String(),
+	)
+}
+
+// noteSeed emits the O1 seed Info event and counts failures (O2). Called from
+// the punch goroutine on each family's handshake result.
+func (p *relayKCPPair) noteSeed(result, family, addr string) {
+	if p == nil {
+		return
+	}
+	if result != "ok" {
+		p.seedFailures.Add(1)
+	}
+	if p.e == nil || p.e.log == nil {
+		return
+	}
+	p.e.log.Info("direct punch seed",
+		"event", "seed",
+		"peer", keyName(p.peer),
+		"result", result,
+		"family", family,
+		"addr", addr,
+	)
+}
+
+// noteRelayLoss emits the O1 relay-loss Info event — the H1 signal — and counts
+// suppressions (O2). suppressed is whether a live direct path kept the relay
+// loss from resetting the pair.
+func (p *relayKCPPair) noteRelayLoss(suppressed bool, reason string) {
+	if p == nil {
+		return
+	}
+	if suppressed {
+		p.relayLossSuppressed.Add(1)
+	}
+	if p.e == nil || p.e.log == nil {
+		return
+	}
+	p.e.log.Info("relay loss",
+		"event", "relay-loss",
+		"peer", keyName(p.peer),
+		"suppressed", suppressed,
+		"reason", reason,
+	)
 }
 
 // ReadFrom returns one datagram from the pair's fan-in channel: the relay and

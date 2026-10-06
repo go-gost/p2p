@@ -622,7 +622,7 @@ func TestClearDirectUnderlayIfLeavesReplacement(t *testing.T) {
 	pair.mu.Unlock()
 
 	// A stale retirement for u1 must not clear u2.
-	if pair.clearDirectUnderlayIf(u1) {
+	if pair.clearDirectUnderlayIf(u1, pathChangeDirectIdle) {
 		t.Fatal("clearDirectUnderlayIf(u1) cleared a replacement underlay")
 	}
 	pair.mu.Lock()
@@ -636,7 +636,7 @@ func TestClearDirectUnderlayIfLeavesReplacement(t *testing.T) {
 	}
 
 	// The current identity clears, and closes exactly that underlay.
-	if !pair.clearDirectUnderlayIf(u2) {
+	if !pair.clearDirectUnderlayIf(u2, pathChangeDirectIdle) {
 		t.Fatal("clearDirectUnderlayIf(u2) did not clear the current underlay")
 	}
 	if !u2.closed() {

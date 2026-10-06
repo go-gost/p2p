@@ -343,6 +343,16 @@ func (s *server) status() p2p.Status {
 			}
 			st.DerpPeers++
 		}
+		// The pair migration counters (O2), summed over the reported peers so
+		// Status and PeerDiagnostics cannot disagree.
+		for _, d := range st.PeerDiagnostics {
+			st.PairMigrations += d.PairMigrations
+			st.PairFallbacks += d.PairFallbacks
+			st.DirectIdleEvictions += d.DirectIdleEvictions
+			st.RepunchAfterIdle += d.RepunchAfterIdle
+			st.SeedFailures += d.SeedFailures
+			st.RelayLossSuppressedByDirect += d.RelayLossSuppressedByDirect
+		}
 		st.PunchAttempts, st.PunchSuccess,
 			st.StreamsDirect, st.StreamsDerp = s.engine.stats.snapshot()
 	}

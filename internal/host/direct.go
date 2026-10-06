@@ -209,6 +209,11 @@ type directConn struct {
 	// again. Guarded by mu like the rest of the round's state.
 	silentFor time.Duration
 
+	// backoffUntil is when the armed re-punch backoff expires, so
+	// PeerDiagnostic.NextPunchIn can answer "how long until we try again"
+	// without reading the timer. Zero when no backoff is armed. Guarded by mu.
+	backoffUntil time.Time
+
 	// This peer's punch history, reported through Status.PeerDiagnostics. Atomics
 	// so a status query reads them without taking dc.mu and queueing behind a
 	// punch round; drops is also incremented while dc.mu is held, where a second
@@ -404,8 +409,28 @@ func (dc *directConn) start() bool {
 		return false
 	}
 	dc.state = directAttempting
+	// The round is starting, so any armed backoff has served its purpose: a
+	// status reader must not still see a "next punch in" for a punch in flight.
+	dc.backoffUntil = time.Time{}
 	go dc.punch()
 	return true
+}
+
+// nextPunchIn reports how long until the armed re-punch backoff expires, 0 when
+// none is armed (a round is in flight, the direct path is up, or nothing is
+// scheduled). It is the O4 field that answers "how long until we try again"
+// without reading the timer.
+func (dc *directConn) nextPunchIn() time.Duration {
+	dc.mu.Lock()
+	until := dc.backoffUntil
+	dc.mu.Unlock()
+	if until.IsZero() {
+		return 0
+	}
+	if d := time.Until(until); d > 0 {
+		return d
+	}
+	return 0
 }
 
 // isUp reports whether this directConn believes it has a registered direct
@@ -909,6 +934,7 @@ func (dc *directConn) retryFrom(d time.Duration, failed bool, fromNone bool) {
 		return
 	}
 	dc.state = directBackoff
+	dc.backoffUntil = time.Now().Add(d)
 	dc.failed = dc.failed || failed
 	if failed {
 		dc.failGen++
@@ -1139,11 +1165,17 @@ func (dc *directConn) punch() {
 			dc.noteErr(fmt.Sprintf("seed failed: %v", err))
 			dc.noteRound("%s seed failed: %v", f.name, err)
 			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", dial.String(), "error", err)
+			if pair := e.relayKCPPairGet(dc.peer); pair != nil {
+				pair.noteSeed("timeout", f.name, dial.String())
+			}
 			continue
 		}
 		sock := f.sock
 		f.sock = nil // owned by the pair's direct underlay
 		closeFams()  // drop the unused family's socket
+		if pair := e.relayKCPPairGet(dc.peer); pair != nil {
+			pair.noteSeed("ok", f.name, dial.String())
+		}
 		// Only the winner's socket is still bound, so only its candidates are
 		// ours to answer a peer's announcement with.
 		dc.mu.Lock()

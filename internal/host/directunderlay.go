@@ -31,6 +31,11 @@ type directUnderlay struct {
 	sock *net.UDPConn
 	peer netip.AddrPort
 
+	// installedAt is when the underlay was built, for the O1 direct-underlay
+	// retired event's lifetime. It is set once at construction and read-only
+	// afterwards, so it needs no lock.
+	installedAt time.Time
+
 	// localToken is this side's raw-UDP seed token (Task 6), set by
 	// newDirectUnderlayToken when the punch threads it through. A seed packet
 	// carrying it is this side's own probe coming back as the peer's echo, not
@@ -58,9 +63,10 @@ type directUnderlay struct {
 // be threaded from the handshake to the underlay: use newDirectUnderlayToken.
 func newDirectUnderlay(sock *net.UDPConn, peer netip.AddrPort) *directUnderlay {
 	return &directUnderlay{
-		sock: sock,
-		peer: peer,
-		done: make(chan struct{}),
+		sock:        sock,
+		peer:        peer,
+		installedAt: time.Now(),
+		done:        make(chan struct{}),
 	}
 }
 
