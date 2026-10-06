@@ -65,6 +65,11 @@ type migFaults struct {
 	dup     atomic.Bool
 	swap    atomic.Bool
 	sent    atomic.Int64
+	// reordered counts adjacent pairs actually emitted out of order. It exists
+	// so a reorder fault cannot silently degrade into a mere delay again (the
+	// original bug: holding one packet and emitting it on the next arrival
+	// delivers in order, never swapping). Tests assert it is non-zero.
+	reordered atomic.Int64
 
 	mu      sync.Mutex
 	pending []byte
@@ -90,10 +95,16 @@ func (f *migFaults) forward(p []byte) {
 			f.mu.Unlock()
 			return
 		}
+		// A genuine adjacent swap: emit the newer packet first, then the one
+		// held back, and clear the slot so neither is delivered twice. (Holding
+		// the newer one instead would deliver every packet in order, just one
+		// arrival late — no reorder ever reaches KCP.)
 		held := f.pending
-		f.pending = cp
+		f.pending = nil
 		f.mu.Unlock()
+		f.deliver(cp)
 		f.deliver(held)
+		f.reordered.Add(1)
 		return
 	}
 	// Not swapping: flush anything held first, then this packet.
@@ -308,6 +319,9 @@ func migFlip(t *testing.T, r *migRig, read *atomic.Int64, first, mid, last int64
 	migWaitRead(t, read, mid, 30*time.Second)
 	r.faultsAB.swap.Store(false)
 	r.faultsAB.flush()
+	if r.faultsAB.reordered.Load() == 0 {
+		t.Fatal("reorder fault never swapped a packet pair: the fault degraded to a delay")
+	}
 
 	// Duplicates on both directions; KCP must dedup by seq.
 	r.faultsAB.dup.Store(true)
@@ -525,6 +539,10 @@ func TestPairMigrationSmux(t *testing.T) {
 	if err := readErr.get(); err != nil {
 		t.Fatalf("smux over pair after migration: %v", err)
 	}
+	if r.faultsAB.sent.Load() == 0 || r.faultsBA.sent.Load() == 0 {
+		t.Fatalf("direct path never carried traffic: AB=%d BA=%d",
+			r.faultsAB.sent.Load(), r.faultsBA.sent.Load())
+	}
 	t.Logf("pair smux migration OK: directAB=%d directBA=%d",
 		r.faultsAB.sent.Load(), r.faultsBA.sent.Load())
 }
@@ -577,11 +595,13 @@ func TestPairMigrationRequiresDualRead(t *testing.T) {
 		}
 	}()
 
-	// Stream on the relay, then A flips to direct while B still reads only the
-	// relay and A's new path is a black hole. B's reader must stall well short
-	// of total.
+	// Stream on the relay, then A flips to direct while B never installs a
+	// direct underlay (B reads only the relay). The new path is NOT black-holed
+	// here: A's packets do reach B's socket, but nothing reads it, so B never
+	// sees them and never ACKs them. The stall therefore isolates the missing
+	// read, not a dropped path — with a black hole the test would pass even if B
+	// were reading direct.
 	migWaitRead(t, &readBytes, 256<<10, 30*time.Second)
-	r.faultsAB.dropAll.Store(true)
 	r.pairA.setDirectUnderlay(r.underlayA)
 	time.Sleep(2 * time.Second)
 
@@ -589,6 +609,11 @@ func TestPairMigrationRequiresDualRead(t *testing.T) {
 		t.Fatalf("expected a stall without dual-read, but read %d/%d", got, total)
 	} else {
 		t.Logf("negative control OK: stalled at %d/%d without dual-read", got, total)
+	}
+	// A's send path did migrate: the stall is the missing peer read, not a
+	// failure to use direct.
+	if r.faultsAB.sent.Load() == 0 {
+		t.Fatal("A never sent on the direct path, so the stall does not isolate the missing read")
 	}
 	// Do not wait on writerDone: the writer is parked in sessA.Write on the
 	// full window. Cleanup closes the sessions, which wakes it.
