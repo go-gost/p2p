@@ -34,6 +34,10 @@ type PeerDiagnostic struct {
 	// never reach the pump, so a peer that is connected and merely idle ages.
 	// Read it as "this peer is this quiet", never as "the path is down" — the
 	// sessions' own ages and liveness say that. 0 when nothing was ever seen.
+	//
+	// LastRecvAge is the merged (freshest of the two paths) value, kept for
+	// compatibility; it hides which path is quiet, so read the per-underlay
+	// RelayKCP.RelayLastRecvAge/DirectLastRecvAge instead (O3).
 	SessionAge  time.Duration
 	LastRecvAge time.Duration
 	// Attempts/Ups/Drops are the peer's punch history (what PeerPunch held).
@@ -69,6 +73,16 @@ type PeerDiagnostic struct {
 // DefaultSnmp, which would mix the direct plane in. Live reports whether a KCP
 // session actually exists, so a zero SRTT reads as "no RTT measured yet", not as
 // a healthy idle session.
+//
+// The session runs on the pair's one KCP session whichever underlay is preferred,
+// so its SRTT/RTO are the *session's*, not a path's; the per-underlay split is
+// BytesSent/BytesRcvd and the recency fields below. Path names the current
+// preferred path ("direct" or "relay"); RelayBytesSent/RelayBytesRcvd and
+// DirectBytesSent/DirectBytesRcvd partition the same datagram totals by the
+// underlay they rode; RelayLastRecvAge/DirectLastRecvAge are the per-underlay
+// silence (0 when that underlay has no stamp), and DirectAlive says whether a
+// direct underlay is installed and fresh. They are deliberately separate values:
+// a merged "last recv" hides which path is quiet (O3).
 type RelayKCPStats struct {
 	SRTT      int64  // smoothed RTT (ms); 0 when no session or none measured yet
 	RTO       int64  // retransmit timeout (ms); 0 when no session
@@ -77,9 +91,25 @@ type RelayKCPStats struct {
 	Mtu       int    // configured relayKCPMtu
 	SndWnd    int    // configured relayKCPSndWnd
 	RcvWnd    int    // configured relayKCPRcvWnd
-	BytesSent uint64 // datagram bytes this pair's KCP offered to the relay hop
-	BytesRcvd uint64 // datagram bytes this pair's KCP read from the relay hop
+	BytesSent uint64 // datagram bytes this pair's KCP offered, both underlays
+	BytesRcvd uint64 // datagram bytes this pair's KCP read, both underlays
 	Live      bool   // whether the pair holds a live KCP session
+
+	// Path is the pair's current preferred path, in the public transport
+	// vocabulary used by Status.PeerTransports: "direct" or "derp" (M1).
+	Path string
+	// Per-underlay datagram-byte counters (O3): the relay hop and the direct
+	// underlay, summing to BytesSent/BytesRcvd.
+	RelayBytesSent  uint64
+	RelayBytesRcvd  uint64
+	DirectBytesSent uint64
+	DirectBytesRcvd uint64
+	// Per-underlay silence (O3): time since that underlay last delivered an
+	// inbound datagram, 0 when it has none (no stamp, or no underlay installed).
+	RelayLastRecvAge  time.Duration
+	DirectLastRecvAge time.Duration
+	// DirectAlive reports a direct underlay installed and fresh (preferredDirect).
+	DirectAlive bool
 }
 
 // DirectConfig is the direct path a host is running with. It answers "why is

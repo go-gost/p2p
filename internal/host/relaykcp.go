@@ -254,6 +254,20 @@ type relayKCPPair struct {
 	// negligible next to the channel send/receive already on those paths.
 	bytesSent atomic.Uint64
 	bytesRcvd atomic.Uint64
+
+	// Per-underlay byte counters (O3): the same datagram totals partitioned by
+	// the underlay they rode. relay* in WriteTo's relay branch and readRelay;
+	// direct* in WriteTo's direct branch and pumpDirect. Atomic for the same
+	// reason as the totals.
+	relayBytesSent  atomic.Uint64
+	relayBytesRcvd  atomic.Uint64
+	directBytesSent atomic.Uint64
+	directBytesRcvd atomic.Uint64
+
+	// lastRelayRecv is when the relay pump last delivered an inbound datagram —
+	// the relay half of the per-underlay recency (O3), the counterpart of
+	// lastDirectRecv. Guarded by mu.
+	lastRelayRecv time.Time
 }
 
 // relayKCPSnapshot is a point-in-time read of the pair's KCP session stats and
@@ -267,6 +281,18 @@ type relayKCPSnapshot struct {
 	bytesSent uint64
 	bytesRcvd uint64
 	present   bool
+
+	// Per-underlay attribution (O3): path is the current preferred path
+	// ("direct"/"relay"), directAlive is preferredDirect, and the relay*/direct*
+	// fields partition the datagram totals and recency by underlay.
+	path            string
+	directAlive     bool
+	relayBytesSent  uint64
+	relayBytesRcvd  uint64
+	directBytesSent uint64
+	directBytesRcvd uint64
+	relayLastRecv   time.Time
+	directLastRecv  time.Time
 }
 
 // session returns the pair's KCP session, building it on first use. The conv is
@@ -384,11 +410,19 @@ func (p *relayKCPPair) shutdown() {
 func (p *relayKCPPair) snapshot() relayKCPSnapshot {
 	p.mu.Lock()
 	sess := p.sess
-	p.mu.Unlock()
 	s := relayKCPSnapshot{
-		bytesSent: p.bytesSent.Load(),
-		bytesRcvd: p.bytesRcvd.Load(),
+		bytesSent:       p.bytesSent.Load(),
+		bytesRcvd:       p.bytesRcvd.Load(),
+		relayBytesSent:  p.relayBytesSent.Load(),
+		relayBytesRcvd:  p.relayBytesRcvd.Load(),
+		directBytesSent: p.directBytesSent.Load(),
+		directBytesRcvd: p.directBytesRcvd.Load(),
+		path:            p.pathNameLocked(),
+		directAlive:     p.preferredDirectLocked(),
+		relayLastRecv:   p.lastRelayRecv,
+		directLastRecv:  p.lastDirectRecv,
 	}
+	p.mu.Unlock()
 	if sess == nil {
 		return s
 	}
@@ -448,6 +482,10 @@ func (p *relayKCPPair) readRelay(b []byte) (int, net.Addr, error) {
 		n, addr, err := ep.ReadFrom(b)
 		if err == nil {
 			p.bytesRcvd.Add(uint64(n))
+			p.relayBytesRcvd.Add(uint64(n))
+			p.mu.Lock()
+			p.lastRelayRecv = time.Now()
+			p.mu.Unlock()
 			return n, addr, nil
 		}
 		// io.EOF: this endpoint is gone and drained (its closeCh or the kick
@@ -614,6 +652,7 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 		// follows it back to direct.
 		idleFired = false
 		p.bytesRcvd.Add(uint64(n))
+		p.directBytesRcvd.Add(uint64(n))
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
 		p.mu.Lock()
@@ -830,6 +869,7 @@ func (p *relayKCPPair) WriteTo(b []byte, _ net.Addr) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	if useDirect {
+		p.directBytesSent.Add(uint64(len(b)))
 		if _, err := direct.writeTo(b); err != nil {
 			return len(b), nil
 		}
@@ -838,6 +878,7 @@ func (p *relayKCPPair) WriteTo(b []byte, _ net.Addr) (int, error) {
 	if ep == nil {
 		return len(b), nil
 	}
+	p.relayBytesSent.Add(uint64(len(b)))
 	if _, err := ep.WriteTo(b, nil); err != nil {
 		return len(b), nil
 	}

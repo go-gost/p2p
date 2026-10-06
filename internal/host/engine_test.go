@@ -796,6 +796,116 @@ func TestPeerTransportReasons(t *testing.T) {
 	}
 }
 
+// TestPeerTransportsReportsPairPath pins the M1 semantics of the transport
+// word: it names the pair's *current* path, not a stream's lifelong plane. A
+// pair with no direct underlay reads "derp"; installing one reads "direct" —
+// even before (or without) a directConn, because the pair's own recency
+// (pathName) is what decides, not the punch state machine.
+func TestPeerTransportsReportsPairPath(t *testing.T) {
+	e := &engine{
+		direct:    true,
+		stunAddr:  "127.0.0.1:3478",
+		peers:     make(map[derpclient.PublicKey]*peerConn),
+		directs:   make(map[derpclient.PublicKey]*directConn),
+		relayKCPs: make(map[derpclient.PublicKey]*relayKCPPair),
+	}
+	peer := derpclient.PublicKey{7}
+	e.peers[peer] = &peerConn{peer: peer, sess: newTestSess(t)}
+
+	if got := e.peerTransports()[keyName(peer)]; got != transportRelay {
+		t.Fatalf("no direct underlay: transport = %q, want %q", got, transportRelay)
+	}
+
+	installDirectUnderlayFor(t, e, peer)
+	// The pair's pumps read the (test-mutable) directUnderlayIdle global; stop
+	// them before the test ends, or the goroutine leaks into a later test that
+	// changes it and trips the race detector.
+	t.Cleanup(func() {
+		if p := e.relayKCPPairGet(peer); p != nil {
+			p.shutdown()
+		}
+	})
+	if got := e.peerTransports()[keyName(peer)]; got != transportDirect {
+		t.Fatalf("direct underlay installed: transport = %q, want %q", got, transportDirect)
+	}
+}
+
+// TestPeerDiagnosticsPerUnderlayAttribution pins O3: the two underlays are
+// reported separately and never merged. Bytes are partitioned by the path each
+// datagram rode, the pair's current path and DirectAlive follow the direct
+// recency, and a stale direct path and a fresh relay path report different
+// ages — the value a merged "last recv" would hide.
+func TestPeerDiagnosticsPerUnderlayAttribution(t *testing.T) {
+	e := &engine{relayKCPs: make(map[derpclient.PublicKey]*relayKCPPair)}
+	peer := derpclient.PublicKey{23}
+	pair := e.relayKCPPairFor(peer)
+	// Stop the pair's pumps before the test ends: they read the mutable
+	// directUnderlayIdle global, and a leak would race a later test that
+	// shortens it.
+	t.Cleanup(pair.shutdown)
+
+	// A registered relay endpoint so the relay branch has somewhere to write.
+	pc := &peerConn{
+		e:       e,
+		peer:    peer,
+		inbound: make(chan []byte, 4),
+		closeCh: make(chan struct{}),
+	}
+	pair.register(pc)
+
+	// Install a fresh direct underlay: it is preferred, so the first write
+	// rides it and counts on the direct side.
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	t.Cleanup(func() { a.Close(); b.Close() })
+	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
+	if n, err := pair.WriteTo(make([]byte, 40), nil); err != nil || n != 40 {
+		t.Fatalf("direct WriteTo = %d, %v; want 40, nil", n, err)
+	}
+
+	// Serve one relay datagram: bytesRcvd and the relay recency are stamped by
+	// the relay pump as it drains the endpoint's queue.
+	pc.inbound <- make([]byte, 30)
+	if _, _, err := pair.ReadFrom(make([]byte, 64)); err != nil {
+		t.Fatalf("relay ReadFrom: %v", err)
+	}
+
+	// Let the direct path go stale: the pair falls back to the relay, and the
+	// next write counts on the relay side. Ages now differ by construction.
+	pair.mu.Lock()
+	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
+	pair.mu.Unlock()
+	if n, err := pair.WriteTo(make([]byte, 20), nil); err != nil || n != 20 {
+		t.Fatalf("relay WriteTo = %d, %v; want 20, nil", n, err)
+	}
+
+	k := e.relayKCPStats(peer)
+	if k.Path != transportRelay {
+		t.Fatalf("Path = %q, want %q for a stale direct underlay", k.Path, transportRelay)
+	}
+	if k.DirectAlive {
+		t.Fatal("DirectAlive = true for a stale direct underlay")
+	}
+	if k.DirectBytesSent != 40 || k.DirectBytesRcvd != 0 {
+		t.Fatalf("direct bytes = sent %d / rcvd %d, want 40 / 0", k.DirectBytesSent, k.DirectBytesRcvd)
+	}
+	if k.RelayBytesSent != 20 || k.RelayBytesRcvd != 30 {
+		t.Fatalf("relay bytes = sent %d / rcvd %d, want 20 / 30", k.RelayBytesSent, k.RelayBytesRcvd)
+	}
+	if k.BytesSent != 60 || k.BytesRcvd != 30 {
+		t.Fatalf("totals = sent %d / rcvd %d, want 60 / 30 (per-underlay sums)", k.BytesSent, k.BytesRcvd)
+	}
+	if k.DirectLastRecvAge < directUnderlayIdle {
+		t.Fatalf("DirectLastRecvAge = %v, want a stale (>= %v) direct age", k.DirectLastRecvAge, directUnderlayIdle)
+	}
+	if k.RelayLastRecvAge <= 0 || k.RelayLastRecvAge >= directUnderlayIdle {
+		t.Fatalf("RelayLastRecvAge = %v, want a fresh (0, %v) relay age", k.RelayLastRecvAge, directUnderlayIdle)
+	}
+	if k.DirectLastRecvAge <= k.RelayLastRecvAge {
+		t.Fatalf("ages not attributed per underlay: direct %v, relay %v", k.DirectLastRecvAge, k.RelayLastRecvAge)
+	}
+}
+
 // TestPeerTransportsDropsPeersWithoutLivePath: the peer list says who is
 // connected, and a peer is connected only while it has a live data path. A
 // killed app sends no PeerGone to an open relay, so its adapter outlives it in

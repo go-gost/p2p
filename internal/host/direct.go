@@ -307,7 +307,18 @@ func (e *engine) peerLive(peer derpclient.PublicKey) bool {
 	if pc != nil && pc.liveSession() {
 		return true
 	}
-	return dc != nil && dc.live()
+	if dc != nil && dc.live() {
+		return true
+	}
+	// A pair with a fresh direct underlay is a live data path in its own right
+	// (M1): the accepting side of a punch can hold the pair before its relay
+	// adapter exists, and the underlay — not the punch state machine — is what
+	// carries traffic. relayKCPPairGet takes kcpMu, so it is called after e.mu
+	// is released.
+	if pair := e.relayKCPPairGet(peer); pair != nil && pair.preferredDirect() {
+		return true
+	}
+	return false
 }
 
 // peerGoneForPunch reports positive evidence that the peer can no longer be

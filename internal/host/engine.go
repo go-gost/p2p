@@ -165,6 +165,14 @@ func (e *engine) peerTransports() map[string]string {
 		if !e.peerLive(p) {
 			continue // no live data path — the peer is not connected
 		}
+		// M1: the word names the pair's current path. The pair's own recency
+		// decides it, so a peer whose pair carries a fresh direct underlay
+		// reads "direct" even before its punch state machine (a directConn)
+		// exists.
+		if pair := e.relayKCPPairGet(p); pair != nil && pair.pathName() == transportDirect {
+			out[keyName(p)] = transportDirect
+			continue
+		}
 		out[keyName(p)] = fallback
 	}
 	for k, dc := range directs {
@@ -172,6 +180,13 @@ func (e *engine) peerTransports() map[string]string {
 			continue // no live data path — whatever the punch state says
 		}
 		name := keyName(k)
+		// M1 again: the pair's path outranks the per-peer punch state, so a
+		// live pair underlay is never overwritten by "failed"/"punching" off a
+		// directConn that has not caught up.
+		if pair := e.relayKCPPairGet(k); pair != nil && pair.pathName() == transportDirect {
+			out[name] = transportDirect
+			continue
+		}
 		switch {
 		case dc.live():
 			out[name] = transportDirect
@@ -1268,6 +1283,27 @@ func (e *engine) relayKCPStats(peer derpclient.PublicKey) p2p.RelayKCPStats {
 	out.BytesSent = s.bytesSent
 	out.BytesRcvd = s.bytesRcvd
 	out.Live = s.present
+	// Per-underlay attribution (O3): the session stats above are the pair's,
+	// these say which underlay carried the bytes and which is quiet. Path uses
+	// the public transport word ("direct"/"derp") so it matches
+	// PeerTransports, not the pair's internal "relay".
+	if s.path == "direct" {
+		out.Path = transportDirect
+	} else {
+		out.Path = transportRelay
+	}
+	out.RelayBytesSent = s.relayBytesSent
+	out.RelayBytesRcvd = s.relayBytesRcvd
+	out.DirectBytesSent = s.directBytesSent
+	out.DirectBytesRcvd = s.directBytesRcvd
+	out.DirectAlive = s.directAlive
+	now := time.Now()
+	if !s.relayLastRecv.IsZero() {
+		out.RelayLastRecvAge = now.Sub(s.relayLastRecv)
+	}
+	if !s.directLastRecv.IsZero() {
+		out.DirectLastRecvAge = now.Sub(s.directLastRecv)
+	}
 	return out
 }
 
