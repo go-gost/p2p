@@ -230,6 +230,22 @@ type relayKCPPair struct {
 	// goroutine) and must never be held across the callback itself.
 	directIdleFiring atomic.Bool
 
+	// onDirectInbound, when set by the engine, is invoked when the direct pump
+	// delivers a datagram while the pair has no live mux consumer (p.stream ==
+	// nil). A relay loss with a live direct path keeps the pair's KCP epoch and
+	// settled keys but closes the per-build mux session on both ends; the
+	// dialing side rebuilds on its next open, while the accepting side has no
+	// relay pump to rebuild from — an inbound direct datagram is the only
+	// signal that a peer wants a new stream. Read under mu and called outside
+	// it, from its own goroutine, so the pump never blocks on the rebuild.
+	// Guarded by mu.
+	onDirectInbound func()
+
+	// directInboundFiring bounds the onDirectInbound dispatch to at most one
+	// in-flight invocation, exactly like directIdleFiring, so a burst of direct
+	// datagrams cannot accumulate one rebuild goroutine per datagram.
+	directInboundFiring atomic.Bool
+
 	// appliedPath is the path whose KCP tuning is currently on p.sess ("direct"
 	// or "relay"), "" before any session has been tuned. appliedNC is the
 	// congestion-control flag last passed to SetNoDelay. Together they make the
@@ -609,19 +625,31 @@ func (p *relayKCPPair) setDirectUnderlay(u *directUnderlay) {
 // here from inside the pump (an idle callback) cannot self-deadlock.
 func (p *relayKCPPair) clearDirectUnderlay() { p.clearDirectUnderlayIf(nil, pathChangeClear) }
 
-// clearDirectUnderlayIf clears the pair's direct underlay only while it is still
-// want (want == nil means whatever is installed), testing and clearing in one
-// critical section. It reports whether it cleared one. This is the
+// clearDirectUnderlayIf clears the pair's direct underlay only while it is
+// still want (want == nil means whatever is installed), testing and clearing in
+// one critical section. It reports whether it cleared one. This is the
 // compare-and-clear the idle watchdog needs: a plain check-then-clear races a
 // re-punch that replaces the underlay between the check and the clear, and would
-// retire the replacement — the new, good path (C1). p.mu is released before stop
-// is closed and u.close() runs, so a caller reached from inside the pump cannot
-// self-deadlock. reason is the finite path-change enum the flip is attributed
-// to; it also picks the underlay's own retire reason (idle vs replaced).
+// retire the replacement — the new, good path (C1). An idle clear (reason
+// pathChangeDirectIdle) additionally requires the underlay to be stale *at the
+// moment of the clear*: the watchdog dispatches its callback from a goroutine,
+// so a datagram can arrive after it observed silence and re-arm the path
+// (reportDirectIdle/pumpDirect) before the callback runs — without the re-check
+// that fresh datagram's clear would retire a healthy, just-recovered underlay.
+// p.mu is released before stop is closed and u.close() runs, so a caller reached
+// from inside the pump cannot self-deadlock. reason is the finite path-change
+// enum the flip is attributed to; it also picks the underlay's own retire reason
+// (idle vs replaced).
 func (p *relayKCPPair) clearDirectUnderlayIf(want *directUnderlay, reason string) bool {
 	p.mu.Lock()
 	u, stop := p.direct, p.directStop
 	if want != nil && u != want {
+		p.mu.Unlock()
+		return false
+	}
+	if reason == pathChangeDirectIdle && time.Since(p.lastDirectRecv) < directUnderlayIdle {
+		// A datagram re-armed the path since the watchdog observed silence:
+		// not ours to retire.
 		p.mu.Unlock()
 		return false
 	}
@@ -709,12 +737,20 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 		copy(pkt, buf[:n])
 		p.mu.Lock()
 		var ev *pathChangeEvent
+		needConsumer := false
 		if p.direct == u {
 			p.lastDirectRecv = time.Now()
 			ev = p.applyPathTuningLocked(pathChangeFirstDirect)
+			// No live mux view: a suppressed relay loss closed the mux session
+			// on top of this pair, and only inbound traffic tells the accepting
+			// side a peer wants a new stream. Ask the engine to rebuild it.
+			needConsumer = p.stream == nil && !p.closed
 		}
 		p.mu.Unlock()
 		p.logPathChange(ev)
+		if needConsumer {
+			p.reportDirectInbound()
+		}
 		select {
 		case p.recv <- pkt:
 		default:
@@ -768,6 +804,33 @@ func (p *relayKCPPair) reportDirectIdle(u *directUnderlay) bool {
 	go func() {
 		defer p.directIdleFiring.Store(false)
 		cb(u)
+	}()
+	return true
+}
+
+// reportDirectInbound hands a "direct datagram arrived with no live mux
+// consumer" event to the engine's onDirectInbound callback, if one is set, and
+// reports whether a callback was dispatched. The engine rebuilds the peer's mux
+// session so an inbound stream can be accepted over the surviving pair (a
+// suppressed relay loss closes the mux on both ends; the accepting side has no
+// relay pump to rebuild from). The dispatch is bounded to one in-flight
+// callback (directInboundFiring), like reportDirectIdle, so a burst of
+// datagrams cannot accumulate goroutines. It runs in its own goroutine, outside
+// p.mu, so the pump never blocks on the rebuild.
+func (p *relayKCPPair) reportDirectInbound() bool {
+	p.mu.Lock()
+	cb := p.onDirectInbound
+	closed := p.closed
+	p.mu.Unlock()
+	if cb == nil || closed {
+		return false
+	}
+	if !p.directInboundFiring.CompareAndSwap(false, true) {
+		return false
+	}
+	go func() {
+		defer p.directInboundFiring.Store(false)
+		cb()
 	}()
 	return true
 }

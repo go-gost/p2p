@@ -547,13 +547,14 @@ scenario_derp_direct() {
 
 	# Kill the relay. A live direct path keeps the pair across the loss (H1):
 	# the relay loss is counted and logged as suppressed, and the pair stays on
-	# direct instead of being reset. This asserts the H1 pair-survival
-	# guarantee, and only that. It does NOT assert stream liveness: a relay
+	# direct instead of being reset. It additionally keeps serving streams: the
 	# loss tears down the per-build mux sessions on both ends (the pair's keys
 	# and KCP epoch survive so a reconnect re-registers without a re-handshake),
-	# and the accepting side rebuilds its mux only from the relay pump — so a
-	# new stream opened while the relay is down is not yet served. That gap is
-	# tracked separately; see .memory/notes/p2p-kcp-session-migration.md.
+	# and each end rebuilds its mux — the dialer on its next OpenStream, the
+	# accepting side from the first inbound direct datagram (onDirectInbound,
+	# the direct-side counterpart of the relay pump). So a stream opened while
+	# the relay is down still flows over direct. See
+	# .memory/notes/p2p-kcp-session-migration.md.
 	# start_derper names its pid file after the tag ("direct"), not the binary.
 	local dpid
 	dpid=$(cat "$RUNDIR/pids/direct" 2>/dev/null || true)
@@ -568,6 +569,12 @@ scenario_derp_direct() {
 	save_status A 127.0.0.1:8003 "$dir/status-no-relay.json"
 	check_grep "the pair keeps its direct path after the relay dies" \
 		'"direct_peers":[1-9]' "$dir/status-no-relay.json"
+
+	# Traffic continues over the surviving direct path: opening a stream now
+	# rebuilds the mux on the dialer and, from the SYN datagram, on the accepting
+	# side — no relay round trip is needed with the keys already settled.
+	body=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/")
+	check "a new stream is served over direct while the relay is down" test "$body" = "hello-p2p"
 }
 
 scenario_forward() {

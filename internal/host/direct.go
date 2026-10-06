@@ -33,8 +33,9 @@ import (
 // re-punch must wait for the relay to return, but existing traffic continues).
 // A relay-reported PeerGone for the peer does not tear it down either — that
 // notice is best-effort and says nothing about a path that does not run through
-// the relay. The session answers for itself through its own keepalive
-// (directSmuxKeepAliveTimeout), and dropIfGone reclaims its entry once it ends.
+// the relay. The direct path is retired by its own idle watchdog, not by the
+// peer-gone notice, and the pair is deliberately kept across the notice so a
+// returning peer resumes without a rekey (H1, see underlayDead).
 
 const (
 	frameControl = 0x00 // [0x00][kind 1B][payload]
@@ -765,7 +766,16 @@ func (dc *directConn) underlayDead(u *directUnderlay) {
 		return // a round or a backoff is already rebuilding: it decides next
 	}
 	if dc.e.dropIfGone(dc.peer, dc) {
-		return // the peer is gone from the relay: nothing to re-punch with
+		// The peer is gone from the relay, so there is nothing to re-punch
+		// with. The pair itself is deliberately left in place: a peer-gone
+		// notice is best-effort and the peer may return — its direct path can
+		// even re-punch on its own — and the pair carries the secure/KCP state
+		// a fast resume needs (H1, TestPeerGoneKeepsLiveDirectSession). Tearing
+		// it down here (without also dropping the secure session) desynced the
+		// nonces of a still-open stream. A peer that truly never returns leaves
+		// one idle pair, reclaimed when the engine closes or when a later
+		// non-direct departure goes through peerGone's reset path.
+		return
 	}
 	if backoff > 0 {
 		dc.e.log.Debug("direct underlay died young, re-punching after backoff",

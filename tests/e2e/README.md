@@ -49,7 +49,7 @@ colliding with a previous run). The last five runs are kept.
 |----------|----------------|
 | `stub` | The loopback bridge (`peer = host:port`) carries HTTP and a 1 MiB bulk transfer; `--token` is enforced (matching token works, missing token is rejected); `-C` config behaves like the equivalent flags. |
 | `derp-relay` | With a real derper and `--direct=false`, the relay path carries traffic, `Status` reports `derp_peers`, and a finished non-mux tunnel leaves no residue (`tunnels` returns to 0). |
-| `derp-direct` | STUN + UDP hole punch establishes a direct session (`status.direct_peers`); a 1 MiB transfer opened while relay-only migrates mid-stream under packet loss and stays byte-exact, the host log shows exactly one relay→direct migration, and killing the relay is logged as a loss suppressed by the live direct path with the pair kept on direct (H1). |
+| `derp-direct` | STUN + UDP hole punch establishes a direct session (`status.direct_peers`); a 1 MiB transfer opened while relay-only migrates mid-stream under packet loss and stays byte-exact, the host log shows exactly one relay→direct migration, and killing the relay is logged as a loss suppressed by the live direct path with the pair kept on direct (H1); a fresh stream opened after the relay dies is still served over direct. |
 | `forward` | `--forward listen=peerkey` exposes a raw TCP port bound to a peer key; a plain TCP client reaches a service on the peer. |
 | `inner-matrix` | The `tcp`, `tls`, `ws`, `mtcp`, `mtls`, and `mws` inner dialers each carry HTTP to peer gost listeners over one relay pair. |
 | `udp-tun` | The datagram link backs a point-to-point tun link (both ends tun clients, `udp` inner dialer): bidirectional ICMP across the link, and the link comes up on both sides. |
@@ -88,14 +88,16 @@ HTTP echo server (`/` and a 1 MiB `/bulk`), and a UDP echo server.
 - **IPv6 DAD delay.** Netns addresses are `tentative` for ~1 s; a tentative
   address is not a usable egress source, so `ipv6-direct` waits for duplicate
   address detection before starting the hosts.
-- **A relay loss tears the mux down; the pair survives.** Killing the relay
-  kills the per-build smux session on both ends, so a stream already open at
-  the cutover breaks, and the accepting side — which rebuilds its mux only
-  from an inbound *relay* packet — does not rebuild one while the relay is
-  down, so a new stream is not served either. What survives is the pair (its
-  KCP epoch and settled keys), which is what lets a reconnect re-register
-  without a re-handshake; `derp-direct` asserts exactly that, and the log's
-  `event=relay-loss` with `suppressed=true`. See
+- **A relay loss tears the mux down; the pair survives and keeps serving.** A
+  relay loss kills the per-build smux session on both ends, so a stream already
+  open at that moment breaks. What survives is the pair (its KCP epoch and
+  settled keys). A stream opened afterwards is still served: the dialer rebuilds
+  its mux on the next `OpenStream`, and the accepting side — whose only other
+  rebuild trigger is an inbound *relay* packet — rebuilds from the first inbound
+  *direct* datagram (`onDirectInbound`), so no relay round trip is needed with
+  the keys already settled. `derp-direct` asserts the pair survival (log's
+  `event=relay-loss` with `suppressed=true`, `direct_peers` kept) and that a
+  fresh request completes over the surviving direct path. See
   `.memory/notes/p2p-kcp-session-migration.md`.
 
 ### Regression found by these tests

@@ -384,7 +384,7 @@ func (e *engine) peerEncryptions() map[string]string {
 		if !pc.liveSession() && !(dc != nil && dc.live()) {
 			continue // no live data path — not a connected session
 		}
-		out[keyName(k)] = encryptionState(pc, dc)
+		out[keyName(k)] = encryptionState(pc)
 	}
 	for k, dc := range directs {
 		if _, ok := out[keyName(k)]; ok {
@@ -393,7 +393,7 @@ func (e *engine) peerEncryptions() map[string]string {
 		if !dc.live() {
 			continue // no live data path
 		}
-		out[keyName(k)] = encryptionState(nil, dc)
+		out[keyName(k)] = encryptionState(nil)
 	}
 	return out
 }
@@ -401,10 +401,9 @@ func (e *engine) peerEncryptions() map[string]string {
 // encryptionState classifies one peer by its live relay session: "secure" when
 // it holds keys, else "plaintext". The direct underlay no longer has a separate
 // secure session (Task 7): it rides the pair's relay secure session, so a live
-// direct path is exactly as encrypted as the relay it shares. dc is accepted for
-// call-site symmetry but no longer consulted.
-func encryptionState(pc *peerConn, dc *directConn) string {
-	_ = dc
+// direct path is exactly as encrypted as the relay it shares and is not
+// consulted here.
+func encryptionState(pc *peerConn) string {
 	considered, allSecure := false, true
 	if pc != nil {
 		// pc.secure is fixed at adapter creation (see peerConn) and read under
@@ -717,30 +716,12 @@ var (
 	smuxKeepAliveInterval = 3 * time.Second
 	smuxKeepAliveTimeout  = 15 * time.Second
 
-	// The direct session's own keepalive, deliberately tighter than the relay's.
-	// Smux answers a NOP with nothing, so a session's liveness is fed by the
-	// frames the *peer* sends — which is why the pair is negotiated
-	// (capsTightKeepalive) rather than applied outright: a peer that does not
-	// advertise it gets smuxKeepAliveInterval/Timeout above instead.
-	//
-	// The timeout is a silence budget, not a failover target, and a measured
-	// field case set it: a phone on Wi-Fi lost its direct session at exactly
-	// 18.000s (~3 ticks of the 6s timeout it then was), and the cause was ~12s
-	// of one-way silence from RF batching — a 6s timeout cannot survive that,
-	// while the relay's 15s one did (relaySilent, 60s, never fired). Smux clears
-	// its activity flag on one tick and closes on the next, so 15s puts the
-	// silent-path window at roughly 30-45s: long enough for the batching, still
-	// far shorter than the relay's. Until then the session is served as live:
-	// status calls the peer "direct" and a new stream is handed to a dead path
-	// instead of the relay. The relay's PeerGone is not a substitute — it is
-	// best-effort and says nothing about a path that does not run through the
-	// relay.
-	//
-	// The direct path is peer-to-peer and its frames ride KCP, so a lost NOP is
-	// retransmitted rather than dropped: silence for seconds means the path
-	// carries nothing at all, not that it is lossy. A false positive costs a
-	// fallback to the relay and a re-punch, so deployments with slow or lossy
-	// direct paths widen it further through timeouts.directSmux.
+	// directSmuxKeepAliveInterval/Timeout are retained for config compatibility
+	// (timeouts.directSmux still parses and applies) but are no longer read: the
+	// direct plane no longer runs its own smux session — it rides the pair's
+	// relay session, whose liveness is smuxKeepAliveInterval/Timeout above and,
+	// for the hole-punched path, the underlay idle watchdog (directUnderlayIdle).
+	// Kept so an existing config that sets them still loads.
 	directSmuxKeepAliveInterval = 2 * time.Second
 	directSmuxKeepAliveTimeout  = 15 * time.Second
 )
@@ -1202,6 +1183,9 @@ func (e *engine) registerDirectUnderlay(peer derpclient.PublicKey, sock *net.UDP
 	if pair.onDirectIdle == nil {
 		pair.onDirectIdle = func(u *directUnderlay) { e.directUnderlayDead(peer, u) }
 	}
+	if pair.onDirectInbound == nil {
+		pair.onDirectInbound = func() { e.onDirectInbound(peer) }
+	}
 	pair.mu.Unlock()
 	u := newDirectUnderlayToken(sock, addr, token)
 	pair.setDirectUnderlay(u)
@@ -1275,6 +1259,37 @@ func (e *engine) directUnderlayDead(peer derpclient.PublicKey, u *directUnderlay
 		return
 	}
 	dc.underlayDead(u)
+}
+
+// onDirectInbound rebuilds the peer's mux session when an inbound direct
+// datagram arrives and the adapter has no live session. A relay loss with a
+// live direct path keeps the pair's KCP epoch and settled keys but closes the
+// per-build mux session on both ends (killSession). The dialing side rebuilds on
+// its next OpenStream; the accepting side has no relay pump to trigger a
+// rebuild (engine.pump is the only non-outbound rebuild trigger), so without
+// this a new stream opened over direct would hang. It is the direct-side
+// counterpart of that relay-pump ensureSession.
+//
+// It runs on its own goroutine dispatched by the pair's direct pump (see
+// reportDirectInbound), so it may take pc.mu and, on a first adapter, dial the
+// relay — both off the data path, and bounded to one in flight per pair. With
+// the settled keys a rebuild needs no relay round trip; the dial only fails
+// fast when the relay is down, which is the case this path exists for.
+func (e *engine) onDirectInbound(peer derpclient.PublicKey) {
+	pc := e.peerConn(peer)
+	if pc == nil {
+		return
+	}
+	pc.mu.Lock()
+	live := pc.liveSessionLocked()
+	pc.mu.Unlock()
+	if live {
+		return
+	}
+	if _, err := pc.ensureSession(false, true); err != nil {
+		e.log.Debug("direct: inbound direct with no live mux",
+			"peer", keyName(peer), "error", err)
+	}
 }
 
 // relayKCPLogAttrs returns the slog attrs describing the pair's relay KCP
@@ -1916,9 +1931,10 @@ func (e *engine) keepalive(c *derpclient.Client) {
 // best-effort notice about the peer's relay connection, and it says nothing
 // about the hole-punched path, which does not run through the relay at all —
 // tearing it down here destroyed a working path every time a peer's relay link
-// blipped. The direct session answers for itself through its own keepalive
-// (see directSmuxKeepAliveTimeout); dropIfGone reclaims the entry once that
-// session ends.
+// blipped. The direct path answers for itself through its own idle watchdog
+// (see directUnderlayDead); a peer-gone notice does not retire it, and the pair
+// is deliberately kept across the notice (H1) so a returning peer resumes
+// without a rekey.
 //
 // For the same reason a live direct path keeps the pair (and its relay secure
 // session) alive across the notice (H1, see resetsPairKCPFor): the relay half is

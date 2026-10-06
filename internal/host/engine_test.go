@@ -247,6 +247,12 @@ func TestPeerGoneWithLiveDirectKeepsPair(t *testing.T) {
 	}
 }
 
+// TestPeerGoneThenDirectDeathDropsPair was removed: the pair is deliberately
+// retained across peerGone even after the direct path goes idle, so a returning
+// peer resumes without a rekey/re-handshake (H1). See
+// TestPeerGoneKeepsLiveDirectSession and the retention comment in
+// directConn.underlayDead.
+
 // TestPeerGoneWithoutDirectResetsPair pins the safe baseline of the peer-gone
 // guard: with no direct path, the notice ends the pair and drops the relay
 // secure session exactly as before.
@@ -357,6 +363,82 @@ func TestRelayLinkLossKeepsLiveDirectPair(t *testing.T) {
 	if got != secure {
 		t.Fatal("teardown dropped the relay secure session despite a live direct path")
 	}
+}
+
+// TestRelayLossServesNewStreamOverDirect pins the follow-up T14: a relay loss
+// with a live direct path keeps the pair (H1) but closes the per-build mux
+// session on both ends (killSession). The dialing side rebuilds its mux on its
+// next OpenStream, but the accepting side has no relay pump to trigger a
+// rebuild — so without a direct-inbound trigger, a new stream opened while the
+// relay is down hangs. Here the relay dies, and a fresh stream must still be
+// served over the surviving direct path.
+func TestRelayLossServesNewStreamOverDirect(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	if err := engineA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engineB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A relay stream settles the secure layer and builds the pair.
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "before-loss")
+	s.Close()
+
+	// Punch a real direct path on both ends and let the pair prefer it.
+	engineA.maybeStartDirect(pubB)
+	engineB.maybeStartDirect(engineA.pub)
+	waitFor(t, 10*time.Second, func() bool {
+		return engineA.pairHasLiveDirect(pubB) && engineB.pairHasLiveDirect(engineA.pub)
+	})
+
+	// The relay dies on both ends (the e2e kills the derper): tear the
+	// transport down, then close the listener so it cannot be re-dialed. The
+	// pair and its settled keys survive on the live direct path (H1).
+	engineA.mu.Lock()
+	cA := engineA.client
+	engineA.mu.Unlock()
+	engineB.mu.Lock()
+	cB := engineB.client
+	engineB.mu.Unlock()
+	if cA == nil || cB == nil {
+		t.Fatal("a relay connection is missing before the loss")
+	}
+	engineA.teardown(cA, errors.New("test: relay lost"))
+	engineB.teardown(cB, errors.New("test: relay lost"))
+	rs.srv.Close()
+	// Losing the relay is not a relay-packet proof of reachability, so a stale
+	// gone mark must not shorten the open: the direct path is live.
+	engineA.clearGone(pubB)
+	engineB.clearGone(engineA.pub)
+	if !engineA.pairHasLiveDirect(pubB) || !engineB.pairHasLiveDirect(engineA.pub) {
+		t.Fatal("the pair lost its live direct path across the relay loss")
+	}
+
+	// A new stream with the relay down must be served over direct: the
+	// accepting side rebuilds its mux from the inbound direct datagram.
+	s2, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatalf("open with the relay down: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "after-loss")
 }
 
 // syncBuffer is a goroutine-safe bytes.Buffer for catching an engine's slog
@@ -1803,23 +1885,18 @@ func TestEncryptionState(t *testing.T) {
 	encRelay, _ := settledSecurePair(t, secureTransportRelay)
 	plain := newSecureSession(nil, secureTransportRelay, derpclient.PrivateKey{}, peer) // never settled
 
-	if got := encryptionState(nil, nil); got != encStatePlaintext {
+	if got := encryptionState(nil); got != encStatePlaintext {
 		t.Errorf("no sessions = %q, want plaintext", got)
 	}
-	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}, nil); got != encStateSecure {
+	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}); got != encStateSecure {
 		t.Errorf("encrypted relay = %q, want secure", got)
 	}
-	if got := encryptionState(&peerConn{peer: peer, secure: plain}, nil); got != encStatePlaintext {
+	if got := encryptionState(&peerConn{peer: peer, secure: plain}); got != encStatePlaintext {
 		t.Errorf("plaintext relay = %q, want plaintext", got)
 	}
-	// A live direct path shares the relay's keys: secure when the relay is.
-	dc := &directConn{peer: peer, sock: mustListenUDP(t), state: directUp}
-	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}, dc); got != encStateSecure {
-		t.Errorf("encrypted relay + live direct = %q, want secure", got)
-	}
-	if got := encryptionState(&peerConn{peer: peer, secure: plain}, dc); got != encStatePlaintext {
-		t.Errorf("plaintext relay + live direct = %q, want plaintext", got)
-	}
+	// A live direct path shares the relay's keys (the direct underlay has no
+	// separate secure session and is not consulted), so it cannot downgrade an
+	// encrypted relay session.
 }
 
 // TestRelayRefusesUnencryptedPeer: a relay that drops every ctrlSecure frame
