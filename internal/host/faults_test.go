@@ -10,7 +10,6 @@ import (
 
 	"github.com/go-gost/p2p"
 	"github.com/go-gost/p2p/internal/derpclient"
-	"github.com/xtaci/smux"
 )
 
 // TestFaultsOffByDefault: the fault set is off in the zero value — that is the
@@ -120,21 +119,20 @@ func startPunchedPair(t *testing.T) (a, b *engine, pubB derpclient.PublicKey) {
 	return a, b, pubB
 }
 
-// watchSession captures B's live direct session to A: the thing every fault test
-// watches die, held directly so it cannot be confused with the session a
-// re-punch would build.
-func watchSession(t *testing.T, b, a *engine) *smux.Session {
+// watchDirect captures B's directConn to A: the direct path every fault test
+// watches go stale, held directly so it cannot be confused with a path a
+// re-punch would build. "Gone" is !isUp(): the idle watchdog retired the
+// underlay.
+func watchDirect(t *testing.T, b, a *engine) *directConn {
 	t.Helper()
 	dcB := b.getDirect(a.pub)
 	if dcB == nil {
 		t.Fatal("B has no direct state to watch")
 	}
-	dcB.mu.Lock()
-	defer dcB.mu.Unlock()
-	if dcB.sess == nil {
-		t.Fatal("B has no direct session to watch")
+	if !dcB.isUp() {
+		t.Fatal("B has no direct path to watch")
 	}
-	return dcB.sess
+	return dcB
 }
 
 // TestDropCtrlStopsNegotiation: with the control plane dropped, nothing settles.
@@ -204,16 +202,15 @@ func TestDropPongMakesALiveRelayLookSilent(t *testing.T) {
 func TestDropDataStarvesADirectSession(t *testing.T) {
 	a, b, _ := startPunchedPair(t)
 
-	sessB := watchSession(t, b, a)
+	dcB := watchDirect(t, b, a)
 
-	// B's session is fed by A's frames alone, and A now stops sending them — on
-	// both planes at once, since dropData covers the relay adapter and the direct
-	// underlay with the same knob.
+	// B's direct path is fed by A's frames alone, and A now stops sending them —
+	// on both planes at once, since dropData is applied at the pair's write path.
 	a.faults.Store(newFaults(&p2p.FaultsConfig{DropData: true}))
 
-	// 1-2x the direct timeout plus a tick: the bound is what separates a starved
-	// session from one that is merely idle.
-	waitFor(t, 8*time.Second, func() bool { return sessB.IsClosed() })
+	// 1-2x the direct idle bound plus a tick: the bound is what separates a
+	// starved path from one that is merely idle.
+	waitFor(t, 2*directUnderlayIdle, func() bool { return dcB.drops.Load() >= 1 })
 }
 
 // TestFaultsDropDataRate pins the probabilistic data-frame loss injector: a
@@ -254,36 +251,37 @@ func TestFaultsDropDataRate(t *testing.T) {
 
 // TestSilenceShorterThanTimeoutIsSurvived: the measured field failure — a
 // one-way silence with the path intact — at test speed. A mute shorter than the
-// session's keepalive timeout is survived; one well beyond it kills the session.
-// That pair is the regression the shipped 15s default fixes: the 6s timeout it
-// replaced died at exactly 18s to ~12s of one-way silence from RF batching.
+// direct idle bound is survived; one well beyond it retires the direct path.
+// That pair is the regression the shipped 15s smux timeout fixes: the 6s
+// timeout it replaced died at exactly 18s to ~12s of one-way silence from RF
+// batching. The idle bound (directUnderlayIdle, 2× the keepalive interval) is
+// what the direct underlay's watchdog uses.
 func TestSilenceShorterThanTimeoutIsSurvived(t *testing.T) {
 	a, b, _ := startPunchedPair(t)
 
-	sessB := watchSession(t, b, a)
+	dcB := watchDirect(t, b, a)
 
-	// Half the timeout: A goes quiet and comes back, and the session must not
-	// notice. The window opens when the fault is built.
+	// Half the idle bound: A goes quiet and comes back, and the direct path must
+	// not be retired. The window opens when the fault is built.
 	short := newFaults(&p2p.FaultsConfig{
-		SilenceFor:   directSmuxKeepAliveTimeout / 2,
+		SilenceFor:   directUnderlayIdle / 2,
 		SilenceEvery: time.Minute,
 	})
 	a.faults.Store(short)
 	if !short.silenced(time.Now()) {
 		t.Fatal("the silence window must be open at the fault's creation")
 	}
-	time.Sleep(directSmuxKeepAliveTimeout)
-	if sessB.IsClosed() {
-		t.Fatal("a silence shorter than the keepalive timeout killed the session")
+	time.Sleep(directUnderlayIdle / 2)
+	if got := dcB.drops.Load(); got != 0 {
+		t.Fatalf("a silence shorter than the idle bound retired the direct path %d time(s)", got)
 	}
 
-	// Three times the timeout: this is the mute a 6s timeout could not survive,
-	// and from here the session must die.
+	// Well beyond the idle bound: the path must be retired and the drop counted.
 	a.faults.Store(newFaults(&p2p.FaultsConfig{
-		SilenceFor:   3 * directSmuxKeepAliveTimeout,
+		SilenceFor:   3 * directUnderlayIdle,
 		SilenceEvery: time.Minute,
 	}))
-	waitFor(t, 3*3*directSmuxKeepAliveTimeout, func() bool { return sessB.IsClosed() })
+	waitFor(t, 3*directUnderlayIdle, func() bool { return dcB.drops.Load() >= 1 })
 }
 
 // TestHostAppliesFaultsToEngine pins the config→engine wiring the embedder path

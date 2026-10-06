@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-gost/p2p/internal/clock"
 	"github.com/go-gost/p2p/internal/derpclient"
 	"github.com/xtaci/kcp-go/v5"
 )
@@ -780,6 +781,16 @@ func (p *relayKCPPair) ReadFrom(b []byte) (int, net.Addr, error) {
 // Reporting the failure instead would be fatal in the other direction: kcp-go
 // turns any WriteTo error into a permanent write failure for the session.
 func (p *relayKCPPair) WriteTo(b []byte, _ net.Addr) (int, error) {
+	// Fault injection (see faults): the data mute lives at the pair's write
+	// path, so it covers both underlays (relay and direct) and a stream cannot
+	// dodge it by migrating to the direct path. A dropped datagram is a lost
+	// segment KCP retransmits; the write reports success, indistinguishable from
+	// a path that ate it (Task 12's relocation from the old direct faultConn).
+	if p.e != nil {
+		if f := p.e.faults.Load(); f.muteDataArmed() && f.muteData(clock.Now()) {
+			return len(b), nil
+		}
+	}
 	p.bytesSent.Add(uint64(len(b)))
 	p.mu.Lock()
 	direct := p.direct

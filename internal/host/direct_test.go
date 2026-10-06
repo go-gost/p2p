@@ -34,6 +34,9 @@ func TestMain(m *testing.M) {
 	// The silent-peer growth doubles from backoffPeriod and stops here, so a
 	// test can reach the cap in a few rounds instead of minutes.
 	deadPeerWaitCap = 4 * time.Second
+	// The H3 hysteresis doubles from backoffPeriod and stops here, so a test can
+	// reach the cap in a few short-lived directs instead of minutes.
+	directRepunchBackoffCap = 4 * time.Second
 	stunTimeout = 500 * time.Millisecond
 	// The direct session's keepalive is the thing TestDirectSilentPeerIsNoticed
 	// measures, so it runs at test speed here (production is 2s/6s).
@@ -106,23 +109,25 @@ func mappedResponse(req []byte, addr *net.UDPAddr, mapped string) []byte {
 	return resp
 }
 
-// hasDirect reports whether an engine has an established direct session to peer.
+// hasDirect reports whether an engine has an established direct path to peer:
+// the directConn is up (a punched socket registered as the pair's underlay).
 func hasDirect(e *engine, peer derpclient.PublicKey) bool {
 	dc := e.getDirect(peer)
-	return dc != nil && dc.session() != nil
+	return dc != nil && dc.isUp()
 }
 
-// directSecureForTest reports whether an engine's direct session to peer is
-// encrypted. It reads the direct session under the engine lock, then its keys
-// under the session's own lock — never the session's lock while holding e.mu.
+// directSecureForTest reports whether an engine's direct path to peer is
+// encrypted. The direct underlay rides the pair's relay secure session now, so
+// this reads that session under the engine lock and its keys under the session's
+// own lock — never the session's lock while holding e.mu.
 func directSecureForTest(e *engine, peer derpclient.PublicKey) bool {
 	e.mu.Lock()
-	dc := e.directs[peer]
+	ss := e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
 	e.mu.Unlock()
-	if dc == nil {
+	if ss == nil {
 		return false
 	}
-	_, _, ok := dc.secure.keys()
+	_, _, ok := ss.keys()
 	return ok
 }
 
@@ -624,6 +629,145 @@ func TestMutualKCPWithSmux(t *testing.T) {
 	}
 }
 
+// TestRegisterDirectUnderlayInstallsOnPair: a punched socket registered for a
+// peer becomes the pair's direct underlay, preferred immediately, with the seed
+// token threaded through so the underlay can echo the peer's late probes.
+func TestRegisterDirectUnderlayInstallsOnPair(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{7}
+	sock := mustListenUDP(t)
+	peerAddr := udpAddrPort(t, mustListenUDP(t))
+	token := [seedTokenLen]byte{0xAB}
+
+	e.registerDirectUnderlay(peer, sock, peerAddr, token)
+
+	pair := e.relayKCPPairFor(peer)
+	if !pair.preferredDirect() {
+		t.Fatal("preferredDirect() = false right after registration, want true")
+	}
+	if got := pair.pathName(); got != "direct" {
+		t.Fatalf("pathName() = %q, want direct", got)
+	}
+	pair.mu.Lock()
+	u := pair.direct
+	pair.mu.Unlock()
+	if u == nil {
+		t.Fatal("the pair holds no direct underlay after registration")
+	}
+	if u.sock != sock {
+		t.Fatal("the pair's underlay wraps a different socket")
+	}
+	if !u.hasToken || u.localToken != token {
+		t.Fatalf("the underlay lost the seed token: hasToken=%v token=%x", u.hasToken, u.localToken)
+	}
+}
+
+// TestDirectUnderlayDeadClearsAndRepunches: the pair's idle watchdog retiring
+// the underlay marks the peer's directConn down and schedules a re-punch, so the
+// path comes back on its own.
+func TestDirectUnderlayDeadClearsAndRepunches(t *testing.T) {
+	e := newTestEngine(t)
+	e.stunAddr = "127.0.0.1:3478" // a candidate source, so start() launches a round
+	peer := derpclient.PublicKey{8}
+	dc := e.directConn(peer)
+	sock := mustListenUDP(t)
+	dc.markUp(sock, udpAddrPort(t, mustListenUDP(t)), [seedTokenLen]byte{0x11})
+	// Make the underlay look long-lived so the re-punch is immediate (no H3
+	// backoff): its lifetime is what keys the hysteresis.
+	dc.mu.Lock()
+	dc.sessAt = time.Now().Add(-3 * directUnderlayIdle)
+	dc.mu.Unlock()
+
+	pair := e.relayKCPPairFor(peer)
+	pair.mu.Lock()
+	u := pair.direct
+	pair.mu.Unlock()
+	if u == nil {
+		t.Fatal("no underlay registered")
+	}
+
+	e.directUnderlayDead(peer, u)
+
+	if pair.preferredDirect() {
+		t.Fatal("preferredDirect() = true after the underlay died, want false")
+	}
+	if dc.isUp() {
+		t.Fatal("isUp() = true after the underlay died, want false")
+	}
+	switch dc.stateOf() {
+	case directAttempting, directBackoff, directNone:
+		// a re-punch is in flight or scheduled
+	default:
+		t.Fatalf("state = %v after the death, want a re-punch scheduled", dc.stateOf())
+	}
+}
+
+// TestRegisterDirectUnderlayRetiresOldSocket: registering a second punched
+// socket retires the first (its underlay is closed exactly once, by the
+// underlay's sync.Once) and the pair serves only the new one, never the old.
+func TestRegisterDirectUnderlayRetiresOldSocket(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{9}
+	peerAddr := udpAddrPort(t, mustListenUDP(t))
+	sock1 := mustListenUDP(t)
+	e.registerDirectUnderlay(peer, sock1, peerAddr, [seedTokenLen]byte{1})
+
+	sock2 := mustListenUDP(t)
+	e.registerDirectUnderlay(peer, sock2, peerAddr, [seedTokenLen]byte{2})
+
+	// sock1 is closed: a read on it fails. (The underlay's sync.Once is what
+	// makes the retirement happen exactly once.)
+	sock1.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	buf := make([]byte, 8)
+	if _, _, err := sock1.ReadFromUDP(buf); err == nil {
+		t.Fatal("sock1 is still readable after being retired, want it closed")
+	}
+
+	pair := e.relayKCPPairFor(peer)
+	pair.mu.Lock()
+	u := pair.direct
+	pair.mu.Unlock()
+	if u == nil || u.sock != sock2 {
+		t.Fatal("the pair does not hold the new socket after re-registration")
+	}
+}
+
+// TestDirectShortLivedBacksOff: a direct that keeps dying shortly after it came
+// up must back off instead of flapping direct↔relay. Each short-lived death
+// doubles the scheduled re-punch wait, up to the cap.
+func TestDirectShortLivedBacksOff(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{10}
+	dc := e.directConn(peer)
+
+	var waits []time.Duration
+	for i := 0; i < 5; i++ {
+		dc.markUp(mustListenUDP(t), udpAddrPort(t, mustListenUDP(t)), [seedTokenLen]byte{byte(i)})
+		pair := e.relayKCPPairFor(peer)
+		pair.mu.Lock()
+		u := pair.direct
+		pair.mu.Unlock()
+		if u == nil {
+			t.Fatalf("round %d: no underlay registered", i)
+		}
+		// Young underlay: its lifetime is ~0, well under 2×directUnderlayIdle.
+		e.directUnderlayDead(peer, u)
+		waits = append(waits, lastBackoffWait(t, dc))
+	}
+
+	for i := 1; i < len(waits); i++ {
+		if waits[i] < waits[i-1] {
+			t.Errorf("wait %d = %v, want at least the previous %v", i, waits[i], waits[i-1])
+		}
+	}
+	if waits[len(waits)-1] <= waits[0] {
+		t.Errorf("backoff did not grow across short-lived directs: %v", waits)
+	}
+	if waits[len(waits)-1] > directRepunchBackoffCap {
+		t.Errorf("backoff %v over the cap %v", waits[len(waits)-1], directRepunchBackoffCap)
+	}
+}
+
 // TestDirectPunchRoundTrip proves that once a hole is punched, traffic flows
 // over the direct path even after the relay stops forwarding data frames.
 func TestDirectPunchRoundTrip(t *testing.T) {
@@ -859,22 +1003,25 @@ func TestDirectRepunchAfterSessionDeath(t *testing.T) {
 		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
 	})
 
-	// Simulate the idle-keepalive death: close the smux session on both sides.
-	// Nothing dials afterwards — the death itself must bring the path back.
-	// That is the phone's Wi-Fi ↔ cellular switch: the session dies with the
-	// old interface, and without the re-punch the pair sits on the relay until
-	// something dials.
+	// Simulate the idle-keepalive death: retire the direct underlay on both
+	// sides through the pair's idle-watchdog path. Nothing dials afterwards —
+	// the death itself must bring the path back. That is the phone's Wi-Fi ↔
+	// cellular switch: the path dies with the old interface, and without the
+	// re-punch the pair sits on the relay until something dials.
 	for _, e := range []*engine{engineA, engineB} {
 		peer := pubB
 		if e == engineB {
 			peer = engineA.pub
 		}
-		dc := e.directConn(peer)
-		dc.mu.Lock()
-		sess := dc.sess
-		dc.mu.Unlock()
-		if sess != nil {
-			sess.Close()
+		pair := e.relayKCPPairGet(peer)
+		if pair == nil {
+			continue
+		}
+		pair.mu.Lock()
+		u := pair.direct
+		pair.mu.Unlock()
+		if u != nil {
+			e.directUnderlayDead(peer, u)
 		}
 	}
 	waitFor(t, 10*time.Second, func() bool {
@@ -1019,30 +1166,28 @@ func TestDirectSilentPeerIsNoticed(t *testing.T) {
 	})
 
 	dcA := engineA.directConn(pubB)
-	dcA.mu.Lock()
-	sessA := dcA.sess
-	dcA.mu.Unlock()
-	if sessA == nil {
-		t.Fatal("A has no direct session to watch")
+	if !dcA.isUp() {
+		t.Fatal("A has no direct path to watch")
 	}
 
 	// B's punch socket goes away without the relay being told: from A's side
-	// this is a black path, which is the case the keepalive has to cover.
+	// this is a black path, which is the case the idle watchdog has to cover.
 	dcB := engineB.directConn(engineA.pub)
 	dcB.mu.Lock()
-	sockB := dcB.socket
+	sockB := dcB.sock
 	dcB.mu.Unlock()
 	if sockB == nil {
 		t.Fatal("B has no punch socket to close")
 	}
 	sockB.Close()
 
-	// 1-2x the direct timeout (2s in TestMain). The relay keepalive this
-	// replaced would take 30-60s, so the bound proves which one is in play.
+	// The direct idle bound (directUnderlayIdle, 6s) plus a read tick. The
+	// relay keepalive this replaced would take 30-60s, so the bound proves
+	// which one is in play.
 	closed := time.Now()
-	waitFor(t, 8*time.Second, func() bool { return sessA.IsClosed() })
-	t.Logf("silent direct path noticed after %v (keepalive %v/%v)",
-		time.Since(closed).Round(time.Millisecond), directSmuxKeepAliveInterval, directSmuxKeepAliveTimeout)
+	waitFor(t, 12*time.Second, func() bool { return !engineA.directConn(pubB).isUp() })
+	t.Logf("silent direct path noticed after %v (idle %v)",
+		time.Since(closed).Round(time.Millisecond), directUnderlayIdle)
 }
 
 // TestPeerGoneKeepsLiveDirectSession: a PeerGone is a notice about the peer's
@@ -1079,16 +1224,13 @@ func TestPeerGoneKeepsLiveDirectSession(t *testing.T) {
 	})
 
 	dcA := engineA.directConn(pubB)
-	dcA.mu.Lock()
-	sessA := dcA.sess
-	dcA.mu.Unlock()
-	if sessA == nil {
-		t.Fatal("A has no direct session to watch")
+	if !dcA.isUp() {
+		t.Fatal("A has no direct path to watch")
 	}
 
 	// B's relay connection goes away, so the relay reports it gone to A. B's
 	// process — and with it the punch socket — stays up, which is the case the
-	// direct session must survive.
+	// direct path must survive.
 	engineB.mu.Lock()
 	clientB := engineB.client
 	engineB.mu.Unlock()
@@ -1099,15 +1241,11 @@ func TestPeerGoneKeepsLiveDirectSession(t *testing.T) {
 
 	waitFor(t, 5*time.Second, func() bool { return engineA.isGone(pubB) })
 
-	// Longer than the direct keepalive's own detection window (2x the 2s
-	// timeout here): a session that survives this is genuinely alive, not just
-	// unexamined.
-	time.Sleep(3 * directSmuxKeepAliveTimeout)
-	if sessA.IsClosed() {
-		t.Fatal("a PeerGone tore down the live direct session")
-	}
+	// Longer than the direct idle detection window: a path that survives this
+	// is genuinely alive, not just unexamined.
+	time.Sleep(3 * directUnderlayIdle)
 	if !hasDirect(engineA, pubB) {
-		t.Fatal("A no longer holds the direct session")
+		t.Fatal("a PeerGone tore down the live direct path")
 	}
 
 	// And it still carries traffic, with the relay out of the picture.
@@ -1379,7 +1517,7 @@ func TestPunchStartsWithoutStream(t *testing.T) {
 // session gets repaired — but the live one keeps serving until a new punch
 // succeeds and markUp replaces it.
 func TestCandidatesKeepLiveSession(t *testing.T) {
-	newEngine := func(state directState) (*engine, *directConn, *smux.Session) {
+	newEngine := func(state directState) (*engine, *directConn) {
 		e := &engine{
 			direct:   true,
 			stunAddr: "127.0.0.1:3478",
@@ -1389,31 +1527,27 @@ func TestCandidatesKeepLiveSession(t *testing.T) {
 			peers:    make(map[derpclient.PublicKey]*peerConn),
 		}
 		peer := derpclient.PublicKey{9}
-		sess := newTestSess(t)
-		dc := &directConn{e: e, peer: peer, sess: sess, state: state, cand: make(chan []candidate, 1)}
+		sock := mustListenUDP(t)
+		t.Cleanup(func() { sock.Close() })
+		dc := &directConn{e: e, peer: peer, sock: sock, state: state, cand: make(chan []candidate, 1)}
 		e.directs[peer] = dc
-		return e, dc, sess
+		return e, dc
 	}
 	cands := []candidate{{addr: netip.MustParseAddrPort("203.0.113.7:1234")}}
 
-	// A live session stays live, and is still what a stream would use.
+	// A live direct underlay stays live across an announcement, whatever the
+	// punch state: a peer's re-announcement must not tear down a working path.
 	for _, state := range []directState{directUp, directBackoff} {
-		_, dc, sess := newEngine(state)
+		_, dc := newEngine(state)
 		dc.onCandidates(cands)
-		if !dc.live() {
-			t.Errorf("state %v: after candidates live = false, want the session untouched", state)
-		}
-		if sess.IsClosed() {
-			t.Errorf("state %v: the live direct session was closed by an announcement", state)
-		}
-		if got := dc.session(); got == nil {
-			t.Errorf("state %v: session() = nil, want the live session served whatever the punch state", state)
+		if !dc.isUp() {
+			t.Errorf("state %v: after candidates isUp = false, want the underlay untouched", state)
 		}
 	}
 
 	// Either way a round runs: the peer is punching now, and a round is what
-	// repairs a session that really is stale.
-	_, dc, _ := newEngine(directBackoff)
+	// repairs a path that really is stale.
+	_, dc := newEngine(directBackoff)
 	dc.failed = true
 	dc.onCandidates(cands)
 	if got := dc.stateOf(); got != directAttempting {
@@ -1444,8 +1578,8 @@ func TestCandidatesIgnoredWhenDirectOff(t *testing.T) {
 	if got := dc.stateOf(); got != directNone {
 		t.Errorf("state = %v, want directNone: the direct path is off", got)
 	}
-	if dc.session() != nil {
-		t.Error("session() = a live session, want nil with the direct path off")
+	if dc.isUp() {
+		t.Error("isUp() = true, want false with the direct path off")
 	}
 	if got := dc.start(); got {
 		t.Error("start() = true, want false: no round may start with the direct path off")
@@ -2087,75 +2221,64 @@ func TestPunchWaitsForRelay(t *testing.T) {
 	}
 }
 
-// A live direct session ending must be counted once, and only when the session
-// actually owned the state: a round already rebuilding is not a new drop.
-func TestDetachSessionCountsDropOnce(t *testing.T) {
-	e := &engine{directs: make(map[derpclient.PublicKey]*directConn)}
-	// A punch session owns the socket kcp closes with it (ownConn=true), so a
-	// session that owned directUp must hand that socket back for closing.
-	uconn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer uconn.Close()
-	dc := &directConn{e: e, peer: derpclient.PublicKey{1}, sess: newTestSess(t), socket: uconn, state: directUp}
+// A live direct underlay ending must be counted once, and only when the
+// underlay actually owned the state: a round already rebuilding is not a new
+// drop.
+func TestUnderlayDeadCountsDropOnce(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{1}
+	sock := mustListenUDP(t)
+	dc := &directConn{e: e, peer: peer, sock: sock, state: directUp}
+	e.directs[peer] = dc
+	u := &directUnderlay{sock: sock}
 
-	sock, repunch := dc.detachSessionLocked(dc.sess)
-	if !repunch {
-		t.Fatal("repunch = false, want true for a session that owned directUp")
-	}
-	if sock == nil {
-		t.Error("socket = nil, want the session's socket")
-	}
+	dc.underlayDead(u)
 	if got := dc.drops.Load(); got != 1 {
 		t.Errorf("drops = %d, want 1", got)
 	}
-
-	// A second detach has nothing to detach: no second drop.
-	if _, repunch := dc.detachSessionLocked(dc.sess); repunch {
-		t.Error("a second detach reported a re-punch")
+	if dc.isUp() {
+		t.Error("isUp = true after the underlay died, want false")
 	}
+	if dc.sock != nil {
+		t.Error("sock not cleared after the underlay died")
+	}
+
+	// A second death has nothing to clear: no second drop.
+	dc.underlayDead(u)
 	if got := dc.drops.Load(); got != 1 {
-		t.Errorf("drops = %d after a no-op detach, want 1", got)
+		t.Errorf("drops = %d after a no-op death, want 1", got)
 	}
 }
 
-// TestDirectSessionAgeZeroedAfterEnd: SessionAge is the age of the *live*
-// session, so a peer whose direct session has ended (state none/backoff, path
-// no longer direct) must report 0 — never a phantom age that keeps growing
-// while the same row's state/path say the session is gone. Both detach paths
-// (teardown, and the detachSessionLocked that markDead uses) zero it.
+// TestDirectSessionAgeZeroedAfterEnd: SessionAge is the age of the *live* direct
+// underlay, so a peer whose direct path has ended (state none/backoff, path no
+// longer direct) must report 0 — never a phantom age that keeps growing while
+// the same row's state/path say the path is gone. Both retirement paths
+// (underlayDead, and teardown) zero it.
 func TestDirectSessionAgeZeroedAfterEnd(t *testing.T) {
-	e := &engine{
-		direct:   true,
-		stunAddr: "127.0.0.1:3478", // a candidate source: directReason() is empty
-		directs:  make(map[derpclient.PublicKey]*directConn),
-		peers:    make(map[derpclient.PublicKey]*peerConn),
-	}
+	e := newTestEngine(t)
 	peer := derpclient.PublicKey{7}
-	e.peers[peer] = &peerConn{peer: peer}
 	dc := &directConn{e: e, peer: peer}
 	e.directs[peer] = dc
 
-	dc.markUp(newTestSess(t), nil, netip.AddrPort{})
+	sock1 := mustListenUDP(t)
+	dc.markUp(sock1, netip.AddrPort{}, [seedTokenLen]byte{})
 	if d := e.peerDiagnostics(e.peerTransports())[keyName(peer)]; d.Path != transportDirect || d.SessionAge <= 0 {
 		t.Fatalf("live session: path=%q age=%v, want direct with age > 0", d.Path, d.SessionAge)
 	}
 
-	// markDead's path.
-	dc.markUp(newTestSess(t), nil, netip.AddrPort{})
-	if sock, _ := dc.detachSessionLocked(dc.sess); sock != nil {
-		sock.Close()
-	}
+	// The underlay-death path.
+	dc.underlayDead(&directUnderlay{sock: sock1})
 	if at := dc.sessAtOf(); !at.IsZero() {
-		t.Errorf("sessAt = %v after detach, want zero", at)
+		t.Errorf("sessAt = %v after underlay death, want zero", at)
 	}
 	if d := e.peerDiagnostics(e.peerTransports())[keyName(peer)]; d.SessionAge != 0 {
 		t.Errorf("SessionAge = %v after the session ended, want 0", d.SessionAge)
 	}
 
 	// teardown's path.
-	dc.markUp(newTestSess(t), nil, netip.AddrPort{})
+	sock2 := mustListenUDP(t)
+	dc.markUp(sock2, netip.AddrPort{}, [seedTokenLen]byte{})
 	dc.teardown()
 	if at := dc.sessAtOf(); !at.IsZero() {
 		t.Errorf("sessAt = %v after teardown, want zero", at)
@@ -2165,33 +2288,41 @@ func TestDirectSessionAgeZeroedAfterEnd(t *testing.T) {
 	}
 }
 
-// A session that did not own the state (a round is already rebuilding) is not
-// this side's drop to count: it returns repunch=false.
-func TestDetachSessionIgnoresNonOwningState(t *testing.T) {
-	e := &engine{directs: make(map[derpclient.PublicKey]*directConn)}
-	sess := newTestSess(t)
-	dc := &directConn{e: e, peer: derpclient.PublicKey{1}, sess: sess, state: directAttempting}
+// An underlay that did not own the state (a round is already rebuilding) is not
+// this side's drop to count: the re-punch is left to that round.
+func TestUnderlayDeadIgnoresNonOwningState(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{1}
+	sock := mustListenUDP(t)
+	dc := &directConn{e: e, peer: peer, sock: sock, state: directAttempting}
+	e.directs[peer] = dc
 
-	if _, repunch := dc.detachSessionLocked(sess); repunch {
-		t.Error("repunch = true for a session that did not own directUp")
-	}
+	dc.underlayDead(&directUnderlay{sock: sock})
+
 	if got := dc.drops.Load(); got != 0 {
 		t.Errorf("drops = %d, want 0", got)
 	}
+	if dc.stateOf() != directAttempting {
+		t.Errorf("state = %v, want directAttempting (round left to finish)", dc.stateOf())
+	}
 }
 
-// A session coming up counts as an up.
+// A direct underlay coming up counts as an up.
 func TestMarkUpCountsUps(t *testing.T) {
-	e := &engine{directs: make(map[derpclient.PublicKey]*directConn)}
+	e := newTestEngine(t)
 	dc := &directConn{e: e, peer: derpclient.PublicKey{1}}
+	sock := mustListenUDP(t)
 
-	dc.markUp(newTestSess(t), nil, netip.AddrPort{})
+	dc.markUp(sock, netip.AddrPort{}, [seedTokenLen]byte{})
 
 	if got := dc.ups.Load(); got != 1 {
 		t.Errorf("ups = %d, want 1", got)
 	}
 	if dc.stateOf() != directUp {
 		t.Errorf("state = %v, want directUp", dc.stateOf())
+	}
+	if !dc.isUp() {
+		t.Error("isUp = false after markUp, want true")
 	}
 }
 
@@ -2208,63 +2339,6 @@ func TestDirectConnRecordsLastError(t *testing.T) {
 	dc.mu.Unlock()
 	if got := dc.lastErrOf(); got != "" {
 		t.Fatalf("lastErr = %q, want empty", got)
-	}
-}
-
-// TestPunchGatesBeforeDial: the encryption gate sits before the dial/seed, so a
-// peer that cannot negotiate the direct cipher is never dialed — it gets no seed
-// echo, so its own punch fails and it backs off instead of falsely reporting a
-// direct path. The round must end in backoff with no direct session.
-//
-// The relay's dropCtrl cannot target only the direct transport (the transport
-// byte is inside the seal), so this drives the punch path directly against a
-// peer that is not registered at the relay: no direct half ever arrives, so the
-// gate cannot settle.
-//
-// It deliberately does NOT shorten handshakeTimeout/resendInterval: another
-// test's lingering background punch/udp-link goroutine can be reading them, and
-// writing a package timing global races with it (see TestMain's note). The gate
-// therefore runs at the default handshakeTimeout.
-func TestPunchGatesBeforeDial(t *testing.T) {
-	rs := &relayServer{}
-	url := rs.start(t)
-	stun := startFakeSTUN(t, "")
-
-	priv, _, _ := derpclient.Generate()
-	e := newEngine(url, "", priv, slog.Default())
-	e.stunAddr = stun
-	t.Cleanup(e.Close)
-	if err := e.Connect(); err != nil {
-		t.Fatal(err)
-	}
-
-	peer := derpclient.PublicKey{9}
-	dc := e.directConn(peer)
-	// A peer candidate list, so the round gets past the candidate exchange to the
-	// gate (otherwise it would back off for "no shared family" instead).
-	dc.cand <- []candidate{{addr: netip.MustParseAddrPort("127.0.0.1:9")}}
-
-	start := time.Now()
-	dc.punch()
-	elapsed := time.Since(start)
-
-	if dc.secure.settled() {
-		t.Fatal("direct session settled without a peer half")
-	}
-	if hasDirect(e, peer) {
-		t.Fatal("a peer that cannot encrypt was marked direct")
-	}
-	if sess := dc.session(); sess != nil {
-		t.Fatal("a direct smux session was built without the cipher")
-	}
-	if got := dc.stateOf(); got != directBackoff {
-		t.Fatalf("punch state = %v, want directBackoff", got)
-	}
-	// The gate returns before the family loop, so no dial/seed ran. A dial would
-	// have burned up to seedTimeout (5s) inside seedHandshake; the round is
-	// bounded well under that.
-	if elapsed >= seedTimeout {
-		t.Fatalf("punch took %v: it dialed/seeded despite the unsettled cipher", elapsed)
 	}
 }
 

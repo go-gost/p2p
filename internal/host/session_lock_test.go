@@ -17,55 +17,57 @@ import (
 	"github.com/xtaci/kcp-go/v5"
 )
 
-// TestDetachSessionKeepsInFlightRound pins the markDead/session fix: a punch
-// round already in flight owns dc.mine, so a dying session must not clear it
-// (that stops this side answering the peer's announcements), and must not reset
-// the state to directNone (that let a second round start on the same candidate
-// channel). Only a session that itself owned the state (directUp) hands the
+// TestUnderlayDeadKeepsInFlightRound pins the underlay-death fix: a punch round
+// already in flight owns dc.mine, so a dying underlay must not clear it (that
+// stops this side answering the peer's announcements), and must not reset the
+// state to directNone (that let a second round start on the same candidate
+// channel). Only an underlay that itself owned the state (directUp) hands the
 // re-punch back.
-func TestDetachSessionKeepsInFlightRound(t *testing.T) {
+func TestUnderlayDeadKeepsInFlightRound(t *testing.T) {
 	own := []candidate{{addr: netip.MustParseAddrPort("203.0.113.7:2222")}}
 
-	// A round is in flight: state and mine must survive the session's death.
+	// A round is in flight: state and mine must survive the underlay's death.
 	dc := newSlotConn(t)
-	sess := newTestSess(t)
+	sock := mustListenUDP(t)
 	dc.mu.Lock()
-	dc.sess, dc.mine, dc.state = sess, own, directAttempting
+	dc.sock, dc.mine, dc.state = sock, own, directAttempting
 	dc.mu.Unlock()
 
-	dc.mu.Lock()
-	_, repunch := dc.detachSessionLocked(sess)
-	mine, state := dc.mine, dc.state
-	dc.mu.Unlock()
+	dc.underlayDead(&directUnderlay{sock: sock})
 
-	if repunch {
-		t.Fatal("detach scheduled a re-punch while a round is in flight")
-	}
+	dc.mu.Lock()
+	mine, state, drops := dc.mine, dc.state, dc.drops.Load()
+	dc.mu.Unlock()
 	if state != directAttempting {
-		t.Fatalf("state = %v after detach, want directAttempting (round left to finish)", state)
+		t.Fatalf("state = %v after underlay death, want directAttempting (round left to finish)", state)
 	}
 	if len(mine) != 1 || mine[0].addr != own[0].addr {
-		t.Fatalf("mine = %v after detach, want the in-flight round's candidates kept", candAddrs(mine))
+		t.Fatalf("mine = %v after underlay death, want the in-flight round's candidates kept", candAddrs(mine))
+	}
+	if drops != 0 {
+		t.Fatalf("drops = %d, want 0: the round, not the underlay, owns the state", drops)
 	}
 
-	// A live session (directUp) hands the re-punch back and clears its state.
+	// An underlay that owned directUp hands the re-punch back and clears state.
 	dc2 := newSlotConn(t)
-	sess2 := newTestSess(t)
+	sock2 := mustListenUDP(t)
 	dc2.mu.Lock()
-	dc2.sess, dc2.mine, dc2.state = sess2, own, directUp
+	dc2.sock, dc2.mine, dc2.state = sock2, own, directUp
 	dc2.mu.Unlock()
 
-	dc2.mu.Lock()
-	_, repunch2 := dc2.detachSessionLocked(sess2)
-	got2, mine2, state2 := dc2.sess, dc2.mine, dc2.state
-	dc2.mu.Unlock()
+	dc2.underlayDead(&directUnderlay{sock: sock2})
 
-	if !repunch2 {
-		t.Fatal("detach did not hand the re-punch back for a directUp session")
+	dc2.mu.Lock()
+	got2, mine2, state2, drops2 := dc2.sock, dc2.mine, dc2.state, dc2.drops.Load()
+	dc2.mu.Unlock()
+	if got2 != nil || mine2 != nil {
+		t.Fatalf("directUp death left sock=%v mine=%v, want nil/nil", got2, candAddrs(mine2))
 	}
-	if state2 != directNone || got2 != nil || mine2 != nil {
-		t.Fatalf("directUp detach left sess=%v mine=%v state=%v, want nil/nil/directNone",
-			got2, candAddrs(mine2), state2)
+	if state2 == directUp {
+		t.Fatalf("state = %v after a directUp death, want the re-punch scheduled", state2)
+	}
+	if drops2 != 1 {
+		t.Fatalf("drops = %d, want 1", drops2)
 	}
 }
 

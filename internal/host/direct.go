@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 
 	"github.com/go-gost/p2p"
@@ -114,6 +113,11 @@ var (
 	// case, so that open keeps the full relay timeout.
 	directOpenTimeout = 3 * time.Second
 	backoffPeriod     = 30 * time.Second
+	// directRepunchBackoffCap caps the H3 hysteresis: the re-punch wait for a
+	// direct that keeps dying shortly after registration grows from
+	// backoffPeriod and stops here, so a flapping path settles into a slow
+	// re-probe instead of a storm.
+	directRepunchBackoffCap = 5 * time.Minute
 	// deadPeerWaitCap bounds how long a punch waits for a peer that shows no
 	// live path at all. See silentPeerWait.
 	deadPeerWaitCap = 5 * time.Minute
@@ -190,28 +194,30 @@ type directConn struct {
 	// caller arriving after any historical failure would read it as "direct is
 	// broken" and never wait again. failGen lets such a caller snapshot the
 	// count and see only the failures that are actually its own.
-	failGen  uint64
-	sess     *smux.Session  // direct smux session when up
-	socket   *net.UDPConn   // punch socket; kcp closes it with the session (ownConn=true)
+	failGen uint64
+	// sock is the punched UDP socket registered as the pair's direct underlay
+	// while the direct path is up. The pair's KCP session reads and writes it
+	// (see relayKCPPair); directConn tracks it for status and re-punch
+	// bookkeeping only. There is no separate direct smux session any more.
+	sock     *net.UDPConn
 	peerAddr netip.AddrPort // peer's dialed endpoint (public cross-NAT, local same-NAT)
 	mine     []candidate    // our candidates for the current punch, answered to the peer
 	lastPeer []candidate    // peer candidates already acted on (dedupes re-announcements)
 	peerCaps uint8          // capability bits the peer advertised via ctrlCaps
 	lastErr  string         // the last punch failure's reason, cleared when one succeeds
-	sessAt   time.Time      // when the live direct session came up (zero when none)
+	sessAt   time.Time      // when the current direct underlay came up (zero when none)
+
+	// repunchBackoff is the hysteresis (H3) for a direct that dies shortly after
+	// it came up: the re-punch wait grows geometrically from backoffPeriod up to
+	// directRepunchBackoffCap while underlays keep dying young, and resets when
+	// one survives its youth. Zero means none earned yet. Guarded by mu.
+	repunchBackoff time.Duration
 
 	// silentFor is the wait silentPeerWait last handed out, carried so the
 	// growth survives across rounds while the peer stays silent. Zero means no
 	// growth has been earned yet, and it resets the moment the peer has a path
 	// again. Guarded by mu like the rest of the round's state.
 	silentFor time.Duration
-
-	// secure is this pair's direct security session, borrowed from e.secure (one
-	// per (peer, transport), outliving any one smux session). The AEAD record
-	// layer wraps the KCP underlay once both halves are exchanged, and stays
-	// plaintext (peer predates encryption) otherwise. Reusing the cached object
-	// across re-punches is what keeps the nonce counters from restarting.
-	secure *secureSession
 
 	// This peer's punch history, reported through Status.PeerDiagnostics. Atomics
 	// so a status query reads them without taking dc.mu and queueing behind a
@@ -245,10 +251,9 @@ func (e *engine) directConn(peer derpclient.PublicKey) *directConn {
 		return dc
 	}
 	dc := &directConn{
-		e:      e,
-		peer:   peer,
-		cand:   make(chan []candidate, 1),
-		secure: e.secureSessionLocked(peer, secureTransportDirect),
+		e:    e,
+		peer: peer,
+		cand: make(chan []candidate, 1),
 	}
 	e.directs[peer] = dc
 	return dc
@@ -421,8 +426,11 @@ func (e *engine) punchAndWait(peer derpclient.PublicKey) *smux.Session {
 	waitsFrom := dc.punchFailures()
 	deadline := time.Now().Add(punchWaitTimeout)
 	for time.Now().Before(deadline) {
-		if sess := dc.session(); sess != nil {
-			return sess
+		if dc.isUp() {
+			// A successful punch installs a direct underlay on the pair; there
+			// is no separate direct smux session to hand back, and the caller
+			// rides the pair session either way. Return nil.
+			return nil
 		}
 		if dc.punchFailures() != waitsFrom {
 			return nil // the round we waited on failed: the relay is the answer
@@ -465,62 +473,21 @@ func (dc *directConn) start() bool {
 	return true
 }
 
-// session returns the live direct smux session, or nil. If the session was
-// found dead it is torn down and, when this session owned the state, a re-punch
-// is scheduled.
-func (dc *directConn) session() *smux.Session {
+// isUp reports whether this directConn believes it has a registered direct
+// underlay: the punch reached directUp and its socket is held. It is a
+// side-effect-free read for status (peerTransports/peerDiagnostics) and the
+// re-punch gates; it never tears anything down. Real liveness — the path
+// actually delivering — is the pair's own recency (preferredDirect).
+func (dc *directConn) isUp() bool {
 	dc.mu.Lock()
-	if dc.sess == nil {
-		dc.mu.Unlock()
-		return nil
-	}
-	sess := dc.sess
-	if !sess.IsClosed() {
-		dc.mu.Unlock()
-		return sess
-	}
-	sock, repunch := dc.detachSessionLocked(sess)
-	dc.mu.Unlock()
-	if sock != nil {
-		sock.Close()
-	}
-	if !repunch {
-		return nil // a round or a backoff is already rebuilding: it decides next
-	}
-	if dc.e.dropIfGone(dc.peer, dc) {
-		return nil // the peer is gone from the relay: nothing to re-punch with
-	}
-	go dc.start() // schedule re-punch
-	return nil
+	defer dc.mu.Unlock()
+	return dc.sock != nil
 }
 
-// detachSessionLocked clears the direct state if sess is still the current
-// session, returning the socket to close and whether a re-punch is now this
-// session's to schedule. dc.sess and dc.socket belong to that session; dc.mine
-// is left alone when a punch round is in flight (directAttempting) — that round
-// has already published its own candidate list, and clearing it would stop this
-// side answering the peer's announcements. The state is reset to directNone
-// only when the dead session owned it (directUp); a round already rebuilding,
-// or a backoff with its own pending retry, is left to finish. Caller must hold
-// dc.mu.
-func (dc *directConn) detachSessionLocked(sess *smux.Session) (*net.UDPConn, bool) {
-	if dc.sess != sess {
-		return nil, false
-	}
-	dc.sess = nil
-	dc.sessAt = time.Time{} // no live session: SessionAge must read 0, not the dead session's age
-	sock := dc.socket
-	dc.socket = nil
-	if dc.state != directAttempting {
-		dc.mine = nil // the socket backing the candidates is closing
-	}
-	if dc.state == directUp {
-		dc.state = directNone
-		dc.drops.Add(1)
-		return sock, true
-	}
-	return sock, false
-}
+// live is isUp under the name the status call sites use. Kept separate so the
+// gauge probe reads the same predicate without a session teardown (the trap
+// TestDirectLiveNoSideEffect pins).
+func (dc *directConn) live() bool { return dc.isUp() }
 
 // stateOf reports the punch state machine's current state, a plain read.
 func (dc *directConn) stateOf() directState {
@@ -557,15 +524,6 @@ func (dc *directConn) punchFailures() uint64 {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	return dc.failGen
-}
-
-// live reports whether a usable direct session exists, without side effects.
-// Unlike session() it never tears down a dead session or schedules a re-punch:
-// a status query must not trigger connection churn.
-func (dc *directConn) live() bool {
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-	return dc.sess != nil && !dc.sess.IsClosed()
 }
 
 // noteErr records why a punch round failed. The latest reason wins; markUp
@@ -739,90 +697,146 @@ drain:
 	// start() only runs from directNone, so reset a backoff first.
 	dc.mu.Lock()
 	if dc.state == directUp || dc.state == directBackoff {
-		// Let a round run. A live session is not torn down for it: session()
-		// serves it whatever the punch state is, and markUp replaces it only
-		// once a new punch actually succeeds. If this peer's session really is
-		// stale (it restarted and we missed its PeerGone), the round is what
-		// repairs it.
+		// Let a round run. A live direct path is not torn down for it: the
+		// pair keeps serving its underlay whatever the punch state is, and
+		// markUp replaces it only once a new punch actually succeeds. If this
+		// peer's direct path really is stale (it restarted and we missed its
+		// PeerGone), the round is what repairs it.
 		dc.state = directNone
 	}
 	dc.mu.Unlock()
 	dc.start()
 }
 
-// teardown closes the direct session and socket, returning to directNone
-// without scheduling a re-punch (used on engine shutdown and in tests).
+// teardown closes the direct socket and returns to directNone without scheduling
+// a re-punch (used on engine shutdown and in tests). It also retires the pair's
+// direct underlay if this directConn owned it, so writes fall back to the relay
+// at once instead of aging out the recency window.
 func (dc *directConn) teardown() {
 	dc.mu.Lock()
-	sess := dc.sess
-	sock := dc.socket
-	dc.sess = nil
-	dc.sessAt = time.Time{} // no live session: SessionAge must read 0, not the dead session's age
-	dc.socket = nil
+	sock := dc.sock
+	dc.sock = nil
+	dc.sessAt = time.Time{} // no live underlay: SessionAge must read 0, not the dead one's age
 	dc.mine = nil
 	dc.state = directNone
 	dc.mu.Unlock()
-	if sess != nil {
-		sess.Close()
+	if sock == nil {
+		return
 	}
-	if sock != nil {
-		sock.Close()
+	if dc.e != nil {
+		if pair := dc.e.relayKCPPairGet(dc.peer); pair != nil {
+			pair.mu.Lock()
+			held := pair.direct != nil && pair.direct.sock == sock
+			pair.mu.Unlock()
+			if held {
+				pair.clearDirectUnderlay() // closes the socket too
+			}
+		}
 	}
+	sock.Close()
 }
 
-// markUp stores the freshly-built session+token and marks the state up.
-func (dc *directConn) markUp(sess *smux.Session, socket *net.UDPConn, peerAddr netip.AddrPort) {
+// markUp stores the freshly punched socket and marks the state up, registering
+// the socket as the pair's direct underlay. token is this side's raw-UDP seed
+// token (Task 6): the underlay echoes the peer's late seed probes with it and
+// drops its own returning echo, so two registered underlays cannot ping-pong.
+//
+// A punch can succeed while an older underlay is still installed (it is re-run
+// on the peer's announcements): the new socket replaces it, and the old one is
+// retired by setDirectUnderlay. Re-registering the same socket is skipped — the
+// pair already holds it, and setDirectUnderlay would close it as the "old"
+// underlay (Task 3 contract).
+func (dc *directConn) markUp(sock *net.UDPConn, peerAddr netip.AddrPort, token [seedTokenLen]byte) {
 	dc.mu.Lock()
-	// A punch can succeed while an older session is still serving (it is
-	// re-run on the peer's announcements): the new session replaces it, and
-	// the old one and its socket are done.
-	prevSess, prevSock := dc.sess, dc.socket
-	dc.sess = sess
-	dc.socket = socket
+	prevSock := dc.sock
+	dc.sock = sock
 	dc.peerAddr = peerAddr
 	dc.state = directUp
 	dc.failed = false
 	dc.lastErr = ""
 	dc.sessAt = time.Now()
 	dc.mu.Unlock()
-	if prevSess != nil && prevSess != sess {
-		prevSess.Close()
+
+	if sock == nil {
+		return
 	}
-	if prevSock != nil && prevSock != socket {
+	if prevSock != nil && prevSock != sock {
 		prevSock.Close()
+	}
+	if prevSock != sock {
+		dc.e.registerDirectUnderlay(dc.peer, sock, peerAddr, token)
 	}
 	dc.e.stats.punchSuccess.Add(1)
 	dc.ups.Add(1)
 }
 
-// markDead tears down the direct session after its accept loop ends and punches
-// again: the path died (a network change, a NAT rebind, an idle keepalive
-// timeout), and a new network is a new chance — nothing else would retry while
-// the pair is idle on the relay. The opening side notices death through
-// session() and re-punches; the accepting side otherwise stays stuck in directUp
-// and never answers the re-punch candidates, so the pair can never re-establish.
+// underlayDead is the pair's idle-watchdog path (Task 4's onDirectIdle): the
+// direct underlay u went silent past directUnderlayIdle and directUnderlayDead
+// has already retired it from the pair. Mark this directConn down and schedule a
+// re-punch. A direct that died shortly after registration backs off
+// exponentially (H3) instead of flapping direct↔relay; one that had a healthy
+// lifetime re-punches at once. A round already in flight, or a backoff already
+// armed, is left to finish — only an underlay that owned directUp schedules the
+// re-punch, matching the old markDead.
 //
-// The re-punch is scheduled only when the dead session owned the state
-// (directUp). A round already in flight is left to finish — it is rebuilding
-// anyway, and resetting the state here (as an unguarded clear did) let a second
-// round start on the same candidate channel and mine list. The session-identity
-// guard ignores a stale session so a concurrent re-punch (markUp) is not
-// clobbered.
-func (dc *directConn) markDead(sess *smux.Session) {
+// Non-blocking (H4): the socket was closed by clearDirectUnderlay, and the
+// re-punch runs on its own goroutine (start) or its own timer (retry).
+func (dc *directConn) underlayDead(u *directUnderlay) {
 	dc.mu.Lock()
-	sock, repunch := dc.detachSessionLocked(sess)
-	dc.mu.Unlock()
-	if sock != nil {
-		sock.Close()
+	if dc.sock == nil || (u != nil && dc.sock != u.sock) {
+		dc.mu.Unlock()
+		return // a newer underlay already replaced this one
 	}
+	lifetime := time.Since(dc.sessAt)
+	dc.sock = nil
+	dc.sessAt = time.Time{} // no live underlay: SessionAge must read 0
+	if dc.state != directAttempting {
+		dc.mine = nil // a round in flight owns its own candidate list
+	}
+	repunch := dc.state == directUp
+	var backoff time.Duration
+	if repunch {
+		dc.state = directNone
+		dc.drops.Add(1)
+		backoff = dc.repunchBackoffAfterLocked(lifetime)
+	}
+	dc.mu.Unlock()
 	if !repunch {
-		return
+		return // a round or a backoff is already rebuilding: it decides next
 	}
 	if dc.e.dropIfGone(dc.peer, dc) {
-		return // the peer is gone from the relay: nothing to punch with
+		return // the peer is gone from the relay: nothing to re-punch with
 	}
-	dc.e.log.Debug("direct punch: session died, punching again", "peer", keyName(dc.peer))
-	go dc.start()
+	if backoff > 0 {
+		dc.e.log.Debug("direct underlay died young, re-punching after backoff",
+			"peer", keyName(dc.peer), "lifetime", lifetime.Round(time.Millisecond).String(),
+			"backoff", backoff.String())
+		dc.retry(backoff, false)
+		return
+	}
+	dc.e.log.Debug("direct underlay died, punching again", "peer", keyName(dc.peer))
+	dc.start()
+}
+
+// repunchBackoffAfterLocked updates and returns the wait before the next punch
+// after a direct underlay died with the given lifetime (H3). A direct that
+// survived at least 2×directUnderlayIdle resets the hysteresis and re-punches at
+// once (0). A younger one grows the stored backoff geometrically from
+// backoffPeriod, capped at directRepunchBackoffCap. Caller must hold dc.mu.
+func (dc *directConn) repunchBackoffAfterLocked(lifetime time.Duration) time.Duration {
+	if lifetime >= 2*directUnderlayIdle {
+		dc.repunchBackoff = 0
+		return 0
+	}
+	if dc.repunchBackoff == 0 {
+		dc.repunchBackoff = backoffPeriod
+	} else {
+		dc.repunchBackoff *= 2
+	}
+	if dc.repunchBackoff > directRepunchBackoffCap {
+		dc.repunchBackoff = directRepunchBackoffCap
+	}
+	return dc.repunchBackoff
 }
 
 // addCaps records the capability bits the peer advertised. The IPv6 and
@@ -1009,9 +1023,6 @@ func (dc *directConn) conv() uint32 {
 
 func (dc *directConn) punch() {
 	e := dc.e
-	// The smux session role (smaller key = client) is independent of who
-	// dials: both peers dial. See docs/2026-09-09-p2p-mutual-punch-design.md.
-	roleIsClient := bytes.Compare(e.pub[:], dc.peer[:]) < 0
 	pname := keyName(dc.peer)
 
 	// Candidates are exchanged over the relay: with no connection there is
@@ -1064,8 +1075,8 @@ func (dc *directConn) punch() {
 		}
 	}
 	// Every socket is closed on all exits except the winner, which is handed to
-	// markUp. Closing an already-closed socket (a failed family's session owns
-	// it via ownConn=true) is a harmless no-op.
+	// markUp (and then owned by the pair's direct underlay). A close of an
+	// already-closed socket is a harmless no-op.
 	closeFams := func() {
 		for i := range fams {
 			if fams[i].sock != nil {
@@ -1090,22 +1101,11 @@ func (dc *directConn) punch() {
 	dc.mu.Lock()
 	dc.mine = mine
 	dc.mu.Unlock()
-	// This punch rebuilds a dead session (a live one is never disturbed by an
-	// announcement): rotate the ephemeral so the rebuilt session runs over a
-	// fresh key and nonce space. The old KCP underlay is gone, so its shared
-	// counter cannot continue without desyncing (see rekeyIfUsed); a live
-	// session's punch skips this and is left serving.
-	if !dc.live() {
-		dc.secure.rekeyIfUsed()
-	}
+	// The direct underlay rides the pair's existing secure session (tag 0x00,
+	// negotiated with the relay session); there is no separate direct secure
+	// session to negotiate or rekey (Task 9 removes the direct half entirely).
 	if err := e.sendCaps(dc.peer, capsIPv6|capsTightKeepalive); err != nil {
 		e.log.Debug("direct punch: send caps failed", "peer", pname, "error", err)
-	}
-	// Our half of the direct security handshake, next to the candidate exchange
-	// it rides with. Sent wanting (unsettled) so the peer answers and a lost
-	// reply heals via the retry below.
-	if err := e.sendSecureHalf(dc.peer, dc.secure); err != nil {
-		e.log.Debug("direct punch: send secure half failed", "peer", pname, "error", err)
 	}
 	if err := e.sendCandidates(dc.peer, mine); err != nil {
 		e.log.Debug("direct punch: send candidates failed", "peer", pname, "error", err)
@@ -1171,48 +1171,13 @@ func (dc *directConn) punch() {
 		return
 	}
 
-	// 4. Encryption gate: settle the direct security handshake BEFORE dialing.
-	// The gate must precede the dial/seed, not follow it: seedHandshake is a
-	// plaintext, version-agnostic path-liveness echo, so a peer that cannot
-	// encrypt would pass it, build its own direct mux, and report "direct" while
-	// our side refuses — its view is local and wrong, and every later punch
-	// re-succeeds. Gating first means it gets no seed echo, so its own punch
-	// fails and it backs off. The handshake rides the relay control channel (our
-	// half was sent at punch start), not the direct path, so gating here has no
-	// bootstrap deadlock: the peer's half reaches us over the relay even though
-	// neither side has dialed. A settled session skips the loop; the retry
-	// re-sends our half (with want set while unsettled) so a lost reply heals;
-	// the deadline bounds a peer that does not support it, which is refused here.
-	deadline := time.Now().Add(handshakeTimeout)
-	for !dc.secure.settled() {
-		if err := e.sendSecureHalf(dc.peer, dc.secure); err != nil {
-			e.log.Debug("direct punch: secure half failed", "peer", pname, "error", err)
-			break
-		}
-		if dc.secure.waitReady(resendInterval) {
-			break
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-	}
-	if !dc.secure.settled() {
-		// Forced encryption: do not dial a peer that cannot encrypt. Abandon the
-		// round; the relay stays the fallback.
-		closeFams()
-		dc.noteErr("encryption not settled")
-		dc.noteRound("encrypted: not settled")
-		e.log.Warn("direct punch refused: encryption required but the peer did not negotiate it",
-			"peer", pname)
-		dc.backoff()
-		return
-	}
-
-	// 5. Try each family once, in order. Per-family sockets preserve the kcp
-	// "one socket, one session" rule; both families failing backs off. The seed
-	// handshake requires a full own->peer->own round trip on both sides, so a
-	// one-way v6 path fails on both peers and both fall back to v4 in this
-	// round.
+	// 4. Try each family once, in order, with the raw-UDP token seed handshake
+	// (Task 6). Per-family sockets keep one socket per attempt; both families
+	// failing backs off. The seed requires a full own->peer->own round trip on
+	// both sides, so a one-way v6 path fails on both peers and both fall back to
+	// v4 in this round. A winning socket is registered as the pair's direct
+	// underlay; the encryption it rides is the pair's relay secure session, so
+	// there is no separate direct secure gate here.
 	for _, idx := range order {
 		f := &fams[idx]
 		var dial netip.AddrPort
@@ -1228,78 +1193,27 @@ func (dc *directConn) punch() {
 				dial = peerV4[0]
 			}
 		}
-		u := net.UDPAddrFromAddrPort(dial)
-		e.log.Debug("direct punch: dial", "peer", pname, "family", f.name, "addr", u.String(), "conv", dc.conv())
-		dc.noteRound("%s dial %s", f.name, dial.String())
-		// ownConn=true: Close closes the socket, so session death tears down the
-		// readLoop with no separate bookkeeping (kcp-go deep-dive R2).
-		kcpConn, err := kcp.NewConn4(dc.conv(), u, nil, 0, 0, true, f.sock)
+		e.log.Debug("direct punch: seed", "peer", pname, "family", f.name, "addr", dial.String())
+		dc.noteRound("%s seed %s", f.name, dial.String())
+		token, err := seedHandshakeUDPToken(f.sock, dial, seedTimeout)
 		if err != nil {
-			dc.noteErr(fmt.Sprintf("dial failed: %v", err))
-			dc.noteRound("%s dial failed: %v", f.name, err)
-			e.log.Debug("direct punch: dial failed", "peer", pname, "family", f.name, "addr", u.String(), "error", err)
-			continue
-		}
-		if err := seedHandshake(kcpConn, seedTimeout); err != nil {
-			kcpConn.Close() // ownConn=true closes f.sock with it
 			dc.noteErr(fmt.Sprintf("seed failed: %v", err))
 			dc.noteRound("%s seed failed: %v", f.name, err)
-			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", u.String(), "error", err)
+			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", dial.String(), "error", err)
 			continue
 		}
-
-		// The encryption gate above already refused an unsettled session before
-		// dialing, so conn() is expected to succeed here; the error stays as a
-		// safety.
-		raw, err := dc.secure.conn(kcpConn)
-		if err != nil {
-			kcpConn.Close()
-			e.log.Debug("direct punch: secure wrap failed", "peer", pname, "error", err)
-			continue
-		}
-		// Fault injection (see faults): the wrapper sits below smux, so a data
-		// fault covers every frame the session would send — stream payload and
-		// the keepalive NOP alike — which is how a live path starves a session.
-		// The seed handshake above stays outside it: it proves the path, and the
-		// path is not what a fault is reproducing.
-		underlay := &faultConn{Conn: raw, e: dc.e}
-
-		// 6. smux over the ciphered KCP underlay; role by key order (external to
-		// who dialed).
-		cfg := directSmuxConfig(dc.supports(capsTightKeepalive))
-		var sess *smux.Session
-		if roleIsClient {
-			sess, err = smux.Client(underlay, cfg)
-		} else {
-			sess, err = smux.Server(underlay, cfg)
-		}
-		if err != nil {
-			kcpConn.Close()
-			dc.noteErr(fmt.Sprintf("smux failed: %v", err))
-			dc.noteRound("%s smux failed", f.name)
-			e.log.Debug("direct punch: smux failed", "peer", pname, "family", f.name, "error", err)
-			continue
-		}
-
 		sock := f.sock
-		f.sock = nil // owned by the session
+		f.sock = nil // owned by the pair's direct underlay
 		closeFams()  // drop the unused family's socket
 		// Only the winner's socket is still bound, so only its candidates are
 		// ours to answer a peer's announcement with.
 		dc.mu.Lock()
 		dc.mine = f.mine
 		dc.mu.Unlock()
-		dc.markUp(sess, sock, dial)
+		dc.markUp(sock, dial, token)
 		dc.noteRound("%s up", f.name)
-		_, _, enc := dc.secure.keys()
 		e.log.Debug("direct established", "peer", pname, "family", f.name,
-			"mine", candAddrs(f.mine), "peerAddr", dial.String(),
-			"keepalive", cfg.KeepAliveInterval.String()+"/"+cfg.KeepAliveTimeout.String(),
-			"secure", enc)
-		go func() {
-			e.acceptLoop(sess, "direct", dc.peer, dial.String())
-			dc.markDead(sess)
-		}()
+			"mine", candAddrs(f.mine), "peerAddr", dial.String())
 		return
 	}
 

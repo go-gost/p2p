@@ -37,7 +37,7 @@ func TestStatusReportsTransportStats(t *testing.T) {
 
 	peerDirect := derpclient.PublicKey{1}
 	peerRelay := derpclient.PublicKey{2}
-	dc := &directConn{e: e, peer: peerDirect, sess: newTestSess(t), state: directUp}
+	dc := &directConn{e: e, peer: peerDirect, sock: mustListenUDP(t), state: directUp}
 	dc.attempts.Store(4)
 	dc.ups.Store(2)
 	dc.drops.Store(1)

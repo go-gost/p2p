@@ -38,27 +38,27 @@ func newTestSess(t *testing.T) *smux.Session {
 }
 
 // TestDirectLiveNoSideEffect pins the one trap in the transport-stats feature:
-// the gauge probe must report a dead session without the teardown and re-punch
-// that session() performs, or a Status query would churn connections. If live()
-// ever delegates to session(), the state assertion below fails.
+// the gauge probe must be a side-effect-free read, or a Status query would churn
+// connections. live() reads the registered-underlay state and never tears
+// anything down.
 func TestDirectLiveNoSideEffect(t *testing.T) {
-	sess := newTestSess(t)
-	dc := &directConn{peer: derpclient.PublicKey{1}, sess: sess, state: directUp}
+	sock := mustListenUDP(t)
+	t.Cleanup(func() { sock.Close() })
+	dc := &directConn{peer: derpclient.PublicKey{1}, sock: sock, state: directUp}
 
 	if !dc.live() {
-		t.Fatal("live() = false for an open session, want true")
+		t.Fatal("live() = false for a registered underlay, want true")
 	}
 
-	sess.Close()
-
-	if dc.live() {
-		t.Fatal("live() = true for a closed session, want false")
-	}
 	dc.mu.Lock()
 	state := dc.state
 	dc.mu.Unlock()
 	if state != directUp {
 		t.Fatalf("live() mutated state to %v, want directUp (side-effect free)", state)
+	}
+	// No registered underlay is not live, whatever the state word says.
+	if (&directConn{state: directUp}).live() {
+		t.Fatal("live() = true with no socket, want false")
 	}
 }
 
@@ -69,8 +69,11 @@ func TestDirectLiveNoSideEffect(t *testing.T) {
 func liveDirectFor(t *testing.T, e *engine, peer derpclient.PublicKey) *directConn {
 	t.Helper()
 	dc := e.directConn(peer)
+	sock := mustListenUDP(t)
+	t.Cleanup(func() { sock.Close() })
 	dc.mu.Lock()
-	dc.sess = newTestSess(t)
+	dc.sock = sock
+	dc.sessAt = time.Now()
 	dc.state = directUp
 	dc.mu.Unlock()
 	installDirectUnderlayFor(t, e, peer)
@@ -369,7 +372,9 @@ func TestTransportCounts(t *testing.T) {
 	peerDirect := derpclient.PublicKey{1}
 	peerRelay := derpclient.PublicKey{2}
 
-	dc := &directConn{e: e, peer: peerDirect, sess: newTestSess(t), state: directUp}
+	directSock := mustListenUDP(t)
+	t.Cleanup(func() { directSock.Close() })
+	dc := &directConn{e: e, peer: peerDirect, sock: directSock, state: directUp}
 	e.directs[peerDirect] = dc
 	// Both peers carry a live relay session — the base path a peer has before
 	// and after a punch — so losing the direct session must leave peerDirect on
@@ -398,11 +403,11 @@ func TestTransportCounts(t *testing.T) {
 		t.Errorf("peer %s transport = %q, want derp", keyName(peerRelay), got)
 	}
 
-	// Losing the direct session moves that peer into the relay column.
+	// Losing the direct underlay moves that peer into the relay column.
 	dc.mu.Lock()
-	sess := dc.sess
+	dc.sock = nil
+	dc.state = directNone
 	dc.mu.Unlock()
-	sess.Close()
 
 	direct, derp = e.transportCounts()
 	if direct != 0 || derp != 2 {
@@ -504,7 +509,7 @@ func TestStatusFacesAgreeOnWhoIsConnected(t *testing.T) {
 		{"relay session ended, direct live", func(t *testing.T) (*peerConn, *directConn) {
 			s := newTestSess(t)
 			s.Close()
-			return &peerConn{sess: s}, &directConn{sess: newTestSess(t), state: directUp}
+			return &peerConn{sess: s}, &directConn{sock: mustListenUDP(t), state: directUp}
 		}},
 	}
 
@@ -627,7 +632,7 @@ func TestPeerTransportReasons(t *testing.T) {
 	e := newEngine()
 	e.peers[peer] = &peerConn{}
 	e.stunFailed.Store(true)
-	e.directs[peer] = &directConn{e: e, peer: peer, sess: newTestSess(t), state: directUp}
+	e.directs[peer] = &directConn{e: e, peer: peer, sock: mustListenUDP(t), state: directUp}
 	if got := e.peerTransports()[keyName(peer)]; got != transportDirect {
 		t.Errorf("live session: transport = %q, want direct", got)
 	}
@@ -712,8 +717,8 @@ func TestPeerDiagnosticsReasonOnlyWhenNotDirect(t *testing.T) {
 		t.Errorf("relay-only state = %q, want none", d.State)
 	}
 
-	// A live direct session outranks the reason: no stale Reason on a direct row.
-	e.directs[peer] = &directConn{e: e, peer: peer, sess: newTestSess(t), state: directUp}
+	// A live direct path outranks the reason: no stale Reason on a direct row.
+	e.directs[peer] = &directConn{e: e, peer: peer, sock: mustListenUDP(t), state: directUp}
 	d = e.peerDiagnostics(e.peerTransports())[keyName(peer)]
 	if d.Path != transportDirect {
 		t.Fatalf("live session: path = %q, want direct", d.Path)
@@ -786,7 +791,7 @@ func TestPeerDiagnosticsMerge(t *testing.T) {
 	pcBoth.lastFrameAt.Store(time.Now().Add(-3 * time.Second).UnixNano())
 	e.peers[both] = pcBoth
 	// The directConn's own stamp is left unset, so the relay age survives.
-	e.directs[both] = &directConn{e: e, peer: both, sess: newTestSess(t), state: directUp}
+	e.directs[both] = &directConn{e: e, peer: both, sock: mustListenUDP(t), state: directUp}
 
 	out := e.peerDiagnostics(e.peerTransports())
 
@@ -832,6 +837,16 @@ func TestTransportStatsCounters(t *testing.T) {
 	s.Close()
 
 	waitFor(t, 5*time.Second, func() bool { return hasDirect(engineA, pubB) })
+
+	// The first stream was opened before the punch and rode the relay (M3):
+	// a stream's transport is a snapshot of the pair's path at open time. Open
+	// another now that the pair prefers direct; that one is counted direct.
+	s2, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s2, "stats-direct")
+	s2.Close()
 
 	punchAttempts, punchSuccess, streamsDirect, _ := engineA.stats.snapshot()
 	if punchAttempts < 1 {
@@ -1520,17 +1535,15 @@ func settledSecurePair(t *testing.T, transport byte) (*secureSession, *secureSes
 	return a, b
 }
 
-// TestEncryptionState pins the peer-level rule: "secure" only when every live
-// session the peer has holds keys. A plaintext live direct session must not be
-// masked by an encrypted relay session — the visibility hole the review flagged.
-// These inputs are synthetic: peerEncryptions skips a peer with no live session
-// entirely (see TestPeerEncryptionsSkipsSessionless), so a live Status never
-// asks the classifier about one; the unit test still covers its own contract.
+// TestEncryptionState pins the peer-level rule: "secure" when the peer's relay
+// session holds keys, else "plaintext". The direct underlay has no separate
+// secure session after the pair migration (Task 7): it rides the pair's relay
+// secure session, so a live direct path is exactly as encrypted as the relay it
+// shares and does not change the classification.
 func TestEncryptionState(t *testing.T) {
 	peer := derpclient.PublicKey{7}
 	encRelay, _ := settledSecurePair(t, secureTransportRelay)
-	encDirect, _ := settledSecurePair(t, secureTransportDirect)
-	plain := newSecureSession(nil, secureTransportDirect, derpclient.PrivateKey{}, peer) // never settled
+	plain := newSecureSession(nil, secureTransportRelay, derpclient.PrivateKey{}, peer) // never settled
 
 	if got := encryptionState(nil, nil); got != encStatePlaintext {
 		t.Errorf("no sessions = %q, want plaintext", got)
@@ -1541,22 +1554,13 @@ func TestEncryptionState(t *testing.T) {
 	if got := encryptionState(&peerConn{peer: peer, secure: plain}, nil); got != encStatePlaintext {
 		t.Errorf("plaintext relay = %q, want plaintext", got)
 	}
-	// Encrypted relay + a live plaintext direct session reads plaintext: the
-	// plaintext path is the one carrying data, so it must not be hidden.
-	dcPlain := &directConn{peer: peer, sess: newTestSess(t), state: directUp, secure: plain}
-	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}, dcPlain); got != encStatePlaintext {
-		t.Errorf("encrypted relay + plaintext live direct = %q, want plaintext", got)
+	// A live direct path shares the relay's keys: secure when the relay is.
+	dc := &directConn{peer: peer, sock: mustListenUDP(t), state: directUp}
+	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}, dc); got != encStateSecure {
+		t.Errorf("encrypted relay + live direct = %q, want secure", got)
 	}
-	// Both live and encrypted: secure.
-	dcEnc := &directConn{peer: peer, sess: newTestSess(t), state: directUp, secure: encDirect}
-	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}, dcEnc); got != encStateSecure {
-		t.Errorf("encrypted relay + encrypted direct = %q, want secure", got)
-	}
-	// A direct session that is not live is not considered: it must not downgrade
-	// an otherwise-encrypted peer.
-	dcDead := &directConn{peer: peer, state: directUp, secure: plain} // sess == nil → !live()
-	if got := encryptionState(&peerConn{peer: peer, secure: encRelay}, dcDead); got != encStateSecure {
-		t.Errorf("encrypted relay + non-live plaintext direct = %q, want secure", got)
+	if got := encryptionState(&peerConn{peer: peer, secure: plain}, dc); got != encStatePlaintext {
+		t.Errorf("plaintext relay + live direct = %q, want plaintext", got)
 	}
 }
 

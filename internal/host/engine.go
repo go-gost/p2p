@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -356,15 +357,13 @@ func (e *engine) peerEncryptions() map[string]string {
 	return out
 }
 
-// encryptionState classifies one peer by its live sessions: "secure" only when
-// every considered session holds keys — the relay session when the peer has one,
-// the direct session while one is live — else "plaintext". Reporting "plaintext"
-// for any unsettled live session is the safe direction for a downgrade alarm: it
-// may over-report transiently (a direct session mid-handshake), but never masks
-// a plaintext data path behind an encrypted relay session. Either argument may
-// be nil: a peer can be present with only a relay adapter or only a direct
-// connection.
+// encryptionState classifies one peer by its live relay session: "secure" when
+// it holds keys, else "plaintext". The direct underlay no longer has a separate
+// secure session (Task 7): it rides the pair's relay secure session, so a live
+// direct path is exactly as encrypted as the relay it shares. dc is accepted for
+// call-site symmetry but no longer consulted.
 func encryptionState(pc *peerConn, dc *directConn) string {
+	_ = dc
 	considered, allSecure := false, true
 	if pc != nil {
 		// pc.secure is fixed at adapter creation (see peerConn) and read under
@@ -377,12 +376,6 @@ func encryptionState(pc *peerConn, dc *directConn) string {
 			if _, _, ok := secure.keys(); !ok {
 				allSecure = false
 			}
-		}
-	}
-	if dc != nil && dc.live() && dc.secure != nil {
-		considered = true
-		if _, _, ok := dc.secure.keys(); !ok {
-			allSecure = false
 		}
 	}
 	if considered && allSecure {
@@ -816,42 +809,21 @@ func (e *engine) PublicKey() string {
 }
 
 // OpenStream opens a tunnel stream to the peer, establishing the DERP
-// connection and mux session on first use. An established direct (hole-punched)
-// session is preferred; on any failure it falls back to the relay session. The
-// returned connection is tagged with the transport it uses ("direct" or
-// "derp") so the caller can log which path the tunnel took.
+// connection and mux session on first use. There is one session per peer now —
+// the pair — and its KCP layer picks the preferred underlay (direct when fresh,
+// relay otherwise), so a stream opened before a punch still migrates to the
+// direct path once it lands. The returned connection is tagged with the pair's
+// current path ("direct" or "derp") so the caller can log which path the tunnel
+// is taking; the label is a snapshot, not a lifelong plane (M1).
 func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 	peer, err := parsePeerKey(peerB64)
 	if err != nil {
 		return nil, err
 	}
-	if dc := e.getDirect(peer); dc != nil {
-		if sess := dc.session(); sess != nil {
-			if c, err := openStream(sess, directOpenTimeout); err == nil {
-				e.stats.countStream("direct")
-				return &openedStream{Conn: &stampConn{Conn: c, at: &dc.lastFrameAt},
-					transport: "direct", peerAddr: dc.peerAddrString()}, nil
-			}
-		}
-	}
-
-	// No direct session yet: try to punch one (bounded by punchWaitTimeout)
-	// before falling back to the relay, so the first connection can ride the
-	// direct path too instead of always starting on the relay.
-	if sess := e.punchAndWait(peer); sess != nil {
-		if c, err := openStream(sess, streamOpenTimeout); err == nil {
-			pa := ""
-			var conn net.Conn = c
-			if dc := e.getDirect(peer); dc != nil {
-				pa = dc.peerAddrString()
-				conn = &stampConn{Conn: c, at: &dc.lastFrameAt}
-			}
-			e.stats.countStream("direct")
-			return &openedStream{Conn: conn, transport: "direct", peerAddr: pa}, nil
-		}
-	}
-
 	pc := e.peerConn(peer)
+	// ensureSession(punch=true) starts a hole punch for the peer, so a first
+	// open still gets the direct path as soon as it comes up; the open itself
+	// does not wait for it (M3).
 	sess, err := pc.ensureSession(true, true)
 	if err != nil {
 		return nil, err
@@ -898,8 +870,32 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 			}
 		}()
 	}
-	e.stats.countStream("derp")
-	return &openedStream{Conn: c, transport: "derp"}, nil
+	path := e.pairPath(peer)
+	e.stats.countStream(path)
+	// Stamp the per-peer last-recv on the directConn (when one exists) so a
+	// stream that carries only one direction still keeps the peer's last-recv
+	// fresh for the diagnostics.
+	var conn net.Conn = c
+	peerAddr := ""
+	if dc := e.getDirect(peer); dc != nil {
+		conn = &stampConn{Conn: c, at: &dc.lastFrameAt}
+		if path == "direct" {
+			peerAddr = dc.peerAddrString()
+		}
+	}
+	return &openedStream{Conn: conn, transport: path, peerAddr: peerAddr}, nil
+}
+
+// pairPath names the peer's current path for stream tagging and status:
+// "direct" while the pair's direct underlay is preferred (recent recency), else
+// "derp". It is a snapshot of the pair's current path, not a stream's lifelong
+// plane: the pair migrates underneath the stream (M1). A peer with no pair yet
+// reads "derp".
+func (e *engine) pairPath(peer derpclient.PublicKey) string {
+	if pair := e.relayKCPPairGet(peer); pair != nil && pair.pathName() == "direct" {
+		return "direct"
+	}
+	return "derp"
 }
 
 // stampConn stamps a per-peer last-recv atomic on every successful read, so a
@@ -1049,6 +1045,73 @@ func (e *engine) relayKCPPairGet(peer derpclient.PublicKey) *relayKCPPair {
 	e.kcpMu.Lock()
 	defer e.kcpMu.Unlock()
 	return e.relayKCPs[peer]
+}
+
+// registerDirectUnderlay installs a freshly punched socket as the peer's pair
+// direct underlay (the P2 cutover). It builds the underlay with the raw-UDP seed
+// token threaded from the handshake (Task 6) so the underlay can echo the peer's
+// late seed probes while dropping its own returning echo; the no-token
+// constructor never echoes, which would regress the late-responder fallback. The
+// pair's idle callback is installed once (idempotent): the pair invokes it when
+// the underlay goes silent past directUnderlayIdle.
+//
+// setDirectUnderlay retires any previous underlay by closing its socket, so a
+// re-punch never leaks the old one and never double-reads. Do not call this with
+// an already-installed socket: setDirectUnderlay would close it as the "old"
+// underlay (the Task 3 contract); markUp guards the same-socket case.
+func (e *engine) registerDirectUnderlay(peer derpclient.PublicKey, sock *net.UDPConn, addr netip.AddrPort, token [seedTokenLen]byte) {
+	if sock == nil {
+		return
+	}
+	// Ensure the local pair session (and its smux/secure) exists before the
+	// underlay is installed: the direct pump only feeds the pair's KCP session,
+	// so a direct path with no built pair session would have no consumer — the
+	// accepting side of a punch that lands before its relay session exists would
+	// otherwise carry nothing. This is what makes "the direct path outlives the
+	// relay" true rather than nominal. Run before taking kcpMu/p.mu to keep the
+	// engine's lock order (e.mu -> pc.mu -> kcpMu -> p.mu); a live pair session
+	// makes it a no-op.
+	if pc := e.peerConn(peer); pc != nil {
+		if _, err := pc.ensureSession(false, true); err != nil {
+			e.log.Debug("direct: ensure pair session failed", "peer", keyName(peer), "error", err)
+		}
+	}
+	pair := e.relayKCPPairFor(peer)
+	pair.mu.Lock()
+	if pair.onDirectIdle == nil {
+		pair.onDirectIdle = func(u *directUnderlay) { e.directUnderlayDead(peer, u) }
+	}
+	pair.mu.Unlock()
+	pair.setDirectUnderlay(newDirectUnderlayToken(sock, addr, token))
+}
+
+// directUnderlayDead is the pair's idle-watchdog callback (Task 4's
+// onDirectIdle): the direct underlay u went silent past directUnderlayIdle. If
+// the pair still holds u — a newer underlay may have replaced it since the
+// callback was dispatched — retire it (clear + close the socket), mark the
+// peer's directConn down, and schedule a re-punch. It is deliberately
+// non-blocking (H4): clearDirectUnderlay signals the pump and closes the socket
+// without joining it, and the re-punch runs on its own goroutine/timer.
+func (e *engine) directUnderlayDead(peer derpclient.PublicKey, u *directUnderlay) {
+	pair := e.relayKCPPairGet(peer)
+	if pair == nil {
+		return
+	}
+	pair.mu.Lock()
+	holds := pair.direct == u
+	pair.mu.Unlock()
+	if !holds {
+		return // a newer underlay replaced it: not ours to retire
+	}
+	pair.clearDirectUnderlay() // closes u's socket too
+	if u != nil {
+		u.close() // idempotent; the socket is already closed
+	}
+	dc := e.getDirect(peer)
+	if dc == nil {
+		return
+	}
+	dc.underlayDead(u)
 }
 
 // relayKCPLogAttrs returns the slog attrs describing the pair's relay KCP
@@ -1568,27 +1631,22 @@ func (e *engine) resetPeerSession(peer derpclient.PublicKey) {
 	}
 }
 
-// resetDirectSession tears the peer's direct mux session down so a re-punch
-// rebuilds it over the peer's new key (a peer restart arrives as a changed
-// secure half). It mirrors resetPeerSession, but the direct path lives in
-// e.directs and is rebuilt by a punch rather than a packet-driven ensureSession,
-// so markDead is what reclaims it: it detaches the session, closes its socket,
-// and (when that session owned directUp) schedules the re-punch. The secure
-// session itself is kept — respond already re-derived it under the new key, and
-// the next punch's conn() wraps the fresh underlay with those keys. It is not
-// added to peerGone: the direct path survives a relay loss by design.
+// resetDirectSession retires the peer's direct underlay so a re-punch rebuilds
+// it. A peer restart arrives as a changed relay secure half; after the pair
+// migration there is no separate direct secure half, so this path is vestigial
+// (Task 9 removes it), but it stays correct for a caller that still triggers it:
+// the pair's current underlay is handed to directUnderlayDead, which clears it
+// and schedules the re-punch. The relay secure session is untouched.
 func (e *engine) resetDirectSession(peer derpclient.PublicKey) {
-	e.mu.Lock()
-	dc := e.directs[peer]
-	e.mu.Unlock()
-	if dc == nil {
+	pair := e.relayKCPPairGet(peer)
+	if pair == nil {
 		return
 	}
-	dc.mu.Lock()
-	sess := dc.sess
-	dc.mu.Unlock()
-	if sess != nil {
-		dc.markDead(sess)
+	pair.mu.Lock()
+	u := pair.direct
+	pair.mu.Unlock()
+	if u != nil {
+		e.directUnderlayDead(peer, u)
 	}
 }
 
