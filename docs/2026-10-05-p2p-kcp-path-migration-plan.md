@@ -368,9 +368,9 @@ git commit -m "feat(p2p): raw-UDP seed handshake for the direct underlay"
 **Interfaces:**
 - Consumes: Task 3/4 pair methods, Task 1 `directUnderlay`.
 - Produces:
-  - `func (e *engine) registerDirectUnderlay(peer derpclient.PublicKey, sock *net.UDPConn, addr netip.AddrPort)` — builds a `directUnderlay`, installs it on `e.relayKCPPairFor(peer)`, and sets the pair's `onDirectIdle` to `func(u *directUnderlay){ e.directUnderlayDead(peer, u) }` (idempotent per pair).
+  - `func (e *engine) registerDirectUnderlay(peer derpclient.PublicKey, sock *net.UDPConn, addr netip.AddrPort, token [seedTokenLen]byte)` — builds a `directUnderlay` via `newDirectUnderlayToken(sock, addr, token)`, installs it on `e.relayKCPPairFor(peer)`, and sets the pair's `onDirectIdle` to `func(u *directUnderlay){ e.directUnderlayDead(peer, u) }` (idempotent per pair). The token MUST be threaded from the handshake (Task 6) so the underlay echoes peer probes; the no-token constructor never echoes.
   - `func (e *engine) directUnderlayDead(peer derpclient.PublicKey, u *directUnderlay)` — if the pair still holds `u`, `clearDirectUnderlay()`, close the socket, mark `directConn` down, and `dc.start()` (re-punch).
-  - `directConn`: replace `sess *smux.Session` with `sock *net.UDPConn`; drop `secure`; `markUp(sock *net.UDPConn, peerAddr netip.AddrPort)` stores them, sets `state=directUp`, and calls `e.registerDirectUnderlay`; `markDead` (`direct.go:797`) becomes the underlay-death handler.
+  - `directConn`: replace `sess *smux.Session` with `sock *net.UDPConn`; drop `secure`; `markUp(sock *net.UDPConn, peerAddr netip.AddrPort, token [seedTokenLen]byte)` stores them, sets `state=directUp`, and calls `e.registerDirectUnderlay(peer, sock, peerAddr, token)`; `markDead` (`direct.go:797`) becomes the underlay-death handler.
   - `func (dc *directConn) isUp() bool` and `func (dc *directConn) peerAddrString() string` keep `peerTransports`/`OpenStream` reporting working.
 
 - [ ] **Step 1: Write the failing tests**
@@ -421,8 +421,8 @@ git commit -m "feat(p2p): register the punched socket as the pair direct underla
 - Test: `p2p/internal/host/direct_test.go`
 
 **Interfaces:**
-- Consumes: Task 6 `seedHandshakeUDP`, Task 7 `registerDirectUnderlay`.
-- Produces: the punch's per-family loop (`direct.go:1202-1290`) ends with `seedHandshakeUDP` + `markUp(sock, dial)` instead of KCP/secure/smux. Deleted: `kcp.NewConn4(dc.conv(), ...)`, `dc.secure.settled()` gate, `dc.secure.conn()`, `faultConn` on the direct path, `directSmuxConfig`, the direct `smux.Client`/`smux.Server`, and the direct `acceptLoop` call.
+- Consumes: Task 6 `seedHandshakeUDPToken`, Task 7 `registerDirectUnderlay`.
+- Produces: the punch's per-family loop (`direct.go:1202-1290`) ends with `token, err := seedHandshakeUDPToken(sock, dial, timeout)` + `markUp(sock, dial, token)` instead of KCP/secure/smux. Deleted: `kcp.NewConn4(dc.conv(), ...)`, `dc.secure.settled()` gate, `dc.secure.conn()`, `faultConn` on the direct path, `directSmuxConfig`, the direct `smux.Client`/`smux.Server`, and the direct `acceptLoop` call.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -674,7 +674,7 @@ git commit -m "test(p2p): cover relay-to-direct migration end to end"
 
 **Step scan:** Every code step names a file, a signature, and the spec value. Test steps name the test and its assertions. No "handle edge cases" placeholders. Deliberately omitted: method bodies for the fan-in and the seed loop (the signatures and the spike/test model determine them).
 
-**Type consistency:** `directUnderlay`/`newDirectUnderlay`/`readFrom`/`writeTo`/`close`/`name`, `setDirectUnderlay`/`clearDirectUnderlay`/`preferredDirect`/`pathName`/`pumpDirect`/`pumpRelay`/`readRelay`/`onDirectIdle`, `registerDirectUnderlay`/`directUnderlayDead`, `markUp(sock, peerAddr)`, `seedHandshakeUDP`, `seedProbeMagic`, `directUnderlayIdle` are used consistently across tasks.
+**Type consistency:** `directUnderlay`/`newDirectUnderlay`/`readFrom`/`writeTo`/`close`/`name`, `setDirectUnderlay`/`clearDirectUnderlay`/`preferredDirect`/`pathName`/`pumpDirect`/`pumpRelay`/`readRelay`/`onDirectIdle`, `registerDirectUnderlay`/`directUnderlayDead`, `markUp(sock, peerAddr, token)`, `seedHandshakeUDPToken`, `newDirectUnderlayToken`, `seedProbeMagic`, `seedTokenLen`, `directUnderlayIdle` are used consistently across tasks.
 
 **Review Focus:** Each of the five lines has an owning-task test: (1) Task 1 `TestDirectUnderlayFiltersForeignSource`, (2) Task 1 `TestDirectUnderlayEchoesSeedMagic` + Task 7 `TestRegisterDirectUnderlayRetiresOldSocket`, (3) Task 2 `TestPairReadFromFanInReturnsDummyAddr` + Task 4, (4) Task 4 `TestPairCloseReturnsEOF`, (5) Task 7 `TestRegisterDirectUnderlayRetiresOldSocket`.
 
