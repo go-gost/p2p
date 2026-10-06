@@ -88,6 +88,11 @@ type engine struct {
 	// outlives any one smux session: a rebuilt mux session reuses its keys and
 	// nonce counters, and a peer restart is seen as a changed half.
 	secure map[secureKey]*secureSession
+	// lastControlHeal is when a control-blackhole trip last reconnected the
+	// relay (see healControlBlackhole): the reconnect tears every peer's
+	// relay session down, so trips are rate limited engine-wide. Guarded by
+	// mu.
+	lastControlHeal time.Time
 	// relayKCPs holds one relay KCP holder per peer, on the same principle as
 	// secure: the pair's KCP session outlives any one adapter, so an adapter
 	// swap does not restart the pair's sequence epoch under a peer whose
@@ -796,11 +801,15 @@ func (e *engine) reconnect() {
 			// The relay just came back, which on a phone means the network
 			// changed (Wi-Fi ↔ cellular): the candidates exchanged over it are
 			// stale, and a round that ran while it was down gave up. Punch
-			// again — nothing else would, while the pair is idle.
+			// again — nothing else would, while the pair is idle. kick, not
+			// start: a backoff armed on the dead registration was earned on a
+			// channel that no longer exists, and start is a no-op while a
+			// backoff is armed — without the kick the re-punch would sit out
+			// the remainder behind a stale timer.
 			if len(punch) > 0 {
 				e.log.Debug("relay reconnected, punching again", "peers", len(punch))
 				for _, dc := range punch {
-					go dc.start()
+					go dc.kick()
 				}
 			}
 		}
@@ -1877,6 +1886,25 @@ func (e *engine) keepalive(c *derpclient.Client) {
 	// goroutine's business, and a new connection starts a new loop.
 	var pingedAt time.Time
 	for range ticker.C {
+		// The death verdict comes before the writes: on a half-open path the
+		// writes below can block (buffered, then stuck) while nothing errors,
+		// and the old order ran both writes before asking whether the path
+		// was answering — each blocked write pushed detection further out
+		// (seen: 2m13s of silence before the 45s ceiling fired). Read the
+		// verdict off the already-kept timestamps, then write.
+		now := time.Now()
+		pong := c.LastPong()
+		if relaySilent(pingedAt, pong, now) {
+			pongAge := "never"
+			if !pong.IsZero() {
+				pongAge = now.Sub(pong).Round(time.Millisecond).String()
+			}
+			e.log.Error("derp: relay path dead, reconnecting", "pongAge", pongAge,
+				"pongs", c.Pongs(), "frames", c.RecvFrames())
+			e.teardown(c, fmt.Errorf("relay path unresponsive for %v (%d pongs, %d frames in)",
+				relayDeadPeriod, c.Pongs(), c.RecvFrames()))
+			return
+		}
 		if err := c.KeepAlive(); err != nil {
 			e.teardown(c, err)
 			return
@@ -1896,11 +1924,11 @@ func (e *engine) keepalive(c *derpclient.Client) {
 		// The ping just sent becomes the *outstanding* probe only once the
 		// previous one was answered (or when none was outstanding yet). The stamp
 		// must not advance on every tick: the age would then stay at one interval
-		// — below the ceiling — and the verdict below could never fire, leaving a
+		// — below the ceiling — and the verdict above could never fire, leaving a
 		// half-open relay in place forever. Candidate exchange rides the relay, so
 		// that is also a punch that never succeeds again.
-		now := time.Now()
-		pong := c.LastPong()
+		now = time.Now()
+		pong = c.LastPong()
 		if pingedAt.IsZero() || (!pong.IsZero() && !pong.Before(pingedAt)) {
 			pingedAt = now
 		}
@@ -1913,13 +1941,6 @@ func (e *engine) keepalive(c *derpclient.Client) {
 		e.log.Debug("derp: keepalive", "pongAge", pongAge, "pongs", c.Pongs(),
 			"inboundFrameAge", time.Since(c.LastRecv()).Round(time.Second).String(),
 			"frames", c.RecvFrames())
-		if relaySilent(pingedAt, pong, now) {
-			e.log.Error("derp: relay path dead, reconnecting", "pongAge", pongAge,
-				"pongs", c.Pongs(), "frames", c.RecvFrames())
-			e.teardown(c, fmt.Errorf("relay path unresponsive for %v (%d pongs, %d frames in)",
-				relayDeadPeriod, c.Pongs(), c.RecvFrames()))
-			return
-		}
 	}
 }
 
@@ -2265,6 +2286,59 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 		pc.e.maybeStartDirect(pc.peer)
 	}
 	return sess, err
+}
+
+// relaySessionEvidence reports what the relay session to peer says about
+// whether the peer is still there: live when a built session is serving now,
+// fresh when one was built within controlBlackholeGrace (a killed adapter
+// keeps its build time until the map drops it, and a replacement carries it
+// across the swap, so "recently built" survives the death itself). It is the
+// blackhole tripwire's discriminator between "the peer is answering on the
+// relay data path but control hears nothing" (wedged registration) and "the
+// peer is just gone" (a killed phone): only the former may trip a relay
+// reconnect.
+func (e *engine) relaySessionEvidence(peer derpclient.PublicKey) (live, fresh bool) {
+	e.mu.Lock()
+	pc := e.peers[peer]
+	e.mu.Unlock()
+	if pc == nil {
+		return false, false
+	}
+	if pc.liveSession() {
+		return true, true
+	}
+	pc.mu.Lock()
+	at := pc.sessAt
+	pc.mu.Unlock()
+	if at.IsZero() {
+		return false, false
+	}
+	return false, time.Since(at) < controlBlackholeGrace
+}
+
+// healControlBlackhole reconnects the relay on the punch control plane's
+// behalf: enough consecutive control misses accumulated while the peer showed
+// a relay session, so the registration — not the peer — is presumed wedged.
+// It is the same cure the relay churn guard and the pong watchdog apply (a
+// fresh registration is what clears stale server-side routing), tripped
+// earlier by control-plane evidence. Rate limited engine-wide, and consuming
+// the peer's live sighting, so one peer death costs at most one reconnect: a
+// peer that never comes back shows no new live session afterwards.
+func (e *engine) healControlBlackhole(peer derpclient.PublicKey, misses int) {
+	e.mu.Lock()
+	if time.Since(e.lastControlHeal) < controlBlackholeCooldown {
+		e.mu.Unlock()
+		return
+	}
+	e.lastControlHeal = time.Now()
+	e.mu.Unlock()
+	if dc := e.getDirect(peer); dc != nil {
+		dc.resetControlMisses()
+	}
+	e.log.Error("derp: control blackhole suspected, reconnecting the relay",
+		"peer", keyName(peer), "misses", misses)
+	e.reconnectRelay(fmt.Errorf("peer %s missed %d punch control exchanges",
+		keyName(peer), misses))
 }
 
 // reconnectRelay tears the shared relay connection down, so the redial loop

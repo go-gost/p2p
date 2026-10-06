@@ -117,6 +117,26 @@ var (
 	// within the reconnect ticker's period.
 	relayWaitRetry = 2 * time.Second
 	stunTimeout    = 3 * time.Second
+	// controlBlackholeThreshold is how many consecutive punch-control misses
+	// (rounds that heard no peer candidates, plus gone-gate skips) with fresh
+	// relay-session evidence trip a relay reconnect. Each miss is cheap
+	// (a STUN lookup and a broadcast, or nothing at all for a skip), while a
+	// wedged relay registration heals nothing until it is re-registered — the
+	// field case was 2.5 minutes of doubling backoff behind a control channel
+	// that delivered nothing. Vars so tests can shorten them.
+	controlBlackholeThreshold = 3
+	// controlBlackholeGrace bounds how stale the peer's relay session may be
+	// for a miss to count: the session must be live now, or have been built
+	// within this window. A peer that died long ago (a killed phone) stops
+	// counting once its last build ages out, so it can never hold the relay
+	// hostage. Together with the live-sighting requirement in
+	// noteControlMiss, one peer death costs at most one reconnect.
+	controlBlackholeGrace = 5 * time.Minute
+	// controlBlackholeCooldown is the minimum gap between two
+	// blackhole-triggered relay reconnects engine-wide: the reconnect tears
+	// every peer's relay session down, so a repeatedly failing peer must not
+	// flap it.
+	controlBlackholeCooldown = 5 * time.Minute
 	// candidateGrace is how long a round holds after taking a peer's candidate
 	// list, for a fresher one to supersede it. See the call site in punch.
 	candidateGrace = 200 * time.Millisecond
@@ -214,6 +234,22 @@ type directConn struct {
 	// PeerDiagnostic.NextPunchIn can answer "how long until we try again"
 	// without reading the timer. Zero when no backoff is armed. Guarded by mu.
 	backoffUntil time.Time
+
+	// controlMisses counts consecutive punch-control failures while the peer
+	// still showed a relay session recently: rounds that heard no peer
+	// candidates, plus armed-timer skips behind the gone-gate. A control
+	// channel that answers nothing while the relay looks connected is the
+	// signature of a wedged registration (server-side routing stale after a
+	// network switch), which no amount of re-punching heals — only a fresh
+	// registration does. controlLiveSeen records that at least one counted
+	// miss saw a live relay session, i.e. the peer was demonstrably answering
+	// on the relay data path while control failed; without it a peer that
+	// simply died could trip the reconnect. Both reset the moment control
+	// works again (onCandidates), when direct comes up (markUp), when the
+	// relay goes down (the reconnect loop owns the re-punch then), or when
+	// the evidence goes stale. Guarded by mu.
+	controlMisses   int
+	controlLiveSeen bool
 
 	// This peer's punch history, reported through Status.PeerDiagnostics. Atomics
 	// so a status query reads them without taking dc.mu and queueing behind a
@@ -591,6 +627,9 @@ func (dc *directConn) onCandidates(cands []candidate) {
 	// answer. Done before the dedupe, so a re-announcement of an identical list
 	// still counts as punching.
 	dc.notePunching()
+	// Candidates arrived: the control channel works, so any counted misses
+	// describe a channel that no longer exists.
+	dc.resetControlMisses()
 	dc.mu.Lock()
 	if sameCandidates(cands, dc.lastPeer) {
 		dc.mu.Unlock()
@@ -716,6 +755,10 @@ func (dc *directConn) markUp(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 	dc.failed = false
 	dc.lastErr = ""
 	dc.sessAt = time.Now()
+	// Direct is up: the control channel delivered, so any counted misses
+	// describe a channel that no longer exists.
+	dc.controlMisses = 0
+	dc.controlLiveSeen = false
 	dc.mu.Unlock()
 
 	if sock == nil {
@@ -922,6 +965,74 @@ func (dc *directConn) silentPeerWait(d time.Duration) time.Duration {
 // backoff marks a failed punch and schedules a retry.
 func (dc *directConn) backoff() { dc.retry(dc.silentPeerWait(backoffPeriod), true) }
 
+// resetControlMisses forgets the counted control failures: control demonstrably
+// works again (or the channel they were counted on is gone), so the old misses
+// say nothing about the current one.
+func (dc *directConn) resetControlMisses() {
+	dc.mu.Lock()
+	dc.controlMisses = 0
+	dc.controlLiveSeen = false
+	dc.mu.Unlock()
+}
+
+// noteControlMiss records one punch-control failure against the blackhole
+// tripwire. live/fresh describe the peer's relay session when the wait
+// started: live says a relay session was serving (the peer was answering on
+// the relay data path while control failed), fresh says one was built within
+// controlBlackholeGrace. A miss without fresh evidence — no relay session in
+// living memory, or the relay itself down — resets the count instead: the
+// peer is likely just gone, and gone peers must never trip a relay reconnect.
+//
+// When enough consecutive misses accumulate with at least one live sighting,
+// the registration is presumed wedged and the relay is reconnected (rate
+// limited engine-wide): the same cure the relay churn guard and the pong
+// watchdog apply, but tripped by the control plane instead of the data plane.
+func (dc *directConn) noteControlMiss(live, fresh bool) {
+	if !dc.e.relayConnected() {
+		dc.resetControlMisses()
+		return
+	}
+	if dc.peerDirectOff() {
+		// The peer said it will not punch: unanswered rounds are by design,
+		// not a wedged registration, and must never trip a relay reconnect.
+		dc.resetControlMisses()
+		return
+	}
+	if !fresh {
+		dc.resetControlMisses()
+		return
+	}
+	dc.mu.Lock()
+	dc.controlMisses++
+	if live {
+		dc.controlLiveSeen = true
+	}
+	fire := dc.controlMisses >= controlBlackholeThreshold && dc.controlLiveSeen
+	misses := dc.controlMisses
+	dc.mu.Unlock()
+	if fire {
+		dc.e.healControlBlackhole(dc.peer, misses)
+	}
+}
+
+// kick restarts a backed-off punch at once: a backoff armed on a dead relay
+// registration was earned on a channel that no longer exists, so a reconnect
+// must not sit out the remainder behind it. Only a backoff is cut short — a
+// round in flight, or a live direct path, is left alone. The miss count goes
+// with the old channel (fresh registration, fresh evidence), while the
+// silent-peer doubling is kept: a dead peer stays a slow re-probe.
+func (dc *directConn) kick() {
+	dc.mu.Lock()
+	if dc.state == directBackoff {
+		dc.state = directNone
+		dc.backoffUntil = time.Time{}
+	}
+	dc.controlMisses = 0
+	dc.controlLiveSeen = false
+	dc.mu.Unlock()
+	dc.start()
+}
+
 // retry reschedules the punch after d. failed says a *round* failed — the relay
 // being away is not a failure, it is a reason to wait: nothing can be exchanged
 // without it, and the round would otherwise back off for 30s over a network
@@ -981,7 +1092,19 @@ func (dc *directConn) retryFrom(d time.Duration, failed bool, fromNone bool) {
 		// a round armed before that advertisement does not run behind its back —
 		// the first symptom being that an endless "punch failed" keeps coming
 		// from a peer that said it was never going to answer.
-		if dc.e.peerGoneForPunch(dc.peer) || dc.peerDirectOff() {
+		gone := dc.e.peerGoneForPunch(dc.peer)
+		if gone || dc.peerDirectOff() {
+			// A skip is a control attempt abandoned: the round never ran, so
+			// nothing was exchanged. Counted like a failed round when the
+			// peer might still be there — behind a wedged registration the
+			// skips are what the backoff degrades into — with the evidence
+			// taken now. A peer that turned the direct path off is never
+			// counted: it will not answer by design, and must not trip a
+			// relay reconnect.
+			if gone {
+				live, fresh := dc.e.relaySessionEvidence(dc.peer)
+				dc.noteControlMiss(live, fresh)
+			}
 			dc.retry(dc.silentPeerWait(d), false)
 			return
 		}
@@ -1092,12 +1215,18 @@ func (dc *directConn) punch() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), punchTimeout)
 	defer cancel()
+	// Capture the relay-session evidence before waiting: a session that is
+	// alive now proves the peer answers on the relay data path, so hearing
+	// no candidates back is control-plane failure, not a dead peer. Taken
+	// up front because the session may die during the wait itself.
+	ctrlLive, ctrlFresh := e.relaySessionEvidence(dc.peer)
 	cands, ok := dc.waitCandidates(ctx)
 	if !ok {
 		e.log.Debug("direct punch: no peer candidates", "peer", pname)
 		closeFams()
 		dc.noteErr("no peer candidates")
 		dc.noteRound("no peer candidates")
+		dc.noteControlMiss(ctrlLive, ctrlFresh)
 		dc.backoff()
 		return
 	}
