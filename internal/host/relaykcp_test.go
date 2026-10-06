@@ -232,6 +232,57 @@ func TestRelayKCPPairDrainsFinalEndpoint(t *testing.T) {
 	}
 }
 
+// TestPairReadFromFanInReturnsDummyAddr pins the fan-in contract Task 3 builds
+// on: the pair's ReadFrom is fed by its buffered recv channel, which the relay
+// pump fills from the registered endpoint (and, from Task 3, the direct pump
+// fills from the punched socket). Every datagram — whether it arrived through
+// the relay pump or was placed on the fan-in directly — must be delivered with
+// the zero-value dummyAddr{} ("derp") that kcp-go locked its source to at
+// NewConn4. Reporting dummyAddr{peer} ("derp:<key>") would make kcp-go's read
+// loop silently drop every packet.
+func TestPairReadFromFanInReturnsDummyAddr(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{6}
+	pair := e.relayKCPPairFor(peer)
+	pc := &peerConn{
+		e:       e,
+		peer:    peer,
+		inbound: make(chan []byte, 1),
+		closeCh: make(chan struct{}),
+	}
+	pair.register(pc)
+	pc.inbound <- []byte("via the relay pump")
+
+	buf := make([]byte, 64)
+	n, addr, err := pair.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if got := string(buf[:n]); got != "via the relay pump" {
+		t.Fatalf("ReadFrom = %q, want %q", got, "via the relay pump")
+	}
+	if addr == nil {
+		t.Fatal("ReadFrom addr is nil")
+	}
+	if got := addr.String(); got != "derp" {
+		t.Fatalf("ReadFrom addr = %q, want the zero dummyAddr %q", got, "derp")
+	}
+
+	// The fan-in channel is what Task 3's direct pump also feeds: a datagram
+	// placed there must be delivered with the same zero address.
+	pair.recv <- []byte("via the fan-in")
+	n, addr, err = pair.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom (fan-in): %v", err)
+	}
+	if got := string(buf[:n]); got != "via the fan-in" {
+		t.Fatalf("ReadFrom (fan-in) = %q, want %q", got, "via the fan-in")
+	}
+	if addr == nil || addr.String() != "derp" {
+		t.Fatalf("ReadFrom (fan-in) addr = %v, want the zero dummyAddr %q", addr, "derp")
+	}
+}
+
 // TestCloseRelayKCPsKeepsLiveDirectPairs pins the pair-level half of the H1
 // guard: when the relay connection goes away, a pair kept alive by a live direct
 // path is left running (only its relay half is unregistered), while a pair with

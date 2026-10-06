@@ -111,6 +111,11 @@ const (
 	// queue — the backpressure the raw byte-stream underlay never had.
 	relayKCPSndWnd = 256
 	relayKCPRcvWnd = 256
+	// relayKCPRecvBuffer bounds the pair's fan-in channel: datagrams the pumps
+	// have read from their underlays but KCP has not yet consumed. It matches
+	// the receive window, so a pump can stay at most one window ahead of the
+	// session without the channel itself becoming the backpressure.
+	relayKCPRecvBuffer = 256
 )
 
 // newRelayKCPPair builds the pair-level KCP holder for peer: the KCP session
@@ -123,12 +128,21 @@ const (
 // segment that KCP retransmits — the same stack the direct plane already runs
 // (KCP -> cryptoConn(secure) -> smux).
 func newRelayKCPPair(e *engine, peer derpclient.PublicKey) *relayKCPPair {
-	return &relayKCPPair{
-		e:    e,
-		peer: peer,
-		wake: make(chan struct{}),
-		idle: make(chan struct{}),
+	p := &relayKCPPair{
+		e:             e,
+		peer:          peer,
+		recv:          make(chan []byte, relayKCPRecvBuffer),
+		done:          make(chan struct{}),
+		relayPumpDone: make(chan struct{}),
+		wake:          make(chan struct{}),
+		idle:          make(chan struct{}),
 	}
+	// The relay pump runs for the pair's lifetime: it parks until an endpoint
+	// is registered, follows the pair across endpoint swaps, and ends only when
+	// the pair itself does. It is what lets a second (direct) pump feed the same
+	// fan-in in Task 3 without the pair's ReadFrom knowing which path delivered.
+	go p.pumpRelay()
+	return p
 }
 
 // signalIdleLocked wakes the retirement waits (see relayKCPStream.Close).
@@ -159,6 +173,17 @@ type relayKCPPair struct {
 	closed  bool
 	wake    chan struct{} // closed and replaced on every endpoint/end change
 	idle    chan struct{} // closed and replaced on every read/write completion
+	// recv is the pair's fan-in: the relay pump (and, from Task 3, the direct
+	// pump) hand it datagrams, and the pair's ReadFrom serves KCP from it. done
+	// is closed exactly once by shutdown; both pumps select on it so neither can
+	// outlive the pair. relayPumpDone is closed by pumpRelay when it exits,
+	// after it has drained the final endpoint into recv; ReadFrom waits on it at
+	// pair end so a datagram the endpoint already queued is delivered, not
+	// dropped. A future direct pump that must preserve its final datagrams the
+	// same way should signal its own exit and have ReadFrom wait on it too.
+	recv          chan []byte
+	done          chan struct{}
+	relayPumpDone chan struct{}
 
 	// bytesSent/bytesRcvd count the pair's relay datagrams in bytes, on the
 	// paths the pair already walks (WriteTo/ReadFrom). They are this pair's own
@@ -256,9 +281,11 @@ func (p *relayKCPPair) newStream() *relayKCPStream {
 	return s
 }
 
-// shutdown ends the pair: no endpoint is served again and the KCP session
-// closes. A reader parked on the proxy wakes with io.EOF (the endpoint's kick
-// fires with the wake channel), so the session's read loop cannot leak.
+// shutdown ends the pair: no endpoint is served again, the pumps stop, and the
+// KCP session closes. A reader parked on the proxy wakes with io.EOF (the
+// endpoint's kick fires with the wake channel), so the session's read loop
+// cannot leak. done is closed exactly once, guarded by closed: a double close
+// would panic.
 func (p *relayKCPPair) shutdown() {
 	p.mu.Lock()
 	if p.closed {
@@ -267,6 +294,7 @@ func (p *relayKCPPair) shutdown() {
 	}
 	p.closed = true
 	close(p.wake)
+	close(p.done)
 	sess := p.sess
 	p.mu.Unlock()
 	if sess != nil {
@@ -324,9 +352,10 @@ func relayKCPSnapshotAttrs(s relayKCPSnapshot) []any {
 	}
 }
 
-// ReadFrom forwards one datagram from the current registered adapter to KCP.
-// Each endpoint degrades per relayPacketConn's drain-once-then-EOF contract;
-// the forwarding adds the swap awareness the pair needs on top:
+// readRelay serves one datagram from the current registered adapter to the
+// pair's relay pump. Each endpoint degrades per relayPacketConn's
+// drain-once-then-EOF contract; the forwarding adds the swap awareness the pair
+// needs on top:
 //
 //   - no endpoint registered (nothing built yet, or the previous one is gone and
 //     the replacement has not built): wait for one. Surfacing io.EOF across the
@@ -335,7 +364,7 @@ func relayKCPSnapshotAttrs(s relayKCPSnapshot) []any {
 //   - the pair is closing: the final endpoint is still drained to its end (its
 //     queued datagrams are delivered first, the same contract the endpoint
 //     itself follows) and only then does the pair report io.EOF.
-func (p *relayKCPPair) ReadFrom(b []byte) (int, net.Addr, error) {
+func (p *relayKCPPair) readRelay(b []byte) (int, net.Addr, error) {
 	for {
 		p.mu.Lock()
 		ep, wake, closed := p.ep, p.wake, p.closed
@@ -363,6 +392,79 @@ func (p *relayKCPPair) ReadFrom(b []byte) (int, net.Addr, error) {
 			return 0, nil, io.EOF
 		}
 	}
+}
+
+// pumpRelay is the relay half of the pair's fan-in: it loops readRelay and
+// copies every datagram onto p.recv for KCP. It runs for the pair's lifetime
+// and exits only on readRelay's io.EOF (the pair ended). A datagram is copied
+// out of the scratch buffer before being queued — the next read reuses it — and
+// the send is preferred over p.done so a shutdown never discards a datagram the
+// endpoint already drained; done is consulted only when recv is full, where the
+// pump must not outlive the pair waiting for a consumer that is gone.
+func (p *relayKCPPair) pumpRelay() {
+	defer close(p.relayPumpDone)
+	buf := make([]byte, relayKCPMtu)
+	for {
+		n, _, err := p.readRelay(buf)
+		if err != nil {
+			return
+		}
+		if n <= 0 {
+			continue
+		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		select {
+		case p.recv <- pkt:
+		default:
+			select {
+			case p.recv <- pkt:
+			case <-p.done:
+				return
+			}
+		}
+	}
+}
+
+// ReadFrom returns one datagram from the pair's fan-in channel: the relay pump
+// (and, from Task 3, the direct pump) feed it, and every read reports the
+// zero-value dummyAddr{} kcp-go locked its source to at NewConn4. On the pair's
+// end it drains what the relay pump left buffered before io.EOF, so an in-flight
+// segment is never dropped at pair end; io.EOF is reserved for the pair itself,
+// because kcp-go ends its read loop on any read error.
+//
+// The pump is asynchronous, so at pair end it may still be draining the final
+// endpoint into recv when this is first called. Waiting only on done would race
+// it and could report io.EOF with datagrams still queued — the drain test's
+// failure mode. Instead, on done this loop serves recv until the pump signals it
+// has exited (relayPumpDone), then serves one last buffered datagram if present.
+// Serving recv while waiting is also what lets a pump parked on a full channel
+// finish, so the wait cannot deadlock.
+func (p *relayKCPPair) ReadFrom(b []byte) (int, net.Addr, error) {
+	var pkt []byte
+	select {
+	case pkt = <-p.recv:
+	case <-p.done:
+		for {
+			select {
+			case pkt = <-p.recv:
+				n := copy(b, pkt)
+				return n, dummyAddr{}, nil
+			case <-p.relayPumpDone:
+				// The relay pump has exited: deliver one last buffered
+				// datagram if any, then report the pair's end.
+				select {
+				case pkt = <-p.recv:
+					n := copy(b, pkt)
+					return n, dummyAddr{}, nil
+				default:
+					return 0, nil, io.EOF
+				}
+			}
+		}
+	}
+	n := copy(b, pkt)
+	return n, dummyAddr{}, nil
 }
 
 // WriteTo forwards one datagram to the current registered adapter. A datagram
