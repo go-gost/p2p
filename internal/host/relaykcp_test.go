@@ -283,6 +283,196 @@ func TestPairReadFromFanInReturnsDummyAddr(t *testing.T) {
 	}
 }
 
+// TestPairPreferredFollowsInboundRecency pins the preferred-path election: a
+// freshly installed direct underlay is preferred immediately (seeded to now), a
+// direct that has gone silent past directUnderlayIdle is not, and one inbound
+// datagram re-elects it. This is the predicate WriteTo and Task 0's H1 guard
+// share.
+func TestPairPreferredFollowsInboundRecency(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{7}
+	pair := e.relayKCPPairFor(peer)
+
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	defer b.Close()
+	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
+
+	if !pair.preferredDirect() {
+		t.Fatal("preferredDirect() = false immediately after setDirectUnderlay, want true")
+	}
+	if got := pair.pathName(); got != "direct" {
+		t.Fatalf("pathName() = %q, want direct", got)
+	}
+
+	// Force the recency stamp past the idle bound: a direct that has gone silent
+	// is no longer preferred.
+	pair.mu.Lock()
+	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
+	pair.mu.Unlock()
+	if pair.preferredDirect() {
+		t.Fatal("preferredDirect() = true for a stale direct underlay, want false")
+	}
+	if got := pair.pathName(); got != "relay" {
+		t.Fatalf("pathName() = %q for a stale direct, want relay", got)
+	}
+
+	// One inbound datagram re-seeds the recency and re-elects the direct path.
+	if _, err := b.WriteToUDP([]byte("fresh"), a.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("peer write: %v", err)
+	}
+	waitFor(t, time.Second, pair.preferredDirect)
+}
+
+// TestPairWriteToUsesPreferredPath pins the send-path election: with the direct
+// underlay preferred, WriteTo lands on the punched socket (the peer reads it)
+// and not on the relay adapter; once the direct goes stale, WriteTo falls back
+// to the relay.
+func TestPairWriteToUsesPreferredPath(t *testing.T) {
+	url, sendCount := startCountingDERPServer(t)
+
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := derpclient.Dial(context.Background(), url, priv, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	e := &engine{client: c}
+	e.faults.Store(&faults{since: time.Now()})
+	peer := derpclient.PublicKey{8}
+	pair := e.relayKCPPairFor(peer)
+	t.Cleanup(pair.shutdown)
+	pc := &peerConn{
+		e:       e,
+		peer:    peer,
+		inbound: make(chan []byte, 1),
+		closeCh: make(chan struct{}),
+	}
+	pair.register(pc)
+
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	defer b.Close()
+	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
+
+	if _, err := pair.WriteTo([]byte("over direct"), nil); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	b.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 64)
+	n, _, err := b.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("peer did not receive the direct write: %v", err)
+	}
+	if got := string(buf[:n]); got != "over direct" {
+		t.Fatalf("direct peer got %q, want %q", got, "over direct")
+	}
+	if got := sendCount.Load(); got != 0 {
+		t.Fatalf("relay SendPacket called %d times for a direct write, want 0", got)
+	}
+
+	// A stale direct falls back to the relay adapter.
+	pair.mu.Lock()
+	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
+	pair.mu.Unlock()
+	if _, err := pair.WriteTo([]byte("over relay"), nil); err != nil {
+		t.Fatalf("WriteTo (relay): %v", err)
+	}
+	var got int64
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		got = sendCount.Load()
+		if got == 1 {
+			break
+		}
+	}
+	if got != 1 {
+		t.Fatalf("relay SendPacket called %d times after the direct went stale, want 1", got)
+	}
+}
+
+// TestPairClearDirectUnderlayIdempotent pins clearDirectUnderlay's contract:
+// it retires the underlay and closes its socket, a second call is a no-op, and
+// the pair reports the relay path afterwards.
+func TestPairClearDirectUnderlayIdempotent(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{9}
+	pair := e.relayKCPPairFor(peer)
+
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	defer b.Close()
+	u := newDirectUnderlay(a, udpAddrPort(t, b))
+	pair.setDirectUnderlay(u)
+	if !pair.preferredDirect() {
+		t.Fatal("preferredDirect() = false after install")
+	}
+
+	pair.clearDirectUnderlay()
+	pair.clearDirectUnderlay() // idempotent: must not panic or double-close
+
+	if !u.closed() {
+		t.Fatal("the underlay socket was not closed by clearDirectUnderlay")
+	}
+	pair.mu.Lock()
+	installed := pair.direct
+	pair.mu.Unlock()
+	if installed != nil {
+		t.Fatal("a direct underlay is still installed after clear")
+	}
+	if pair.preferredDirect() {
+		t.Fatal("preferredDirect() = true after clear, want false")
+	}
+	if got := pair.pathName(); got != "relay" {
+		t.Fatalf("pathName() = %q after clear, want relay", got)
+	}
+}
+
+// TestPairDirectPumpStopsOnShutdown pins the symmetric pump-done contract: a
+// shutdown stops the direct pump (closing directPumpDone) and a subsequent
+// ReadFrom returns io.EOF instead of parking forever waiting on a pump that
+// never exits.
+func TestPairDirectPumpStopsOnShutdown(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{10}
+	pair := e.relayKCPPairFor(peer)
+
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	defer b.Close()
+	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
+
+	pair.mu.Lock()
+	directDone := pair.directPumpDone
+	pair.mu.Unlock()
+
+	pair.shutdown()
+
+	select {
+	case <-directDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the direct pump did not exit after shutdown")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		_, _, err := pair.ReadFrom(buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("ReadFrom after shutdown = %v, want io.EOF", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ReadFrom did not return io.EOF after shutdown")
+	}
+}
+
 // TestCloseRelayKCPsKeepsLiveDirectPairs pins the pair-level half of the H1
 // guard: when the relay connection goes away, a pair kept alive by a live direct
 // path is left running (only its relay half is unregistered), while a pair with

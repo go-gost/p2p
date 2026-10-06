@@ -118,6 +118,14 @@ const (
 	relayKCPRecvBuffer = 256
 )
 
+// directUnderlayIdle is how long a direct underlay may go without delivering an
+// inbound datagram before it stops being preferred. It is 2x the smux keepalive
+// interval (3s): a healthy but momentarily quiet direct path — an idle smux
+// session still exchanges a keepalive every 3s — survives one missed keepalive,
+// while a genuinely silent socket is demoted within a keepalive period of the
+// second miss. The same bound is the H1 "live direct" predicate (Task 0).
+const directUnderlayIdle = 6 * time.Second
+
 // newRelayKCPPair builds the pair-level KCP holder for peer: the KCP session
 // lives on the pair (like the pair's secure session — "one per (peer,
 // transport), outliving this adapter"), and reads through the holder itself,
@@ -128,14 +136,19 @@ const (
 // segment that KCP retransmits — the same stack the direct plane already runs
 // (KCP -> cryptoConn(secure) -> smux).
 func newRelayKCPPair(e *engine, peer derpclient.PublicKey) *relayKCPPair {
+	// No direct underlay is installed yet: a pre-closed directPumpDone keeps
+	// ReadFrom's pair-end wait from parking on a pump that was never started.
+	noDirect := make(chan struct{})
+	close(noDirect)
 	p := &relayKCPPair{
-		e:             e,
-		peer:          peer,
-		recv:          make(chan []byte, relayKCPRecvBuffer),
-		done:          make(chan struct{}),
-		relayPumpDone: make(chan struct{}),
-		wake:          make(chan struct{}),
-		idle:          make(chan struct{}),
+		e:              e,
+		peer:           peer,
+		recv:           make(chan []byte, relayKCPRecvBuffer),
+		done:           make(chan struct{}),
+		relayPumpDone:  make(chan struct{}),
+		directPumpDone: noDirect,
+		wake:           make(chan struct{}),
+		idle:           make(chan struct{}),
 	}
 	// The relay pump runs for the pair's lifetime: it parks until an endpoint
 	// is registered, follows the pair across endpoint swaps, and ends only when
@@ -173,24 +186,36 @@ type relayKCPPair struct {
 	closed  bool
 	wake    chan struct{} // closed and replaced on every endpoint/end change
 	idle    chan struct{} // closed and replaced on every read/write completion
-	// recv is the pair's fan-in: the relay pump (and, from Task 3, the direct
-	// pump) hand it datagrams, and the pair's ReadFrom serves KCP from it. done
-	// is closed exactly once by shutdown; both pumps select on it so neither can
-	// outlive the pair. relayPumpDone is closed by pumpRelay when it exits,
-	// after it has drained the final endpoint into recv; ReadFrom waits on it at
-	// pair end so a datagram the endpoint already queued is delivered, not
-	// dropped. A future direct pump that must preserve its final datagrams the
-	// same way should signal its own exit and have ReadFrom wait on it too.
-	recv          chan []byte
-	done          chan struct{}
-	relayPumpDone chan struct{}
+	// recv is the pair's fan-in: the relay pump and the direct pump hand it
+	// datagrams, and the pair's ReadFrom serves KCP from it. done is closed
+	// exactly once by shutdown; both pumps select on it so neither can outlive
+	// the pair. relayPumpDone and directPumpDone are closed by their pumps when
+	// they exit, after draining their final datagrams into recv; ReadFrom waits
+	// on both at pair end so a datagram either pump already read is delivered,
+	// not dropped. directPumpDone starts closed (no underlay yet) and is replaced
+	// on every setDirectUnderlay.
+	recv           chan []byte
+	done           chan struct{}
+	relayPumpDone  chan struct{}
+	directPumpDone chan struct{}
 
-	// bytesSent/bytesRcvd count the pair's relay datagrams in bytes, on the
-	// paths the pair already walks (WriteTo/ReadFrom). They are this pair's own
-	// counters — deliberately NOT kcp-go's process-global DefaultSnmp, which
-	// aggregates every KCP session including the direct plane. Atomic rather
-	// than under p.mu: these sit on the pair's data path, and a status read must
-	// never contend with it. The increment is one lock-free Add per datagram,
+	// direct is the pair's installed direct (raw UDP) underlay, nil when none is
+	// registered. directStop ends that underlay's pump; the pump closes
+	// directPumpDone as it exits. lastDirectRecv is when the direct pump last
+	// delivered an inbound datagram; preferredDirect compares its age against
+	// directUnderlayIdle. All guarded by mu.
+	direct         *directUnderlay
+	directStop     chan struct{}
+	lastDirectRecv time.Time
+
+	// bytesSent/bytesRcvd count the pair's datagrams in bytes, on the paths the
+	// pair already walks: bytesSent in WriteTo (whichever path it picks), and
+	// bytesRcvd where a pump drains an underlay (readRelay for the relay pump,
+	// pumpDirect for the direct pump). They are this pair's own counters —
+	// deliberately NOT kcp-go's process-global DefaultSnmp, which aggregates
+	// every KCP session including the direct plane. Atomic rather than under
+	// p.mu: these sit on the pair's data path, and a status read must never
+	// contend with it. The increment is one lock-free Add per datagram,
 	// negligible next to the channel send/receive already on those paths.
 	bytesSent atomic.Uint64
 	bytesRcvd atomic.Uint64
@@ -297,6 +322,10 @@ func (p *relayKCPPair) shutdown() {
 	close(p.done)
 	sess := p.sess
 	p.mu.Unlock()
+	// Stop the direct pump and close its socket, or a read parked in readFrom
+	// would not observe p.done for up to directUnderlayReadTimeout. Idempotent,
+	// and safe here: p.mu is released.
+	p.clearDirectUnderlay()
 	if sess != nil {
 		sess.Close()
 	}
@@ -426,33 +455,151 @@ func (p *relayKCPPair) pumpRelay() {
 	}
 }
 
-// ReadFrom returns one datagram from the pair's fan-in channel: the relay pump
-// (and, from Task 3, the direct pump) feed it, and every read reports the
-// zero-value dummyAddr{} kcp-go locked its source to at NewConn4. On the pair's
-// end it drains what the relay pump left buffered before io.EOF, so an in-flight
-// segment is never dropped at pair end; io.EOF is reserved for the pair itself,
-// because kcp-go ends its read loop on any read error.
+// setDirectUnderlay installs u as the pair's direct underlay: any previous
+// underlay is retired (its pump stopped and its socket closed), a pump for u is
+// started on the pair's fan-in, and lastDirectRecv is seeded to now so the new
+// path is preferred immediately — a freshly punched direct socket is by
+// definition live. Installing after the pair has closed closes u instead, so the
+// caller's socket cannot leak. The lock is released before the old underlay is
+// retired, so starting the replacement cannot block on the old pump.
+func (p *relayKCPPair) setDirectUnderlay(u *directUnderlay) {
+	if u == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		u.close()
+		return
+	}
+	old, oldStop := p.direct, p.directStop
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	p.direct = u
+	p.directStop = stop
+	p.directPumpDone = done
+	p.lastDirectRecv = time.Now()
+	p.mu.Unlock()
+
+	if old != nil {
+		close(oldStop)
+		old.close()
+	}
+	go func() {
+		defer close(done)
+		p.pumpDirect(u, stop)
+	}()
+}
+
+// clearDirectUnderlay stops the pair's direct pump and closes its socket exactly
+// once. It is idempotent: a second call finds no underlay and returns. p.mu is
+// released before stop is closed and u.close() runs, so a caller that reached
+// here from inside the pump (an idle callback) cannot self-deadlock.
+func (p *relayKCPPair) clearDirectUnderlay() {
+	p.mu.Lock()
+	u, stop := p.direct, p.directStop
+	p.direct = nil
+	p.directStop = nil
+	p.mu.Unlock()
+	if u == nil {
+		return
+	}
+	close(stop)
+	u.close()
+}
+
+// pumpDirect is the direct half of the pair's fan-in: it loops u.readFrom,
+// stamps lastDirectRecv on every delivered datagram, and copies the datagram
+// onto p.recv for KCP. stop is the underlay's own stop channel, closed when the
+// pair retires or replaces it; p.done ends the pair. It exits on readFrom's
+// error (u.close() makes readFrom return io.EOF) or on stop/done while pushing.
+// Like pumpRelay, a datagram already drained is preferred over stop/done on the
+// fast path, and done is consulted only when recv is full, where the pump must
+// not outlive the pair waiting for a consumer that is gone.
+func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
+	buf := make([]byte, relayKCPMtu)
+	for {
+		n, err := u.readFrom(buf)
+		if err != nil {
+			return
+		}
+		if n <= 0 {
+			continue
+		}
+		p.bytesRcvd.Add(uint64(n))
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		p.mu.Lock()
+		if p.direct == u {
+			p.lastDirectRecv = time.Now()
+		}
+		p.mu.Unlock()
+		select {
+		case p.recv <- pkt:
+		default:
+			select {
+			case p.recv <- pkt:
+			case <-p.done:
+				return
+			case <-stop:
+				return
+			}
+		}
+	}
+}
+
+// preferredDirect reports whether the direct underlay is the path WriteTo should
+// use: an underlay is installed and it delivered an inbound datagram within
+// directUnderlayIdle. A direct that has gone silent past that bound is no longer
+// preferred, so writes fall back to the relay even before the watchdog retires
+// the socket (Task 4). This is also the H1 "live direct" predicate (Task 0).
+func (p *relayKCPPair) preferredDirect() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.preferredDirectLocked()
+}
+
+// preferredDirectLocked is preferredDirect for callers already holding p.mu.
+func (p *relayKCPPair) preferredDirectLocked() bool {
+	return p.direct != nil && time.Since(p.lastDirectRecv) < directUnderlayIdle
+}
+
+// pathName names the pair's current preferred path for stats and diagnostics:
+// "direct" while preferredDirect, else "relay".
+func (p *relayKCPPair) pathName() string {
+	if p.preferredDirect() {
+		return "direct"
+	}
+	return "relay"
+}
+
+// ReadFrom returns one datagram from the pair's fan-in channel: the relay and
+// direct pumps feed it, and every read reports the zero-value dummyAddr{} kcp-go
+// locked its source to at NewConn4. On the pair's end it drains what the pumps
+// left buffered before io.EOF, so an in-flight segment is never dropped at pair
+// end; io.EOF is reserved for the pair itself, because kcp-go ends its read loop
+// on any read error.
 //
-// The pump is asynchronous, so at pair end it may still be draining the final
-// endpoint into recv when this is first called. Waiting only on done would race
-// it and could report io.EOF with datagrams still queued — the drain test's
-// failure mode. Instead, on done this loop serves recv until the pump signals it
-// has exited (relayPumpDone), then serves one last buffered datagram if present.
-// Serving recv while waiting is also what lets a pump parked on a full channel
-// finish, so the wait cannot deadlock.
+// The pumps are asynchronous, so at pair end either may still be draining its
+// final datagram into recv when this is first called. Waiting only on done would
+// race them and could report io.EOF with datagrams still queued — the drain
+// test's failure mode. Instead, on done this loop serves recv until both pumps
+// have signalled their exit (relayPumpDone and directPumpDone), then serves one
+// last buffered datagram if present. Serving recv while waiting is also what
+// lets a pump parked on a full channel finish, so the wait cannot deadlock.
 func (p *relayKCPPair) ReadFrom(b []byte) (int, net.Addr, error) {
 	var pkt []byte
 	select {
 	case pkt = <-p.recv:
 	case <-p.done:
+		p.mu.Lock()
+		directDone := p.directPumpDone
+		p.mu.Unlock()
+		relayDone := p.relayPumpDone
 		for {
-			select {
-			case pkt = <-p.recv:
-				n := copy(b, pkt)
-				return n, dummyAddr{}, nil
-			case <-p.relayPumpDone:
-				// The relay pump has exited: deliver one last buffered
-				// datagram if any, then report the pair's end.
+			if relayDone == nil && directDone == nil {
+				// Both pumps have exited: deliver one last buffered datagram
+				// if any, then report the pair's end.
 				select {
 				case pkt = <-p.recv:
 					n := copy(b, pkt)
@@ -461,25 +608,43 @@ func (p *relayKCPPair) ReadFrom(b []byte) (int, net.Addr, error) {
 					return 0, nil, io.EOF
 				}
 			}
+			select {
+			case pkt = <-p.recv:
+				n := copy(b, pkt)
+				return n, dummyAddr{}, nil
+			case <-relayDone:
+				relayDone = nil
+			case <-directDone:
+				directDone = nil
+			}
 		}
 	}
 	n := copy(b, pkt)
 	return n, dummyAddr{}, nil
 }
 
-// WriteTo forwards one datagram to the current registered adapter. A datagram
-// dropped for want of a live endpoint — or refused by one whose send failed —
-// is a lost packet on a lossy path, the same outcome as a relay drop: the write
-// reports success and KCP retransmits. Reporting the failure instead would be
-// fatal in the other direction: kcp-go turns any WriteTo error into a permanent
-// write failure for the session.
+// WriteTo forwards one datagram to the pair's current preferred path: the direct
+// underlay when it has delivered inbound traffic within directUnderlayIdle, else
+// the registered relay adapter. A datagram dropped for want of a live path — or
+// refused by one whose send failed — is a lost packet on a lossy path, the same
+// outcome as a relay drop: the write reports success and KCP retransmits.
+// Reporting the failure instead would be fatal in the other direction: kcp-go
+// turns any WriteTo error into a permanent write failure for the session.
 func (p *relayKCPPair) WriteTo(b []byte, _ net.Addr) (int, error) {
 	p.bytesSent.Add(uint64(len(b)))
 	p.mu.Lock()
+	direct := p.direct
+	useDirect := p.preferredDirectLocked()
 	ep, closed := p.ep, p.closed
 	p.mu.Unlock()
 	if closed {
 		return 0, io.ErrClosedPipe
+	}
+	if useDirect {
+		if _, err := direct.writeTo(b); err != nil {
+			return len(b), nil
+		}
+		return len(b), nil
 	}
 	if ep == nil {
 		return len(b), nil

@@ -1151,9 +1151,9 @@ func (e *engine) closeAllRelayKCPs(cause error) {
 }
 
 // closeRelayKCPsFor is the shared body of closeRelayKCPs/closeAllRelayKCPs.
-// The live-direct decision is taken outside e.kcpMu: pairHasLiveDirect takes
-// e.mu, and relayKCPPairFor's contract keeps e.mu and kcpMu un-nested, so
-// consulting the check under kcpMu would nest the two locks. The pair is
+// The live-direct decision is taken between kcpMu sections, not under one:
+// pairHasLiveDirect takes kcpMu itself (to read the pair store) and then the
+// pair's mu, so calling it while holding kcpMu would nest the two. The pair is
 // compare-and-deleted so a concurrent lookup that replaced it is left alone.
 func (e *engine) closeRelayKCPsFor(cause error, force bool) {
 	type pairEntry struct {
@@ -2262,18 +2262,20 @@ func relayChurnReason(reason sessionEndReason) bool {
 // so a relay-only failure must not tear the pair down (H1: the pair lives while
 // any underlay lives).
 //
-// TODO(Task 3): redefine as the pair's direct-underlay recency
-// (directUnderlayIdle) once the unified direct underlay is installed on the
-// pair; today the liveness signal is the per-peer directConn's live smux
-// session, the same signal peerTransports and Status already trust.
+// The signal is the pair's own direct-underlay recency (preferredDirect, the
+// shared predicate of Task 3): the pair holds an installed underlay that
+// delivered inbound traffic within directUnderlayIdle. It deliberately does not
+// read the per-peer directConn's smux session, which will no longer carry the
+// data plane once the unified underlay lands (Task 7). A pair that does not
+// exist yet has no direct path, so it reports false.
 //
-// The live probe runs after e.mu is released, like peerLive: dc.live takes
-// dc.mu, and the engine keeps that lock out of e.mu's critical sections.
+// relayKCPPairGet takes kcpMu, the pair store's leaf lock, and preferredDirect
+// takes the pair's own mu after kcpMu is released; neither nests e.mu, so this
+// keeps the engine's lock order intact (unlike the directConn probe it
+// replaces, which had to copy the pointer under e.mu and release first).
 func (e *engine) pairHasLiveDirect(peer derpclient.PublicKey) bool {
-	e.mu.Lock()
-	dc := e.directs[peer]
-	e.mu.Unlock()
-	return dc != nil && dc.live()
+	pair := e.relayKCPPairGet(peer)
+	return pair != nil && pair.preferredDirect()
 }
 
 // resetsPairKCPFor reports whether a kill with this reason must end the pair's

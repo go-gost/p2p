@@ -62,9 +62,10 @@ func TestDirectLiveNoSideEffect(t *testing.T) {
 	}
 }
 
-// liveDirectFor installs a live direct path for peer, which is what
-// pairHasLiveDirect consults today (the per-peer directConn's live smux
-// session). It returns the directConn so a test can inspect or tear it down.
+// liveDirectFor installs a live direct path for peer: the per-peer directConn
+// is marked up (the punch/status signal) and, since Task 3, a real direct
+// underlay is installed on the pair — that recency is what pairHasLiveDirect
+// now consults. It returns the directConn so a test can inspect or tear it down.
 func liveDirectFor(t *testing.T, e *engine, peer derpclient.PublicKey) *directConn {
 	t.Helper()
 	dc := e.directConn(peer)
@@ -72,7 +73,20 @@ func liveDirectFor(t *testing.T, e *engine, peer derpclient.PublicKey) *directCo
 	dc.sess = newTestSess(t)
 	dc.state = directUp
 	dc.mu.Unlock()
+	installDirectUnderlayFor(t, e, peer)
 	return dc
+}
+
+// installDirectUnderlayFor installs a live direct underlay on peer's pair,
+// seeded to now so preferredDirect is true. It is the pair-level half of
+// liveDirectFor and is also used directly by tests that drive the real punch
+// (which does not register the underlay until Task 7).
+func installDirectUnderlayFor(t *testing.T, e *engine, peer derpclient.PublicKey) {
+	t.Helper()
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	t.Cleanup(func() { b.Close() })
+	e.relayKCPPairFor(peer).setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
 }
 
 // relaySessionFor builds the state a peer has once a relay stream has been
@@ -134,12 +148,11 @@ func TestRelayLossWithoutDirectResetsPair(t *testing.T) {
 // and must NOT drop the relay secure session — a relay blip cannot be allowed
 // to tear down a path that does not run through the relay.
 //
-// The unified direct underlay (Tasks 1+) does not exist yet, so "live direct"
-// here is the existing directConn's live smux session; pairHasLiveDirect carries
-// a TODO to redefine it as the pair's direct-underlay recency once the underlay
-// lands. This test deliberately asserts the guard's observable effect (pair,
-// session, secure identity, nonce counter), not stream survival: killSession
-// still closes the adapter's mux session, which only the unification removes.
+// "Live direct" here is the pair's direct-underlay recency (Task 3's
+// preferredDirect): liveDirectFor installs a real direct underlay on the pair.
+// This test deliberately asserts the guard's observable effect (pair, session,
+// secure identity, nonce counter), not stream survival: killSession still closes
+// the adapter's mux session, which only the unification removes.
 func TestRelayLossWithLiveDirectKeepsPair(t *testing.T) {
 	priv, _, err := derpclient.Generate()
 	if err != nil {
@@ -301,9 +314,13 @@ func TestRelayLinkLossKeepsLiveDirectPair(t *testing.T) {
 	engineB.maybeStartDirect(engineA.pub)
 	waitFor(t, 10*time.Second, func() bool { return hasDirect(engineA, pubB) })
 
-	pair := engineA.relayKCPPairGet(pubB)
-	if pair == nil {
-		t.Fatal("A built no relay pair for B")
+	pair := engineA.relayKCPPairFor(pubB)
+	// Task 3's predicate is the pair's direct-underlay recency; the real punch
+	// does not register the unified underlay on the pair until Task 7, so install
+	// one here to represent the live direct path the guard must honor.
+	installDirectUnderlayFor(t, engineA, pubB)
+	if !engineA.pairHasLiveDirect(pubB) {
+		t.Fatal("A's live direct path was not recognized by pairHasLiveDirect")
 	}
 	engineA.mu.Lock()
 	secure := engineA.secure[secureKey{peer: pubB, transport: secureTransportRelay}]
