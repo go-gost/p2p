@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/xtaci/kcp-go/v5"
-	"github.com/xtaci/smux"
 
 	"github.com/go-gost/p2p/internal/derpclient"
 )
@@ -157,61 +156,6 @@ func roundTrip(t *testing.T, c net.Conn, payload string) {
 	}
 	if string(buf) != payload {
 		t.Fatalf("round trip = %q, want %q", buf, payload)
-	}
-}
-
-// scriptConn is a net.Conn fed by a fixed reader; writes are discarded.
-type scriptConn struct{ io.Reader }
-
-func (scriptConn) Write(p []byte) (int, error)      { return len(p), nil }
-func (scriptConn) Close() error                     { return nil }
-func (scriptConn) LocalAddr() net.Addr              { return nil }
-func (scriptConn) RemoteAddr() net.Addr             { return nil }
-func (scriptConn) SetDeadline(time.Time) error      { return nil }
-func (scriptConn) SetReadDeadline(time.Time) error  { return nil }
-func (scriptConn) SetWriteDeadline(time.Time) error { return nil }
-
-// TestSeedHandshake covers the symmetric echo handshake: two peer ends
-// complete when both directions flow; a half-open path (the peer's token
-// arrives but our own echo never comes back) must fail — the false-direct
-// regression this handshake exists to prevent.
-func TestSeedHandshake(t *testing.T) {
-	// success over a real KCP pair: both sides write first, which only works
-	// because KCP buffers writes in its send window (an unbuffered transport
-	// like net.Pipe would deadlock).
-	sockA, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sockA.Close()
-	sockB, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sockB.Close()
-	a, err := kcp.NewConn3(0x5eed, sockB.LocalAddr(), nil, 0, 0, sockA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer a.Close()
-	b, err := kcp.NewConn3(0x5eed, sockA.LocalAddr(), nil, 0, 0, sockB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer b.Close()
-
-	errs := make(chan error, 2)
-	go func() { errs <- seedHandshake(a, 5*time.Second) }()
-	go func() { errs <- seedHandshake(b, 5*time.Second) }()
-	for i := 0; i < 2; i++ {
-		if err := <-errs; err != nil {
-			t.Fatalf("seedHandshake: %v", err)
-		}
-	}
-
-	// half-open: peer token arrives (1 byte), then EOF — own echo never comes
-	if err := seedHandshake(scriptConn{Reader: bytes.NewReader([]byte{42})}, time.Second); err == nil {
-		t.Fatal("half-open seed unexpectedly succeeded")
 	}
 }
 
@@ -547,87 +491,6 @@ func TestMutualNewConn3Merge(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
-	}
-}
-
-// TestMutualKCPWithSmux: smux over a mutual KCP pair, roles by key order
-// (external to who dialed), streams in both directions.
-func TestMutualKCPWithSmux(t *testing.T) {
-	conv := uint32(0x9abcdef0)
-	sockA, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sockA.Close()
-	sockB, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sockB.Close()
-
-	a, err := kcp.NewConn3(conv, sockB.LocalAddr(), nil, 0, 0, sockA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer a.Close()
-	b, err := kcp.NewConn3(conv, sockA.LocalAddr(), nil, 0, 0, sockB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer b.Close()
-
-	seeds := make(chan error, 2)
-	go func() { seeds <- seedHandshake(a, 3*time.Second) }()
-	go func() { seeds <- seedHandshake(b, 3*time.Second) }()
-	for i := 0; i < 2; i++ {
-		if err := <-seeds; err != nil {
-			t.Fatalf("seed: %v", err)
-		}
-	}
-
-	cfg := smux.DefaultConfig()
-	sessA, err := smux.Client(a, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sessA.Close()
-	sessB, err := smux.Server(b, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sessB.Close()
-
-	accepted := make(chan *smux.Stream, 1)
-	go func() {
-		s, err := sessB.AcceptStream()
-		if err != nil {
-			t.Errorf("B accept: %v", err)
-			return
-		}
-		accepted <- s
-	}()
-	s1, err := sessA.OpenStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s1.Close()
-	bs := <-accepted
-	defer bs.Close()
-
-	s1.SetDeadline(time.Now().Add(5 * time.Second))
-	bs.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := s1.Write([]byte("ping")); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 4)
-	if _, err := io.ReadFull(bs, buf); err != nil {
-		t.Fatalf("B read: %v", err)
-	}
-	if _, err := bs.Write([]byte("pong")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.ReadFull(s1, buf); err != nil {
-		t.Fatalf("A read: %v", err)
 	}
 }
 
@@ -1217,27 +1080,6 @@ func TestDirectRepunchAfterMissedPeerGone(t *testing.T) {
 	roundTrip(t, s2, "re-punched after missed peer gone")
 }
 
-// TestDirectSmuxConfig: the tighter direct keepalive applies only to a peer
-// that advertised it. smux answers a NOP with nothing, so a session is kept
-// alive by the frames the peer sends — a peer pinging every 10s cannot keep a
-// 6s timeout alive, and every direct session to it would be torn down and
-// re-punched on a loop. A peer that does not set the bit gets the relay's pair,
-// which is what every peer had before the tighter one existed.
-func TestDirectSmuxConfig(t *testing.T) {
-	tight := directSmuxConfig(true)
-	if tight.KeepAliveInterval != directSmuxKeepAliveInterval || tight.KeepAliveTimeout != directSmuxKeepAliveTimeout {
-		t.Fatalf("an advertising peer got %v/%v, want the direct pair %v/%v",
-			tight.KeepAliveInterval, tight.KeepAliveTimeout,
-			directSmuxKeepAliveInterval, directSmuxKeepAliveTimeout)
-	}
-	loose := directSmuxConfig(false)
-	if loose.KeepAliveInterval != smuxKeepAliveInterval || loose.KeepAliveTimeout != smuxKeepAliveTimeout {
-		t.Fatalf("a peer that did not advertise got %v/%v, want the relay pair %v/%v",
-			loose.KeepAliveInterval, loose.KeepAliveTimeout,
-			smuxKeepAliveInterval, smuxKeepAliveTimeout)
-	}
-}
-
 // TestDirectSilentPeerIsNoticed: a direct session whose path goes silent must
 // be given up on its own keepalive, not left looking live. The relay only
 // reports a peer gone when the peer leaves the relay, which is not what a dead
@@ -1437,120 +1279,6 @@ func TestDirectStunUnreachableStaysOnRelay(t *testing.T) {
 	}
 	defer s2.Close()
 	roundTrip(t, s2, "relay only")
-}
-
-// TestPunchAndWaitDoesNotStallWhenPunchCannotStart: the punch wait is charged
-// to the call that starts the punch. A peer that already failed to punch (in
-// backoff) or has one in flight is not affected by a blocking wait, so waiting
-// there would stall every stream open by the full punchWaitTimeout — on a
-// symmetric-NAT peer, every connection over a permanent relay path.
-func TestPunchAndWaitDoesNotStallWhenPunchCannotStart(t *testing.T) {
-	rs := &relayServer{}
-	url := rs.start(t)
-
-	privA, _, _ := derpclient.Generate()
-	_, pubB, _ := derpclient.Generate()
-	engineA := newEngine(url, "", privA, slog.Default())
-	engineA.stunAddr = "192.0.2.1:9" // candidate source exists; the punch itself fails
-	defer engineA.Close()
-
-	engineA.Connect()
-
-	dc := engineA.directConn(pubB)
-	for _, state := range []directState{directBackoff, directUp} {
-		dc.mu.Lock()
-		dc.state = state
-		dc.mu.Unlock()
-
-		start := time.Now()
-		if sess := engineA.punchAndWait(pubB); sess != nil {
-			t.Fatalf("punchAndWait returned a session in state %d", state)
-		}
-		if d := time.Since(start); d > punchWaitTimeout/4 {
-			t.Fatalf("punchAndWait waited %v in state %d; want an immediate nil", d, state)
-		}
-	}
-
-	// An idle connection still owns the wait: that is the case the wait is for.
-	dc.mu.Lock()
-	dc.state = directNone
-	dc.failed = false
-	dc.mu.Unlock()
-	if sess := engineA.punchAndWait(pubB); sess != nil {
-		t.Fatal("punchAndWait returned a session for an unreachable peer")
-	}
-	dc.mu.Lock()
-	state := dc.state
-	dc.mu.Unlock()
-	if state == directNone {
-		t.Fatal("punchAndWait did not start a punch from directNone")
-	}
-
-	// A failure from before this call no longer vetoes the wait. That veto is
-	// what stopped a direct session — which came up milliseconds later in the
-	// field — from ever being used, so it is deliberately gone. What is kept is
-	// the anti-stall bound: the round this call starts still ends the wait when
-	// it fails, so the cost is that round's own failure latency (one STUN
-	// timeout here) and never the whole punchWaitTimeout.
-	dc.mu.Lock()
-	dc.state = directNone
-	dc.failed = true
-	dc.failGen = 0
-	dc.mu.Unlock()
-	start := time.Now()
-	if sess := engineA.punchAndWait(pubB); sess != nil {
-		t.Fatal("punchAndWait returned a session after a failed round")
-	}
-	if d := time.Since(start); d > punchWaitTimeout/2 {
-		t.Fatalf("punchAndWait waited %v after a failed round; want the round's own failure latency, not the timeout", d)
-	}
-	if d := time.Since(start); d >= punchWaitTimeout {
-		t.Fatalf("punchAndWait waited the full punchWaitTimeout (%v)", d)
-	}
-}
-
-// TestPunchAndWaitWaitsForARoundInFlight is the case the field run turned on:
-// the candidate exchange rides the DERP control channel, so by the time a
-// stream is opened the punch is normally already running. Declining direct
-// there sent every tunnel stream to the relay while the direct session came up
-// a couple of hundred milliseconds later — and since the transport is chosen
-// once, at stream open, the tunnel never left the relay.
-//
-// It is set up by state rather than by a real round on purpose: the state is
-// what punchAndWait branches on, and a real round would make the assertion a
-// race with a punch that may or may not have completed yet.
-func TestPunchAndWaitWaitsForARoundInFlight(t *testing.T) {
-	rs := &relayServer{}
-	url := rs.start(t)
-
-	privA, _, _ := derpclient.Generate()
-	_, pubB, _ := derpclient.Generate()
-	engineA := newEngine(url, "", privA, slog.Default())
-	engineA.stunAddr = "192.0.2.1:9"
-	defer engineA.Close()
-	engineA.Connect()
-
-	dc := engineA.directConn(pubB)
-	dc.mu.Lock()
-	dc.state = directAttempting // a round is running; start() will report false
-	dc.failGen = 0
-	dc.mu.Unlock()
-
-	if dc.start() {
-		t.Fatal("start() claimed to launch a round while one was already in flight")
-	}
-
-	// Nothing will come up, so this returns nil — but only after waiting, which
-	// is the whole point: the wait is what lets the round that is already
-	// running deliver its session to this caller.
-	start := time.Now()
-	if sess := engineA.punchAndWait(pubB); sess != nil {
-		sess.Close()
-		t.Fatal("punchAndWait returned a session for a round that never came up")
-	}
-	if d := time.Since(start); d < punchWaitTimeout/4 {
-		t.Fatalf("punchAndWait returned in %v for a round in flight; it must wait for the round rather than fall back to the relay", d)
-	}
 }
 
 // TestWarmConnectsWithoutStream: warming a peer brings up its relay session

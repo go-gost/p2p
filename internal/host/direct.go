@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -104,15 +102,7 @@ var (
 	// so the first connection rides the direct path instead of starting on
 	// the relay.
 	punchWaitTimeout = 5 * time.Second
-	// directOpenTimeout bounds opening a stream on an *existing* direct session.
-	// Deliberately shorter than the relay's streamOpenTimeout: a healthy direct
-	// open is sub-millisecond, and the session may already be dead without smux
-	// having noticed (the documented "a dead session is served as live" hole),
-	// where a long wait is a stall on a path that will not answer while the
-	// relay stands ready. A session built by the punch just now is not this
-	// case, so that open keeps the full relay timeout.
-	directOpenTimeout = 3 * time.Second
-	backoffPeriod     = 30 * time.Second
+	backoffPeriod    = 30 * time.Second
 	// directRepunchBackoffCap caps the H3 hysteresis: the re-punch wait for a
 	// direct that keeps dying shortly after registration grows from
 	// backoffPeriod and stops here, so a flapping path settles into a slow
@@ -1025,19 +1015,6 @@ func (dc *directConn) retryFrom(d time.Duration, failed bool, fromNone bool) {
 	}()
 }
 
-// conv deterministically derives the KCP conversation ID from the (sorted)
-// keypair so both sides agree and retries reuse the same conv without a
-// handshake. 4 bytes of sha256 is collision-free for the peer counts this
-// host will see.
-func (dc *directConn) conv() uint32 {
-	a, b := dc.e.pub, dc.peer
-	if bytes.Compare(a[:], b[:]) > 0 {
-		a, b = b, a
-	}
-	h := sha256.Sum256(append(a[:], b[:]...))
-	return binary.BigEndian.Uint32(h[:4])
-}
-
 func (dc *directConn) punch() {
 	e := dc.e
 	pname := keyName(dc.peer)
@@ -1239,59 +1216,6 @@ func (dc *directConn) punch() {
 	dc.backoff()
 }
 
-// faultConn wraps a direct session's underlay and drops its writes while a data
-// fault is on (see faults). It sits below smux so the drop covers every frame
-// the session sends, and it reports the write as done: a real black hole is
-// silent too, and a session that starves without an error is the failure this
-// must reproduce.
-type faultConn struct {
-	net.Conn
-	e *engine
-}
-
-func (c *faultConn) Write(p []byte) (int, error) {
-	if c.e.faults.Load().muteData(time.Now()) {
-		return len(p), nil
-	}
-	return c.Conn.Write(p)
-}
-
-// seedHandshake runs the symmetric echo handshake over a fresh KCP session.
-// Both peers execute the same four steps — write own token, read the peer's
-// token, echo it back, then require the own token's echo. Success therefore
-// proves a full own->peer->own round trip on both sides; a half-open path
-// (we can receive but our bytes never arrive) fails instead of producing a
-// "false direct" session whose streams would blackhole. KCP retransmits the
-// unacked bytes, so the window also covers a NAT mapping that only opens
-// after the peer's first packet (k3s conntrack-assist).
-func seedHandshake(c net.Conn, timeout time.Duration) error {
-	c.SetDeadline(time.Now().Add(timeout))
-	defer c.SetDeadline(time.Time{}) // clear: the session must outlive the seed
-
-	var token [1]byte
-	if _, err := rand.Read(token[:]); err != nil {
-		return err
-	}
-	if _, err := c.Write(token[:]); err != nil {
-		return err
-	}
-	var peer [1]byte
-	if _, err := io.ReadFull(c, peer[:]); err != nil {
-		return err
-	}
-	if _, err := c.Write(peer[:]); err != nil { // echo the peer's token
-		return err
-	}
-	var echo [1]byte
-	if _, err := io.ReadFull(c, echo[:]); err != nil {
-		return err
-	}
-	if echo[0] != token[0] {
-		return errors.New("derp engine: seed echo mismatch")
-	}
-	return nil
-}
-
 // seedHandshakeUDP runs the raw-UDP token-echo seed handshake and discards the
 // token. Callers that will wrap the same socket in a directUnderlay must use
 // seedHandshakeUDPToken instead: the underlay needs the token to tell the
@@ -1302,8 +1226,8 @@ func seedHandshakeUDP(sock *net.UDPConn, peer netip.AddrPort, timeout time.Durat
 }
 
 // seedHandshakeUDPToken runs the symmetric token echo over a raw UDP socket and
-// returns the local token it used. It mirrors seedHandshake's semantics without
-// a reliability layer: it writes its own token to peer every seedRetransmit
+// returns the local token it used. It mirrors the KCP seed handshake's semantics
+// without a reliability layer: it writes its own token to peer every seedRetransmit
 // until it reads that same token back, and it echoes each of the peer's probes
 // so the peer's own handshake can complete. A raw UDP socket has no retransmit,
 // so the resend loop stands in for KCP's send window; the read deadline between
@@ -1563,24 +1487,6 @@ func detectV6Egress() *net.UDPAddr {
 // relay control channel.
 func (e *engine) sendCandidates(peer derpclient.PublicKey, cands []candidate) error {
 	return e.sendControl(peer, ctrlPunchCandidates, e.priv.SealTo(peer, encodeCandidates(cands)))
-}
-
-// directSmuxConfig is the smux configuration for a direct session. The tighter
-// pair applies only when the peer advertised it (capsTightKeepalive): a session
-// is kept alive by the frames the peer sends, so a timeout shorter than the
-// peer's ping interval would tear the session down and re-punch it on a loop.
-// A peer that did not advertise the bit gets the relay's pair — the behavior
-// every peer had before the tighter one existed.
-func directSmuxConfig(peerTight bool) *smux.Config {
-	cfg := smux.DefaultConfig()
-	if peerTight {
-		cfg.KeepAliveInterval = directSmuxKeepAliveInterval
-		cfg.KeepAliveTimeout = directSmuxKeepAliveTimeout
-		return cfg
-	}
-	cfg.KeepAliveInterval = smuxKeepAliveInterval
-	cfg.KeepAliveTimeout = smuxKeepAliveTimeout
-	return cfg
 }
 
 // sendCaps advertises our capability bits to the peer. Re-sent with every
