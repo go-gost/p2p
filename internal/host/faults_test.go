@@ -260,20 +260,28 @@ func TestSilenceShorterThanTimeoutIsSurvived(t *testing.T) {
 	a, b, _ := startPunchedPair(t)
 
 	dcB := watchDirect(t, b, a)
+	pairB := b.relayKCPPairFor(a.pub)
 
-	// Half the idle bound: A goes quiet and comes back, and the direct path must
-	// not be retired. The window opens when the fault is built.
+	// A window well below the idle bound, then a sleep well past it: A goes quiet
+	// for idle/3 and comes back, and the direct path must not be retired. The
+	// sleep past idle is what makes this a boundary test — a watchdog that fired
+	// on any silence (or did not re-arm on resumed data) would retire the path
+	// even though the mute ended before the threshold. The window opens when the
+	// fault is built.
 	short := newFaults(&p2p.FaultsConfig{
-		SilenceFor:   directUnderlayIdle / 2,
+		SilenceFor:   directUnderlayIdle / 3,
 		SilenceEvery: time.Minute,
 	})
 	a.faults.Store(short)
 	if !short.silenced(time.Now()) {
 		t.Fatal("the silence window must be open at the fault's creation")
 	}
-	time.Sleep(directUnderlayIdle / 2)
+	time.Sleep(directUnderlayIdle + directUnderlayReadTimeout)
 	if got := dcB.drops.Load(); got != 0 {
 		t.Fatalf("a silence shorter than the idle bound retired the direct path %d time(s)", got)
+	}
+	if !pairB.preferredDirect() {
+		t.Fatal("the direct path was not preferred after a silence shorter than the idle bound")
 	}
 
 	// Well beyond the idle bound: the path must be retired and the drop counted.

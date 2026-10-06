@@ -116,11 +116,13 @@ func hasDirect(e *engine, peer derpclient.PublicKey) bool {
 	return dc != nil && dc.isUp()
 }
 
-// directSecureForTest reports whether an engine's direct path to peer is
-// encrypted. The direct underlay rides the pair's relay secure session now, so
-// this reads that session under the engine lock and its keys under the session's
-// own lock — never the session's lock while holding e.mu.
-func directSecureForTest(e *engine, peer derpclient.PublicKey) bool {
+// pairSecureForTest reports whether the pair's secure session to peer has
+// settled. The direct underlay rides that same session (there is no separate
+// direct secure session after Task 7), so this reads it under the engine lock
+// and its keys under the session's own lock — never the session's lock while
+// holding e.mu. It is a property of the pair, not of the direct path: a caller
+// asserting the direct path is encrypted must also assert the underlay is up.
+func pairSecureForTest(e *engine, peer derpclient.PublicKey) bool {
 	e.mu.Lock()
 	ss := e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
 	e.mu.Unlock()
@@ -695,9 +697,11 @@ func TestDirectUnderlayDeadClearsAndRepunches(t *testing.T) {
 		t.Fatal("isUp() = true after the underlay died, want false")
 	}
 	switch dc.stateOf() {
-	case directAttempting, directBackoff, directNone:
+	case directAttempting, directBackoff:
 		// a re-punch is in flight or scheduled
 	default:
+		// directNone here means nothing was scheduled: the regression this
+		// guards (a death that does not re-punch) would pass otherwise.
 		t.Fatalf("state = %v after the death, want a re-punch scheduled", dc.stateOf())
 	}
 }
@@ -729,6 +733,105 @@ func TestRegisterDirectUnderlayRetiresOldSocket(t *testing.T) {
 	pair.mu.Unlock()
 	if u == nil || u.sock != sock2 {
 		t.Fatal("the pair does not hold the new socket after re-registration")
+	}
+}
+
+// TestClearDirectUnderlayIfLeavesReplacement pins the compare-and-clear the idle
+// watchdog needs (C1): a retirement aimed at an underlay the pair no longer
+// holds must not clear the replacement — that is the direct↔relay flapping a
+// plain check-then-clear causes.
+func TestClearDirectUnderlayIfLeavesReplacement(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{11}
+	pair := e.relayKCPPairFor(peer)
+	addr := udpAddrPort(t, mustListenUDP(t))
+
+	sock1 := mustListenUDP(t)
+	pair.setDirectUnderlay(newDirectUnderlay(sock1, addr))
+	pair.mu.Lock()
+	u1 := pair.direct
+	pair.mu.Unlock()
+
+	sock2 := mustListenUDP(t)
+	pair.setDirectUnderlay(newDirectUnderlay(sock2, addr))
+	pair.mu.Lock()
+	u2 := pair.direct
+	pair.mu.Unlock()
+
+	// A stale retirement for u1 must not clear u2.
+	if pair.clearDirectUnderlayIf(u1) {
+		t.Fatal("clearDirectUnderlayIf(u1) cleared a replacement underlay")
+	}
+	pair.mu.Lock()
+	held := pair.direct
+	pair.mu.Unlock()
+	if held != u2 {
+		t.Fatal("the replacement underlay was retired by a stale clear")
+	}
+	if u2.closed() {
+		t.Fatal("the replacement underlay's socket was closed")
+	}
+
+	// The current identity clears, and closes exactly that underlay.
+	if !pair.clearDirectUnderlayIf(u2) {
+		t.Fatal("clearDirectUnderlayIf(u2) did not clear the current underlay")
+	}
+	if !u2.closed() {
+		t.Fatal("the cleared underlay was not closed")
+	}
+}
+
+// TestRegisterDirectUnderlayRetiresWhenSecureFails: a peer that passes the
+// plaintext seed handshake but cannot settle the pair's secure handshake must
+// not be left reported direct. The underlay is installed by the seed, then the
+// async pair-session ensure refuses the unsettled cipher and retires it — the
+// replacement for the deleted direct encryption gate (I4).
+func TestRegisterDirectUnderlayRetiresWhenSecureFails(t *testing.T) {
+	defer func(d time.Duration) { handshakeTimeout = d }(handshakeTimeout)
+	handshakeTimeout = 300 * time.Millisecond
+
+	rs := &relayServer{}
+	url := rs.start(t)
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	eA := newEngine(url, "", privA, slog.Default())
+	eB := newEngine(url, "", privB, slog.Default())
+	t.Cleanup(func() { eA.Close(); eB.Close() })
+	if err := eA.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := eB.Connect(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The relay drops every ctrlSecure frame, so the pair's secure handshake can
+	// never settle (the same injection TestRelayRefusesUnencryptedPeer uses).
+	rs.mu.Lock()
+	rs.dropCtrl = func(_ [32]byte, payload []byte) bool {
+		return len(payload) > 1 && payload[1] == ctrlSecure
+	}
+	rs.mu.Unlock()
+
+	peer := pubB
+	dc := eA.directConn(peer)
+	sock := mustListenUDP(t)
+	dc.markUp(sock, udpAddrPort(t, mustListenUDP(t)), [seedTokenLen]byte{0x5A})
+	if !dc.isUp() {
+		t.Fatal("markUp did not install the underlay")
+	}
+
+	// The pair-session ensure refuses the unsettled cipher and retires the
+	// underlay, so the peer is not reported direct while carrying nothing.
+	waitFor(t, 5*time.Second, func() bool { return !dc.isUp() })
+	found := false
+	for _, l := range dc.traceLines() {
+		if strings.Contains(l, "encrypted: not settled") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("the retirement was not recorded as a secure refusal: %v", dc.traceLines())
 	}
 }
 
@@ -829,10 +932,12 @@ func TestDirectPunchRoundTrip(t *testing.T) {
 	roundTrip(t, s2, "ping!")
 }
 
-// TestDirectSessionEncrypted proves the hole-punched direct path is
-// end-to-end encrypted: after a direct session is up, a stream round-trips
-// over it and both ends report the direct session as settled encrypted (the
-// handshake ran, not just a plaintext round trip).
+// TestDirectSessionEncrypted proves the hole-punched direct path carries
+// encrypted bytes: after a direct underlay is up, a stream round-trips over it
+// with the relay data plane cut, and the pair secure session it rides is
+// settled. There is no separate direct secure session after Task 7, so the
+// encryption property belongs to the pair — the test asserts the underlay is up
+// as well, or the pair-secure assertion would hold even with no direct path.
 func TestDirectSessionEncrypted(t *testing.T) {
 	rs := &relayServer{}
 	url := rs.start(t)
@@ -872,13 +977,16 @@ func TestDirectSessionEncrypted(t *testing.T) {
 	defer s2.Close()
 	roundTrip(t, s2, "encrypted-direct")
 
-	// A direct session is built only after its own side settled the handshake,
-	// so both ends must report it encrypted once the sessions are up.
-	if !directSecureForTest(engineA, pubB) {
-		t.Fatal("A's direct session did not settle encrypted")
+	// The direct underlay is up on both ends, and the pair secure session it
+	// rides has settled — that is what makes the round trip above encrypted.
+	if !hasDirect(engineA, pubB) || !hasDirect(engineB, engineA.pub) {
+		t.Fatal("the direct underlay is not up after the punch")
 	}
-	if !directSecureForTest(engineB, engineA.pub) {
-		t.Fatal("B's direct session did not settle encrypted")
+	if !pairSecureForTest(engineA, pubB) {
+		t.Fatal("A's pair secure session did not settle")
+	}
+	if !pairSecureForTest(engineB, engineA.pub) {
+		t.Fatal("B's pair secure session did not settle")
 	}
 }
 

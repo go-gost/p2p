@@ -1059,22 +1059,18 @@ func (e *engine) relayKCPPairGet(peer derpclient.PublicKey) *relayKCPPair {
 // re-punch never leaks the old one and never double-reads. Do not call this with
 // an already-installed socket: setDirectUnderlay would close it as the "old"
 // underlay (the Task 3 contract); markUp guards the same-socket case.
+//
+// The pair session (the direct feed's consumer) is built asynchronously, off the
+// punch goroutine. The direct pump only feeds the pair's KCP session, so a
+// direct path with no built pair session has nowhere to deliver — the accepting
+// side of a punch can land before its relay session exists. Doing it here rather
+// than inline keeps registration non-blocking, so a re-punch that replaces this
+// underlay cannot be raced by a stale install; if the session cannot be built
+// (forced encryption not settled), the underlay is retired rather than reported
+// direct while carrying nothing (I1/I4).
 func (e *engine) registerDirectUnderlay(peer derpclient.PublicKey, sock *net.UDPConn, addr netip.AddrPort, token [seedTokenLen]byte) {
 	if sock == nil {
 		return
-	}
-	// Ensure the local pair session (and its smux/secure) exists before the
-	// underlay is installed: the direct pump only feeds the pair's KCP session,
-	// so a direct path with no built pair session would have no consumer — the
-	// accepting side of a punch that lands before its relay session exists would
-	// otherwise carry nothing. This is what makes "the direct path outlives the
-	// relay" true rather than nominal. Run before taking kcpMu/p.mu to keep the
-	// engine's lock order (e.mu -> pc.mu -> kcpMu -> p.mu); a live pair session
-	// makes it a no-op.
-	if pc := e.peerConn(peer); pc != nil {
-		if _, err := pc.ensureSession(false, true); err != nil {
-			e.log.Debug("direct: ensure pair session failed", "peer", keyName(peer), "error", err)
-		}
 	}
 	pair := e.relayKCPPairFor(peer)
 	pair.mu.Lock()
@@ -1082,30 +1078,68 @@ func (e *engine) registerDirectUnderlay(peer derpclient.PublicKey, sock *net.UDP
 		pair.onDirectIdle = func(u *directUnderlay) { e.directUnderlayDead(peer, u) }
 	}
 	pair.mu.Unlock()
-	pair.setDirectUnderlay(newDirectUnderlayToken(sock, addr, token))
+	u := newDirectUnderlayToken(sock, addr, token)
+	pair.setDirectUnderlay(u)
+	go e.ensureDirectConsumer(peer, pair, u)
+}
+
+// ensureDirectConsumer builds the pair session that consumes the direct feed,
+// then retires the underlay if it cannot be built. It runs in its own goroutine
+// so registration stays non-blocking (I1). The retirement is a
+// compare-and-clear against u, so a re-punch that replaced u in the meantime is
+// left alone (C1).
+func (e *engine) ensureDirectConsumer(peer derpclient.PublicKey, pair *relayKCPPair, u *directUnderlay) {
+	if !e.relayConnected() {
+		// No relay, no pair session to build, and the punch could not have
+		// exchanged candidates without it: leave the underlay installed (unit
+		// tests register underlays on relay-less engines).
+		return
+	}
+	pc := e.peerConn(peer)
+	if pc == nil {
+		return
+	}
+	_, err := pc.ensureSession(false, true)
+	if err == nil {
+		return
+	}
+	if errors.Is(err, errEncryptionRequired) {
+		e.log.Warn("direct: pair secure not settled, retiring the direct underlay",
+			"peer", keyName(peer))
+	} else {
+		e.log.Debug("direct: pair session not ready", "peer", keyName(peer), "error", err)
+	}
+	if dc := e.getDirect(peer); dc != nil {
+		if errors.Is(err, errEncryptionRequired) {
+			dc.noteErr("encryption not settled")
+			dc.noteRound("encrypted: not settled")
+		} else {
+			dc.noteErr("pair session not ready")
+			dc.noteRound("pair session not ready")
+		}
+	}
+	if pair.clearDirectUnderlayIf(u) {
+		if dc := e.getDirect(peer); dc != nil {
+			dc.underlayDead(u)
+		}
+	}
 }
 
 // directUnderlayDead is the pair's idle-watchdog callback (Task 4's
 // onDirectIdle): the direct underlay u went silent past directUnderlayIdle. If
-// the pair still holds u — a newer underlay may have replaced it since the
-// callback was dispatched — retire it (clear + close the socket), mark the
-// peer's directConn down, and schedule a re-punch. It is deliberately
-// non-blocking (H4): clearDirectUnderlay signals the pump and closes the socket
+// the pair still holds u, retire it and mark the peer's directConn down so it
+// re-punches. The identity test and the clear are one critical section
+// (clearDirectUnderlayIf): a plain check-then-clear would race a re-punch that
+// replaces u and retire the replacement instead (C1). It is deliberately
+// non-blocking (H4): clearDirectUnderlayIf signals the pump and closes the socket
 // without joining it, and the re-punch runs on its own goroutine/timer.
 func (e *engine) directUnderlayDead(peer derpclient.PublicKey, u *directUnderlay) {
 	pair := e.relayKCPPairGet(peer)
 	if pair == nil {
 		return
 	}
-	pair.mu.Lock()
-	holds := pair.direct == u
-	pair.mu.Unlock()
-	if !holds {
+	if !pair.clearDirectUnderlayIf(u) {
 		return // a newer underlay replaced it: not ours to retire
-	}
-	pair.clearDirectUnderlay() // closes u's socket too
-	if u != nil {
-		u.close() // idempotent; the socket is already closed
 	}
 	dc := e.getDirect(peer)
 	if dc == nil {

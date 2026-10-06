@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-gost/p2p/internal/clock"
 	"github.com/go-gost/p2p/internal/derpclient"
 	"github.com/xtaci/kcp-go/v5"
 )
@@ -531,9 +530,23 @@ func (p *relayKCPPair) setDirectUnderlay(u *directUnderlay) {
 // once. It is idempotent: a second call finds no underlay and returns. p.mu is
 // released before stop is closed and u.close() runs, so a caller that reached
 // here from inside the pump (an idle callback) cannot self-deadlock.
-func (p *relayKCPPair) clearDirectUnderlay() {
+func (p *relayKCPPair) clearDirectUnderlay() { p.clearDirectUnderlayIf(nil) }
+
+// clearDirectUnderlayIf clears the pair's direct underlay only while it is still
+// want (want == nil means whatever is installed), testing and clearing in one
+// critical section. It reports whether it cleared one. This is the
+// compare-and-clear the idle watchdog needs: a plain check-then-clear races a
+// re-punch that replaces the underlay between the check and the clear, and would
+// retire the replacement — the new, good path (C1). p.mu is released before stop
+// is closed and u.close() runs, so a caller reached from inside the pump cannot
+// self-deadlock.
+func (p *relayKCPPair) clearDirectUnderlayIf(want *directUnderlay) bool {
 	p.mu.Lock()
 	u, stop := p.direct, p.directStop
+	if want != nil && u != want {
+		p.mu.Unlock()
+		return false
+	}
 	p.direct = nil
 	p.directStop = nil
 	// No underlay is preferred any more: fall the session's congestion control
@@ -541,10 +554,11 @@ func (p *relayKCPPair) clearDirectUnderlay() {
 	p.applyPathTuningLocked()
 	p.mu.Unlock()
 	if u == nil {
-		return
+		return false
 	}
 	close(stop)
 	u.close()
+	return true
 }
 
 // pumpDirect is the direct half of the pair's fan-in: it loops u.readFrom,
@@ -787,7 +801,11 @@ func (p *relayKCPPair) WriteTo(b []byte, _ net.Addr) (int, error) {
 	// segment KCP retransmits; the write reports success, indistinguishable from
 	// a path that ate it (Task 12's relocation from the old direct faultConn).
 	if p.e != nil {
-		if f := p.e.faults.Load(); f.muteDataArmed() && f.muteData(clock.Now()) {
+		// time.Now(), not clock.Now(): the silence window's origin is stamped
+		// with time.Now() (newFaults), and the other fault checks
+		// (sendControl/faultConn/handleControl) read time.Now() too. One clock
+		// for the window, or its boundaries drift by the clock's resolution.
+		if f := p.e.faults.Load(); f.muteDataArmed() && f.muteData(time.Now()) {
 			return len(b), nil
 		}
 	}

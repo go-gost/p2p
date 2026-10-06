@@ -811,7 +811,9 @@ func (dc *directConn) underlayDead(u *directUnderlay) {
 		dc.e.log.Debug("direct underlay died young, re-punching after backoff",
 			"peer", keyName(dc.peer), "lifetime", lifetime.Round(time.Millisecond).String(),
 			"backoff", backoff.String())
-		dc.retry(backoff, false)
+		// Guarded: onCandidates may have started a round since the state was
+		// cleared above, and retry must not clobber it (I6).
+		dc.retryFrom(backoff, false, true)
 		return
 	}
 	dc.e.log.Debug("direct underlay died, punching again", "peer", keyName(dc.peer))
@@ -955,7 +957,22 @@ func (dc *directConn) backoff() { dc.retry(dc.silentPeerWait(backoffPeriod), tru
 // without it, and the round would otherwise back off for 30s over a network
 // blip (the phone's Wi-Fi ↔ cellular switch).
 func (dc *directConn) retry(d time.Duration, failed bool) {
+	dc.retryFrom(d, failed, false)
+}
+
+// retryFrom is retry with an optional state guard. fromNone makes it refuse to
+// run unless the state is still directNone, so a re-punch scheduled off the idle
+// watchdog (underlayDead) cannot clobber a round a peer's candidate announcement
+// started in the meantime (onCandidates → start); without the guard, retry's
+// unconditional state=directBackoff/mine=nil wipes that round's state and
+// candidates (I6). A guarded refusal is safe: a round is running, so it decides
+// what happens next.
+func (dc *directConn) retryFrom(d time.Duration, failed bool, fromNone bool) {
 	dc.mu.Lock()
+	if fromNone && dc.state != directNone {
+		dc.mu.Unlock()
+		return
+	}
 	dc.state = directBackoff
 	dc.failed = dc.failed || failed
 	if failed {
