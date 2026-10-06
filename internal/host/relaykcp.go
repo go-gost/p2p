@@ -218,6 +218,14 @@ type relayKCPPair struct {
 	// the pump that reported the idle. Guarded by mu.
 	onDirectIdle func(*directUnderlay)
 
+	// directIdleFiring bounds the callback dispatch to at most one in-flight
+	// invocation: a new episode's callback is suppressed while the previous one
+	// is still running, so a slow or blocking engine callback cannot accumulate
+	// one goroutine per re-armed episode. It is atomic, not under mu, because it
+	// is set and cleared on the dispatch path (the pump and the callback
+	// goroutine) and must never be held across the callback itself.
+	directIdleFiring atomic.Bool
+
 	// bytesSent/bytesRcvd count the pair's datagrams in bytes, on the paths the
 	// pair already walks: bytesSent in WriteTo (whichever path it picks), and
 	// bytesRcvd where a pump drains an underlay (readRelay for the relay pump,
@@ -544,15 +552,12 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 		n, err := u.readFrom(buf)
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				// Silence tick: consult the watchdog bound. On the first
-				// silent tick of an episode, hand the underlay to the engine
-				// outside p.mu.
-				if p.directIdle(u) {
-					if !idleFired && p.fireDirectIdle(u) {
-						idleFired = true
-					}
-				} else {
-					idleFired = false
+				// Silence tick: on the first silent tick of an episode, hand
+				// the underlay to the engine outside p.mu. A tick with a
+				// callback already in flight reports false and is retried on
+				// the next tick, so dispatch stays bounded.
+				if !idleFired && p.reportDirectIdle(u) {
+					idleFired = true
 				}
 				continue
 			}
@@ -585,28 +590,36 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 	}
 }
 
-// directIdle reports whether u is still the pair's installed direct underlay and
-// has gone silent past directUnderlayIdle. It re-checks u's identity so a tick
-// from a pump retired by a replacement cannot report the replacement idle.
-func (p *relayKCPPair) directIdle(u *directUnderlay) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.direct == u && time.Since(p.lastDirectRecv) >= directUnderlayIdle
-}
-
-// fireDirectIdle hands a silent direct underlay to the engine's callback (Task
-// 7), if one is set, and reports whether a callback was invoked. It captures the
-// callback under p.mu and runs it in its own goroutine: the callback retires the
-// underlay and re-punches, and the pump that observed the idle must never block
-// on a clear that could join it (H4).
-func (p *relayKCPPair) fireDirectIdle(u *directUnderlay) bool {
-	p.mu.Lock()
-	cb := p.onDirectIdle
-	p.mu.Unlock()
-	if cb == nil {
+// reportDirectIdle hands a silent direct underlay to the engine's callback (Task
+// 7), if one is set, and reports whether a callback was dispatched. It performs
+// every eligibility check in one critical section — u is still the installed
+// underlay, the pair is not closing, and the underlay has been silent past
+// directUnderlayIdle — so a retirement racing the tick cannot fire for an
+// underlay the pair no longer holds (Minor #3/#6).
+//
+// The dispatch is bounded to at most one in-flight callback (directIdleFiring):
+// a new episode's callback is suppressed while the previous one is still
+// running, so a slow or blocking engine callback cannot accumulate goroutines
+// across re-armed episodes. The callback runs in its own goroutine, outside
+// p.mu, so the pump that observed the idle never blocks on it and the engine's
+// retirement (clearDirectUnderlay) can never join that pump (H4).
+func (p *relayKCPPair) reportDirectIdle(u *directUnderlay) bool {
+	if !p.directIdleFiring.CompareAndSwap(false, true) {
+		// A callback is still in flight: suppress this episode's dispatch.
 		return false
 	}
-	go cb(u)
+	p.mu.Lock()
+	cb := p.onDirectIdle
+	ok := p.direct == u && !p.closed && time.Since(p.lastDirectRecv) >= directUnderlayIdle
+	p.mu.Unlock()
+	if !ok || cb == nil {
+		p.directIdleFiring.Store(false)
+		return false
+	}
+	go func() {
+		defer p.directIdleFiring.Store(false)
+		cb(u)
+	}()
 	return true
 }
 

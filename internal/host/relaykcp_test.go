@@ -488,6 +488,7 @@ func TestPairDirectIdleFiresCallbackOnce(t *testing.T) {
 	defer func() { directUnderlayIdle = oldIdle }()
 
 	e := newTestEngine(t)
+	before := runtime.NumGoroutine()
 	peer := derpclient.PublicKey{11}
 	pair := e.relayKCPPairFor(peer)
 	defer pair.shutdown()
@@ -496,8 +497,6 @@ func TestPairDirectIdleFiresCallbackOnce(t *testing.T) {
 	b := mustListenUDP(t)
 	defer b.Close()
 	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
-
-	before := runtime.NumGoroutine()
 
 	var fires atomic.Int64
 	fired := make(chan int64, 8)
@@ -571,7 +570,9 @@ func TestPairDirectIdleFiresCallbackOnce(t *testing.T) {
 		t.Fatal("the direct pump did not exit after its callback cleared the underlay")
 	}
 
-	// No goroutine leak: the direct pump and the callback goroutine are gone.
+	// No goroutine leak: the pair's relay and direct pumps and the callback
+	// goroutine are all gone, back to the pre-pair baseline.
+	pair.shutdown()
 	settleGoroutines(t, before)
 }
 
@@ -582,6 +583,7 @@ func TestPairDirectIdleFiresCallbackOnce(t *testing.T) {
 // the goroutine count must settle back.
 func TestPairCloseReturnsEOF(t *testing.T) {
 	e := newTestEngine(t)
+	before := runtime.NumGoroutine()
 	peer := derpclient.PublicKey{12}
 	pair := e.relayKCPPairFor(peer)
 
@@ -602,7 +604,6 @@ func TestPairCloseReturnsEOF(t *testing.T) {
 	directDone := pair.directPumpDone
 	pair.mu.Unlock()
 
-	before := runtime.NumGoroutine()
 	readErr := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 16)
@@ -631,9 +632,92 @@ func TestPairCloseReturnsEOF(t *testing.T) {
 	settleGoroutines(t, before)
 }
 
+// TestPairDirectIdleSlowCallbackDoesNotAccumulate pins the dispatch bound: at
+// most one onDirectIdle invocation may be in flight at a time, so a slow or
+// blocking engine callback (e.g. a re-punch that stalls) cannot accumulate one
+// goroutine per idle episode while traffic keeps re-arming the watchdog. The
+// callback is held across three re-armed idle episodes; while it is held,
+// exactly one invocation must have run and exactly one must be in flight.
+func TestPairDirectIdleSlowCallbackDoesNotAccumulate(t *testing.T) {
+	oldIdle := directUnderlayIdle
+	directUnderlayIdle = 150 * time.Millisecond
+	defer func() { directUnderlayIdle = oldIdle }()
+
+	e := newTestEngine(t)
+	before := runtime.NumGoroutine()
+	peer := derpclient.PublicKey{13}
+	pair := e.relayKCPPairFor(peer)
+	defer pair.shutdown()
+
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	defer b.Close()
+	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	var inflight, calls atomic.Int64
+	pair.mu.Lock()
+	pair.onDirectIdle = func(u *directUnderlay) {
+		calls.Add(1)
+		inflight.Add(1)
+		defer inflight.Add(-1)
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	}
+	pair.mu.Unlock()
+
+	// The first idle episode dispatches a callback that blocks here.
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the idle callback never entered")
+	}
+
+	// Re-arm the watchdog several times while the callback is held. Each
+	// re-arm begins a new idle episode that would dispatch again if dispatch
+	// were not bounded.
+	buf := make([]byte, 64)
+	for i := 0; i < 3; i++ {
+		if _, err := b.WriteToUDP([]byte("rearm"), a.LocalAddr().(*net.UDPAddr)); err != nil {
+			t.Fatalf("peer write: %v", err)
+		}
+		if _, _, err := pair.ReadFrom(buf); err != nil {
+			t.Fatalf("ReadFrom: %v", err)
+		}
+		time.Sleep(1200 * time.Millisecond) // let at least one idle tick pass
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("slow callback dispatched %d times while one was in flight, want 1", got)
+	}
+	if got := inflight.Load(); got != 1 {
+		t.Fatalf("in-flight callbacks = %d, want exactly 1", got)
+	}
+
+	// Releasing the callback frees the dispatch slot.
+	close(release)
+	deadline := time.Now().Add(3 * time.Second)
+	for inflight.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := inflight.Load(); got != 0 {
+		t.Fatalf("in-flight callbacks = %d after release, want 0", got)
+	}
+
+	pair.shutdown()
+	settleGoroutines(t, before)
+}
+
 // settleGoroutines waits (bounded) for the live goroutine count to fall back to
-// the baseline captured before the test started its readers/pumps, and fails if
-// it stays above it. The bound absorbs transient runtime goroutines.
+// the baseline captured before any test-created goroutine started (before the
+// pair's pumps and any reader), and fails if it stays above it. Because the pair
+// is shut down before the settle, a leaked relay/direct pump or callback
+// goroutine keeps the count above the baseline instead of being masked by a
+// pump that has already exited. The bound absorbs transient runtime goroutines.
 func settleGoroutines(t *testing.T, before int) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
