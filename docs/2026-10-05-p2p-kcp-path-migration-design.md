@@ -145,12 +145,65 @@ type pairUnderlay interface {
 - `relayKCPPair.snapshot`（`relaykcp.go:287`）增加：当前 preferred、每条 underlay 的 bytes / recv-at、direct 存活。
 - doctor / status 的 relay/direct 展示改为「pair 当前路径 + underlay 健康」；`transport` 语义从「流终身平面」变为「pair 当前路径」（M1），消费方需同步。
 - faults：数据故障过去注入在 direct underlay（`faultConn`）；现在挂在 pair 的 `WriteTo`（或 per-underlay write），并支持 **per-path mute**（只静音 direct）以覆盖「direct 死、relay 恢复」；控制故障仍走 `sendControl`。`docs/2026-09-30-p2p-fault-injection-plan.md` 的用例需相应改造。
+- **事件级可观测与事后诊断见「可观测性与可诊断性」章节（O1–O8）**：路径事件日志、迁移计数器、per-underlay 归因、回落原因、迁移事件 ring、`transport` 消歧、e2e 跨切换完整性。
 
 ### 11. KCP 调优（H5）
 
 - 现状：direct 会话（`direct.go:1222`）未设 `SetNoDelay/SetMtu/SetWindowSize`，用 kcp-go 默认（snd/rcv wnd `32`、拥塞控制**开**、interval 40 ms）；relay pair 用 `SetNoDelay(1,10,2,1)`（interval 10 ms、**nc=1 关拥塞控制**）+ `SetWindowSize(256,256)`（`relaykcp.go:207-209`）。
 - 统一后 direct 继承 pair 的调优：窗口 32→256 是提升；但 **nc=1 用在公网 direct 上是行为变化**——relay 的「丢包=有界队列溢出」理由不适用于公网拥塞路径。
 - 决定：preferred 切到 **direct 时把 `nc` 设为 0**（`SetNoDelay` 运行时可调），**relay 时设 1**；`SetWindowSize(256,256)` 保留（两路共用一条会话，无法 per-path 设窗口）。切换时同步调整，并加单测覆盖。
+
+## 可观测性与可诊断性
+
+迁移是**离散事件**（relay↔direct 切换），而现状只有「可轮询的状态」，没有「事件」和「归因」。本节补齐：事件日志、计数器、per-underlay 归因，并把最危险的 H1 抑制路径做成显式信号。
+
+### O1. 路径事件日志（pair 级）
+
+pair 目前**没有 logger**（`relaykcp.go` 无日志），recency 驱动的翻转在 `WriteTo`/`setDirectUnderlay`/`clearDirectUnderlay` 里静默发生。给 pair 一个 logger（或一个回调到 engine 的事件钩子），在以下时机各记一条 **Info** 级事件，attrs 稳定可 grep：
+
+- `event=path-change`：`from`（relay/direct）、`to`、`reason`（有限枚举：`first-direct-datagram` / `direct-idle` / `relay-lost` / `relay-restored` / `clear`）、`directRecvAge`、`relayAlive`、`nc`、`migrations`、`fallbacks`。
+- `event=direct-underlay`：`installed` / `retired`，含 `reason`（`punch` / `idle` / `replaced`）、`peerAddr`、`lifetime`。
+- `event=seed`：`result`（ok/timeout）、`family`、`addr`（失败时给出原因）。
+- `event=relay-loss`：`suppressed=true/false`（是否被 live direct 抑制）——**H1 的显式信号**。
+
+`reason` 必须是有限枚举，禁止自由文本。
+
+### O2. 计数器（Status + PeerDiagnostic）
+
+对齐既有 `RelayRebuilds`/`PeerRekeys` 的 churn 计数器先例，新增：
+
+- `PairMigrations`：relay→direct 次数。
+- `PairFallbacks`：direct→relay 次数（含 idle 与 relay-lost 两类）；`DirectIdleEvictions` 单独计数。
+- `RepunchAfterIdle`、`SeedFailures`。
+- `RelayLossSuppressedByDirect`：H1 抑制次数，与「触发重置」成对，区分「被抑制」vs「重置」。
+
+进 `p2p.Status` 与 `p2p.PeerDiagnostic`；gRPC proto 冻结，跨线只到 in-process 消费方（与 `PeerTransports`/`RelayKCP` 同）。
+
+### O3. per-underlay 归因（不合并）
+
+- `RelayKCPStats` 增加 `Path`（当前 preferred）与 **per-underlay** 的 `BytesSent/BytesRcvd`、`RelayLastRecvAge`/`DirectLastRecvAge`、`DirectAlive`；会话总计字段保留，另加 per-path 分项。
+- `PeerDiagnostic.LastRecvAge` 现在把两条路「取最新」合并（`engine.go:289-295`），**恰好藏掉「哪条路是活的」**；改为分别暴露两条路的 age，合并值保留为兼容字段并标注语义。
+- 不追求 per-underlay RTT/丢包（kcp-go 不暴露，且两路共用一条会话）；direct 健康度以 `DirectLastRecvAge` + `DirectAlive` 表达。
+
+### O4. 回落原因与 backoff 可见
+
+`PeerDiagnostic` 增加 `FallbackReason`（有限枚举）与 `BackoffUntil`/`NextPunchIn`（H3 的退避状态），使「为什么回落到 relay」「还要多久再打洞」无需读日志。
+
+### O5. 迁移事件 ring
+
+`PeerDiagnostic.Trace` 现为 punch 历史。新增 `PathTrace`（迁移事件 ring，与 Trace 同尺寸），记录最近 N 条 `path-change`，供事后复盘「这对 peer 最近怎么变的」。
+
+### O6. `transport` 语义（M1）消歧
+
+`transport` 从「流终身平面」变为「pair 当前路径」。为免历史日志误导：明确其为**时点**语义（文档 + 字段注释）；流首次跨路径时补一条 **Info** 级 `stream path-changed` 日志（或 per-pair `pathChanges` 计数），使「这条流现在在哪条路」可从日志重建；消费方（Status/doctor）同步为「pair 当前路径」。
+
+### O7. faults 与运行时降级
+
+faults（T12）提供 **per-path mute**（只静音 direct），覆盖「direct 死、relay 恢复」。可选：一个运行时可观测的强制路径/`degraded` 开关，便于线上验证回落（非必需，标注为可选）。
+
+### O8. e2e 完整性（可验证性）
+
+e2e（T13）不只验「迁移发生了」：在一次真实切换（含注入丢包）中，对**跨越切换点的字节流做端到端校验和/hash**，证明切换期无丢/重/乱。单测已有 byte-exact，e2e 补集成层证据。
 
 ## pair 生命周期（与 relay 解耦，H1）
 

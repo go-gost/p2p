@@ -738,3 +738,33 @@ In addition to muting all data at `pair.WriteTo`, support muting only the direct
 - `directUnderlayIdle` is also the "live direct" predicate (Task 0 + Task 3).
 - Spike file retained (Task 5).
 - Task ordering: **0 → 1 → 2 → 3 → 4 → 14 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13**.
+
+---
+
+## Observability & Diagnosability Revision (2026-10-06)
+
+Spec §「可观测性与可诊断性」(O1–O8) added event-level observability and post-mortem diagnosability. **Where this section differs from a task above, this section wins.** These fold into Tasks 10–13; O1/O2's H1 signal should land with Task 7 if cheap, else Task 11.
+
+### Task 10 — stream-level path disambiguation (O6)
+- When a stream's path changes, emit one **Info** log `stream path-changed` with `peer`, `from`, `to`, `reason` (finite enum), so historical logs can reconstruct where a long-lived stream ran. Keep `openedStream.transport` as the point-in-time pair path and document it as such. Add a per-pair `pathChanges` counter as a cheap fallback.
+- Test: a stream opened on `derp`, then migrated, logs exactly one path-change and `pathChanges` increments once.
+
+### Task 11 — events, counters, per-underlay attribution (O1–O5)
+Files: `relaykcp.go` (pair logger/event hook + counters + per-underlay snapshot), `engine.go` (wire into Status/PeerDiagnostic), `direct.go` (seed/underlay events), `status.go` (fields).
+- **O1 events:** give the pair a logger (or an engine callback). Emit Info `event=path-change` on every flip (set/clear/recency/`reportDirectIdle`) with `from/to/reason/directRecvAge/relayAlive/nc/migrations/fallbacks`; `event=direct-underlay` on install/retire; `event=seed` on handshake result; `event=relay-loss` with `suppressed=true/false` (the H1 signal). `reason` must be a finite enum.
+- **O2 counters:** `PairMigrations`, `PairFallbacks`, `DirectIdleEvictions`, `RepunchAfterIdle`, `SeedFailures`, `RelayLossSuppressedByDirect` on the pair; surface in `p2p.Status` and `p2p.PeerDiagnostic`.
+- **O3 attribution:** `RelayKCPStats` gains `Path`, per-underlay `BytesSent/BytesRcvd`, `RelayLastRecvAge`/`DirectLastRecvAge`, `DirectAlive`. Stop merging `PeerDiagnostic.LastRecvAge` across paths (`engine.go:289-295`); keep the merged value as a documented compatibility field.
+- **O4:** `PeerDiagnostic.FallbackReason` (finite enum) + `BackoffUntil`/`NextPunchIn`.
+- **O5:** `PeerDiagnostic.PathTrace` — a bounded ring of recent `path-change` events, same sizing as `Trace`.
+- Tests: flip → exactly one `path-change` with the right `reason`; a fallback records `FallbackReason` + a `PairFallbacks` bump; `RelayLossSuppressedByDirect` increments on relay loss with a live direct and NOT without one; per-underlay ages differ (direct stale, relay fresh) and are not merged.
+
+### Task 12 — per-path mute (O7) [unchanged from the revision above]
+- Mute all data at `pair.WriteTo` (existing) **and** mute only the direct underlay. Optionally expose a runtime forced-path/degraded switch (mark optional).
+
+### Task 13 — e2e integrity across the cutover (O8)
+- Extend `derp-direct`/`udp-tun`: start a transfer relay-only, wait for `direct`, inject loss at the cutover, finish, and compare an **end-to-end hash/checksum** of the whole stream (not just "it migrated"). Read the preferred path + the O2 counters from Status and assert exactly one migration; assert the relay-loss-suppressed signal where applicable.
+- Update `.memory` with the observability surface (events, counters, per-underlay fields).
+
+### Review Focus (add)
+- Can a reader reconstruct, from logs + Status alone, (a) which path a long-lived stream is on now, (b) why it fell back, (c) whether a relay loss was suppressed? If not, O1/O4 is incomplete.
+- Do the counters distinguish "healthy idle" from "flapping" (steady state vs `PairMigrations`/`PairFallbacks` growth)?
