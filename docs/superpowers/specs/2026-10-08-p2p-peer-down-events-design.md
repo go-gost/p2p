@@ -82,7 +82,7 @@ peer 块上的三个数（次数/最近/累计/最长）属 v2，沿用既有**�
 
 - `silentFor` ≈ 0 → 死亡突发/主动，看 `relayReason`；
 - `silentFor` 明显 > 0 → peer 先静默才被判死，链路问题的形状（黑洞、WiFi 切 4G、relay 断）；
-- `silentFor=0` 也可能是「引擎当时没有 pair 可测」（六个 reason 会删掉 pair），**不等于**「peer 一直说到死」。
+- `silentFor=0` 是「说不出」而不是「没静默」：pair 从没建过、pair 已被**更早**的一次事件删掉（六个 reason 会 `delete(e.relayKCPs, peer)`），或者 peer 真的刚说过话。读 recency 的时机刻意选在本次 `dropRelayKCP` **之前**，所以**本次**死亡不会抹掉自己的测量值。
 
 ## 6. 测试（v1 已落地）
 

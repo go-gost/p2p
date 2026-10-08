@@ -196,6 +196,79 @@ func TestRebuildStormFiresAcrossAdapterSwaps(t *testing.T) {
 	}
 }
 
+// TestKillRecordsItsDeathBeforeTheAdapterReadsAsDead pins the ordering inside
+// killSession that the peer-down line depends on: the death must be recorded in
+// the same pc.mu block that publishes pc.closed, because pc.closed is what a
+// concurrent rebuild reads to decide the adapter is dead. Date the death after
+// that unlock and a rebuild landing in the gap consumes an unset death — it
+// emits a line carrying no downFor, and the stamp lands on an adapter already
+// out of e.peers, so nothing ever reports it.
+//
+// The gap is made deterministic rather than raced for: relayKCPFreshness takes
+// e.kcpMu, so holding that lock freezes the kill at its pair read.
+func TestKillRecordsItsDeathBeforeTheAdapterReadsAsDead(t *testing.T) {
+	capture := &logCapture{}
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(capture))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{37}
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	pc := e.peerConn(peer)
+	pc.mu.Lock()
+	pc.secure = settled
+	if _, err := pc.sessionLocked(); err != nil {
+		pc.mu.Unlock()
+		t.Fatalf("build session: %v", err)
+	}
+	pc.mu.Unlock()
+
+	// Park the kill on its pair read. reasonLocalKill is a clean kill, so this is
+	// the only e.kcpMu it waits on and holding the lock freezes it in place.
+	e.kcpMu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		pc.killSession(errors.New("test: clean kill"), true, reasonLocalKill)
+		close(done)
+	}()
+	// Let the kill get as far as it can. It cannot pass its pair read while this
+	// lock is held, so whatever it has published by now is all a rebuild arriving
+	// now could ever see — and it must not have published "dead" without the
+	// death to go with it.
+	time.Sleep(200 * time.Millisecond)
+	pc.mu.Lock()
+	closed := pc.closed
+	pc.mu.Unlock()
+	if closed {
+		e.kcpMu.Unlock()
+		<-done
+		t.Fatal("the adapter reads as dead before its death is recorded: a rebuild landing here emits no downFor, and the stamp is orphaned")
+	}
+
+	e.kcpMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the kill did not finish after the pair lock was released")
+	}
+
+	e.peerConn(peer)
+	attrs := capture.nth("relay session rebuilt", 0)
+	if attrs == nil {
+		t.Fatal("a kill-driven rebuild logged no \"relay session rebuilt\" record")
+	}
+	if attrs["downFor"] == "" {
+		t.Fatal("the rebuild line carries no downFor: the kill published the adapter dead before it recorded the death")
+	}
+	if attrs["silentFor"] == "" {
+		t.Fatal("the rebuild line carries no silentFor")
+	}
+}
+
 // TestSessionGenerationMonotonicAndDistinct pins the session-generation
 // identifier: every built relay session gets a process-unique, strictly
 // increasing generation, so two peers never collide and a rebuild advances it.

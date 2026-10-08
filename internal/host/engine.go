@@ -2297,9 +2297,15 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 		// This path has no kill behind it, so the death has to be dated here:
 		// nothing else observed it, and without this the rebuild line is the
 		// only trace of an outage with no start time. The pair's recency is read
-		// out of pc.mu (it takes the pair's lock) and then the whole set is read
-		// out and cleared in one block, so a kill arriving in between cannot
-		// stamp a second death over this one.
+		// out of pc.mu (it takes the pair's lock) and the whole set is then read
+		// out and cleared in one block.
+		//
+		// The IsZero guard keeps one death from being dated twice, but it is not
+		// a barrier against a concurrent kill: killSession stamps in the same
+		// block that publishes pc.closed, so a kill landing inside this window
+		// either wins (this branch reports the kill's death) or lands after the
+		// clear and is reported by that kill's own rebuild. Both are the later
+		// death, so neither double-counts an outage.
 		fresh, freshOK := pc.e.relayKCPFreshness(pc.peer)
 		now := time.Now()
 		pc.mu.Lock()
@@ -2767,6 +2773,26 @@ func (e *engine) resetsPairKCPFor(peer derpclient.PublicKey, reason sessionEndRe
 // peer restarted or the pair is ending, or the engine is going away. smux's
 // Close above reaches only the per-build stream view, never the pair's session.
 func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndReason) {
+	// Date the outage HERE, at the death, and out of pc.mu: reading the pair
+	// takes its own lock, and pc.mu is taken under e.mu elsewhere. The
+	// observation has to happen at this point and not when the rebuild log is
+	// emitted, for two reasons — by emit time the peer may be sending again, so
+	// the span collapses to ~0, and this same call resets the pair's KCP epoch
+	// for six of the nine kill reasons (see resetsPairKCP), so dropRelayKCP
+	// below deletes the pair and the rebuild is left with no recency at all.
+	// Taking it after that deletion is the one order that loses the value.
+	//
+	// It also has to happen BEFORE pc.mu, not after it: the stamp below goes in
+	// the same block that publishes pc.closed, and a rebuild reaching a dead
+	// adapter in between would consume an unset death — emitting a line with no
+	// downFor, and orphaning the stamp on an adapter already out of e.peers.
+	// (See TestKillRecordsItsDeathBeforeTheAdapterReadsAsDead.)
+	var fresh time.Time
+	var freshOK bool
+	if pc.e != nil {
+		fresh, freshOK = pc.e.relayKCPFreshness(pc.peer)
+	}
+
 	pc.mu.Lock()
 	if pc.closed {
 		pc.mu.Unlock()
@@ -2774,6 +2800,18 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	}
 	pc.closed = true
 	pc.lastEndReason = reason
+	// When the peer went dead, and how long it had been silent before that:
+	// both observed above, both consumed by the next rebuild log, which is the
+	// only reader (see relayDownAttrs and the peerConn field docs). Stamped
+	// unconditionally, unlike ensureSession's IsZero guard: the pc.closed check
+	// runs in this same block, so an adapter can only ever be dated once.
+	// silentFor stays 0 when the engine held no pair to measure — see the field
+	// doc for what that does and does not mean.
+	pc.deadSince = time.Now()
+	pc.silentFor = 0
+	if freshOK {
+		pc.silentFor = pc.deadSince.Sub(fresh)
+	}
 	close(pc.closeCh)
 	sess := pc.sess
 	kcpConn := pc.kcp
@@ -2785,28 +2823,6 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	age := time.Duration(0)
 	if !pc.sessAt.IsZero() {
 		age = time.Since(pc.sessAt)
-	}
-	pc.mu.Unlock()
-
-	// Date the outage HERE, at the death, and out of pc.mu: reading the pair
-	// takes its own lock, and pc.mu is taken under e.mu elsewhere. The
-	// observation has to happen at this point and not when the rebuild log is
-	// emitted, for two reasons — by emit time the peer may be sending again, so
-	// the span collapses to ~0, and this same call resets the pair's KCP epoch
-	// for six of the nine kill reasons (see resetsPairKCP), so dropRelayKCP
-	// below deletes the pair and the rebuild is left with no recency at all.
-	// Taking it after that deletion is the one order that loses the value.
-	var fresh time.Time
-	var freshOK bool
-	if pc.e != nil {
-		fresh, freshOK = pc.e.relayKCPFreshness(pc.peer)
-	}
-	now := time.Now()
-	pc.mu.Lock()
-	pc.deadSince = now
-	pc.silentFor = 0
-	if freshOK {
-		pc.silentFor = now.Sub(fresh)
 	}
 	pc.mu.Unlock()
 

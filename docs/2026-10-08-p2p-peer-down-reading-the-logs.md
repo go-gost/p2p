@@ -29,9 +29,16 @@
 - `silentFor` 明显大于 0 → peer 先静默了一会儿才被判死，这是**链路问题**的形状
   （黑洞、WiFi 切 4G、relay 断），不是软件把它踢了。
 
-`silentFor=0` 也可能是「引擎当时没有 pair 可测」：六个 kill reason 会重置 pair 的
-KCP epoch 并删掉 pair（`killSession → dropRelayKCP → delete(e.relayKCPs, peer)`），
-那一次没有 recency 可读。它不等于「peer 一直说到死」。
+`silentFor=0` 也可能是「引擎当时没有 pair 可测」—— 没有 recency 可读，原因有三个，
+都不是「peer 一直说到死」：
+
+- **pair 从来没建过**（peer 还从没走过 relay）；
+- **pair 已经被更早的一次事件删掉**（六个 kill reason 会重置 pair 的 KCP epoch 并
+  `delete(e.relayKCPs, peer)`）—— 注意是**更早**的那次：这一次死亡读 recency 的时机
+  刻意选在 `dropRelayKCP` 之前，否则这次死亡会把自己的测量值一起抹掉；
+- **pair 刚刚才收到过数据报**，也就是静默时长真的≈0。
+
+所以 `silentFor=0` 是「说不出」而不是「没静默」；要区分只能看这一行之外的东西。
 
 没有观测到死亡时（例如换了实现路径），这行只带 `relayReason`，不带两个时长 ——
 零值时间会被渲染成一个「从公元 1 年算起」的荒谬时长，所以宁可不给。
