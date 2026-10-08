@@ -1665,6 +1665,10 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 	// window state — events, warned, and the injected clock — keeps the
 	// "exactly one WARN per window" guarantee across the swap.
 	dead.storm.carryTo(&pc.storm)
+	// The churn window is the same class of pair state: without it a peer
+	// killed on every adapter restarts at zero per swap and the churn guard
+	// can never trip on the kill-driven path.
+	pc.churn, pc.churnFrom, pc.churnTripped = dead.churn, dead.churnFrom, dead.churnTripped
 	// The new session starts at a zero streak, so the count that explains
 	// the rebuild has to come off the session being replaced.
 	var streak int

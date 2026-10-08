@@ -518,3 +518,48 @@ func TestRelayDownAttrsWithoutAnObservedDeath(t *testing.T) {
 		}
 	}
 }
+
+// TestChurnSurvivesAdapterSwap pins the pair scope of the churn window: two
+// kills of the same peer with one adapter swap between them must count as two
+// builds in one window, not two fresh windows of one. The swap carries the
+// rebuild counters, the storm and the reason across (see peerConn); the churn
+// window is the same class of pair state, and without it the A path (repeated
+// active kills, one swap each) restarts at zero every time and the churn guard
+// can never trip there.
+func TestChurnSurvivesAdapterSwap(t *testing.T) {
+	capture := &logCapture{}
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(capture))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{38}
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	build := func() *peerConn {
+		t.Helper()
+		pc := e.peerConn(peer)
+		pc.mu.Lock()
+		pc.secure = settled
+		if _, err := pc.sessionLocked(); err != nil {
+			pc.mu.Unlock()
+			t.Fatalf("build session: %v", err)
+		}
+		pc.mu.Unlock()
+		return pc
+	}
+
+	pc1 := build()
+	pc1.killSession(errors.New("test: first kill"), true, reasonLocalKill)
+	pc2 := build()
+	pc2.killSession(errors.New("test: second kill"), true, reasonLocalKill)
+	pc3 := e.peerConn(peer)
+
+	pc3.mu.Lock()
+	churn := pc3.churn
+	pc3.mu.Unlock()
+	if churn != 2 {
+		t.Fatalf("churn after two kills across one swap = %d, want 2 — the swap restarted the window", churn)
+	}
+}
