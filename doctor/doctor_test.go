@@ -277,3 +277,22 @@ func TestReportDegradesWithoutRelayState(t *testing.T) {
 		t.Errorf("unknown relay verdict missing:\n%s", out)
 	}
 }
+
+// TestReportStatesThePeerDownPairingRule pins the reading rule in the place an
+// operator reaches for when a peer misbehaves. It is prose, not state: the
+// rebuild line is log-only (Status carries no down/up fields), so without this
+// the rule lives nowhere a reader will look — and "a rebuild with no kill" reads
+// like a bug to whoever meets it first.
+func TestReportStatesThePeerDownPairingRule(t *testing.T) {
+	out := Report(p2p.Status{}, Options{})
+	for _, want := range []string{
+		"one outage = one \"relay session rebuilt\"",
+		"empty relayReason",
+		"a rebuild without a kill is normal",
+		"a kill without a rebuild",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing the pairing rule %q\n---\n%s", want, out)
+		}
+	}
+}

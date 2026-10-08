@@ -1682,6 +1682,12 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		"sessionAge", age.Round(time.Millisecond),
 		"gen", gen,
 	}
+	// This line, not the kill's, is the record of one outage: a kill always
+	// implies a rebuild here (killSession closed the adapter, so this is the
+	// only way back), and the relay-side accept loop logs nothing at all when a
+	// session dies — so a rebuild with no kill is the normal shape of a silent
+	// keepalive timeout, not a missing event. See
+	// docs/2026-10-08-p2p-peer-down-reading-the-logs.md.
 	rebuildAttrs = append(rebuildAttrs, relayDownAttrs(reason, deadSince, silentFor, time.Now())...)
 	e.mu.Unlock()
 
@@ -2320,6 +2326,9 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 		// An empty reason is the informative case, not a missing one: it says
 		// the smux keepalive timeout judged this session dead with no kill at
 		// all, which is the outage the relay-side accept loop logs nothing for.
+		// One outage is one rebuild line whichever path it came by, and a
+		// rebuild with no kill is normal — see
+		// docs/2026-10-08-p2p-peer-down-reading-the-logs.md.
 		replacedAttrs = append(replacedAttrs, relayDownAttrs(reason, deadSince, silentFor, time.Now())...)
 		// The dead session died on its own (a clean end), so the pair's KCP
 		// session survives and its health rides the rebuild line.
