@@ -2793,10 +2793,11 @@ const (
 	reasonQueueOverflow sessionEndReason = "queue-overflow"
 	// reasonLinkLost: the relay link carrying it went down.
 	reasonLinkLost sessionEndReason = "link-lost"
-	// reasonRelaySilent: the relay idle watchdog's first strike — the relay
-	// underlay went quiet past relayIdleWindow. A clean death by omission
-	// from resetsPairKCP: the pair's KCP session and keys survive, so the
-	// rebuild is the cheap transparent one.
+	// reasonRelaySilent: the relay idle watchdog's first strike — the PAIR
+	// went quiet past relayIdleWindow (neither underlay carrying, not relay
+	// alone: a session living on direct sends nothing over relay). A clean
+	// death by omission from resetsPairKCP: the pair's KCP session and keys
+	// survive, so the rebuild is the cheap transparent one.
 	reasonRelaySilent sessionEndReason = "relay-silent"
 	// reasonPeerGone: the relay reported the peer is gone.
 	reasonPeerGone sessionEndReason = "peer-gone"

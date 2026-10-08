@@ -221,7 +221,9 @@ func verdicts(st p2p.Status, opts Options) []string {
 func peerDownPairingRule() string {
 	return `peer down/up (in the log): one outage = one "relay session rebuilt" line; ` +
 		`empty relayReason means the smux keepalive judged the peer dead with no kill, ` +
-		`so a rebuild without a kill is normal, while a kill without a rebuild means the outage never healed`
+		`so a rebuild without a kill is normal, while a kill without a rebuild means the outage never healed; ` +
+		`a "relay-silent" kill is the idle watchdog's strike 1 (pair silent past its window, mux only, keys kept), ` +
+		`and a "link-lost" right after it is strike 2 resetting the pair — one outage in two lines, not two outages`
 }
 
 // relayVerdict names the relay's state. A caller that carries it (in-process,

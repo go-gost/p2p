@@ -296,3 +296,20 @@ func TestReportStatesThePeerDownPairingRule(t *testing.T) {
 		}
 	}
 }
+
+// TestReportMentionsRelaySilentStrikes pins the two-strike reading rule where
+// an operator looks when a peer flaps: strike 1 kills only the mux (clean,
+// keys kept), strike 2 resets the pair. Without it a "relay-silent" kill
+// reads as a software kick and a "link-lost" after it reads as a second,
+// unrelated outage.
+func TestReportMentionsRelaySilentStrikes(t *testing.T) {
+	out := Report(p2p.Status{}, Options{})
+	for _, want := range []string{
+		"relay-silent",
+		"strike 2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing the two-strike rule %q\n---\n%s", want, out)
+		}
+	}
+}

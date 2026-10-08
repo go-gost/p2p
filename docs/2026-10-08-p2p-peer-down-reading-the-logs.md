@@ -54,6 +54,38 @@ relay session rebuilt  peer=Hpv9… secureReuse=true desyncStreak=0 sessionAge=3
 peer 换了密钥 → 主动 kill → 立刻重建，键复用。`silentFor≈downFor` 说的是「它说到死为止，
 然后才被换掉」，跟 `silentFor=9s downFor=9.4s` 的「先静默 9 秒，然后超时判死」是完全不同的两件事。
 
+## 两击序列读法（relay idle watchdog）
+
+pair 两条路都不走、超过 6s（`relayIdleWindow`），watchdog 开一个 episode，
+按击次升级。按顺序找这三行，它们是**一次断链**，不是三次：
+
+```
+relay path silent  peer=Hpv9… silentFor=9.2s strike=1
+peer session killed  peer=Hpv9… relayReason=relay-silent …
+peer session killed  peer=Hpv9… relayReason=link-lost …
+relay kcp pair reset  peer=Hpv9… cause=… gen=…
+```
+
+- `strike=1` + `relay-silent` kill：只杀 mux（clean death，pair 和密钥都在），
+  重建走透明路径，不重新握手。
+- `strike=2` + `link-lost` kill + `relay kcp pair reset`：同一 episode 里静默
+  还在继续（重建后仍然没流量），升级为杀 pair、结束 epoch。`link-lost` 在这里
+  不是「relay 链路断了」的独立事件，而是第二击借用的 reason —— `resetsPairKCP`
+  本来就认它，所以抑制与 churn 计数自动生效。
+- 只看到 `strike=1`、没有 `strike=2`：静默没熬过第二个窗口（流量回来了，或者
+  session 先被别的路径判死）。episode 靠流量关闭，两条路的数据报都算数。
+
+两个 `silentFor` 含义不同，不要直接比大小：
+
+| 行 | `silentFor` 的起点 | 含义 |
+| --- | --- | --- |
+| `relay path silent` | pair 的 relay 面上次收到数据报 | relay 面实测的静默时长 —— 证据 |
+| `peer session killed` / `relay session rebuilt` | pair 两条路较新者（`freshestRecv`） | 合并口径的静默时长 —— 判决依据 |
+
+relay 面静默 ≠ pair 静默：peer 迁到 direct 之后 relay 面自然就静了，
+`relay path silent` 的 `silentFor` 照样涨，但只要 direct 还在走，watchdog
+一击都不会打。看到很大的 `silentFor` 先问「direct 在走吗」，再下结论。
+
 ## 不要做的事
 
 - 不要因为「rebuild 没有配对的 kill」就给静默判死补一条 kill 日志 —— 现状就是设计。
