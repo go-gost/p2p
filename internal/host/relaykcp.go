@@ -129,11 +129,14 @@ const (
 // production default is 6s.
 var directUnderlayIdle = 6 * time.Second
 
-// relayIdleWindow is how long the relay underlay may go without delivering an
-// inbound datagram before the pair's idle watchdog reports it. It is 2x the
-// smux keepalive interval (3s): a healthy relay session's NOPs cross in both
+// relayIdleWindow is how long the pair may go without delivering an inbound
+// datagram on either underlay before its idle watchdog reports it. It is 2x
+// the smux keepalive interval (3s): a healthy session's NOPs cross in both
 // directions every 3s, so a pair quiet past this window is not an idle link
-// but a dead one. The same bound is Task 2's relayLiveWindow (a separate var
+// but a dead one. Relay-only quiet is not enough — a session living on
+// direct sends nothing over relay — so the fire condition is pair silence
+// (the freshest of the two stamps), while silentFor stays relay-measured as
+// the evidence. The same bound is Task 2's relayLiveWindow (a separate var
 // for the death handler's gate — same default, deliberate). It is a var so
 // tests can shorten it; the production default is 6s.
 var relayIdleWindow = 6 * time.Second
@@ -677,6 +680,13 @@ func (p *relayKCPPair) reportRelayIdle() (strike int, silentFor time.Duration) {
 		return 0, 0
 	}
 	silentFor = time.Since(p.lastRelayRecv)
+	if p.lastRelayRecv.IsZero() {
+		// No relay datagram ever observed (a session raised on direct, or a
+		// virgin pair): "since the zero time" is uptime-shaped noise, not a
+		// measurement. Zero reads as "cannot say", matching silentFor=0's
+		// standing meaning elsewhere.
+		silentFor = 0
+	}
 	if p.relayIdleFired {
 		return 0, 0
 	}
@@ -720,7 +730,7 @@ func (p *relayKCPPair) watchRelayIdle() {
 				continue
 			}
 			peer := p.peer
-			go p.e.relayPathSilent(peer, strike, silentFor)
+			go p.e.relayPathSilent(peer, p, strike, silentFor)
 		}
 	}
 }

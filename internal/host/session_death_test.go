@@ -263,11 +263,17 @@ func TestDeathReportRacingKillStandsDown(t *testing.T) {
 	pc.mu.Unlock()
 
 	var wg sync.WaitGroup
+	var resMu sync.Mutex
+	accepted := 0
 	for i := 0; i < 50; i++ {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_ = e.peerRelaySessionEnded(sess, peer, errors.New("test: read error"))
+			if err := e.peerRelaySessionEnded(sess, peer, errors.New("test: read error")); err == nil {
+				resMu.Lock()
+				accepted++
+				resMu.Unlock()
+			}
 		}()
 		go func(n int) {
 			defer wg.Done()
@@ -289,6 +295,15 @@ func TestDeathReportRacingKillStandsDown(t *testing.T) {
 	total := capture.count("peer relay session ended") + capture.count("peer session killed")
 	if total == 0 || total > 100 {
 		t.Fatalf("ended + killed lines = %d, want in (0, 100]: every death accounted for, none invented", total)
+	}
+	// Every rebuild line has a cause: an accepted report's single ensureSession
+	// call, or a dead adapter left by an effective kill (whose replacement
+	// logs the rebuild on the next lookup — repeat kills on a closed adapter
+	// return early and log nothing). A kill racing an accepted report can
+	// never conjure a rebuild from neither: kills resurrect nothing.
+	kills := capture.count("peer session killed")
+	if got := capture.count("relay session rebuilt"); got > accepted+kills {
+		t.Fatalf("rebuilt lines = %d, accepted reports + kills = %d: a rebuild without a cause", got, accepted+kills)
 	}
 }
 

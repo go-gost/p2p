@@ -1330,9 +1330,9 @@ func (e *engine) directUnderlayDead(peer derpclient.PublicKey, u *directUnderlay
 	dc.underlayDead(u)
 }
 
-// relayPathSilent is the relay idle watchdog's engine side: the pair's relay
-// underlay went quiet past relayIdleWindow, and the strike says which hit
-// this is. The evidence line always fires — silentFor is the pair's own
+// relayPathSilent is the relay idle watchdog's engine side: the pair went
+// quiet on both underlays past relayIdleWindow, and the strike says which
+// hit this is. The evidence line always fires — silentFor is the pair's own
 // relay-measured silence, not the kill line's merged freshestRecv — and then:
 // strike 1 kills only the mux (reasonRelaySilent is a clean death: the pair
 // and its keys survive for the cheap rebuild), strike 2 and beyond kill with
@@ -1344,13 +1344,29 @@ func (e *engine) directUnderlayDead(peer derpclient.PublicKey, u *directUnderlay
 // It runs on the watchdog's dispatch goroutine, off the tick, and takes no
 // pair lock itself: livePeerConn takes e.mu, killSession reads the pair's
 // recency outside pc.mu, so the order stays pair-then-adapter throughout.
-func (e *engine) relayPathSilent(peer derpclient.PublicKey, strike int, silentFor time.Duration) {
+//
+// pair is the pair that observed the silence. A strike dispatched from a pair
+// that is reset before the dispatch runs must not kill the replacement
+// adapter — the store lookup below stands a stale dispatch down, mirroring
+// dropRelayKCP's compare-and-delete.
+func (e *engine) relayPathSilent(peer derpclient.PublicKey, pair *relayKCPPair, strike int, silentFor time.Duration) {
 	e.log.Debug("relay path silent", "peer", keyName(peer),
 		"silentFor", silentFor.String(), "strike", strike)
 	// livePeerConn, not peerConn (see peerRelaySessionEnded): a report for a
 	// peer with no adapter must not create one.
 	pc := e.livePeerConn(peer)
 	if pc == nil {
+		return
+	}
+	// Stale dispatch: the pair that fired no longer owns the peer — a reset
+	// replaced it (or nothing did). Killing the current adapter would bill a
+	// previous episode's strike to the new session.
+	e.kcpMu.Lock()
+	live := e.relayKCPs[peer]
+	e.kcpMu.Unlock()
+	if live != pair {
+		e.log.Debug("relay path silent: pair replaced, standing down",
+			"peer", keyName(peer), "strike", strike)
 		return
 	}
 	pc.mu.Lock()

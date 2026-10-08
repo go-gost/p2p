@@ -134,7 +134,7 @@ func TestRelayWatchdogSecondStrikeResetsPair(t *testing.T) {
 	if silentFor <= relayIdleWindow {
 		t.Fatalf("first report silentFor = %v, want past the window", silentFor)
 	}
-	e.relayPathSilent(peer, strike, silentFor)
+	e.relayPathSilent(peer, pair, strike, silentFor)
 	waitFor(t, 5*time.Second, func() bool {
 		return capture.count("peer session killed") >= 1
 	})
@@ -165,7 +165,7 @@ func TestRelayWatchdogSecondStrikeResetsPair(t *testing.T) {
 	if strike != 2 {
 		t.Fatalf("second report strike = %d, want 2: the rebuild re-arms the latch, the continued silence escalates", strike)
 	}
-	e.relayPathSilent(peer, strike, silentFor)
+	e.relayPathSilent(peer, pair, strike, silentFor)
 	if got := e.relayKCPPairGet(peer); got != nil {
 		t.Fatal("the pair survived strike 2: a continued silence must end the epoch")
 	}
@@ -292,6 +292,52 @@ func TestRelayWatchdogRearmsOnDirectTraffic(t *testing.T) {
 	}
 }
 
+// TestRelayWatchdogStaleDispatchStandsDown: a strike dispatched from a pair
+// that is reset before the dispatch runs must not kill the replacement
+// adapter. The dispatch carries no identity today — it kills whatever adapter
+// is current — so a scheduling stall across a pair reset turns one outage's
+// strike into a second, unrelated kill.
+func TestRelayWatchdogStaleDispatchStandsDown(t *testing.T) {
+	shortenRelayWindowOnly(t)
+	capture := &logCapture{}
+	peer := derpclient.PublicKey{58}
+	e, pc, pair := watchdogEngine(t, capture, peer)
+
+	// Reset the pair out from under the strike: the strike-2 kill ends P1
+	// and its adapter, and the rebuild comes up on a new pair P2 with a new
+	// adapter — the production interleaving a stalled dispatch lands in.
+	// dropSecure=false keeps the keys, like the real strike 2.
+	killsBefore := capture.count("peer session killed")
+	pc.killSession(errors.New("test: strike 2"), false, reasonLinkLost)
+	if got := e.relayKCPPairGet(peer); got != nil {
+		t.Fatal("the pair survived the link-lost kill")
+	}
+	e.mu.Lock()
+	settled := e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
+	e.mu.Unlock()
+	if settled == nil {
+		t.Fatal("the link-lost kill dropped the secure session")
+	}
+	pc2 := relaySessionFor(t, e, peer, settled)
+	pair2 := e.relayKCPPairGet(peer)
+	if pair2 == nil || pair2 == pair {
+		t.Fatal("no replacement pair carries the rebuilt session")
+	}
+	setPairRecency(pair2, time.Now(), time.Now())
+
+	// The stale strike, dispatched from P1 before the reset, runs now.
+	e.relayPathSilent(peer, pair, 1, time.Second)
+	if got := capture.count("peer session killed"); got != killsBefore+1 {
+		t.Fatalf("killed lines = %d, want %d: a stale dispatch must not kill the replacement adapter", got, killsBefore+1)
+	}
+	pc2.mu.Lock()
+	closed := pc2.sess.IsClosed()
+	pc2.mu.Unlock()
+	if closed {
+		t.Fatal("the replacement session is closed: the stale strike killed it")
+	}
+}
+
 // TestRelayWatchdogIgnoresSessionlessPair: a pair that never built a session
 // (sessAt zero — no mux to kill) must not be killed by the watchdog, however
 // silent. There is nothing to rebuild and no outage to date.
@@ -315,13 +361,44 @@ func TestRelayWatchdogIgnoresSessionlessPair(t *testing.T) {
 	if strike != 1 {
 		t.Fatalf("report strike = %d, want 1: the pair-side report does not know about sessions", strike)
 	}
-	e.relayPathSilent(peer, strike, silentFor)
+	e.relayPathSilent(peer, pair, strike, silentFor)
 
 	if got := capture.count("peer session killed"); got != 0 {
 		t.Fatalf("killed lines = %d, want 0: a sessionless pair has no mux to kill", got)
 	}
 	if got := e.relayKCPPairGet(peer); got == nil {
 		t.Fatal("the pair died on a sessionless strike")
+	}
+}
+
+// TestRelayWatchdogZeroRelayStampClampsEvidence: a pair that never received a
+// relay datagram (raised on direct, or virgin) has a zero relay stamp.
+// Reporting "since the zero time" would emit uptime-shaped noise as evidence;
+// the report clamps it to 0 — "cannot say", matching silentFor=0's standing
+// meaning on the kill/rebuild lines.
+func TestRelayWatchdogZeroRelayStampClampsEvidence(t *testing.T) {
+	shortenRelayWindowOnly(t)
+	capture := &logCapture{}
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(capture))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{59}
+	pair := e.relayKCPPairFor(peer)
+	t.Cleanup(pair.shutdown)
+	// Relay stamp stays zero (never observed); direct stale past the window
+	// so the pair reads as silent and the report fires.
+	setPairDirectRecency(pair, time.Now().Add(-time.Hour))
+
+	strike, silentFor := pair.reportRelayIdle()
+	if strike != 1 {
+		t.Fatalf("report strike = %d, want 1", strike)
+	}
+	if silentFor != 0 {
+		t.Fatalf("report silentFor = %v, want 0: a zero relay stamp is unmeasured, not ancient", silentFor)
 	}
 }
 
