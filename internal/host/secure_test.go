@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -826,4 +827,44 @@ func TestCryptoConnFailedWriteHandsNonceBack(t *testing.T) {
 	if string(pt) != "kept" {
 		t.Fatalf("the surviving record = %q, want %q", pt, "kept")
 	}
+}
+
+// TestResendIntervalSafeToChangeWhileEnginesAreLive pins that the handshake
+// retry spacing can be changed while engines are live. Tests shorten it, and an
+// engine from an earlier test can still be inside ensureSession's retry loop
+// while they do — that goroutine belongs to no test that is running. A plain
+// var makes that a data race, and -race fails the whole package's run on it,
+// not just this test.
+//
+// The reader samples through an atomic sink so the load cannot be optimized
+// away, and reports its first sample before the writes begin, so the two really
+// do overlap rather than racing by accident of scheduling.
+func TestResendIntervalSafeToChangeWhileEnginesAreLive(t *testing.T) {
+	var sink atomic.Int64
+	started := make(chan struct{})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			sink.Add(int64(resendInterval.Load()))
+			if i == 0 {
+				close(started)
+			}
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+
+	<-started
+	defer resendInterval.Store(resendInterval.Load())
+	for i := 0; i < 1000; i++ {
+		resendInterval.Store(int64(50 * time.Millisecond))
+	}
+
+	close(stop)
+	<-done
 }

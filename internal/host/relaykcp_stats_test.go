@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
 )
@@ -224,5 +225,93 @@ func TestRelayKCPStatsOnRebuildLog(t *testing.T) {
 	}
 	if attrs["kcpBytesSent"] == "" || attrs["kcpBytesRcvd"] == "" {
 		t.Fatal("rebuild log is missing a KCP byte counter")
+	}
+}
+
+// TestRelayKCPPairFreshestRecv pins the merged underlay recency the peer-down
+// observability reads: the FRESHER of the two underlays' last inbound datagram.
+// Not the relay's stamp alone (a peer alive on the direct underlay leaves the
+// relay's stamp aging, so the relay-only read calls a live peer silent), and not
+// gated on the pair's presence (a kill that resets the pair's KCP epoch retires
+// the session while the recency is exactly what explains the death).
+func TestRelayKCPPairFreshestRecv(t *testing.T) {
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{23}
+	relayAt := time.Date(2026, 1, 1, 0, 0, 3, 0, time.UTC)
+	directAt := time.Date(2026, 1, 1, 0, 0, 7, 0, time.UTC)
+
+	tests := []struct {
+		name           string
+		lastRelayRecv  time.Time
+		lastDirectRecv time.Time
+		want           time.Time
+		wantOK         bool
+	}{
+		{"neither underlay heard from", time.Time{}, time.Time{}, time.Time{}, false},
+		{"relay only", relayAt, time.Time{}, relayAt, true},
+		{"direct only", time.Time{}, directAt, directAt, true},
+		{"direct fresher", relayAt, directAt, directAt, true},
+		{"relay fresher", directAt, relayAt, directAt, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pair := newRelayKCPPair(e, peer)
+			t.Cleanup(pair.shutdown)
+			pair.lastRelayRecv = tc.lastRelayRecv
+			pair.lastDirectRecv = tc.lastDirectRecv
+
+			got, ok := pair.freshestRecv()
+			if ok != tc.wantOK {
+				t.Fatalf("freshestRecv ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !got.Equal(tc.want) {
+				t.Fatalf("freshestRecv = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// No KCP session exists in any case above, and that must not hide the
+	// recency: absent-session is the state a kill leaves behind, and the
+	// peer-down observability reads this precisely then.
+	pair := newRelayKCPPair(e, peer)
+	t.Cleanup(pair.shutdown)
+	if pair.snapshot().present {
+		t.Fatal("a fresh pair reports a live KCP session")
+	}
+	pair.lastDirectRecv = directAt
+	if got, ok := pair.freshestRecv(); !ok || !got.Equal(directAt) {
+		t.Fatalf("freshestRecv with no KCP session = %v, %v; want %v, true", got, ok, directAt)
+	}
+}
+
+// TestEngineRelayKCPFreshness pins the engine-side read: a peer the engine has
+// no pair for reports no recency, rather than a zero time that would age into
+// "since 1970" in a downstream log.
+func TestEngineRelayKCPFreshness(t *testing.T) {
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{29}
+	if at, ok := e.relayKCPFreshness(peer); ok {
+		t.Fatalf("freshness for a peer with no pair = %v, true; want false", at)
+	}
+
+	at := time.Date(2026, 1, 1, 0, 0, 11, 0, time.UTC)
+	pair := e.relayKCPPairFor(peer)
+	t.Cleanup(pair.shutdown)
+	pair.lastRelayRecv = at
+	got, ok := e.relayKCPFreshness(peer)
+	if !ok || !got.Equal(at) {
+		t.Fatalf("relayKCPFreshness = %v, %v; want %v, true", got, ok, at)
 	}
 }

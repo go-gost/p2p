@@ -1754,8 +1754,8 @@ func TestRelayLinkLossRekeys(t *testing.T) {
 // bit A would stay unsettled (and plaintext) while B encrypts, killing both mux
 // sessions and churning the shared relay.
 func TestRelayHandshakeLostReplyHeals(t *testing.T) {
-	defer func(d time.Duration) { resendInterval = d }(resendInterval)
-	resendInterval = 50 * time.Millisecond
+	defer resendInterval.Store(resendInterval.Load())
+	resendInterval.Store(int64(50 * time.Millisecond))
 
 	rs := &relayServer{}
 	url := rs.start(t)
@@ -1907,8 +1907,8 @@ func TestEncryptionState(t *testing.T) {
 func TestRelayRefusesUnencryptedPeer(t *testing.T) {
 	defer func(d time.Duration) { handshakeTimeout = d }(handshakeTimeout)
 	handshakeTimeout = 300 * time.Millisecond
-	defer func(d time.Duration) { resendInterval = d }(resendInterval)
-	resendInterval = 50 * time.Millisecond
+	defer resendInterval.Store(resendInterval.Load())
+	resendInterval.Store(int64(50 * time.Millisecond))
 
 	eA, eB, rs := newEncryptedPair(t)
 	rs.mu.Lock()

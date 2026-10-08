@@ -196,6 +196,79 @@ func TestRebuildStormFiresAcrossAdapterSwaps(t *testing.T) {
 	}
 }
 
+// TestKillRecordsItsDeathBeforeTheAdapterReadsAsDead pins the ordering inside
+// killSession that the peer-down line depends on: the death must be recorded in
+// the same pc.mu block that publishes pc.closed, because pc.closed is what a
+// concurrent rebuild reads to decide the adapter is dead. Date the death after
+// that unlock and a rebuild landing in the gap consumes an unset death — it
+// emits a line carrying no downFor, and the stamp lands on an adapter already
+// out of e.peers, so nothing ever reports it.
+//
+// The gap is made deterministic rather than raced for: relayKCPFreshness takes
+// e.kcpMu, so holding that lock freezes the kill at its pair read.
+func TestKillRecordsItsDeathBeforeTheAdapterReadsAsDead(t *testing.T) {
+	capture := &logCapture{}
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("", "", priv, slog.New(capture))
+	t.Cleanup(e.Close)
+
+	peer := derpclient.PublicKey{37}
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	pc := e.peerConn(peer)
+	pc.mu.Lock()
+	pc.secure = settled
+	if _, err := pc.sessionLocked(); err != nil {
+		pc.mu.Unlock()
+		t.Fatalf("build session: %v", err)
+	}
+	pc.mu.Unlock()
+
+	// Park the kill on its pair read. reasonLocalKill is a clean kill, so this is
+	// the only e.kcpMu it waits on and holding the lock freezes it in place.
+	e.kcpMu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		pc.killSession(errors.New("test: clean kill"), true, reasonLocalKill)
+		close(done)
+	}()
+	// Let the kill get as far as it can. It cannot pass its pair read while this
+	// lock is held, so whatever it has published by now is all a rebuild arriving
+	// now could ever see — and it must not have published "dead" without the
+	// death to go with it.
+	time.Sleep(200 * time.Millisecond)
+	pc.mu.Lock()
+	closed := pc.closed
+	pc.mu.Unlock()
+	if closed {
+		e.kcpMu.Unlock()
+		<-done
+		t.Fatal("the adapter reads as dead before its death is recorded: a rebuild landing here emits no downFor, and the stamp is orphaned")
+	}
+
+	e.kcpMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the kill did not finish after the pair lock was released")
+	}
+
+	e.peerConn(peer)
+	attrs := capture.nth("relay session rebuilt", 0)
+	if attrs == nil {
+		t.Fatal("a kill-driven rebuild logged no \"relay session rebuilt\" record")
+	}
+	if attrs["downFor"] == "" {
+		t.Fatal("the rebuild line carries no downFor: the kill published the adapter dead before it recorded the death")
+	}
+	if attrs["silentFor"] == "" {
+		t.Fatal("the rebuild line carries no silentFor")
+	}
+}
+
 // TestSessionGenerationMonotonicAndDistinct pins the session-generation
 // identifier: every built relay session gets a process-unique, strictly
 // increasing generation, so two peers never collide and a rebuild advances it.
@@ -310,5 +383,138 @@ func TestSessionGenerationOnRebuildLog(t *testing.T) {
 	}
 	if got := attrs["gen"]; got != fmt.Sprint(gen) {
 		t.Fatalf("rebuild log gen = %q, want %d (the replaced session's generation)", got, gen)
+	}
+}
+
+// TestSessionRebuildLogCarriesReasonAndDownDurations pins how the rebuild log
+// answers the question a reader of "peer session killed" actually has: what
+// killed this peer, how long it had been down by the time the rebuild ran, and
+// how long it had already been silent when it died.
+//
+// The two paths are pinned separately because they are different code, and
+// reading either through the other asserts on a line the other never emits: a
+// kill-driven rebuild goes through peerConn (killSession closed the adapter), a
+// self-died one through ensureSession's replacement branch.
+func TestSessionRebuildLogCarriesReasonAndDownDurations(t *testing.T) {
+	// A pair whose last underlay datagram is backdated, so silentFor has a real
+	// recency to measure from instead of "heard from microseconds ago".
+	const quiet = 2 * time.Second
+
+	t.Run("kill-driven rebuild names the reason", func(t *testing.T) {
+		capture := &logCapture{}
+		priv, _, err := derpclient.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		e := newEngine("", "", priv, slog.New(capture))
+		t.Cleanup(e.Close)
+
+		peer := derpclient.PublicKey{31}
+		pair := e.relayKCPPairFor(peer)
+		t.Cleanup(pair.shutdown)
+		pair.lastRelayRecv = time.Now().Add(-quiet)
+
+		settled, _ := settledSecurePair(t, secureTransportRelay)
+		pc := e.peerConn(peer)
+		pc.mu.Lock()
+		pc.secure = settled
+		_, err = pc.sessionLocked()
+		pc.mu.Unlock()
+		if err != nil {
+			t.Fatalf("build session: %v", err)
+		}
+
+		pc.killSession(errors.New("test: clean kill"), true, reasonLocalKill)
+		if got := e.peerConn(peer); got == pc {
+			t.Fatal("the killed adapter was handed back instead of a replacement")
+		}
+
+		attrs := capture.nth("relay session rebuilt", 0)
+		if attrs == nil {
+			t.Fatal("a kill-driven rebuild logged no \"relay session rebuilt\" record")
+		}
+		if got, ok := attrs["relayReason"]; !ok || got != string(reasonLocalKill) {
+			t.Fatalf("relayReason = %q (present=%v), want %q", got, ok, reasonLocalKill)
+		}
+		if attrs["downFor"] == "" {
+			t.Fatal("the rebuild log carries no downFor: how long the peer was down is the line's reason to exist")
+		}
+		got := attrs["silentFor"]
+		if got == "" {
+			t.Fatal("the rebuild log carries no silentFor: how long the peer was already quiet is the part that tells a stall from a kill")
+		}
+		d, err := time.ParseDuration(got)
+		if err != nil {
+			t.Fatalf("silentFor = %q, not a duration: %v", got, err)
+		}
+		if d < quiet || d > quiet+2*time.Second {
+			t.Fatalf("silentFor = %v, want about %v (the pair's last underlay datagram)", d, quiet)
+		}
+	})
+
+	t.Run("self-died rebuild has no reason but still has durations", func(t *testing.T) {
+		capture := &logCapture{}
+		priv, _, err := derpclient.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		e := newEngine("", "", priv, slog.New(capture))
+		t.Cleanup(e.Close)
+
+		peer := derpclient.PublicKey{32}
+		settled, _ := settledSecurePair(t, secureTransportRelay)
+		pc := e.peerConn(peer)
+		pc.mu.Lock()
+		pc.secure = settled
+		pc.mu.Unlock()
+		// A dead session standing in for one the smux keepalive timeout expired
+		// in place: closed, with the adapter still live — the state the
+		// replacement branch sees, and the one that leaves no kill behind it.
+		dead := newTestSess(t)
+		if err := dead.Close(); err != nil {
+			t.Fatal(err)
+		}
+		pc.mu.Lock()
+		pc.sess, pc.sessAt = dead, time.Now()
+		pc.mu.Unlock()
+
+		if _, err := pc.ensureSession(false, true); err != nil {
+			t.Fatalf("replace the dead session: %v", err)
+		}
+
+		attrs := capture.nth("relay session rebuilt", 0)
+		if attrs == nil {
+			t.Fatal("replacing a self-died session logged no \"relay session rebuilt\" record")
+		}
+		if got, ok := attrs["relayReason"]; !ok || got != "" {
+			t.Fatalf("relayReason = %q (present=%v), want \"\": nothing killed this session, so there is no reason to name", got, ok)
+		}
+		if attrs["downFor"] == "" {
+			t.Fatal("a self-died rebuild carries no downFor: the no-kill path is the one that most needs it, having no kill line to read a time off")
+		}
+		if attrs["silentFor"] == "" {
+			t.Fatal("a self-died rebuild carries no silentFor")
+		}
+	})
+}
+
+// TestRelayDownAttrsWithoutAnObservedDeath pins the zero rule shared by both
+// rebuild paths: with no observed death there is a reason to report but no
+// durations. A duration measured from an unset time is the 1970 bug this
+// codebase already hit once on sessionAge (see killSession), and it would read
+// as an outage that started in year 1 and never ends.
+func TestRelayDownAttrsWithoutAnObservedDeath(t *testing.T) {
+	pairs := relayDownAttrs(reasonLocalKill, time.Time{}, 0, time.Now())
+	attrs := map[string]string{}
+	for i := 0; i+1 < len(pairs); i += 2 {
+		attrs[fmt.Sprint(pairs[i])] = fmt.Sprint(pairs[i+1])
+	}
+	if got := attrs["relayReason"]; got != string(reasonLocalKill) {
+		t.Fatalf("relayReason = %q, want %q — the reason does not depend on a death being timed", got, reasonLocalKill)
+	}
+	for _, name := range []string{"downFor", "silentFor"} {
+		if _, ok := attrs[name]; ok {
+			t.Fatalf("%s reported for an adapter with no observed death", name)
+		}
 	}
 }

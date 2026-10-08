@@ -205,7 +205,23 @@ func verdicts(st p2p.Status, opts Options) []string {
 	for _, k := range peerKeys(st, opts.Peer) {
 		out = append(out, peerVerdict(k, st.PeerDiagnostics[k]))
 	}
+	out = append(out, peerDownPairingRule())
 	return out
+}
+
+// peerDownPairingRule is how to read the relay-session down/up lines, carried
+// in the report because it is the thing a reader needs and cannot infer from
+// the numbers here: the rebuild line is log-only, so nothing in this report
+// shows a down or an up.
+//
+// It is last on purpose — it is a footnote to the verdicts above it, not a
+// verdict about this host. Without it "a rebuild with no kill in the log" reads
+// as a missing event, and gets "fixed" by someone adding a kill line to the
+// silent keepalive path.
+func peerDownPairingRule() string {
+	return `peer down/up (in the log): one outage = one "relay session rebuilt" line; ` +
+		`empty relayReason means the smux keepalive judged the peer dead with no kill, ` +
+		`so a rebuild without a kill is normal, while a kill without a rebuild means the outage never healed`
 }
 
 // relayVerdict names the relay's state. A caller that carries it (in-process,
