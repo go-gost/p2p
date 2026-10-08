@@ -1717,6 +1717,12 @@ func (e *engine) acceptLoop(sess *smux.Session, transport string, peer derpclien
 				// orderly close.
 				e.log.Debug("direct session ended", "peer", keyName(peer),
 					"duration", time.Since(start).String(), "error", err)
+			} else {
+				// A relay session that died without closing itself (smux's
+				// recvLoop exits on the read error while the session stays
+				// open) is otherwise silent: report it off the data path and
+				// let the handler decide whether the pair is still carrying.
+				go e.peerRelaySessionEnded(sess, peer, err)
 			}
 			return // session dead
 		}

@@ -552,6 +552,15 @@ type peerConn struct {
 	deadSince time.Time
 	silentFor time.Duration
 
+	// lastEnded is the session the last death report was accepted for. The
+	// accept loop reports a session's death, and the report force-closes the
+	// session — which wakes the loop's own parked AcceptStream, whose exit
+	// reports the same session again. Identity against pc.sess cannot dedup
+	// that second report (the rebuild has not replaced sess yet), so the
+	// first accepted report records itself here and a repeat stands down.
+	// Guarded by pc.mu.
+	lastEnded *smux.Session
+
 	// Relay-session churn for this peer: sessions built inside the current
 	// window, when that window opened, and whether its limit has been crossed.
 	// The crossing is acted on by the next caller, out of pc.mu (the reconnect
@@ -1352,6 +1361,70 @@ func (e *engine) onDirectInbound(peer derpclient.PublicKey) {
 	}
 }
 
+// peerRelaySessionEnded is the relay-side counterpart of onDirectInbound: the
+// relay accept loop dispatches here (on its own goroutine) when AcceptStream
+// fails, which is how a session that died without closing itself is noticed.
+// A smux session whose underlay goes quiet never closes on its own — the
+// recvLoop exits on the read error while the session stays open — so without
+// this the death is silent until some unrelated caller happens to rebuild.
+//
+// The report is deduped against the kill path (a kill swaps the adapter, so a
+// report for its old session stands down) and against itself (the force-Close
+// below wakes the loop's own parked AcceptStream, whose exit reports the same
+// session again; lastEnded records the first). The death is always reported —
+// the ended line is the event the silent window never had — but the rebuild
+// is gated on the pair still carrying: a pair quiet past relayLiveWindow
+// means the link is down, and a new session on it would die on the next
+// keepalive tick. That case answers errRelaySessionStale and leaves the link
+// to the pair's own watchdog.
+func (e *engine) peerRelaySessionEnded(sess *smux.Session, peer derpclient.PublicKey, err error) error {
+	// Freshness is read before any adapter lock: it takes the pair's lock,
+	// and pc.mu is taken under e.mu elsewhere, so the order here is
+	// pair-then-adapter, never the reverse.
+	fresh, ok := e.relayKCPFreshness(peer)
+	pairFresh := ok && time.Since(fresh) <= relayLiveWindow
+	// livePeerConn, not peerConn: the creating lookup would resurrect what
+	// the kill just dropped — secureSessionLocked re-creates the e.secure
+	// entry the kill deleted, and the dead-adapter branch logs a "relay
+	// session rebuilt" line for a session nobody built. A report that finds
+	// no live adapter has nothing to rebuild on.
+	pc := e.livePeerConn(peer)
+	if pc == nil {
+		return errRelaySessionSuperseded
+	}
+	pc.mu.Lock()
+	deduped := pc.closed || pc.sess != sess || pc.lastEnded == sess
+	if !deduped {
+		pc.lastEnded = sess
+	}
+	pc.mu.Unlock()
+
+	// The line fires on every processed report, including stand-downs: it
+	// is the event the silent window never had, and deduped/pairFresh say
+	// what the handler did with it.
+	e.log.Debug("peer relay session ended", "peer", keyName(peer), "error", err,
+		"deduped", deduped, "pairFresh", pairFresh)
+	if deduped {
+		return errRelaySessionSuperseded
+	}
+	if !sess.IsClosed() {
+		// The §2.3 window: the session died without closing itself. Close
+		// is idempotent, so the check only skips a spurious error return.
+		_ = sess.Close()
+	}
+	if !pairFresh {
+		return errRelaySessionStale
+	}
+	_, rerr := pc.ensureSession(false, false)
+	if errors.Is(rerr, errPeerSessionClosed) {
+		// A kill won the race after the report was accepted: the kill owns
+		// the death now, and there is nothing left to rebuild.
+		e.log.Debug("peer relay session ended: rebuild lost to kill", "peer", keyName(peer))
+		return nil
+	}
+	return rerr
+}
+
 // relayKCPLogAttrs returns the slog attrs describing the pair's relay KCP
 // session, or nil when the pair holds no session. It is appended (additively)
 // to the lifecycle lines that carry gen=, so a reader sees the session's health
@@ -1975,6 +2048,24 @@ var (
 // identity so callers can map it: the p2p contract exposes the same thing as
 // p2p.ErrPeerUnreachable.
 var errPeerSessionClosed = errors.New("derp engine: peer session closed")
+
+// relayLiveWindow is how recently the pair must have carried an underlay
+// datagram for a dead session's death to read as "the session's, not the
+// link's". A healthy relay session's smux NOPs cross in both directions every
+// smuxKeepAliveInterval (3s), so a pair quiet past this window is not an idle
+// link but a dead one, and rebuilding smux on it is the 15s-death loop. A
+// var so tests can name the boundary without backdating stamps.
+var relayLiveWindow = 6 * time.Second
+
+// errRelaySessionStale is what a death report answers when the pair went
+// quiet past relayLiveWindow: the death is reported, the rebuild is stood
+// down, and the pair's own watchdog owns what happens next.
+var errRelaySessionStale = errors.New("derp engine: relay pair stale, rebuild stood down")
+
+// errRelaySessionSuperseded is what a death report answers when it is not
+// for the adapter's live session — a kill swapped the adapter first, or the
+// same session already reported. The death belongs to someone else's path.
+var errRelaySessionSuperseded = errors.New("derp engine: death report superseded")
 
 // keepalive keeps the DERP connection alive through proxy/CDN idle timeouts.
 func (e *engine) keepalive(c *derpclient.Client) {
