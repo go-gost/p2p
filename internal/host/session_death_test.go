@@ -66,7 +66,7 @@ func TestSessionEndReportedWithoutKill(t *testing.T) {
 	peer := derpclient.PublicKey{41}
 	_, pc, pair := buildRelaySession(t, capture, peer)
 	// The pair is still carrying: the gate must let the rebuild through.
-	pair.lastRelayRecv = time.Now()
+	setPairRelayRecency(pair, time.Now())
 
 	pc.mu.Lock()
 	old := pc.sess
@@ -168,7 +168,7 @@ func TestDeathHandlerRebuildsOnFreshPair(t *testing.T) {
 	capture := &logCapture{}
 	peer := derpclient.PublicKey{43}
 	e, pc, pair := buildRelaySession(t, capture, peer)
-	pair.lastRelayRecv = time.Now()
+	setPairRelayRecency(pair, time.Now())
 
 	pc.mu.Lock()
 	old := pc.sess
@@ -215,8 +215,7 @@ func TestDeathHandlerStandsDownOnStalePair(t *testing.T) {
 	e, pc, pair := buildRelaySession(t, capture, peer)
 	// Both underlays quiet well past the window: nothing is carrying.
 	old := time.Now().Add(-(relayLiveWindow + time.Minute))
-	pair.lastRelayRecv = old
-	pair.lastDirectRecv = old
+	setPairRecency(pair, old, old)
 
 	pc.mu.Lock()
 	sess := pc.sess
@@ -257,7 +256,7 @@ func TestDeathReportRacingKillStandsDown(t *testing.T) {
 	capture := &logCapture{}
 	peer := derpclient.PublicKey{45}
 	e, pc, pair := buildRelaySession(t, capture, peer)
-	pair.lastRelayRecv = time.Now()
+	setPairRelayRecency(pair, time.Now())
 
 	pc.mu.Lock()
 	sess := pc.sess
@@ -302,7 +301,7 @@ func TestDuplicateDeathReportIsIdempotent(t *testing.T) {
 	capture := &logCapture{}
 	peer := derpclient.PublicKey{46}
 	e, pc, pair := buildRelaySession(t, capture, peer)
-	pair.lastRelayRecv = time.Now()
+	setPairRelayRecency(pair, time.Now())
 
 	pc.mu.Lock()
 	sess := pc.sess

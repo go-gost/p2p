@@ -82,6 +82,7 @@ func TestRelayKCPPairByteCounters(t *testing.T) {
 
 	peer := derpclient.PublicKey{13}
 	pair := newRelayKCPPair(e, peer)
+	t.Cleanup(pair.shutdown)
 	pc := &peerConn{
 		e:       e,
 		peer:    peer,
@@ -263,8 +264,7 @@ func TestRelayKCPPairFreshestRecv(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pair := newRelayKCPPair(e, peer)
 			t.Cleanup(pair.shutdown)
-			pair.lastRelayRecv = tc.lastRelayRecv
-			pair.lastDirectRecv = tc.lastDirectRecv
+			setPairRecency(pair, tc.lastRelayRecv, tc.lastDirectRecv)
 
 			got, ok := pair.freshestRecv()
 			if ok != tc.wantOK {
@@ -284,7 +284,7 @@ func TestRelayKCPPairFreshestRecv(t *testing.T) {
 	if pair.snapshot().present {
 		t.Fatal("a fresh pair reports a live KCP session")
 	}
-	pair.lastDirectRecv = directAt
+	setPairDirectRecency(pair, directAt)
 	if got, ok := pair.freshestRecv(); !ok || !got.Equal(directAt) {
 		t.Fatalf("freshestRecv with no KCP session = %v, %v; want %v, true", got, ok, directAt)
 	}
@@ -309,7 +309,7 @@ func TestEngineRelayKCPFreshness(t *testing.T) {
 	at := time.Date(2026, 1, 1, 0, 0, 11, 0, time.UTC)
 	pair := e.relayKCPPairFor(peer)
 	t.Cleanup(pair.shutdown)
-	pair.lastRelayRecv = at
+	setPairRelayRecency(pair, at)
 	got, ok := e.relayKCPFreshness(peer)
 	if !ok || !got.Equal(at) {
 		t.Fatalf("relayKCPFreshness = %v, %v; want %v, true", got, ok, at)

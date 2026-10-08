@@ -302,6 +302,16 @@ func TestSessionGenerationMonotonicAndDistinct(t *testing.T) {
 		}
 		return pc
 	}
+	// This engine is hand-rolled (no Close), so its pairs outlive the test
+	// unless shut down here: each pair's idle watchdog ticks for the suite's
+	// lifetime otherwise, reading the window vars across later tests.
+	t.Cleanup(func() {
+		for _, peer := range []derpclient.PublicKey{{1}, {2}} {
+			if pair := e.relayKCPPairGet(peer); pair != nil {
+				pair.shutdown()
+			}
+		}
+	})
 
 	peerA := derpclient.PublicKey{1}
 	pcA := build(peerA)
@@ -412,7 +422,7 @@ func TestSessionRebuildLogCarriesReasonAndDownDurations(t *testing.T) {
 		peer := derpclient.PublicKey{31}
 		pair := e.relayKCPPairFor(peer)
 		t.Cleanup(pair.shutdown)
-		pair.lastRelayRecv = time.Now().Add(-quiet)
+		setPairRelayRecency(pair, time.Now().Add(-quiet))
 
 		settled, _ := settledSecurePair(t, secureTransportRelay)
 		pc := e.peerConn(peer)

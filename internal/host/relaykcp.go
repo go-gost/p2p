@@ -129,6 +129,21 @@ const (
 // production default is 6s.
 var directUnderlayIdle = 6 * time.Second
 
+// relayIdleWindow is how long the relay underlay may go without delivering an
+// inbound datagram before the pair's idle watchdog reports it. It is 2x the
+// smux keepalive interval (3s): a healthy relay session's NOPs cross in both
+// directions every 3s, so a pair quiet past this window is not an idle link
+// but a dead one. The same bound is Task 2's relayLiveWindow (a separate var
+// for the death handler's gate — same default, deliberate). It is a var so
+// tests can shorten it; the production default is 6s.
+var relayIdleWindow = 6 * time.Second
+
+// relayIdleTick paces the relay idle watchdog: how often it compares
+// lastRelayRecv against relayIdleWindow. A var so tests can shorten it; the
+// production default is 1s. The tick never enters the read path — it only
+// reads the stamp — because kcp-go's readLoop exits permanently on error.
+var relayIdleTick = time.Second
+
 // newRelayKCPPair builds the pair-level KCP holder for peer: the KCP session
 // lives on the pair (like the pair's secure session — "one per (peer,
 // transport), outliving this adapter"), and reads through the holder itself,
@@ -150,6 +165,7 @@ func newRelayKCPPair(e *engine, peer derpclient.PublicKey) *relayKCPPair {
 		done:           make(chan struct{}),
 		relayPumpDone:  make(chan struct{}),
 		directPumpDone: noDirect,
+		watchDone:      make(chan struct{}),
 		wake:           make(chan struct{}),
 		idle:           make(chan struct{}),
 		// A fresh pair has no direct underlay, so its path starts on the relay;
@@ -162,6 +178,10 @@ func newRelayKCPPair(e *engine, peer derpclient.PublicKey) *relayKCPPair {
 	// the pair itself does. It is what lets a second (direct) pump feed the same
 	// fan-in in Task 3 without the pair's ReadFrom knowing which path delivered.
 	go p.pumpRelay()
+	// The relay idle watchdog shares the pair's lifetime: one ticker per pair,
+	// ending with it on p.done. It never enters the read path (see
+	// relayIdleTick): it only compares the stamp the pump maintains.
+	go p.watchRelayIdle()
 	return p
 }
 
@@ -205,6 +225,10 @@ type relayKCPPair struct {
 	done           chan struct{}
 	relayPumpDone  chan struct{}
 	directPumpDone chan struct{}
+	// watchDone is closed by watchRelayIdle on exit; shutdown joins it, so a
+	// pair's teardown never returns while its ticker can still read the
+	// window/tick vars or dispatch a strike.
+	watchDone chan struct{}
 
 	// direct is the pair's installed direct (raw UDP) underlay, nil when none is
 	// registered. directStop ends that underlay's pump; the pump closes
@@ -288,6 +312,16 @@ type relayKCPPair struct {
 	// the relay half of the per-underlay recency (O3), the counterpart of
 	// lastDirectRecv. Guarded by mu.
 	lastRelayRecv time.Time
+
+	// relayIdleFired is the relay watchdog's episode latch, relayStrikes its
+	// strike count: the pumpDirect idleFired pattern for the relay underlay.
+	// A silence past relayIdleWindow fires once per episode (latch set,
+	// strikes++ capped at 2); an inbound relay datagram closes the episode
+	// (both cleared at readRelay's stamp site); a rebuild re-arms the latch
+	// for the new session while the strikes carry (the episode continues).
+	// Guarded by mu.
+	relayIdleFired bool
+	relayStrikes   int
 
 	// lastPath is the last preferred path recorded for events/counters (O1/O2),
 	// distinct from appliedPath, which is only the KCP tuning state and stays ""
@@ -439,6 +473,13 @@ func (p *relayKCPPair) shutdown() {
 	if sess != nil {
 		sess.Close()
 	}
+	// Join the watchdog: done is closed above, so it is already exiting;
+	// waiting keeps a torn-down pair from firing a strike (or reading the
+	// window vars) after its owner moved on. Never nested — the watchdog
+	// dispatches strikes onto other goroutines and never calls shutdown.
+	if p.watchDone != nil {
+		<-p.watchDone
+	}
 }
 
 // snapshot returns the pair's KCP session stats and its datagram counters. The
@@ -558,6 +599,10 @@ func (p *relayKCPPair) readRelay(b []byte) (int, net.Addr, error) {
 			p.relayBytesRcvd.Add(uint64(n))
 			p.mu.Lock()
 			p.lastRelayRecv = time.Now()
+			// Inbound traffic closes the idle episode: the next silence
+			// starts over at strike 1, not at an escalation.
+			p.relayIdleFired = false
+			p.relayStrikes = 0
 			p.mu.Unlock()
 			return n, addr, nil
 		}
@@ -602,6 +647,80 @@ func (p *relayKCPPair) pumpRelay() {
 			case <-p.done:
 				return
 			}
+		}
+	}
+}
+
+// reportRelayIdle is the relay idle watchdog's decision: when the PAIR has
+// been silent past relayIdleWindow it opens (or continues) an episode and
+// returns its strike (1, escalating to 2 while the silence continues across
+// rebuilds) with the relay-measured silence. The fire condition is pair
+// silence — either underlay carrying resets it — not relay silence: a
+// session living on direct sends nothing over the relay underlay, and
+// treating that quiet as an outage would kill every stable direct session's
+// mux once per window. (0, 0) means no action: either the pair is carrying,
+// or this episode already fired (the latch, same as pumpDirect's idleFired).
+// A rebuild re-arms the latch for the new session (see rearmRelayIdle) while
+// the strikes carry, so a silence that survives a rebuild escalates; traffic
+// on either path clears both at its stamp site, ending the episode.
+func (p *relayKCPPair) reportRelayIdle() (strike int, silentFor time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Pair silence, not relay silence: the freshest of the two underlays is
+	// what says the link is carrying. silentFor below stays relay-measured
+	// — it is the evidence, not the decision.
+	fresh := p.lastRelayRecv
+	if p.lastDirectRecv.After(fresh) {
+		fresh = p.lastDirectRecv
+	}
+	if time.Since(fresh) < relayIdleWindow {
+		return 0, 0
+	}
+	silentFor = time.Since(p.lastRelayRecv)
+	if p.relayIdleFired {
+		return 0, 0
+	}
+	p.relayIdleFired = true
+	if p.relayStrikes < 2 {
+		p.relayStrikes++
+	}
+	return p.relayStrikes, silentFor
+}
+
+// rearmRelayIdle re-arms the watchdog's latch after a (re)build, for the new
+// session. The strikes carry: a silence that continues past a rebuild is the
+// episode continuing, and the next over-window report escalates. Called from
+// sessionLocked, which holds pc.mu; the only lock order here is pc.mu -> p.mu
+// (pair.register already runs under pc.mu in sessionLocked), so taking p.mu
+// cannot invert.
+func (p *relayKCPPair) rearmRelayIdle() {
+	p.mu.Lock()
+	p.relayIdleFired = false
+	p.mu.Unlock()
+}
+
+// watchRelayIdle is the pair's relay-side silence ticker: every relayIdleTick
+// it asks reportRelayIdle, and a strike is handed to the engine — on its own
+// goroutine, outside p.mu — which decides (kill mux only, or kill the pair).
+// It ends with the pair on p.done, like both pumps.
+func (p *relayKCPPair) watchRelayIdle() {
+	defer close(p.watchDone)
+	ticker := time.NewTicker(relayIdleTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.done:
+			return
+		case <-ticker.C:
+			strike, silentFor := p.reportRelayIdle()
+			if strike == 0 {
+				continue
+			}
+			if p.e == nil {
+				continue
+			}
+			peer := p.peer
+			go p.e.relayPathSilent(peer, strike, silentFor)
 		}
 	}
 }
@@ -769,6 +888,12 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 		needConsumer := false
 		if p.direct == u {
 			p.lastDirectRecv = time.Now()
+			// Inbound direct traffic closes the idle episode like relay
+			// traffic does (see readRelay): without this a path that flaps
+			// direct-up then down again would never escalate, the latch
+			// held from the first silence forever.
+			p.relayIdleFired = false
+			p.relayStrikes = 0
 			ev = p.applyPathTuningLocked(pathChangeFirstDirect)
 			// No live mux view: a suppressed relay loss closed the mux session
 			// on top of this pair, and only inbound traffic tells the accepting

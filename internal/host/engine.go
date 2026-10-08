@@ -1330,6 +1330,42 @@ func (e *engine) directUnderlayDead(peer derpclient.PublicKey, u *directUnderlay
 	dc.underlayDead(u)
 }
 
+// relayPathSilent is the relay idle watchdog's engine side: the pair's relay
+// underlay went quiet past relayIdleWindow, and the strike says which hit
+// this is. The evidence line always fires — silentFor is the pair's own
+// relay-measured silence, not the kill line's merged freshestRecv — and then:
+// strike 1 kills only the mux (reasonRelaySilent is a clean death: the pair
+// and its keys survive for the cheap rebuild), strike 2 and beyond kill with
+// reasonLinkLost, which resets the pair's KCP epoch (H1-suppressed while a
+// live direct path carries it; the churn window counts it like any link
+// loss). A pair that never built a session has no mux to kill and no outage
+// to date, so it is evidence only.
+//
+// It runs on the watchdog's dispatch goroutine, off the tick, and takes no
+// pair lock itself: livePeerConn takes e.mu, killSession reads the pair's
+// recency outside pc.mu, so the order stays pair-then-adapter throughout.
+func (e *engine) relayPathSilent(peer derpclient.PublicKey, strike int, silentFor time.Duration) {
+	e.log.Debug("relay path silent", "peer", keyName(peer),
+		"silentFor", silentFor.String(), "strike", strike)
+	// livePeerConn, not peerConn (see peerRelaySessionEnded): a report for a
+	// peer with no adapter must not create one.
+	pc := e.livePeerConn(peer)
+	if pc == nil {
+		return
+	}
+	pc.mu.Lock()
+	neverBuilt := pc.sessAt.IsZero()
+	pc.mu.Unlock()
+	if neverBuilt {
+		return
+	}
+	if strike >= 2 {
+		pc.killSession(errRelaySilent, false, reasonLinkLost)
+		return
+	}
+	pc.killSession(errRelaySilent, false, reasonRelaySilent)
+}
+
 // onDirectInbound rebuilds the peer's mux session when an inbound direct
 // datagram arrives and the adapter has no live session. A relay loss with a
 // live direct path keeps the pair's KCP epoch and settled keys but closes the
@@ -2049,6 +2085,12 @@ var (
 // p2p.ErrPeerUnreachable.
 var errPeerSessionClosed = errors.New("derp engine: peer session closed")
 
+// errRelaySilent is the cause both watchdog strikes kill with: the relay path
+// went silent. It is cause-grade (for the kill line and dropRelayKCP's cause
+// passthrough), while the reasons differ per strike (relay-silent, then
+// link-lost).
+var errRelaySilent = errors.New("derp engine: relay path silent")
+
 // relayLiveWindow is how recently the pair must have carried an underlay
 // datagram for a dead session's death to read as "the session's, not the
 // link's". A healthy relay session's smux NOPs cross in both directions every
@@ -2654,6 +2696,11 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	// it): what the build rode, for the kill path and the KCP-underlay probes.
 	pc.kcp = kcpConn
 	pc.sessAt = time.Now()
+	// A (re)build re-arms the relay idle watchdog for the new session: the
+	// latch clears while the strikes carry, so a silence that continues past
+	// a rebuild escalates to strike 2 instead of latching silent forever.
+	// First builds clear nothing (the latch starts unset) — harmless.
+	pair.rearmRelayIdle()
 	// Every build — first included — gets a fresh, process-unique generation so
 	// the up line, and a later kill/desync/KCP-reset on this session, all share
 	// one number.
@@ -2746,6 +2793,11 @@ const (
 	reasonQueueOverflow sessionEndReason = "queue-overflow"
 	// reasonLinkLost: the relay link carrying it went down.
 	reasonLinkLost sessionEndReason = "link-lost"
+	// reasonRelaySilent: the relay idle watchdog's first strike — the relay
+	// underlay went quiet past relayIdleWindow. A clean death by omission
+	// from resetsPairKCP: the pair's KCP session and keys survive, so the
+	// rebuild is the cheap transparent one.
+	reasonRelaySilent sessionEndReason = "relay-silent"
 	// reasonPeerGone: the relay reported the peer is gone.
 	reasonPeerGone sessionEndReason = "peer-gone"
 	// reasonPeerRekeyed: the peer's identity changed under us (a restarted peer).

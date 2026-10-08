@@ -21,6 +21,34 @@ import (
 	"github.com/go-gost/p2p/internal/derpclient"
 )
 
+// setPairRecency stamps both underlay recencies under p.mu. The relay idle
+// watchdog's ticker reads them concurrently, so a bare field assignment
+// races under -race even when it never overlapped a read before. Tests
+// backdate through here (or the single-side variants below), never by direct
+// assignment.
+func setPairRecency(pair *relayKCPPair, relay, direct time.Time) {
+	pair.mu.Lock()
+	pair.lastRelayRecv = relay
+	pair.lastDirectRecv = direct
+	pair.mu.Unlock()
+}
+
+// setPairRelayRecency stamps only the relay recency, under p.mu (see
+// setPairRecency).
+func setPairRelayRecency(pair *relayKCPPair, at time.Time) {
+	pair.mu.Lock()
+	pair.lastRelayRecv = at
+	pair.mu.Unlock()
+}
+
+// setPairDirectRecency stamps only the direct recency, under p.mu (see
+// setPairRecency).
+func setPairDirectRecency(pair *relayKCPPair, at time.Time) {
+	pair.mu.Lock()
+	pair.lastDirectRecv = at
+	pair.mu.Unlock()
+}
+
 // TestRelayConvStableAndDistinct pins the deterministic conversation ID used
 // for the relay KCP underlay: it must be symmetric, stable, and deliberately
 // different from the direct-plane conv for the same key pair.
@@ -308,9 +336,7 @@ func TestPairPreferredFollowsInboundRecency(t *testing.T) {
 
 	// Force the recency stamp past the idle bound: a direct that has gone silent
 	// is no longer preferred.
-	pair.mu.Lock()
-	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
-	pair.mu.Unlock()
+	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
 	if pair.preferredDirect() {
 		t.Fatal("preferredDirect() = true for a stale direct underlay, want false")
 	}
@@ -377,9 +403,7 @@ func TestPairWriteToUsesPreferredPath(t *testing.T) {
 	}
 
 	// A stale direct falls back to the relay adapter.
-	pair.mu.Lock()
-	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
-	pair.mu.Unlock()
+	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
 	if _, err := pair.WriteTo([]byte("over relay"), nil); err != nil {
 		t.Fatalf("WriteTo (relay): %v", err)
 	}
@@ -477,9 +501,7 @@ func TestPairCongestionFollowsPreferredPath(t *testing.T) {
 	// The idle watchdog observing the direct go stale flips it back to relay.
 	// The watchdog is invoked directly so the assertion does not depend on the
 	// 1s read-tick granularity.
-	pair.mu.Lock()
-	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
-	pair.mu.Unlock()
+	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
 	pair.reportDirectIdle(u)
 	if got := appliedNC(pair); got != 1 {
 		t.Fatalf("applied nc after idle = %d, want 1 (relay)", got)

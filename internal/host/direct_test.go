@@ -552,9 +552,7 @@ func TestDirectUnderlayDeadClearsAndRepunches(t *testing.T) {
 	}
 	// The idle callback only runs after the watchdog observed silence, so the
 	// underlay must read as stale for the clear to be valid.
-	pair.mu.Lock()
-	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
-	pair.mu.Unlock()
+	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
 
 	e.directUnderlayDead(peer, u)
 
@@ -643,9 +641,7 @@ func TestClearDirectUnderlayIfLeavesReplacement(t *testing.T) {
 	// The current identity clears once it is genuinely stale — an idle clear of
 	// a *fresh* underlay is refused (see the sibling test) — and closes exactly
 	// that underlay.
-	pair.mu.Lock()
-	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
-	pair.mu.Unlock()
+	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
 	if !pair.clearDirectUnderlayIf(u2, pathChangeDirectIdle) {
 		t.Fatal("clearDirectUnderlayIf(u2) did not clear the current underlay")
 	}
@@ -687,9 +683,7 @@ func TestClearDirectUnderlayIfKeepsFreshIdleUnderlay(t *testing.T) {
 	}
 
 	// Once it has truly gone silent past the idle bound, the idle clear retires it.
-	pair.mu.Lock()
-	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
-	pair.mu.Unlock()
+	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
 	if !pair.clearDirectUnderlayIf(u, pathChangeDirectIdle) {
 		t.Fatal("clearDirectUnderlayIf did not retire a stale underlay on an idle clear")
 	}
@@ -770,9 +764,7 @@ func TestDirectShortLivedBacksOff(t *testing.T) {
 		// Young underlay: its lifetime is ~0, well under 2×directUnderlayIdle.
 		// The idle callback only runs after observed silence, so age the
 		// recency for the clear to be valid.
-		pair.mu.Lock()
-		pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
-		pair.mu.Unlock()
+		setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
 		e.directUnderlayDead(peer, u)
 		waits = append(waits, lastBackoffWait(t, dc))
 	}

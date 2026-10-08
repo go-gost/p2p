@@ -684,6 +684,14 @@ func TestRelayRebuildCounters(t *testing.T) {
 	settled, _ := settledSecurePair(t, secureTransportRelay)
 	tpc := &peerConn{e: e, peer: two, closeCh: make(chan struct{}), secure: settled}
 	e.peers[two] = tpc
+	// This engine is hand-rolled (no Close), so the pair built below outlives
+	// the test unless shut down here: its idle watchdog would tick for the
+	// suite's lifetime otherwise, reading the window vars across later tests.
+	t.Cleanup(func() {
+		if pair := e.relayKCPPairGet(two); pair != nil {
+			pair.shutdown()
+		}
+	})
 	// sessionLocked's contract is "caller holds pc.mu", and startAccept's defer
 	// takes it from the goroutine it just spawned — so the lock is taken here as
 	// ensureSession does, or the race detector fires on our own test.
@@ -954,9 +962,7 @@ func TestPeerDiagnosticsPerUnderlayAttribution(t *testing.T) {
 
 	// Let the direct path go stale: the pair falls back to the relay, and the
 	// next write counts on the relay side. Ages now differ by construction.
-	pair.mu.Lock()
-	pair.lastDirectRecv = time.Now().Add(-2 * directUnderlayIdle)
-	pair.mu.Unlock()
+	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
 	if n, err := pair.WriteTo(make([]byte, 20), nil); err != nil || n != 20 {
 		t.Fatalf("relay WriteTo = %d, %v; want 20, nil", n, err)
 	}
