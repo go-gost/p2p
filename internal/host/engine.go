@@ -1162,6 +1162,23 @@ func (e *engine) relayKCPPairGet(peer derpclient.PublicKey) *relayKCPPair {
 	return e.relayKCPs[peer]
 }
 
+// relayKCPFreshness returns the peer's merged underlay recency and whether the
+// engine holds a pair that has one. It never creates a pair: like
+// relayKCPPairGet, a peer with no pair reports false rather than a zero time
+// that would age into "since 1970" downstream.
+//
+// A false here is not "the peer was quiet" — it is "the engine has nothing to
+// say", which for a peer whose kill reset its pair (killSession ->
+// dropRelayKCP -> delete(e.relayKCPs, peer)) is the more common half of the
+// state.
+func (e *engine) relayKCPFreshness(peer derpclient.PublicKey) (time.Time, bool) {
+	pair := e.relayKCPPairGet(peer)
+	if pair == nil {
+		return time.Time{}, false
+	}
+	return pair.freshestRecv()
+}
+
 // registerDirectUnderlay installs a freshly punched socket as the peer's pair
 // direct underlay (the P2 cutover). It builds the underlay with the raw-UDP seed
 // token threaded from the handshake (Task 6) so the underlay can echo the peer's

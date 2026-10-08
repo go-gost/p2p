@@ -478,6 +478,35 @@ func (p *relayKCPPair) snapshot() relayKCPSnapshot {
 	return s
 }
 
+// freshestRecv returns the later of the two underlays' last inbound datagram,
+// and whether either has ever been stamped. Reading the MERGED recency is what
+// makes this honest on both underlays: a peer that migrated to the direct path
+// keeps the relay's stamp aging, so the relay-only read calls a live peer
+// silent.
+//
+// There is deliberately no `present` gate here, unlike snapshot(). A zero
+// KCP-stat set would read as "healthy idle session" (that is what present guards
+// in relayKCPSnapshotAttrs), but here the consumer is asking how long the peer
+// has been quiet, and the answers that matter are exactly the ones taken when
+// the session is already gone: a kill that resets the pair's KCP epoch retires
+// the session, and the recency is what explains the death.
+func (p *relayKCPPair) freshestRecv() (time.Time, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// lastRelayRecv/lastDirectRecv are stamped under p.mu, so this read is
+	// race-free under -race.
+	switch {
+	case p.lastDirectRecv.After(p.lastRelayRecv):
+		return p.lastDirectRecv, !p.lastDirectRecv.IsZero()
+	case p.lastRelayRecv.After(p.lastDirectRecv):
+		return p.lastRelayRecv, true
+	default:
+		// Equal: either both zero, or the two stamps coincide. Only the zero
+		// case has nothing to report.
+		return p.lastRelayRecv, !p.lastRelayRecv.IsZero()
+	}
+}
+
 // relayKCPSnapshotAttrs renders a pair's KCP snapshot as stable slog attrs, or
 // nil when there is no session (present=false). The configured MTU/window are
 // included so a log reader can compare configured against observed SRTT/RTO;
