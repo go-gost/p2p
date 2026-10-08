@@ -1,6 +1,6 @@
 # p2p peer 断链成对可观测性设计
 
-日期：2026-10-08 | 状态：draft 待 review | 路径：architectural（跨 p2p + wisper 两个仓库）
+日期：2026-10-08 | 状态：已 review | 路径：**bounded**（全部落在 p2p 一个仓；doctor 报告由 p2p 自己的 `doctor` 包渲染，wisper 零改动——初稿误判为跨仓，实现前查证更正）
 
 ## 1. 目标
 
@@ -38,27 +38,32 @@
 |---|---|---|
 | `relayReason` | 谁打死了被替换的 session | `dead.lastEndReason`（`engine.go:1560` 已读出） |
 | `downFor` | kill → 重建 的时长（含重建握手） | 新增 `pc.lastKilledAt` |
-| `silentFor` | 最后一帧 → 判死 的时长 | 新增 `relayKCPSnapshot.lastRecvAt`（源自 `relayLastRecv`，`relaykcp.go:338`） |
+| `silentFor` | 最后一帧 → 判死 的时长 | `relayKCPSnapshot.relayLastRecv`/`directLastRecv` **已存在**（`relaykcp.go:338-339`，`snapshot()` 已填充）——不需要新字段，只需在 `relayKCPSnapshotAttrs` 里发出来 |
 
 `downFor` 与 `silentFor` **语义不同，不可互换**：`silentFor` 只含静默（约等于 `smuxKeepAliveTimeout`），`downFor` 含重建握手（实测基线 ~33s）。混淆两者会得出错误结论。
 
 **为什么必须去 pair 取 `silentFor`**：断链起点只在 pair 级的 `relayLastRecv`，而 `killSession` 是 peerConn 级——跨了一层。走 snapshot 管道（`relayKCPSnapshotAttrs`）是最短路径，不引入跨层调用。
 
-### 4.2 计数：`Status` 新增三个字段
+### 4.2 计数
 
-- `SessionRebuilds` —— 断链重建总次数
+**断链次数不新增字段**：`PeerDiagnostic.RelayRebuilds` 已存在（`engine.go:289` 填）且 doctor 已渲染（`doctor.go:149`），缺的只是 `Status` 侧的聚合——`Status.RelayRebuilds`，按 `server.go:347` 既有的求和循环加。
+
+真正新增的是两个时长：
+
 - `SessionDownTotal` —— 累计断链时长
 - `SessionDownMax` —— **最长单次断链**
 
 `SessionDownMax` 优先于平均值：卡死是长尾问题，平均值会把它稀释掉。
 
-`PeerDiagnostic` 新增 `Rebuilds` 与 `LastRebuildAge`，供 doctor 页按 peer 聚合。
+`PeerDiagnostic` 新增 `LastRebuildAge`、`SessionDownTotal`、`SessionDownMax`，供 doctor 按 peer 聚合。
 
 ### 4.3 doctor 页：每个 peer 一行
 
 显示：当前路径（已有 `Path`）、断链次数、最近一次断链距今多久、累计断链时长、最长单次断链。
 
-消费者是 wisper 的 `doctor.Report(tunnel.P2PHostStatus(), opts)`（`api/p2p_handler.go:113`）。这是本设计唯一跨到 wisper 的部分。
+**doctor 报告由 p2p 自己渲染**（`p2p/doctor/doctor.go:45` `func Report(st p2p.Status, opts Options) string`），peer 块在 `peerBlock`（`doctor.go:139`）。wisper 的 `api/p2p_handler.go:113` 只是把它打印出来——**wisper 零改动**，本设计全部落在 p2p 一个仓内。
+
+渲染遵循既有的条件渲染约定（见 `relay churn` 行 `doctor.go:149-152` 与 `TestReportRelayChurn`）：peer 块恒渲染，只有断链行在「有断链史」时出现。因此 §5 的「缺失即信号」只约束**日志**，不约束 doctor。
 
 ## 5. 关键语义：缺失即信号
 
@@ -75,13 +80,13 @@
 - p2p（`internal/host`）：断链-重建配对测试——构造一次 `killSession` 后重建，断言 `relay session rebuilt` 的 `relayReason` 等于 kill 的 reason、`downFor` 非负且 ≥ `silentFor`、`silentFor` 落在 `smuxKeepAliveTimeout` 量级。日志 attrs 的断言可沿用文件内既有的 log-capture 手法（先读现有测试怎么做，不要新发明夹具）。
 - p2p：`Status` 新计数器随一次断链递增、`SessionDownMax` 只增不减。
 - p2p：`relayKCPSnapshot.lastRecvAt` 在 pair 无 session 时为零值，不得报出「自 1970 年起」。
-- wisper（doctor）：报告渲染出三个数字；无断链的 peer 仍渲染该行——**缺失的行会被读成「没有断链」**，因此不可用「有断链才渲染」的条件渲染。
+- doctor（p2p 内）：有断链史的 peer 渲染出三个数；无断链史的 peer **不**出该行（沿用 `relay churn` 的条件渲染约定）。peer 块本身恒渲染，条件只作用在断链行上。
 - 回归：`go test ./... -p 1`（`-p 1` 是必须的，见下）；`-race` 需 `CGO_ENABLED=1`。
 
 ## 7. 交付门禁
 
 - p2p：`GOWORK=off go build ./...`；`CGO_ENABLED=1 go test -race -p 1 ./...`
-- wisper：`GOWORK=off go build ./...`；`go test ./doctor/ ./api/ -count=1`
+- doctor：`go test ./doctor/ -count=1`（无独立 wisper 门禁，wisper 零改动）
 - 验收（比门禁更重要）：用一次真实断链验证 `downFor`/`silentFor` 的量级合理，且 §5 的判定规则能在 hub 日志上跑通一次。
 
 ## 8. 待确认项
@@ -92,5 +97,5 @@
 
 - 无 TBD/TODO；三条设计选择（snapshot 取值、只补字段、显示次数+最近+最长）均由用户确认。
 - 与既有事实无矛盾：`relay session rebuilt` 两条路径（`engine.go:1606` adapter 替换、`engine.go:2209` 原地）都要带新字段，否则原地重建缺 `silentFor`。
-- 范围单一：一个 p2p 文件加一个 pair 字段、一个公共 Status 结构扩展、一处 wisper doctor 渲染。不需拆分。
+- 范围单一：一个 pair 的 attrs、一个 peerConn 的时间戳与计数、两个日志发射点、一个公共 Status 结构扩展、一处 doctor 渲染。不需拆分。
 - 歧义已收敛：`downFor`/`silentFor` 差异、缺失即信号、无心跳日志三点均已显式定义。
