@@ -712,9 +712,21 @@ const (
 
 // resendInterval is how often an unsettled handshake re-sends its half while
 // ensureSession waits out handshakeTimeout, so a dropped reply heals instead of
-// leaving one side plaintext while the other encrypts. A var so tests can
-// shorten it.
-var resendInterval = 500 * time.Millisecond
+// leaving one side plaintext while the other encrypts. Settable so tests can
+// shorten it — and atomic because they do so while engines are live: an engine
+// from an earlier test can still be inside ensureSession's retry loop, reading a
+// value no running test owns, so a plain var here is a data race that takes the
+// whole package's -race run down with it.
+var resendInterval = newAtomicDuration(500 * time.Millisecond)
+
+// newAtomicDuration returns an atomic holding d as nanoseconds. A pointer,
+// because a zero Int64 reads as 0 — a hot spin in every caller that waits on it
+// — and because copying an atomic by value is itself a vet error.
+func newAtomicDuration(d time.Duration) *atomic.Int64 {
+	v := &atomic.Int64{}
+	v.Store(int64(d))
+	return v
+}
 
 // Deployment-dependent timings, adjustable via the `timeouts` config section
 // (applyTimeouts in config.go). Vars, not consts, so tests can shorten them.
@@ -2356,7 +2368,7 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 			if err := pc.e.sendSecureHalf(pc.peer, secure); err != nil {
 				pc.e.log.Debug("secure: send half failed", "peer", keyName(pc.peer), "error", err)
 			}
-			if secure.waitReady(resendInterval) {
+			if secure.waitReady(time.Duration(resendInterval.Load())) {
 				break
 			}
 			if secure.settled() || !time.Now().Before(deadline) {
