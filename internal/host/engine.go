@@ -530,6 +530,28 @@ type peerConn struct {
 	// kill. Guarded by pc.mu.
 	lastEndReason sessionEndReason
 
+	// deadSince and silentFor date one outage: the moment this side OBSERVED the
+	// relay session die, and how long the pair's underlays had been quiet when
+	// it did. They are set in the two places a death is observable and nowhere
+	// else — killSession (the adapter is closed by a kill, so the rebuild goes
+	// through peerConn) and ensureSession's replacement branch (the session
+	// died on its own, so the rebuild happens in place) — which are mutually
+	// exclusive, since killSession sets closed and ensureSession returns early
+	// on it.
+	//
+	// Consumed by the next rebuild log, which reads and clears them in one
+	// pc.mu block: the clear must not happen outside that block (it would race
+	// killSession's stamp), and must not be skipped (the next rebuild would
+	// report a span measured from an older death). The zero value means no
+	// death was observed, and the log then carries the reason alone.
+	//
+	// The silence is taken from the pair at the moment of death, never at
+	// emit time: by then the peer may be sending again, and six of the nine kill
+	// reasons reset the pair's KCP epoch, which deletes the pair before the
+	// rebuild runs. Guarded by pc.mu.
+	deadSince time.Time
+	silentFor time.Duration
+
 	// Relay-session churn for this peer: sessions built inside the current
 	// window, when that window opened, and whether its limit has been crossed.
 	// The crossing is acted on by the next caller, out of pc.mu (the reconnect
@@ -1330,6 +1352,37 @@ func (e *engine) relayKCPLogAttrs(peer derpclient.PublicKey) []any {
 	return relayKCPSnapshotAttrs(pair.snapshot())
 }
 
+// relayDownAttrs renders one outage's evidence for the "relay session rebuilt"
+// line: the reason the relay session ended with, how long it stayed down before
+// this rebuild, and how long it had already been silent when it died. Both
+// rebuild paths (peerConn's kill-driven swap and ensureSession's in-place
+// replacement) emit through here, so the rule about which fields appear is
+// stated once.
+//
+// An empty reason is the informative case and is always emitted: it says the
+// smux keepalive timeout judged the session dead with no kill behind it, which
+// is exactly the outage the relay-side accept loop logs nothing for.
+//
+// The durations are emitted only for a death this side observed (deadSince
+// set). An unobserved death reports the reason alone: a span measured from an
+// unset time reads as an outage that began in year 1 and never ends — the same
+// trap sessionAge already had to guard.
+//
+// downFor spans from the death to now, which is before the rebuild's new
+// session is built, so it says how long the peer was down rather than how long
+// the recovery took. silentFor is 0 when the engine held no pair to measure
+// from (a kill that reset the pair's KCP epoch deleted it), which is not the
+// same claim as "the peer was talking until that instant".
+func relayDownAttrs(reason sessionEndReason, deadSince time.Time, silentFor time.Duration, now time.Time) []any {
+	attrs := []any{"relayReason", reason}
+	if deadSince.IsZero() {
+		return attrs
+	}
+	return append(attrs,
+		"downFor", now.Sub(deadSince).Round(time.Millisecond),
+		"silentFor", silentFor.Round(time.Millisecond))
+}
+
 // relayKCPStats snapshots the pair's relay KCP session for Status, filled with
 // the configured constants so a reader can compare configured against observed
 // SRTT/RTO. Live is false when the pair holds no session; Status reports only
@@ -1575,6 +1628,12 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 	prev, at := dead.secure, dead.sessAt
 	gen := dead.sessionGen.Load()
 	reason := dead.lastEndReason
+	// The outage killSession dated is consumed here and nowhere else: read and
+	// cleared in this one block, because a clear outside it races the stamp
+	// under -race, and left set it would be reported against a later death.
+	// It is not copied to the replacement — this line is that death's record.
+	deadSince, silentFor := dead.deadSince, dead.silentFor
+	dead.deadSince, dead.silentFor = time.Time{}, time.Duration(0)
 	dead.mu.Unlock()
 	// The rebuild counters are the pair's, not the adapter's: the
 	// replacement continues them — and the pair's build timestamp with
@@ -1611,6 +1670,7 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		"sessionAge", age.Round(time.Millisecond),
 		"gen", gen,
 	}
+	rebuildAttrs = append(rebuildAttrs, relayDownAttrs(reason, deadSince, silentFor, time.Now())...)
 	e.mu.Unlock()
 
 	// The pair's KCP session survives a clean kill (it is what the rebuild
@@ -2212,6 +2272,31 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	}
 	pc.mu.Unlock()
 
+	var reason sessionEndReason
+	var deadSince time.Time
+	var silentFor time.Duration
+	if replaced {
+		// This path has no kill behind it, so the death has to be dated here:
+		// nothing else observed it, and without this the rebuild line is the
+		// only trace of an outage with no start time. The pair's recency is read
+		// out of pc.mu (it takes the pair's lock) and then the whole set is read
+		// out and cleared in one block, so a kill arriving in between cannot
+		// stamp a second death over this one.
+		fresh, freshOK := pc.e.relayKCPFreshness(pc.peer)
+		now := time.Now()
+		pc.mu.Lock()
+		if pc.deadSince.IsZero() {
+			pc.deadSince = now
+			pc.silentFor = 0
+			if freshOK {
+				pc.silentFor = now.Sub(fresh)
+			}
+		}
+		reason, deadSince, silentFor = pc.lastEndReason, pc.deadSince, pc.silentFor
+		pc.deadSince, pc.silentFor = time.Time{}, time.Duration(0)
+		pc.mu.Unlock()
+	}
+
 	if replaced {
 		replacedAttrs := []any{
 			"peer", keyName(pc.peer),
@@ -2220,6 +2305,10 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 			"sessionAge", age.Round(time.Millisecond),
 			"gen", gen,
 		}
+		// An empty reason is the informative case, not a missing one: it says
+		// the smux keepalive timeout judged this session dead with no kill at
+		// all, which is the outage the relay-side accept loop logs nothing for.
+		replacedAttrs = append(replacedAttrs, relayDownAttrs(reason, deadSince, silentFor, time.Now())...)
 		// The dead session died on its own (a clean end), so the pair's KCP
 		// session survives and its health rides the rebuild line.
 		replacedAttrs = append(replacedAttrs, pc.e.relayKCPLogAttrs(pc.peer)...)
@@ -2675,6 +2764,28 @@ func (pc *peerConn) killSession(cause error, dropSecure bool, reason sessionEndR
 	age := time.Duration(0)
 	if !pc.sessAt.IsZero() {
 		age = time.Since(pc.sessAt)
+	}
+	pc.mu.Unlock()
+
+	// Date the outage HERE, at the death, and out of pc.mu: reading the pair
+	// takes its own lock, and pc.mu is taken under e.mu elsewhere. The
+	// observation has to happen at this point and not when the rebuild log is
+	// emitted, for two reasons — by emit time the peer may be sending again, so
+	// the span collapses to ~0, and this same call resets the pair's KCP epoch
+	// for six of the nine kill reasons (see resetsPairKCP), so dropRelayKCP
+	// below deletes the pair and the rebuild is left with no recency at all.
+	// Taking it after that deletion is the one order that loses the value.
+	var fresh time.Time
+	var freshOK bool
+	if pc.e != nil {
+		fresh, freshOK = pc.e.relayKCPFreshness(pc.peer)
+	}
+	now := time.Now()
+	pc.mu.Lock()
+	pc.deadSince = now
+	pc.silentFor = 0
+	if freshOK {
+		pc.silentFor = now.Sub(fresh)
 	}
 	pc.mu.Unlock()
 
