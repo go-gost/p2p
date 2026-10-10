@@ -1486,7 +1486,12 @@ func TestDroppedDirectTimerDoesNotRepunch(t *testing.T) {
 	dc := &directConn{e: e, peer: peer, cand: make(chan []candidate, 1)}
 	e.directs[peer] = dc
 	dc.retry(10*time.Millisecond, true)
+	// Delete under the engine lock: the timer goroutine reads e.directs through
+	// getDirect (which takes e.mu), and an unsynchronized delete here is a data
+	// race under -race in CI.
+	e.mu.Lock()
 	delete(e.directs, peer)
+	e.mu.Unlock()
 
 	time.Sleep(100 * time.Millisecond) // several timer periods at test speed
 	if in := dc.nextPunchIn(); in > 0 {
