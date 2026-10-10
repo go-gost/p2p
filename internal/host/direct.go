@@ -440,6 +440,20 @@ func (dc *directConn) start() bool {
 			"peer", keyName(dc.peer), "reason", dc.e.directReason())
 		return false
 	}
+	if dc.e.getDirect(dc.peer) != dc {
+		// The engine dropped this instance: dropIfGone removed it (the relay
+		// reported the peer gone and its underlay died) while a retry timer or
+		// an in-flight round was still scheduled, and a later punch — the peer
+		// coming back — built a new directConn in its place. A round from here
+		// broadcasts candidates for a peer the map no longer tracks: the peer
+		// answers with a real round, which replaces the healthy underlay the
+		// new instance just installed, while this instance — whose candidate
+		// slot no announcement fills any more — times out and re-arms itself,
+		// a broadcast every punchTimeout+backoffPeriod (40s in the field)
+		// forever. The dropped instance has nothing to punch for; the current
+		// one (if any) owns the peer.
+		return false
+	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	if dc.state != directNone {
@@ -1072,6 +1086,13 @@ func (dc *directConn) retryFrom(d time.Duration, failed bool, fromNone bool) {
 		case <-dc.e.stop:
 			return
 		case <-time.After(d):
+		}
+		if dc.e.getDirect(dc.peer) != dc {
+			// The engine dropped this instance while the timer ran (see
+			// start): a newer directConn owns the peer, and a round from here
+			// would replace its healthy underlay and re-arm this timer
+			// forever. Do not punch, and do not re-arm either.
+			return
 		}
 		// A peer that is gone cannot answer a round, so skip it: running one only
 		// burns a STUN lookup, a broadcast and a timeout, forever (the field

@@ -1439,6 +1439,64 @@ func TestCandidatesKeepLiveSession(t *testing.T) {
 	}
 }
 
+// TestDroppedDirectDoesNotStart: once the engine has dropped a peer's
+// directConn (dropIfGone, when the relay reported the peer gone and its
+// underlay died), the stale retry timer or an inbound path must not punch
+// through it. A round from a dropped instance cannot receive candidates —
+// onCandidates pushes into the map's current instance — so it always times
+// out and re-arms, a broadcast every punchTimeout+backoffPeriod (40s in the
+// field) while each broadcast makes the current instance replace a healthy
+// underlay. See TestDroppedDirectTimerDoesNotRepunch for the timer half.
+func TestDroppedDirectDoesNotStart(t *testing.T) {
+	e := &engine{
+		direct:   true,
+		stunAddr: "127.0.0.1:3478",
+		log:      slog.Default(),
+		stop:     make(chan struct{}),
+		directs:  make(map[derpclient.PublicKey]*directConn),
+		peers:    make(map[derpclient.PublicKey]*peerConn),
+	}
+	peer := derpclient.PublicKey{9}
+	dc := &directConn{e: e, peer: peer, cand: make(chan []candidate, 1)}
+	e.directs[peer] = dc
+	delete(e.directs, peer) // what dropIfGone does when the peer is gone
+
+	if dc.start() {
+		t.Error("start() = true on a dropped directConn, want false: no round may run")
+	}
+	if got := dc.stateOf(); got != directNone {
+		t.Errorf("state = %v, want directNone: a dropped instance must not punch", got)
+	}
+}
+
+// TestDroppedDirectTimerDoesNotRepunch: a retry timer armed before the drop
+// must die with its instance. Without the guard it punched (relayWaitRetry
+// backoff while the relay was down), and once the relay returned it broadcast
+// every 40s forever.
+func TestDroppedDirectTimerDoesNotRepunch(t *testing.T) {
+	e := &engine{
+		direct:   true,
+		stunAddr: "127.0.0.1:3478",
+		log:      slog.Default(),
+		stop:     make(chan struct{}),
+		directs:  make(map[derpclient.PublicKey]*directConn),
+		peers:    make(map[derpclient.PublicKey]*peerConn),
+	}
+	peer := derpclient.PublicKey{9}
+	dc := &directConn{e: e, peer: peer, cand: make(chan []candidate, 1)}
+	e.directs[peer] = dc
+	dc.retry(10*time.Millisecond, true)
+	delete(e.directs, peer)
+
+	time.Sleep(100 * time.Millisecond) // several timer periods at test speed
+	if in := dc.nextPunchIn(); in > 0 {
+		t.Errorf("dropped instance re-armed a punch, next punch in %v", in)
+	}
+	if got := dc.stateOf(); got != directBackoff {
+		t.Errorf("state = %v, want directBackoff: the dropped instance must stay put", got)
+	}
+}
+
 // TestCandidatesIgnoredWhenDirectOff: the direct switch is a master gate, and
 // it must hold on the inbound path too. A peer that still punches announces its
 // candidates over the relay; a host with the direct path off must not start a
