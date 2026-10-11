@@ -1,6 +1,7 @@
 package host
 
 import (
+	"context"
 	"encoding/base64"
 	"testing"
 	"time"
@@ -66,6 +67,78 @@ func TestStatusReportsTransportStats(t *testing.T) {
 		t.Errorf("PeerDiagnostics has no entry for the direct peer: %+v", st.PeerDiagnostics)
 	} else if got.Attempts != 4 || got.Ups != 2 || got.Drops != 1 {
 		t.Errorf("PeerDiagnostic = %+v, want attempts=4 ups=2 drops=1", got)
+	}
+}
+
+// TestRelayRTTMillis pins the conversion the status line does: a loopback or
+// LAN relay answers a ping in well under a millisecond, and a truncating
+// Milliseconds() would report 0 for it — the value that means "not measured" —
+// so every fast relay would read as unmeasured. Round half up, with a 1ms
+// floor for any answered ping; zero stays zero (no client, no ping answered).
+func TestRelayRTTMillis(t *testing.T) {
+	for _, tc := range []struct {
+		d    time.Duration
+		want int64
+	}{
+		{0, 0},
+		{1, 1},
+		{300 * time.Microsecond, 1},
+		{900 * time.Microsecond, 1},
+		{1400 * time.Microsecond, 1},
+		{1500 * time.Microsecond, 2},
+		{1600 * time.Microsecond, 2},
+		{2600 * time.Microsecond, 3},
+		{42 * time.Millisecond, 42},
+	} {
+		if got := relayRTTMillis(tc.d); got != tc.want {
+			t.Errorf("relayRTTMillis(%v) = %d, want %d", tc.d, got, tc.want)
+		}
+	}
+}
+
+// TestStatusRelayRTTIsVisible is the end-to-end shape of the rounding: a relay
+// that has answered a ping over loopback (a sub-millisecond round trip, the
+// normal case on a LAN relay) must reach Status as at least 1ms. The
+// truncating conversion reported it as 0, which the report then rendered as
+// "not measured yet" for a relay that was measured.
+func TestStatusRelayRTTIsVisible(t *testing.T) {
+	url, _ := startCountingDERPServer(t)
+
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := derpclient.Dial(context.Background(), url, priv, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// A reader is what turns the server's reply into a stamped pong: Recv
+	// consumes pongs internally.
+	go func() {
+		for {
+			if _, _, err := c.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+	if err := c.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	var rtt time.Duration
+	for deadline := time.Now().Add(2 * time.Second); rtt == 0 && time.Now().Before(deadline); {
+		rtt = c.LastRTT()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if rtt == 0 {
+		t.Fatal("no pong within the deadline: the test server must answer a ping")
+	}
+
+	st := newServer(&engine{client: c}).status()
+	if st.RelayRTT < 1 {
+		t.Errorf("RelayRTT = %d, want >= 1 for a measured round trip of %v",
+			st.RelayRTT, rtt)
 	}
 }
 

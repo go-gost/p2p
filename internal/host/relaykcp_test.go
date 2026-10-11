@@ -1057,14 +1057,24 @@ func startCountingDERPServer(t *testing.T) (string, *atomic.Int64) {
 			return
 		}
 
-		// Count every FrameSendPacket.
+		// Count every FrameSendPacket, and answer a ping the way a relay does:
+		// the 8-byte payload sent back as a pong, which is the engine's
+		// keepalive probe and the only round trip the host measures itself.
 		for {
 			ft, body, err := readTestFrame(br)
 			if err != nil {
 				return
 			}
-			if ft == 0x04 && len(body) >= 32 {
+			switch {
+			case ft == 0x04 && len(body) >= 32:
 				sends.Add(1)
+			case ft == 0x12: // framePing
+				if err := writeTestFrame(bw, 0x13, body); err != nil { // framePong
+					return
+				}
+				if err := bw.Flush(); err != nil {
+					return
+				}
 			}
 		}
 	})

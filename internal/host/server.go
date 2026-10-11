@@ -319,13 +319,28 @@ func (s *server) addForwardAddr(addr, key string) error {
 	return nil
 }
 
+// relayRTTMillis converts one measured round trip into the integer
+// milliseconds Status reports. Rounded half up, then floored at 1ms for any
+// answered ping: a loopback or LAN relay answers in well under a millisecond,
+// and a truncating Milliseconds() would collapse those to 0 — the value that
+// means "not measured" — so the report would read "not measured yet" for a
+// relay that answers. Zero stays zero: no client, or no ping answered yet.
+func relayRTTMillis(d time.Duration) int64 {
+	ms := (d + 500*time.Microsecond) / time.Millisecond
+	if ms == 0 && d > 0 {
+		ms = 1
+	}
+	return int64(ms)
+}
+
 // status reports the tunnel count and the engine's transport stats. A
 // stub-mode server (no relay configured) has no engine and reports zeros there.
 func (s *server) status() p2p.Status {
 	var st p2p.Status
 	if s.engine != nil {
 		st.RelayConnected, st.RelayError = s.engine.relayState()
-		st.RelayRTT = s.engine.relayRTT().Milliseconds()
+		// Rounded, not truncated: a fast relay must not read as "not measured".
+		st.RelayRTT = relayRTTMillis(s.engine.relayRTT())
 		st.DirectConfig = s.engine.directConfig()
 		st.PeerTransports = s.engine.peerTransports()
 		st.PeerDiagnostics = s.engine.peerDiagnostics(st.PeerTransports)
