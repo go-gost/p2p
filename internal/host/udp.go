@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -63,6 +64,22 @@ type link struct {
 	own      net.Conn // our presentation edge; nil once adopted or when it dies
 	hadEdge  bool     // a peer edge has been established at least once
 	closed   bool
+	// edgeGen is bumped every time a peer edge is installed. serveEdge
+	// captures it and stops feeding the local conn once it moves on: closing a
+	// superseded edge is not the same as silencing it, because streamConn.Read
+	// selects between a queued chunk and its closed channel and can still hand
+	// one over. Those bytes belong to a retired stream, and writing them into
+	// the tunnel splices two streams into one byte stream.
+	edgeGen uint64
+
+	// Observability for the supersede window. staleWrites counts writes dropped
+	// because the edge was superseded; maxLocalWriters is the high-water mark of
+	// serveEdge goroutines writing the local conn at once. Both ride the edge-end
+	// log line, so the window shows up next to the traffic that flowed through
+	// it instead of needing its own line.
+	staleWrites     atomic.Int64
+	localWriters    atomic.Int64
+	maxLocalWriters atomic.Int64
 }
 
 // linkBufLimit caps the first-datagram buffer: it exists to keep the datagram
@@ -230,8 +247,10 @@ func (l *link) publishOwn(c net.Conn) bool {
 		return false
 	}
 	l.own, l.peerEdge, l.hadEdge = c, c, true
+	l.edgeGen++
+	gen := l.edgeGen
 	l.mu.Unlock()
-	go l.serveEdge(c)
+	go l.serveEdge(c, gen)
 	// Asynchronous: a flush can block on a peer that is not reading yet, and
 	// the presenter must stay free to react to the edge dying. wmu keeps the
 	// buffered bytes ahead of anything written later.
@@ -257,6 +276,8 @@ func (l *link) adopt(c net.Conn, transport string) bool {
 	}
 	old, own := l.peerEdge, l.own
 	l.peerEdge, l.own, l.hadEdge = c, nil, true
+	l.edgeGen++
+	gen := l.edgeGen
 	l.mu.Unlock()
 	// Our presentation is superseded; its reader retires it.
 	if own != nil && own != c {
@@ -266,7 +287,7 @@ func (l *link) adopt(c net.Conn, transport string) bool {
 		old.Close()
 	}
 	l.e.log.Info("datagram link up", "peer", keyName(l.peer), "transport", transport)
-	go l.serveEdge(c)
+	go l.serveEdge(c, gen)
 	go l.flush() // as in publishOwn: never block the adopter on a slow reader
 	return true
 }
@@ -281,9 +302,14 @@ func (l *link) isClosed() bool {
 // serveEdge moves bytes from one peer edge to the local edge until it ends,
 // then retires it. It is the edge's only reader, so the cleanup cannot race a
 // second reader of the same conn.
-func (l *link) serveEdge(c net.Conn) {
+//
+// gen is the link's edge generation when this edge was installed. It is the
+// fence that keeps a superseded edge off the local conn: the edge it replaced
+// may still be readable for a moment (a queued chunk outlives Close), and those
+// bytes belong to a different stream.
+func (l *link) serveEdge(c net.Conn, gen uint64) {
 	started := time.Now()
-	var read, written, drops int64
+	var read, written, drops, stale int64
 	var readErr error
 
 	defer func() {
@@ -292,7 +318,7 @@ func (l *link) serveEdge(c net.Conn) {
 		// One line closes out the edge, because "datagram link down" alone left
 		// the only open question unanswered: did anything flow, and what broke
 		// it. readErr carries the reason when there was one.
-		l.logEdgeEnd(started, read, written, drops, readErr)
+		l.logEdgeEnd(started, read, written, drops, stale, readErr)
 	}()
 
 	buf := make([]byte, linkChunkSize)
@@ -300,54 +326,106 @@ func (l *link) serveEdge(c net.Conn) {
 		n, err := c.Read(buf)
 		if n > 0 {
 			read += int64(n)
-			l.mu.Lock()
-			local := l.local
-			l.mu.Unlock()
-			if local != nil {
-				if wn, werr := local.Write(buf[:n]); werr != nil {
+			local, isCurrent := l.localFor(gen)
+			switch {
+			case !isCurrent:
+				// Superseded while this read was in flight. Dropping is the
+				// whole point: the far end is parsing one continuous byte
+				// stream, and these bytes are not part of it.
+				stale += int64(n)
+				l.staleWrites.Add(1)
+			case local == nil:
+				// No local yet: the carrier has not attached, so there is nobody
+				// to deliver to — dropped, like any datagram loss.
+				drops += int64(n)
+			default:
+				// Track the overlap that the supersede window makes possible, so
+				// a stream that ever saw two writers at once says so here
+				// instead of leaving it to be inferred from a bad frame.
+				l.noteLocalWriter()
+				wn, werr := local.Write(buf[:n])
+				l.localWriters.Add(-1)
+				if werr != nil {
 					// Keep serving: a write error (e.g. the gost edge just died)
 					// must not cost the link its peer edge.
 					l.e.log.Debug("link: write local", "peer", keyName(l.peer), "error", werr)
 				} else {
 					written += int64(wn)
 				}
-			} else {
-				// No local yet: the carrier has not attached, so there is nobody to
-				// deliver to — dropped, like any datagram loss.
-				drops += int64(n)
 			}
 		}
 		if err != nil {
 			readErr = err
 			return
 		}
+		if stale > 0 {
+			// Nothing this edge holds can reach the local conn any more, so
+			// stop reading rather than spin on a retired stream.
+			readErr = errEdgeSuperseded
+			return
+		}
 	}
 }
+
+// localFor returns the local edge to write to, and whether this edge is still
+// the link's current peer edge.
+func (l *link) localFor(gen uint64) (net.Conn, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.local, l.edgeGen == gen
+}
+
+// noteLocalWriter records the high-water mark of goroutines writing the local
+// conn. Compare-and-swap rather than a plain store: two writers racing can
+// finish out of order, and a plain store would let the smaller one land last
+// and overwrite the larger — hiding exactly the overlap this exists to surface.
+func (l *link) noteLocalWriter() {
+	w := l.localWriters.Add(1)
+	for {
+		m := l.maxLocalWriters.Load()
+		if w <= m || l.maxLocalWriters.CompareAndSwap(m, w) {
+			return
+		}
+	}
+}
+
+// errEdgeSuperseded ends a serveEdge loop whose edge was replaced. It is not a
+// failure to report: the edge-end line already says what happened.
+var errEdgeSuperseded = errors.New("edge superseded")
 
 // logEdgeEnd reports how a peer edge ended. The byte counts are the point: every
 // reader of this log asks whether anything flowed before the edge died, and
 // answering that needed a packet capture before.
 //
+// stale and maxLocalWriters ride along because they answer the two questions
+// the counts above cannot: whether a superseded edge wrote anything, and
+// whether two edges were ever writing the local conn at once. Both stay 0 on a
+// healthy link, so a non-zero value is the whole diagnosis in one line.
+//
 // The level follows the cause. A stream the peer ended (EOF) or that a teardown
 // closed (ErrClosed) is the ordinary case the presenter recovers from by
 // re-presenting, so it stays at debug; anything else means the edge broke while
 // it was still supposed to work, and that is a warning.
-func (l *link) logEdgeEnd(started time.Time, read, written, drops int64, err error) {
+func (l *link) logEdgeEnd(started time.Time, read, written, drops, stale int64, err error) {
 	if l.e.log == nil {
 		return
 	}
-	if err != nil && !isEdgeEndError(err) {
-		l.e.log.Warn("link: edge failed", l.edgeEndFields(started, read, written, drops, err)...)
+	if err != nil && !isEdgeEndError(err) && !errors.Is(err, errEdgeSuperseded) {
+		l.e.log.Warn("link: edge failed", l.edgeEndFields(started, read, written, drops, stale, err)...)
 		return
 	}
-	l.e.log.Debug("link: edge ended", l.edgeEndFields(started, read, written, drops, err)...)
+	l.e.log.Debug("link: edge ended", l.edgeEndFields(started, read, written, drops, stale, err)...)
 }
 
-func (l *link) edgeEndFields(started time.Time, read, written, drops int64, err error) []any {
+func (l *link) edgeEndFields(started time.Time, read, written, drops, stale int64, err error) []any {
 	fields := []any{
 		"peer", keyName(l.peer),
 		"age", time.Since(started).Round(time.Millisecond).String(),
 		"read", read, "written", written, "dropped", drops,
+	}
+	if stale > 0 || l.maxLocalWriters.Load() > 1 {
+		fields = append(fields, "staleWrites", stale,
+			"maxLocalWriters", l.maxLocalWriters.Load())
 	}
 	if err != nil {
 		fields = append(fields, "error", err)

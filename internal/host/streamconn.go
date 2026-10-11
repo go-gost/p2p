@@ -52,6 +52,14 @@ type streamConn struct {
 	rb  []byte
 	rd  time.Time
 
+	// sendMu serializes Send. gRPC permits one Send and one Recv on a stream at
+	// once, but not two Sends: SendMsg is not safe to call from two goroutines.
+	// Two writers reach this conn when a datagram link supersedes a peer edge
+	// and the old edge's reader has not finished draining, and the failure that
+	// produces is not a returned error — it is a byte stream the far end can no
+	// longer parse. The x-side conn has the same lock under the same name.
+	sendMu sync.Mutex
+
 	once sync.Once
 }
 
@@ -186,6 +194,11 @@ func (c *streamConn) Write(b []byte) (int, error) {
 	}
 	// The bridge writes through an io.Copy 32 KiB buffer, so a send always
 	// stays well under gRPC's message limit; no splitting here.
+	//
+	// Under sendMu: see the field's comment. One send at a time is the whole
+	// requirement, and it is checked once per call rather than assumed.
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	if err := c.stream.Send(b); err != nil {
 		return 0, err
 	}
