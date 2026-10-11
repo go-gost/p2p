@@ -384,6 +384,9 @@ func (c *Client) Ping() error {
 	if _, err := rand.Read(payload[:]); err != nil {
 		return err
 	}
+	// The wall clock, not clock.UnixNano: internal/clock's coarse tick is
+	// forbidden for elapsed-time measurement, and pongAt in Recv shares this
+	// clock — one source for both stamps or the difference is noise.
 	c.pingedAt.Store(time.Now().UnixNano())
 	return c.writeFrame(framePing, payload[:])
 }
