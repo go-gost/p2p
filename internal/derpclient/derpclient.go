@@ -384,7 +384,7 @@ func (c *Client) Ping() error {
 	if _, err := rand.Read(payload[:]); err != nil {
 		return err
 	}
-	c.pingedAt.Store(clock.UnixNano())
+	c.pingedAt.Store(time.Now().UnixNano())
 	return c.writeFrame(framePing, payload[:])
 }
 
