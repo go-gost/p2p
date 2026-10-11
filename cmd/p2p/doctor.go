@@ -59,6 +59,10 @@ func runDoctor(args []string) {
 		STUN:     firstNonEmpty(*stunAddr, cfg.Stun),
 		Direct:   cfg.Direct,
 		Peer:     *peer,
+		// InProcess stays false: the Status was read off the wire, so every
+		// field the control-plane proto does not carry (the relay's round trip
+		// today) is structurally zero here, and the report must name the field
+		// as not reported instead of asserting the relay measured nothing.
 	}
 	if key, err := host.PublicKeyFile(firstNonEmpty(*keyFile, cfg.Key)); err == nil {
 		opts.Identity = key

@@ -39,6 +39,14 @@ type Options struct {
 	Direct *bool
 	// Peer, when set, narrows the peer section and its verdict to that one key.
 	Peer string
+	// InProcess marks a caller that reads the Status in process (wisper), where
+	// a zero field means the measurement genuinely has not happened yet. A
+	// wire-sourced caller (the p2p doctor CLI, over a proto that is frozen)
+	// leaves it false: a field the control plane does not carry is structurally
+	// zero there, so the report says it was not reported rather than asserting
+	// a zero. False is the safe default — the shape a new caller gets unless it
+	// knows the Status came from the live endpoint.
+	InProcess bool
 }
 
 // Report renders st as a plain-text diagnostic report with verdicts.
@@ -63,10 +71,12 @@ func Report(st p2p.Status, opts Options) string {
 	// The relay's own round trip: the one latency here measured by this host
 	// instead of inferred from a peer's session, and the only thing that tells
 	// "the relay is slow" from "the relay is down" while a direct session keeps
-	// every counter healthy. Zero until the relay answers a ping, so it says so
-	// rather than printing a 0ms that reads like a broken line.
+	// every counter healthy. A zero has two different causes — not measured yet
+	// (an in-process caller) and not carried over the wire (a frozen proto) —
+	// and the formatter names which one applies, so the CLI cannot assert a
+	// host that has answered pings for days never measured one.
 	if st.RelayConnected {
-		field(&b, "relay rtt", relayRTT(st))
+		field(&b, "relay rtt", relayRTT(st, opts))
 	}
 	if opts.Direct != nil {
 		field(&b, "direct path", onOff(*opts.Direct))
@@ -294,10 +304,17 @@ func peerVerdict(key string, d p2p.PeerDiagnostic) string {
 }
 
 // relayRTT formats the relay's own round trip: milliseconds once the relay
-// has answered a ping, else the reason there is no number to show.
-func relayRTT(st p2p.Status) string {
+// has answered a ping, else the reason there is no number to show — which is
+// the caller's, not the field's. An in-process caller that reads zero has a
+// relay that has not answered a ping yet; a wire-sourced caller reads zero
+// always, because the control-plane proto does not carry the field, and must
+// say it was not reported rather than claim a measurement that never ran.
+func relayRTT(st p2p.Status, opts Options) string {
 	if st.RelayRTT > 0 {
 		return fmt.Sprintf("%dms", st.RelayRTT)
+	}
+	if !opts.InProcess {
+		return "not reported by the control plane"
 	}
 	return "not measured yet"
 }

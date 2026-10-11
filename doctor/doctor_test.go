@@ -102,13 +102,32 @@ func TestReport(t *testing.T) {
 
 // TestReportRelayRTTNotMeasured: a connected relay that has not answered a
 // ping yet says so, rather than leaving a reader to wonder whether the line
-// was dropped.
+// was dropped. This is the in-process caller's zero: the relay really has not
+// been measured here.
 func TestReportRelayRTTNotMeasured(t *testing.T) {
-	report := Report(p2p.Status{RelayConnected: true}, Options{RelayURL: "wss://relay.example/derp"})
+	report := Report(p2p.Status{RelayConnected: true}, Options{InProcess: true, RelayURL: "wss://relay.example/derp"})
 	for _, want := range []string{"relay rtt:", "not measured"} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report missing %q\n---\n%s", want, report)
 		}
+	}
+}
+
+// TestReportRelayRTTNotReportedByControlPlane: a wire-sourced caller (the p2p
+// doctor CLI, whose proto is frozen) structurally reads zero in every field the
+// proto does not carry — so a host that has answered pings for days would be
+// described as "not measured yet", byte-identical to the genuine first-30s
+// case. Over the wire the report must name the field as unreported, the idiom
+// the relay state line above it already uses.
+func TestReportRelayRTTNotReportedByControlPlane(t *testing.T) {
+	report := Report(p2p.Status{RelayConnected: true}, Options{RelayURL: "wss://relay.example/derp"})
+	for _, want := range []string{"relay rtt:", "not reported by the control plane"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report missing %q\n---\n%s", want, report)
+		}
+	}
+	if strings.Contains(report, "not measured yet") {
+		t.Errorf("wire-sourced report claims the relay never measured an RTT:\n%s", report)
 	}
 }
 
