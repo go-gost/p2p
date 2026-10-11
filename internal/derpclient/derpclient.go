@@ -203,6 +203,14 @@ type Client struct {
 	pongAt atomic.Int64
 	pongN  atomic.Int64
 
+	// pingedAt (unix nanos) is when the most recent ping was sent, and rtt
+	// (nanos) is the last ping→pong round trip. The keepalive ping is answered
+	// by the relay, so the round trip measures host↔relay over the ws control
+	// connection. Nanoseconds, not milliseconds: a loopback relay answers in
+	// under a millisecond and must not read as "not measured".
+	pingedAt atomic.Int64
+	rtt      atomic.Int64
+
 	// dropPong is a debug-only fault injection (p2p.FaultsConfig.DropPong): pong
 	// handling is swallowed, both the answer to the relay's ping and the stamp
 	// that records an arriving one, so a relay that is answering reads as silent
@@ -239,6 +247,11 @@ func (c *Client) LastPong() time.Time {
 
 // Pongs returns how many pongs have arrived.
 func (c *Client) Pongs() int64 { return c.pongN.Load() }
+
+// LastRTT returns the round trip of the most recent ping→pong exchange, zero if
+// none has completed. It is sampled by the engine's 30s keepalive ping and
+// measures host↔relay over the ws control connection.
+func (c *Client) LastRTT() time.Duration { return time.Duration(c.rtt.Load()) }
 
 // Dial connects to the DERP server at rawURL ("wss://host/derp", or ws://
 // for plaintext dev deployments), completes the DERP handshake, and returns
@@ -371,6 +384,7 @@ func (c *Client) Ping() error {
 	if _, err := rand.Read(payload[:]); err != nil {
 		return err
 	}
+	c.pingedAt.Store(clock.UnixNano())
 	return c.writeFrame(framePing, payload[:])
 }
 
@@ -421,6 +435,11 @@ func (c *Client) Recv() (src PublicKey, pkt []byte, err error) {
 			}
 			c.pongAt.Store(time.Now().UnixNano())
 			c.pongN.Add(1)
+			if at := c.pingedAt.Load(); at > 0 {
+				// time.Since against the ping's send stamp; unix nanos keep a
+				// loopback round trip from rounding to "not measured".
+				c.rtt.Store(time.Since(time.Unix(0, at)).Nanoseconds())
+			}
 		default:
 			// Unknown frame type: skip (forward compatibility).
 		}

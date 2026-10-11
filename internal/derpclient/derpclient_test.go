@@ -463,4 +463,7 @@ func TestPingIsAnsweredAndStamped(t *testing.T) {
 	if c.LastPong().IsZero() {
 		t.Error("LastPong() is zero after a stamped pong")
 	}
+	if got := c.LastRTT(); got <= 0 {
+		t.Errorf("LastRTT() = %v, want > 0 after a stamped pong", got)
+	}
 }
