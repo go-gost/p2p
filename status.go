@@ -220,6 +220,12 @@ type Status struct {
 	RelayConnected bool
 	RelayError     string
 
+	// RelayRTT is the milliseconds to the relay's last answered ping, measured
+	// by the host itself (derpclient's ping/pong timestamps) rather than
+	// inferred from a peer's session. 0 = no connection or not measured yet.
+	// In-process only: the gRPC proto is frozen.
+	RelayRTT int64
+
 	// DirectConfig is the direct path this host is *running* with, not the one
 	// it was configured with: Direct is Config.Direct, Stun is the server the
 	// engine actually holds (an embedder that probed one and got no answer

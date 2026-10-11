@@ -60,6 +60,14 @@ func Report(st p2p.Status, opts Options) string {
 	} else {
 		field(&b, "relay state", "not reported by the control plane")
 	}
+	// The relay's own round trip: the one latency here measured by this host
+	// instead of inferred from a peer's session, and the only thing that tells
+	// "the relay is slow" from "the relay is down" while a direct session keeps
+	// every counter healthy. Zero until the relay answers a ping, so it says so
+	// rather than printing a 0ms that reads like a broken line.
+	if st.RelayConnected {
+		field(&b, "relay rtt", relayRTT(st))
+	}
 	if opts.Direct != nil {
 		field(&b, "direct path", onOff(*opts.Direct))
 	}
@@ -283,6 +291,15 @@ func peerVerdict(key string, d p2p.PeerDiagnostic) string {
 	default:
 		return fmt.Sprintf("peer %s: on the relay (%s)", key, d.Path)
 	}
+}
+
+// relayRTT formats the relay's own round trip: milliseconds once the relay
+// has answered a ping, else the reason there is no number to show.
+func relayRTT(st p2p.Status) string {
+	if st.RelayRTT > 0 {
+		return fmt.Sprintf("%dms", st.RelayRTT)
+	}
+	return "not measured yet"
 }
 
 // relayState reports the relay's liveness when the Status carried it

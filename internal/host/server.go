@@ -325,6 +325,7 @@ func (s *server) status() p2p.Status {
 	var st p2p.Status
 	if s.engine != nil {
 		st.RelayConnected, st.RelayError = s.engine.relayState()
+		st.RelayRTT = s.engine.relayRTT().Milliseconds()
 		st.DirectConfig = s.engine.directConfig()
 		st.PeerTransports = s.engine.peerTransports()
 		st.PeerDiagnostics = s.engine.peerDiagnostics(st.PeerTransports)

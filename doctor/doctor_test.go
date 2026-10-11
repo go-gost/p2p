@@ -27,6 +27,7 @@ func TestReport(t *testing.T) {
 		StreamsDerp:    2,
 		EncryptedPeers: 2,
 		RelayConnected: true,
+		RelayRTT:       42,
 		PeerDiagnostics: map[string]p2p.PeerDiagnostic{
 			relayKey: {
 				Path:       "failed",
@@ -70,6 +71,8 @@ func TestReport(t *testing.T) {
 		"wss://relay.example/derp",
 		"relay state:",
 		"connected",
+		"relay rtt:",
+		"42ms",
 		"direct path:",
 		"on",
 		"summary:",
@@ -93,6 +96,18 @@ func TestReport(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("report missing %q\n---\n%s", want, out)
+		}
+	}
+}
+
+// TestReportRelayRTTNotMeasured: a connected relay that has not answered a
+// ping yet says so, rather than leaving a reader to wonder whether the line
+// was dropped.
+func TestReportRelayRTTNotMeasured(t *testing.T) {
+	report := Report(p2p.Status{RelayConnected: true}, Options{RelayURL: "wss://relay.example/derp"})
+	for _, want := range []string{"relay rtt:", "not measured"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report missing %q\n---\n%s", want, report)
 		}
 	}
 }

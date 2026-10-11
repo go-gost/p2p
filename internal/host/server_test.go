@@ -59,6 +59,9 @@ func TestStatusReportsTransportStats(t *testing.T) {
 	if st.RelayConnected {
 		t.Error("RelayConnected = true, want false for an engine with no client")
 	}
+	if st.RelayRTT != 0 {
+		t.Errorf("RelayRTT = %d, want 0 for an engine with no client", st.RelayRTT)
+	}
 	if got, ok := st.PeerDiagnostics[base64.RawURLEncoding.EncodeToString(peerDirect[:])]; !ok {
 		t.Errorf("PeerDiagnostics has no entry for the direct peer: %+v", st.PeerDiagnostics)
 	} else if got.Attempts != 4 || got.Ups != 2 || got.Drops != 1 {

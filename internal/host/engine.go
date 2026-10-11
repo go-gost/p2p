@@ -237,6 +237,19 @@ func (e *engine) relayState() (connected bool, lastErr string) {
 	return e.client != nil, lastErr
 }
 
+// relayRTT reports the relay's last answered ping round trip, or 0 while there
+// is no client (stub mode, or before Connect) or none has been answered yet.
+// Status exposes it as the relay's own latency: a peer's KCP SRTT measures the
+// peer's path through the relay, this measures ours to it.
+func (e *engine) relayRTT() time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.client == nil {
+		return 0
+	}
+	return e.client.LastRTT()
+}
+
 // peerDiagnostics snapshots each connected peer. transports is the peer-set
 // snapshot peerTransports just computed (its only caller is status()), so it is
 // also the peer set here: the same filter, the paths read once per status tick.
