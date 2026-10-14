@@ -572,6 +572,63 @@ func TestDirectUnderlayDeadClearsAndRepunches(t *testing.T) {
 	}
 }
 
+// TestPairDropMarksTheDirectConnDown: a pair reset (a peer rekey, a secure
+// desync, a dead relay) retires the pair's direct underlay, and the peer's
+// directConn must learn it. Without that the punch state machine keeps
+// reporting a socket nobody can send on as up: Status says the peer rides a
+// direct session closed minutes ago, its session age keeps counting, and no
+// drop is ever counted.
+func TestPairDropMarksTheDirectConnDown(t *testing.T) {
+	e := newTestEngine(t)
+	e.stunAddr = "127.0.0.1:3478" // a candidate source, so the re-punch can be armed
+	peer := derpclient.PublicKey{0x7A}
+	dc := e.directConn(peer)
+	sock := mustListenUDP(t)
+	dc.markUp(sock, udpAddrPort(t, mustListenUDP(t)), [seedTokenLen]byte{0x11})
+
+	// What a peer rekey does: resetPeerSession drops the peer's pair.
+	e.dropRelayKCP(peer, nil, errors.New("test: peer rekeyed"), 0)
+
+	if dc.isUp() {
+		t.Error("isUp() = true after the pair dropped the underlay, want false")
+	}
+	if got := dc.stateOf(); got == directUp {
+		t.Errorf("state = %v after the pair dropped the underlay, want not up", got)
+	}
+	if at := dc.sessAtOf(); !at.IsZero() {
+		t.Errorf("sessAt = %v after the pair dropped the underlay, want zero (no live underlay)", at)
+	}
+}
+
+// TestPeerDirectOffAfterPairDropIsNotDirect is the field case behind
+// TestPairDropMarksTheDirectConnDown: a phone turned the direct path off and
+// rebuilt its host, which drops this side's pair. The hub must name the
+// asymmetry ("peer-direct-off"), not keep reporting a direct session the phone
+// closed — the word a user reads to decide whether punching is on at all.
+func TestPeerDirectOffAfterPairDropIsNotDirect(t *testing.T) {
+	e := newTestEngine(t)
+	e.stunAddr = "127.0.0.1:3478"
+	peer := derpclient.PublicKey{0x7B}
+	// A live relay session: the peer stays connected across the direct death,
+	// so it is reported at all (peerTransports filters on peerLive). Built
+	// through peerConn so Close can tear it down.
+	pc := e.peerConn(peer)
+	pc.mu.Lock()
+	pc.sess = newTestSess(t)
+	pc.mu.Unlock()
+	dc := e.directConn(peer)
+	dc.markUp(mustListenUDP(t), udpAddrPort(t, mustListenUDP(t)), [seedTokenLen]byte{0x11})
+
+	// The peer rebuilt its host (a rekey drops the pair), then announced that
+	// its direct path is off.
+	e.dropRelayKCP(peer, nil, errors.New("test: peer rekeyed"), 0)
+	dc.addCaps(capsNoDirect)
+
+	if got := e.peerTransports()[keyName(peer)]; got != transportPeerDirectOff {
+		t.Errorf("transport = %q, want %q", got, transportPeerDirectOff)
+	}
+}
+
 // TestRegisterDirectUnderlayRetiresOldSocket: registering a second punched
 // socket retires the first (its underlay is closed exactly once, by the
 // underlay's sync.Once) and the pair serves only the new one, never the old.

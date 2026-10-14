@@ -1619,10 +1619,40 @@ func (e *engine) dropRelayKCP(peer derpclient.PublicKey, expect *kcp.UDPSession,
 	// pair never built a session there are no attrs, and the line stays as it
 	// was.
 	stats := pair.snapshot()
+	// The shutdown below retires the pair's direct underlay, so the punch state
+	// machine has to hear it first: a directConn still holding that socket goes
+	// on reporting the peer as riding a live direct session (Status, the
+	// re-punch gates, PeerDiagnostics) long after the path is gone. The field
+	// case: a phone turned punching off and rebuilt its host, the rekey dropped
+	// this side's pair, and the hub kept showing the direct session the phone
+	// had closed — with its session age counting and no drop ever counted.
+	e.markDirectUnderlayRetired(peer, pair)
 	pair.shutdown()
 	resetAttrs := []any{"peer", keyName(peer), "cause", cause, "gen", gen}
 	resetAttrs = append(resetAttrs, relayKCPSnapshotAttrs(stats)...)
 	e.log.Debug("relay kcp pair reset", resetAttrs...)
+}
+
+// markDirectUnderlayRetired hands a pair's direct underlay to its peer's
+// directConn as a death, before the pair that owns it is shut down. The pair
+// has no way to say this itself (shutdown just closes the socket), and the
+// directConn is the only object that can schedule the replacement punch and
+// clear the "live direct session" the status surfaces read off it. underlayDead
+// is the identity-guarded one: a directConn that has since moved on to another
+// socket (a re-punch won the race) is left alone, as is a pair with no underlay
+// and a peer with no directConn.
+func (e *engine) markDirectUnderlayRetired(peer derpclient.PublicKey, pair *relayKCPPair) {
+	pair.mu.Lock()
+	u := pair.direct
+	pair.mu.Unlock()
+	if u == nil {
+		return
+	}
+	dc := e.getDirect(peer)
+	if dc == nil {
+		return
+	}
+	dc.underlayDead(u)
 }
 
 // closeRelayKCPs ends every pair's relay KCP session: the relay connection
@@ -1658,7 +1688,7 @@ func (e *engine) closeRelayKCPsFor(cause error, force bool) {
 	}
 	e.kcpMu.Unlock()
 
-	pairs := make([]*relayKCPPair, 0, len(entries))
+	pairs := make([]pairEntry, 0, len(entries))
 	for _, en := range entries {
 		if !force && e.pairHasLiveDirect(en.peer) {
 			continue // a live direct path keeps the pair; only the relay half is gone
@@ -1670,10 +1700,17 @@ func (e *engine) closeRelayKCPsFor(cause error, force bool) {
 		}
 		delete(e.relayKCPs, en.peer)
 		e.kcpMu.Unlock()
-		pairs = append(pairs, en.pair)
+		pairs = append(pairs, en)
 	}
-	for _, pair := range pairs {
-		pair.shutdown()
+	for _, en := range pairs {
+		// The same handoff dropRelayKCP does: the pair is about to retire any
+		// direct underlay it still holds, and the punch state machine must hear
+		// it. Skipped when force is set — the engine is closing and tears every
+		// directConn down itself right after.
+		if !force {
+			e.markDirectUnderlayRetired(en.peer, en.pair)
+		}
+		en.pair.shutdown()
 	}
 	if len(pairs) > 0 {
 		e.log.Debug("relay kcp pairs reset", "pairs", len(pairs), "cause", cause)
