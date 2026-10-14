@@ -19,12 +19,14 @@ import (
 
 // shortenRelayIdle names the window/tick boundary without backdating stamps
 // by hours: the production 6s/1s would make every test sleep for seconds.
+// The stored values are atomic because a pair's watchdog goroutine can
+// outlive the test that built it and still reads them mid-shorten.
 func shortenRelayIdle(t *testing.T) {
 	t.Helper()
-	oldWindow, oldTick := relayIdleWindow, relayIdleTick
-	relayIdleWindow = 150 * time.Millisecond
-	relayIdleTick = 25 * time.Millisecond
-	t.Cleanup(func() { relayIdleWindow, relayIdleTick = oldWindow, oldTick })
+	oldWindow, oldTick := relayIdleWindow.Load(), relayIdleTick.Load()
+	relayIdleWindow.Store(int64(150 * time.Millisecond))
+	relayIdleTick.Store(int64(25 * time.Millisecond))
+	t.Cleanup(func() { relayIdleWindow.Store(oldWindow); relayIdleTick.Store(oldTick) })
 }
 
 // shortenRelayWindowOnly shortens the window but leaves the tick at its
@@ -33,9 +35,9 @@ func shortenRelayIdle(t *testing.T) {
 // tests that ride the real ticker (FirstStrike, ExitsWithPair) shorten both.
 func shortenRelayWindowOnly(t *testing.T) {
 	t.Helper()
-	oldWindow := relayIdleWindow
-	relayIdleWindow = 150 * time.Millisecond
-	t.Cleanup(func() { relayIdleWindow = oldWindow })
+	oldWindow := relayIdleWindow.Load()
+	relayIdleWindow.Store(int64(150 * time.Millisecond))
+	t.Cleanup(func() { relayIdleWindow.Store(oldWindow) })
 }
 
 // watchdogEngine builds an engine with a captured log and a live relay
@@ -109,7 +111,7 @@ func TestRelayWatchdogFirstStrikeKillsMuxOnly(t *testing.T) {
 		t.Fatalf("rebuilt lines = %d, want 0: the pair is stale, nothing may rebuild on it", got)
 	}
 	// One episode, one strike: the latch holds for the rest of the silence.
-	time.Sleep(3 * relayIdleWindow)
+	time.Sleep(3 * time.Duration(relayIdleWindow.Load()))
 	if got := capture.count("relay path silent"); got != 1 {
 		t.Fatalf("evidence lines = %d, want 1: the episode latch must hold while the silence continues", got)
 	}
@@ -131,7 +133,7 @@ func TestRelayWatchdogSecondStrikeResetsPair(t *testing.T) {
 	if strike != 1 {
 		t.Fatalf("first report strike = %d, want 1", strike)
 	}
-	if silentFor <= relayIdleWindow {
+	if silentFor <= time.Duration(relayIdleWindow.Load()) {
 		t.Fatalf("first report silentFor = %v, want past the window", silentFor)
 	}
 	e.relayPathSilent(peer, pair, strike, silentFor)
@@ -419,7 +421,7 @@ func TestRelayWatchdogExitsWithPair(t *testing.T) {
 	// The watchdog is gone with the pair: continued silence fires nothing.
 	// (The pair object is shut down; its ticker must not report again.)
 	setPairRelayRecency(pair, time.Now().Add(-time.Hour))
-	time.Sleep(3 * relayIdleTick)
+	time.Sleep(3 * time.Duration(relayIdleTick.Load()))
 	if got := capture.count("relay path silent"); got != before {
 		t.Fatalf("evidence lines grew %d -> %d after the pair died: the watchdog outlived it", before, got)
 	}

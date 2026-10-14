@@ -138,14 +138,22 @@ var directUnderlayIdle = 6 * time.Second
 // (the freshest of the two stamps), while silentFor stays relay-measured as
 // the evidence. The same bound is Task 2's relayLiveWindow (a separate var
 // for the death handler's gate — same default, deliberate). It is a var so
-// tests can shorten it; the production default is 6s.
-var relayIdleWindow = 6 * time.Second
+// tests can shorten it; the production default is 6s. Atomic, in nanos: the
+// watchdog goroutines read it while a test shortens it, and a test's
+// shorten/restore must not race a pair that outlived the test.
+var relayIdleWindow atomic.Int64
 
 // relayIdleTick paces the relay idle watchdog: how often it compares
 // lastRelayRecv against relayIdleWindow. A var so tests can shorten it; the
-// production default is 1s. The tick never enters the read path — it only
-// reads the stamp — because kcp-go's readLoop exits permanently on error.
-var relayIdleTick = time.Second
+// production default is 1s. Atomic, in nanos, for the same reason as
+// relayIdleWindow. The tick never enters the read path — it only reads the
+// stamp — because kcp-go's readLoop exits permanently on error.
+var relayIdleTick atomic.Int64
+
+func init() {
+	relayIdleWindow.Store(int64(6 * time.Second))
+	relayIdleTick.Store(int64(time.Second))
+}
 
 // newRelayKCPPair builds the pair-level KCP holder for peer: the KCP session
 // lives on the pair (like the pair's secure session — "one per (peer,
@@ -676,7 +684,7 @@ func (p *relayKCPPair) reportRelayIdle() (strike int, silentFor time.Duration) {
 	if p.lastDirectRecv.After(fresh) {
 		fresh = p.lastDirectRecv
 	}
-	if time.Since(fresh) < relayIdleWindow {
+	if time.Since(fresh) < time.Duration(relayIdleWindow.Load()) {
 		return 0, 0
 	}
 	silentFor = time.Since(p.lastRelayRecv)
@@ -715,7 +723,7 @@ func (p *relayKCPPair) rearmRelayIdle() {
 // It ends with the pair on p.done, like both pumps.
 func (p *relayKCPPair) watchRelayIdle() {
 	defer close(p.watchDone)
-	ticker := time.NewTicker(relayIdleTick)
+	ticker := time.NewTicker(time.Duration(relayIdleTick.Load()))
 	defer ticker.Stop()
 	for {
 		select {
