@@ -1370,14 +1370,20 @@ func seedHandshakeUDP(sock *net.UDPConn, peer netip.AddrPort, timeout time.Durat
 // so the resend loop stands in for KCP's send window; the read deadline between
 // sends is short so a retransmit interleaves with waiting for a reply.
 //
-// Only a datagram from peer and carrying seedProbeMagic with a full token is
-// considered. Success requires a full own->peer->own round trip, so a half-open
-// path (we receive but our bytes never arrive) times out instead of producing a
-// false direct session. A packet carrying our own token is the success case; a
-// peer's token is echoed back on every probe, with no dedupe, because our own
-// token is never echoed (an echo of our echo can only carry the peer's token,
-// which this side re-echoes to the peer, never back to itself). Termination is
-// the handshake deadline, not a per-token count.
+// Only a datagram carrying seedProbeMagic with a full token is considered,
+// from any source address: the token authenticates the peer, the source
+// address cannot. A per-destination NAT maps a different public endpoint than
+// the one advertised, and the endpoint that can answer is rarely the one that
+// was dialed, so a source filter is what made such a path untraversable. A
+// probe from an unexpected source is echoed back to that source and the resend
+// loop retargets to it, so both sides complete on the path that actually works.
+// Success requires a full own->peer->own round trip, so a half-open path (we
+// receive but our bytes never arrive) times out instead of producing a false
+// direct session. A packet carrying our own token is the success case; a peer's token
+// is echoed back on every probe, with no dedupe, because our own token is
+// never echoed (an echo of our echo can only carry the peer's token, which
+// this side re-echoes to the peer, never back to itself). Termination is the
+// handshake deadline, not a per-token count.
 func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) ([seedTokenLen]byte, error) {
 	var token [seedTokenLen]byte
 	if _, err := rand.Read(token[:]); err != nil {
@@ -1420,9 +1426,12 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 			}
 			return token, err
 		}
-		if !sameAddrPort(src.AddrPort(), peer) {
-			continue
-		}
+		// No source filter: the token authenticates the peer, the source
+		// address cannot — a per-destination NAT maps a different public
+		// endpoint than the one it advertised, and the endpoint that can
+		// answer is rarely the one that was dialed. Only the magic and a
+		// full token shape are required, and only an echo of this side's
+		// own token completes the handshake.
 		if n < len(seedProbeMagic)+seedTokenLen || !bytes.Equal(buf[:len(seedProbeMagic)], seedProbeMagic[:]) {
 			continue
 		}
@@ -1430,6 +1439,16 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 		copy(got[:], buf[len(seedProbeMagic):len(seedProbeMagic)+seedTokenLen])
 		if got == token {
 			return token, nil // the peer echoed our probe
+		}
+		// A probe from an unexpected source: the peer answers from where it
+		// is reachable, not from where it advertised — a per-destination NAT
+		// maps a different public endpoint per destination. Learn that
+		// endpoint so the resend loop carries our token to it, letting the
+		// peer echo our probe and complete this side's round trip; the echo
+		// below answers the peer's own handshake on the same path.
+		if !sameAddrPort(src.AddrPort(), peer) {
+			learned := *src
+			dst = &learned
 		}
 		// The peer's probe: echo it. Every retransmit is echoed again — raw UDP
 		// has no reliability, so an echo lost in flight must be recovered by
@@ -1439,7 +1458,10 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 		echo := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
 		echo = append(echo, seedProbeMagic[:]...)
 		echo = append(echo, got[:]...)
-		_, _ = sock.WriteToUDP(echo, dst)
+		// Echo to the probe's source, not the dialed address: for the
+		// expected peer they are the same, but for a peer answering from an
+		// unexpected endpoint this is what lets its own handshake complete.
+		_, _ = sock.WriteToUDP(echo, src)
 	}
 }
 
