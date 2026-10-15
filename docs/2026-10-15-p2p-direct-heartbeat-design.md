@@ -122,6 +122,19 @@ exactly as before.
   would look live while losing data — accepted: today's code has the same
   blind spot (seed ok ≠ data flows), and KCP retransmit over relay still
   covers it. Future work, not this spec.
+
+  **Corrected (2026-10-15, `339f05d`):** the "KCP retransmit over relay still
+  covers it" premise was false, and the shape reached production — a real
+  phone/hub pair whose underlay and heartbeat looked healthy for 45 minutes
+  while nothing came back, recoverable only by a human toggling direct off and
+  back on. Retransmits ride the *preferred* path, so with direct preferred they
+  rode the dead one and nothing covered it. The blind spot is no longer
+  accepted: `relayKCPPair.directOneWayDead` retires a direct path whose send
+  counter moves while its receive counter does not, past
+  `directOneWayWindow`. It cannot use recency — a dead path and an idle one
+  show the same silence, which is why this took a byte-counter read rather
+  than a timestamp. The peer's KCP acknowledgements move the receive counter
+  on a healthy path, so a working one-directional stream is not caught by it.
 - `markUp` must register the seed-learned source, not the dialed candidate
   (companion fix, same release): otherwise both ends' heartbeats go to a
   stale address and every path reads dead.
