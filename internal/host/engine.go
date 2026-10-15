@@ -101,7 +101,16 @@ type engine struct {
 	// before pc.mu everywhere else.
 	kcpMu     sync.Mutex
 	relayKCPs map[derpclient.PublicKey]*relayKCPPair
-	stop      chan struct{}
+	// sessionEvents holds one channel per peer that is closed when that peer's
+	// next relay session is built, so whoever registered state scoped to the
+	// old session can re-register. Guarded by its own leaf lock for the same
+	// reason as relayKCPs: sessionLocked notifies from under pc.mu, and e.mu is
+	// taken before pc.mu everywhere else, so notifying under e.mu would invert
+	// the order. Nothing takes sessionEventMu and then reaches for another
+	// lock, which keeps it a leaf.
+	sessionEventMu sync.Mutex
+	sessionEvents  map[derpclient.PublicKey]chan struct{}
+	stop           chan struct{}
 
 	stats engineStats
 }
@@ -2771,6 +2780,12 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	// the up line, and a later kill/desync/KCP-reset on this session, all share
 	// one number.
 	pc.sessionGen.Store(sessionGenSeq.Add(1))
+	// Wake whoever is waiting on this peer's session to change. Every build
+	// notifies — including the first — so a consumer that subscribes on its
+	// first dial and re-registers on every event stays correct from the start.
+	// The sub-line order matters: the store above is what makes the new
+	// session's generation visible to a reader that is woken here.
+	pc.e.notifyPeerSession(pc.peer)
 	if rebuild {
 		// The rebuild-storm check runs only here, on the rebuild path: it
 		// consumes the reason the previous session ended with (set by
@@ -2784,6 +2799,67 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	pc.e.log.Debug("peer relay session up", "peer", keyName(pc.peer), "client", roleIsClient, "secure", enc, "gen", pc.sessionGen.Load())
 	pc.startAccept()
 	return pc.sess, nil
+}
+
+// peerSessionEvents returns the channel that is closed when the peer next has a
+// relay session built. Callers park on it to learn that the session they
+// registered against is gone and a new one has taken its place.
+//
+// The engine states the fact and nothing more — no key ordering, no transport,
+// no notion of what was registered. That is the point: a consumer that
+// registered per-session state with its peer (a tun peer's address set, or
+// anything else that only one session knows about) re-pushes it in reaction,
+// and the engine neither names nor carries that state. Baking one consumer's
+// reason into the engine is what made the link layer's session-scoped rule
+// wrong for everybody else.
+//
+// Each build closes and replaces its peer's channel, so an event is delivered
+// once and a later build wakes a subscription taken now. After the engine
+// closes it returns an already-closed channel, so a subscriber parks nowhere
+// rather than hanging forever: its tunnel is being torn down regardless (Close
+// closes every link, which ends its carrier).
+func (e *engine) peerSessionEvents(peer derpclient.PublicKey) <-chan struct{} {
+	select {
+	case <-e.stop:
+		return closedChan
+	default:
+	}
+	e.sessionEventMu.Lock()
+	defer e.sessionEventMu.Unlock()
+	if e.sessionEvents == nil {
+		e.sessionEvents = make(map[derpclient.PublicKey]chan struct{})
+	}
+	ch, ok := e.sessionEvents[peer]
+	if !ok {
+		ch = make(chan struct{})
+		e.sessionEvents[peer] = ch
+	}
+	return ch
+}
+
+// closedChan is what a subscriber gets once the engine is gone: a closed
+// channel reads as immediately ready, so waiting on it is a no-op.
+var closedChan = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+// notifyPeerSession wakes peerSessionEvents' current subscribers for peer.
+// Called from sessionLocked under pc.mu, which is why it may only touch a leaf
+// lock (see sessionEvents).
+func (e *engine) notifyPeerSession(peer derpclient.PublicKey) {
+	e.sessionEventMu.Lock()
+	ch, ok := e.sessionEvents[peer]
+	if ok {
+		// Replace rather than latch: the next build must have a channel to
+		// close, or the second event is silently dropped.
+		delete(e.sessionEvents, peer)
+	}
+	e.sessionEventMu.Unlock()
+	if ok {
+		close(ch)
+	}
 }
 
 // noteBuildLocked records one relay session built for this peer, opening a new

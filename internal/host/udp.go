@@ -39,10 +39,12 @@ type link struct {
 	e    *engine
 	peer derpclient.PublicKey
 
-	// sessionScoped: once a peer edge has been established, losing it ends the
-	// link instead of re-presenting (see retireEdge). Set for an "ip" (tun)
-	// link, whose peer-side state — the addresses this side registered — is tied
-	// to the peer session and must be re-registered on a fresh one.
+	// sessionScoped: a peer edge that was already established is not re-presented
+	// onto the session it died on — the consumer's registered state (the
+	// addresses an "ip"/tun side registers, per session) is stale for it, so the
+	// presenter waits for a newer session (see mayPresent and
+	// engine.peerSessionEvents). The link itself is unaffected: it lives as long
+	// as its local carrier does (see retireEdge).
 	sessionScoped bool
 
 	stop     chan struct{} // closed by close(); ends the presenter and the pumps
@@ -235,6 +237,10 @@ func (l *link) presentLoop() {
 			select {
 			case <-l.stop:
 				return
+			// Wake on the session event rather than only on the poll timer: the
+			// 2s floor is the worst case, and a consumer re-registering on a new
+			// session is waiting on this lane becoming usable.
+			case <-l.e.peerSessionEvents(l.peer):
 			case <-time.After(channelRetryMin):
 			}
 			continue

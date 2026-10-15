@@ -161,12 +161,12 @@ func normalizeNetwork(network string) string {
 }
 
 // datagramNetwork reports whether network selects a datagram ("udp"-shaped)
-// link. "udp" is the transparent datagram link; "ip" is the same datagram shape
-// but session-scoped: the link does not re-present after a peer session is lost
-// (see link.retireEdge), so the consumer's conn ends and it re-dials. It is the
-// tun link — a tun peer's addresses are registered with the far tun server per
-// session, so a fresh peer session needs a fresh registration, and only a
-// re-dial resends it.
+// link. "ip" is the same datagram shape but session-scoped: a link that already
+// rode an edge waits for the peer to build a newer relay session before
+// re-presenting (see link.mayPresent), since the consumer registered per-session
+// state with the peer and re-pushes it on the session event
+// (engine.peerSessionEvents). It does not end on that wait: the consumer's conn
+// carries on, and only the consumer ending its own stream ends the link.
 func datagramNetwork(network string) bool {
 	return network == "udp" || network == "ip"
 }

@@ -160,8 +160,10 @@ func (s *server) allocateTunnel(network, peer string, attached bool) (*tunnelRec
 			// A dial is the intent to connect: start the punch now instead of
 			// only once a stream is opened (which never happens for the
 			// responder half of the key orders). An "ip" link is session-scoped:
-			// it ends rather than re-presenting when a peer session is lost, so
-			// the consumer re-dials (see link.retireEdge).
+			// it does not re-present onto the session an edge it already rode
+			// died on, because that session's state is stale for it (see
+			// link.mayPresent and engine.peerSessionEvents). It still survives
+			// the edge loss and re-presents once the peer builds a new session.
 			s.engine.maybeStartDirect(key)
 			lnk := newLink(s.engine, key, network == "ip")
 			s.engine.addLink(lnk)
