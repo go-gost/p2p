@@ -112,13 +112,21 @@ func TestEnsureSessionNoLockInversion(t *testing.T) {
 	}
 }
 
-// TestRelaySessionChurnReconnectsRelay: a pair whose packets the relay stopped
-// routing rebuilds its session every keepalive timeout, forever, while the
-// shared connection stays busy with every other peer — the one shape the
-// connection-level silence check cannot see (frames still arrive; they are just
-// not this pair's). The engine tears the transport down itself, because the
-// stale registration that caused it is cleared by nothing smaller.
-func TestRelaySessionChurnReconnectsRelay(t *testing.T) {
+// TestRelaySessionChurnReplacesThePairsRegistration: a pair whose packets the
+// relay stopped routing rebuilds its session every keepalive timeout, forever,
+// while the shared connection stays busy with every other peer — the one shape
+// the connection-level silence check cannot see (frames still arrive; they are
+// just not this pair's). The engine acts itself, because the stale registration
+// that caused it is cleared by nothing else.
+//
+// What changed is the scope of that action, not whether it happens: the cure used
+// to reconnect the relay, which tore the shared connection down and with it every
+// peer's session. It is now the per-peer registration drop (see
+// TestRelaySessionChurnSparesOtherPeers for the blast radius, and
+// TestRelaySessionChurnStillCuresTheChurningPeer for the cure itself). The
+// diagnosis above is untouched — this test keeps the shape that motivated the
+// guard, so a future change that stops acting on churn at all still fails here.
+func TestRelaySessionChurnReplacesThePairsRegistration(t *testing.T) {
 	defer func(w time.Duration, m int) { relayChurnWindow, relayChurnMax = w, m }(relayChurnWindow, relayChurnMax)
 	relayChurnWindow, relayChurnMax = time.Minute, 2
 
@@ -170,13 +178,28 @@ func TestRelaySessionChurnReconnectsRelay(t *testing.T) {
 		}
 	}
 
-	if e.relayConnected() {
-		t.Fatal("a churned peer did not take the relay down with it")
+	// The engine acted: the churning pair's adapter is closed and its relay
+	// registration dropped, which is what makes the next build re-handshake.
+	if !e.relayConnected() {
+		t.Fatal("a churn trip disconnected the shared relay")
+	}
+	e.mu.Lock()
+	_, secureKept := e.secure[secureKey{peer: eB.pub, transport: secureTransportRelay}]
+	e.mu.Unlock()
+	if secureKept {
+		t.Fatal("a churn trip left the churning pair's stale relay registration in place")
+	}
+	pc.mu.Lock()
+	closed := pc.closed
+	pc.mu.Unlock()
+	if !closed {
+		t.Fatal("a churn trip did not replace the churning pair's adapter")
 	}
 	// One-shot: the count is cleared, so a later window can trip again.
-	pc.mu.Lock()
-	churn, tripped := pc.churn, pc.churnTripped
-	pc.mu.Unlock()
+	pc2 := e.peerConn(pc.peer)
+	pc2.mu.Lock()
+	churn, tripped := pc2.churn, pc2.churnTripped
+	pc2.mu.Unlock()
 	if churn != 0 || tripped {
 		t.Fatalf("after the trip: churn=%d tripped=%v, want 0/false", churn, tripped)
 	}

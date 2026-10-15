@@ -2620,12 +2620,20 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 		// This pair is rebuilding sessions far faster than a working one ever
 		// does: its packets are not getting through a relay that still looks
 		// healthy for every other peer, and each rebuild rides the same path.
-		// A fresh registration is the cure, so the transport goes down and the
-		// redial brings it back.
-		pc.e.log.Error("derp: peer relay session churn, reconnecting the relay",
+		// A fresh registration is the cure, so this pair's registration goes
+		// down and the redial brings it back.
+		//
+		// Scoped to this pair, always. The old cure reconnected the relay, and
+		// the relay client is shared: teardown killed every peer's session,
+		// deleted every peer's relay keys, and shut down every pair's KCP
+		// session. In production one flapping phone took other peers' sessions
+		// with it, and the victims had done nothing — they were only visible by
+		// grepping "peer session killed" for peers with no churn of their own.
+		// What the churn is a symptom of is this pair's own stale registration,
+		// which the per-peer drop already handles.
+		pc.e.log.Error("derp: peer relay session churn, replacing the pair's registration",
 			"peer", keyName(pc.peer), "builds", relayChurnMax+1, "window", relayChurnWindow.String())
-		pc.e.reconnectRelay(fmt.Errorf("peer %s rebuilt its relay session more than %d times in %v",
-			keyName(pc.peer), relayChurnMax, relayChurnWindow))
+		pc.e.curePeerRelayChurn(pc.peer, pc)
 	}
 	if err == nil && punch {
 		pc.e.maybeStartDirect(pc.peer)
@@ -2889,6 +2897,31 @@ func (pc *peerConn) takeChurnTripped() bool {
 	return true
 }
 
+// curePeerRelayChurn applies the churn guard's cure to ONE peer: end its session
+// and drop its relay registration, so the build that follows re-handshakes
+// against a fresh one. pc is the adapter that tripped.
+//
+// Nothing here touches the shared relay client or any other peer. The trip is a
+// statement about this pair's registration, not about the relay connection:
+// reconnecting the connection to cure one peer's registration was the old
+// behaviour, and it cost every other peer its session (see the ensureSession call
+// site for the field evidence).
+//
+// A peer whose adapter was already replaced (a rekey raced the trip) is left
+// alone: its replacement borrows whatever registration the engine currently
+// holds, so there is no stale half to drop, and acting on a dead adapter could
+// only drop the LIVE registration the replacement is using.
+func (e *engine) curePeerRelayChurn(peer derpclient.PublicKey, pc *peerConn) {
+	e.mu.Lock()
+	cur := e.peers[peer]
+	e.mu.Unlock()
+	if cur != pc {
+		return
+	}
+	pc.killSession(fmt.Errorf("peer %s rebuilt its relay session more than %d times in %v",
+		keyName(peer), relayChurnMax, relayChurnWindow), true, reasonRelayChurn)
+}
+
 // startAccept launches the inbound stream loop for the adapter's current
 // session, if that session has none yet. Caller must hold pc.mu.
 //
@@ -2952,6 +2985,14 @@ const (
 	reasonSecureDesync sessionEndReason = "secure-desync"
 	// reasonEngineClosed: this process is shutting down.
 	reasonEngineClosed sessionEndReason = "engine-closed"
+	// reasonRelayChurn: this pair rebuilt its relay session more than
+	// relayChurnMax times inside relayChurnWindow, so its registration with the
+	// peer is presumed stale. The pair's own epoch resets (see resetsPairKCP),
+	// but NOT gated on a live direct path (unlike the relay-churn reasons): a
+	// live direct path does not make this pair's relay registration fresh, and
+	// suppressing the drop would leave the stale keys in place — the very thing
+	// the trip exists to cure.
+	reasonRelayChurn sessionEndReason = "relay-churn"
 	// reasonAdapterClosed: the adapter's underlay is gone.
 	reasonAdapterClosed sessionEndReason = "adapter-closed"
 )
@@ -2966,7 +3007,7 @@ const (
 // adapter death — the pair's session runs on.
 func resetsPairKCP(reason sessionEndReason) bool {
 	switch reason {
-	case reasonPeerGoneProbe, reasonLinkLost, reasonPeerGone, reasonPeerRekeyed, reasonSecureDesync, reasonEngineClosed:
+	case reasonPeerGoneProbe, reasonLinkLost, reasonPeerGone, reasonPeerRekeyed, reasonSecureDesync, reasonEngineClosed, reasonRelayChurn:
 		return true
 	}
 	return false
