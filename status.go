@@ -56,6 +56,20 @@ type PeerDiagnostic struct {
 	// RelayKCPStats). In-process only: the gRPC proto is frozen and does not
 	// carry it, like RelayRebuilds.
 	RelayKCP RelayKCPStats
+	// SessionState is the relay mux session's own state — "up" or "down" — the
+	// layer the report had no field for at all. It is deliberately separate
+	// from State and Path: those are set from the punch state machine and from
+	// underlay recency, and neither reads the session object, so both can say
+	// "up" over a session that is gone. The measured field shape was
+	// `path: direct`, `state: up`, `last traffic: 4m47s` with the smux session
+	// dead, which printed as healthy and stayed that way for 45 minutes.
+	//
+	// Empty means this host does not serve a session for the peer, so it says
+	// nothing either way — the same convention as State, and the reason it is a
+	// string rather than a bool: a diagnostic that never reported it (the gRPC
+	// proto is frozen and does not carry it, like RelayKCP) must not be read as
+	// "down".
+	SessionState string
 	// Trace is the peer's recent punch history: short human-readable lines, the
 	// oldest first, capped at the ring's size (the newest are kept). Nil for a
 	// peer with no direct punch state (a relay-only peer).

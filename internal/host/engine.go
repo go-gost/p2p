@@ -313,6 +313,11 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 				// The pair's relay KCP session health, read through the pair (not the
 				// adapter) so a clean adapter swap still reports the surviving session.
 				RelayKCP: e.relayKCPStats(pc.peer),
+				// The mux session's own liveness, the one layer nothing reported:
+				// Path and State come from the punch machine and underlay recency,
+				// neither of which reads the session, so both can say "up" over a
+				// session that is gone.
+				SessionState: sessState(pc),
 			}
 			// The pair's O2/O4/O5 migration history (in-process only).
 			e.fillPairDiag(&d, pc.peer)
@@ -373,6 +378,24 @@ func (e *engine) fillPairDiag(d *p2p.PeerDiagnostic, peer derpclient.PublicKey) 
 	d.RepunchAfterIdle = int64(pd.repunchAfterIdle)
 	d.SeedFailures = int64(pd.seedFailures)
 	d.RelayLossSuppressedByDirect = int64(pd.relayLossSuppressed)
+}
+
+// sessState names the adapter's relay mux session state, or "" when it holds
+// no session yet. smux does not always close a dead session on its own: a
+// recvLoop that exits on a read error leaves IsClosed false, so "a session
+// object exists" is a different question, and it is this one that says
+// whether the peer is actually being served.
+func sessState(pc *peerConn) string {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	switch {
+	case pc.sess == nil:
+		return ""
+	case pc.sess.IsClosed():
+		return "down"
+	default:
+		return "up"
+	}
 }
 
 // ageOf is the time since a UnixNano stamp, or 0 when unset.

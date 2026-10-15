@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/go-gost/p2p"
 )
@@ -153,6 +154,40 @@ func field(b *strings.Builder, label, value string) {
 	fmt.Fprintf(b, "%-16s %s\n", label+":", value)
 }
 
+// underlayWord reports both underlays as themselves, so an underlay that is
+// answering a heartbeat is distinguishable from one that is carrying bytes.
+//
+// The heartbeat is a raw-UDP magic packet: it round-trips on the socket and is
+// consumed before KCP ever sees it, so "hb alive" is a statement about the NAT
+// path and nothing else. The recency ages are the per-underlay datagram
+// stamps, which bytes do move — except that "last direct recv" is re-armed by a
+// heartbeat answer too, so a reader must compare it against the session and
+// data-plane lines above before reading the path as healthy.
+func underlayWord(d p2p.PeerDiagnostic) string {
+	k := d.RelayKCP
+	return fmt.Sprintf("direct hb %s, direct last recv %s, relay last recv %s",
+		hbWord(k.DirectAlive), recvWord(k.DirectLastRecvAge), recvWord(k.RelayLastRecvAge))
+}
+
+// hbWord names a heartbeat answer, or "unknown" when nothing was measured.
+func hbWord(alive bool) string {
+	if alive {
+		return "alive"
+	}
+	return "unknown"
+}
+
+// recvWord renders a per-underlay silence age. 0 means no stamp at all — the
+// underlay never delivered a datagram — which is a different fact from "silent
+// for 0s", and negative values (a relay-only peer with no direct stamp) mean the
+// same thing.
+func recvWord(d time.Duration) string {
+	if d <= 0 {
+		return "never"
+	}
+	return d.String()
+}
+
 // peerBlock writes one peer's full diagnostic, its trace one round per line.
 func peerBlock(b *strings.Builder, key string, d p2p.PeerDiagnostic) {
 	fmt.Fprintf(b, "  %s\n", key)
@@ -181,12 +216,22 @@ func peerBlock(b *strings.Builder, key string, d p2p.PeerDiagnostic) {
 	field(b, "    peer addr", orNone(d.PeerAddr))
 	field(b, "    candidates", fmt.Sprintf("%d", d.Candidates))
 	field(b, "    caps", orNone(strings.Join(d.Caps, ", ")))
-	field(b, "    session age", d.SessionAge.String())
+	// The three layers, each attributed separately. They used to be one word:
+	// "path" and "state" come from the punch machine and from underlay recency,
+	// and "last traffic" carried a note telling the reader to discount it, so a
+	// dead data plane under a heartbeat-alive underlay printed as healthy and
+	// stayed that way for 45 minutes. Neither path nor state reads the session
+	// object, which is why "session" now has a line of its own.
+	field(b, "    session", orNone(d.SessionState))
+	field(b, "    underlay", underlayWord(d))
 	// "last traffic", not "last frame": smux keepalive NOPs never reach the
 	// pump, so an idle peer ages here and "last recv" reads like a dead path.
-	// The window is stated next to the number for the same reason.
+	// The window is stated next to the number for the same reason — but it is no
+	// longer the only field that could contradict path/state, so it is no longer
+	// the only one a reader has to be told to distrust.
 	field(b, "    last traffic", fmt.Sprintf("%s (a connected idle peer ages here: keepalives carry no traffic)",
 		d.LastRecvAge))
+	field(b, "    session age", d.SessionAge.String())
 	field(b, "    punch", fmt.Sprintf("%d attempts, %d ups, %d drops", d.Attempts, d.Ups, d.Drops))
 	if len(d.Trace) > 0 {
 		b.WriteString("    trace:\n")
@@ -279,6 +324,14 @@ func stunVerdict(st p2p.Status, opts Options) string {
 func peerVerdict(key string, d p2p.PeerDiagnostic) string {
 	switch d.Path {
 	case "direct":
+		// The underlay and the punch say direct; only the session says whether
+		// anything is being carried. A verdict built from the first two alone
+		// read "up" over a one-way-dead data plane, which is the report shape
+		// that hid a 45-minute outage from the one person watching it.
+		if d.SessionState == "down" {
+			return fmt.Sprintf("peer %s: direct underlay up but the session is DOWN (underlay %s, last traffic %s) — the path is not carrying",
+				key, underlayWord(d), d.LastRecvAge)
+		}
 		return fmt.Sprintf("peer %s: direct path up (session %s, last traffic %s)", key, d.SessionAge, d.LastRecvAge)
 	case "punching":
 		return fmt.Sprintf("peer %s: punch in flight (candidates %d)", key, d.Candidates)
