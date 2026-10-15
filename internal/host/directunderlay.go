@@ -67,7 +67,10 @@ type directUnderlay struct {
 	// lastHbRecv is when this side last saw its own heartbeat echoed back, as
 	// unix nanos. The pair's idle watchdog reads it: an underlay whose
 	// heartbeats are answered is live even with no KCP traffic, so silence
-	// alone must not retire it.
+	// alone must not retire it. Note what this does and does not prove: the
+	// packet never reaches KCP, so this says the socket path is open and nothing
+	// about the data plane. The pair keeps that question separate (see
+	// directOneWayDead) rather than reading this answer as both.
 	lastHbRecv atomic.Int64
 
 	// seedEchoes counts seed probes this underlay has echoed. Diagnostic, and

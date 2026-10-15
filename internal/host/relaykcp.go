@@ -129,6 +129,15 @@ const (
 // production default is 6s.
 var directUnderlayIdle = 6 * time.Second
 
+// directOneWayWindow is how long a direct path must keep sending without
+// receiving anything before it is treated as one-way dead and re-punched.
+// Generous on purpose: a stall guard, not a fast detector. A healthy path's
+// receive counter moves on the peer's KCP acknowledgements alone, so a
+// receive-counter gap means the KCP plane is not returning anything at all, and
+// the window exists only to ride out a transient gap (a burst of retransmits
+// the peer's window could not accept yet, say).
+var directOneWayWindow = 60 * time.Second
+
 // relayIdleWindow is how long the pair may go without delivering an inbound
 // datagram on either underlay before its idle watchdog reports it. It is 2x
 // the smux keepalive interval (3s): a healthy session's NOPs cross in both
@@ -249,6 +258,11 @@ type relayKCPPair struct {
 	direct         *directUnderlay
 	directStop     chan struct{}
 	lastDirectRecv time.Time
+	// directOneWay state (see directOneWayDead): the per-underlay byte counters
+	// last seen, and when the send-without-receive shape started holding. A
+	// zero oneWayAt means the shape is not holding. Guarded by mu.
+	oneWayAt               time.Time
+	oneWaySent, oneWayRcvd uint64
 
 	// onDirectIdle, when set by the engine (Task 7), is invoked once per idle
 	// episode when the direct pump observes the underlay silent past
@@ -861,6 +875,53 @@ func underlayRetireReason(pathReason string) string {
 // once the underlay has been silent past directUnderlayIdle it reports it to the
 // engine through onDirectIdle, once per idle episode, and a fresh datagram
 // re-arms it. The pump never clears the underlay itself — the engine decides.
+// directOneWayDead reports whether the direct path is sending while receiving
+// nothing — the one shape a heartbeat cannot distinguish from healthy silence.
+//
+// It deliberately does not use recency: a dead path and a genuinely idle one show
+// the same silence, so no timestamp can tell them apart, and reading it that way
+// is how a one-way-dead path lived forever under an answered heartbeat. What does
+// tell them apart is the per-underlay byte counters, which the pair already
+// partitions: a path whose send counter moves while its receive counter does not
+// is delivering nothing, and the peer's KCP acknowledgements alone keep the
+// receive counter moving on a healthy path — so this holds for a working
+// one-directional stream too, and not for a silent one.
+//
+// The window is a stall guard: the shape must persist past it before the path is
+// declared dead, because declaring it earlier re-punches every healthy path
+// going through a burst of retransmits.
+//
+// An idle pair clears the tracker instead of latching. Once the sender stops the
+// shape no longer applies, and holding it would retire the pair a window later
+// for traffic that has already ended.
+func (p *relayKCPPair) directOneWayDead(now time.Time) bool {
+	sent := p.directBytesSent.Load()
+	rcvd := p.directBytesRcvd.Load()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	switch {
+	case sent == p.oneWaySent && rcvd == p.oneWayRcvd:
+		// No movement either way: idle, not dead. Clear the shape so a stopped
+		// sender is never judged by traffic that has already ended.
+		p.oneWayAt, p.oneWaySent, p.oneWayRcvd = time.Time{}, sent, rcvd
+		return false
+	case rcvd > p.oneWayRcvd:
+		// Receiving: the KCP plane is answering, so the path is carrying.
+		p.oneWayAt, p.oneWaySent, p.oneWayRcvd = time.Time{}, sent, rcvd
+		return false
+	}
+
+	// Sending without receiving. The window opens here and is not restarted by a
+	// later tick: the shape has to hold continuously from the first send.
+	if p.oneWayAt.IsZero() {
+		p.oneWayAt = now
+	}
+	p.oneWaySent, p.oneWayRcvd = sent, rcvd
+	return now.Sub(p.oneWayAt) >= directOneWayWindow
+}
+
 func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 	buf := make([]byte, relayKCPMtu)
 	// idleFired is the episode latch: set when the watchdog reports this
@@ -888,8 +949,16 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 				// A live heartbeat answer means the underlay is healthy
 				// with no KCP traffic: re-arm its recency so the session
 				// keeps preferring it, and never retire it for idle. Only
-				// a path whose heartbeats also go unanswered is dead.
-				if u.hbLive() {
+				// a path whose heartbeats go unanswered, or whose KCP plane
+				// is returning nothing while it keeps sending (see
+				// directOneWayDead), is dead.
+				// The heartbeat proves the path, so an answered one keeps the
+				// underlay and never retires it for idle — unless it is the only
+				// thing alive. A path sending while receiving nothing is not
+				// carrying, and letting its echo keep it fixed the sticky-direct
+				// problem by building a second one: the underlay lived forever
+				// under an answered heartbeat while nothing came back.
+				if u.hbLive() && !p.directOneWayDead(time.Now()) {
 					p.mu.Lock()
 					if p.direct == u {
 						p.lastDirectRecv = time.Now()
