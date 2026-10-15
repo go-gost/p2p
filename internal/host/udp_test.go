@@ -278,14 +278,19 @@ func TestLinkRepresentsAfterEdgeDeath(t *testing.T) {
 	}
 }
 
-// TestScopedLinkEndsOnEdgeDeath is the counterpart for the session-scoped "ip"
-// (tun) link: it does NOT re-present a lost peer edge, because the far tun
-// server registered this side's addresses per session and a fresh session needs
-// a fresh registration — which only the consumer re-dialing sends. So the link
-// ends — the local edge is closed and the presenter stops — instead of riding a
-// stale session over a new edge. Regression test for the tun hub losing a
-// spoke's route after a hub restart.
-func TestScopedLinkEndsOnEdgeDeath(t *testing.T) {
+// TestScopedLinkSurvivesEdgeDeathUntilFreshSession is the counterpart for the
+// session-scoped "ip" link, and it pins the liveness ownership: the link lives
+// as long as its local carrier does. Losing the peer edge does not end the link,
+// because the carrier cannot tell "my tunnel is over" from "this edge died" and
+// would never re-dial — the fix for the route that stayed gone for an hour after
+// a hub restart.
+//
+// What it still waits for is the session: the state this side registered with
+// the peer was scoped to the session that edge rode, so the link does not present
+// again until the peer has built a newer one (sessionGen moves), rather than
+// riding a stale session over a new edge. Before the first edge there is nothing
+// stale to ride, so it presents — that is how a peer that starts late converges.
+func TestScopedLinkSurvivesEdgeDeathUntilFreshSession(t *testing.T) {
 	e := newTestEngine(t)
 	_, peerKey, _ := derpclient.Generate()
 
@@ -304,23 +309,24 @@ func TestScopedLinkEndsOnEdgeDeath(t *testing.T) {
 	first := <-peerSides
 	waitFor(t, 3*time.Second, l.hasEdge)
 
-	first.Close() // the peer session is lost (the hub restarted)
+	first.Close() // the peer edge is lost
 
+	// The link lives on: done stays open, so the carrier is not told to end.
 	select {
 	case <-l.done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("a session-scoped link did not end when its peer edge was lost")
+		t.Fatal("the link ended on a lost peer edge while its local carrier lived")
+	case <-time.After(3 * time.Second):
 	}
-	// It ended instead of re-presenting: no second edge was opened.
+	// The carrier's stream is untouched, so it can still be written to.
+	local.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := local.Write([]byte("x")); err != nil {
+		t.Fatalf("the local carrier was closed with the link: %v", err)
+	}
+	// It does not present over the session the dead edge rode.
 	select {
 	case <-peerSides:
-		t.Fatal("the session-scoped link opened a new peer edge after the session was lost")
+		t.Fatal("the session-scoped link opened a new edge on the session it had ridden")
 	default:
-	}
-	// The local edge is closed with the link, so the consumer re-dials.
-	local.SetWriteDeadline(time.Now().Add(time.Second))
-	if _, err := local.Write([]byte("x")); err == nil {
-		t.Fatal("the local edge survived the session-scoped link")
 	}
 }
 

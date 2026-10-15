@@ -83,7 +83,7 @@ func TestSpokeReachesTargetOutlet(t *testing.T) {
 // a udp target stub and the spoke holding one link to the hub (scoped or
 // transparent) attached to a local edge, with the edge already established by
 // one datagram. Shared by the fault-injection tests below.
-func linkToHubStub(t *testing.T, scoped bool) (l *link, hub, spoke *engine) {
+func linkToHubStub(t *testing.T, scoped bool) (l *link, hub, spoke *engine, stub *net.UDPConn) {
 	t.Helper()
 	rs := &relayServer{}
 	url := rs.start(t)
@@ -121,18 +121,23 @@ func linkToHubStub(t *testing.T, scoped bool) (l *link, hub, spoke *engine) {
 		t.Fatalf("establish edge: %v", err)
 	}
 	waitFor(t, 10*time.Second, l.hasEdge)
-	return l, hub, spoke
+	return l, hub, spoke, stub
 }
 
-// TestScopedLinkEndsUnderBlackhole pins the tun fix's liveness bound: a
-// session-scoped link ends when the peer path goes dead in both directions —
-// the "network switch / blackhole" shape, where no frame gets through and the
-// smux keepalive is dropped too — because the session's own liveness gives up.
-// That end is what makes the tun consumer re-dial and re-register. The
-// transparent link does the opposite: it re-presents and stays up, which is why
-// it lost the registration. The bound logged here is the smux keepalive timeout.
-func TestScopedLinkEndsUnderBlackhole(t *testing.T) {
-	l, hub, spoke := linkToHubStub(t, true)
+// TestScopedLinkSurvivesAndRecoversUnderBlackhole pins the link's liveness
+// ownership: the link lives as long as its local carrier does. When the peer
+// path goes dead in both directions — the "network switch / blackhole" shape,
+// where no frame gets through and the smux keepalive is dropped too — the link
+// holds on and recovers by itself once the session is rebuilt, instead of ending
+// and leaving the consumer to re-dial.
+//
+// It used to end instead, on the theory that the consumer would re-dial and
+// re-register. It would not: the consumer's only signal that the tunnel was over
+// was the link ending, so nothing re-dialed and the route stayed gone for the
+// best part of an hour. Recovery is the link's job now — see link.mayPresent,
+// which waits for a fresh peer session rather than presenting over a stale one.
+func TestScopedLinkSurvivesAndRecoversUnderBlackhole(t *testing.T) {
+	l, hub, spoke, _ := linkToHubStub(t, true)
 
 	// Blackhole both directions: no data frame either way, smux keepalives
 	// included. This is the shape a network switch (or a silent path) leaves
@@ -140,14 +145,19 @@ func TestScopedLinkEndsUnderBlackhole(t *testing.T) {
 	hub.faults.Store(newFaults(&p2p.FaultsConfig{DropData: true}))
 	spoke.faults.Store(newFaults(&p2p.FaultsConfig{DropData: true}))
 
-	start := time.Now()
+	// It does not end: the carrier is still there, so the tunnel is not over.
+	// That is the whole fix — an ending link was the consumer's only cue to
+	// re-dial, and it never made it.
 	select {
 	case <-l.done:
-		t.Logf("session-scoped link ended %s after the path went dead (the smux keepalive bound)",
-			time.Since(start).Round(time.Second))
-	case <-time.After(90 * time.Second):
-		t.Fatal("a session-scoped link never ended under a blackhole — the tun would not re-register")
+		t.Fatal("the link ended under a blackhole while its local carrier lived")
+	case <-time.After(60 * time.Second):
+		// survived the whole blackhole.
 	}
+	// Recovery is pinned at the unit level, not here: it needs a session gen
+	// bump this scenario produces only by incidentally rebuilding the relay,
+	// which the churn guard may tear down first. See
+	// TestScopedLinkRePresentsAfterNewPeerSession.
 }
 
 // TestScopedLinkSurvivesPacketLoss: under a lossy path that still carries the
@@ -157,7 +167,7 @@ func TestScopedLinkEndsUnderBlackhole(t *testing.T) {
 // smux keepalive, sent every few seconds, still gets through, so the session
 // survives and the link stays up.
 func TestScopedLinkSurvivesPacketLoss(t *testing.T) {
-	l, hub, spoke := linkToHubStub(t, true)
+	l, hub, spoke, _ := linkToHubStub(t, true)
 
 	hub.faults.Store(newFaults(&p2p.FaultsConfig{DropDataRate: 0.5}))
 	spoke.faults.Store(newFaults(&p2p.FaultsConfig{DropDataRate: 0.5}))

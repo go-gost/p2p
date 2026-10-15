@@ -63,7 +63,21 @@ type link struct {
 	peerEdge net.Conn // current peer edge: our presentation or an adopted one
 	own      net.Conn // our presentation edge; nil once adopted or when it dies
 	hadEdge  bool     // a peer edge has been established at least once
-	closed   bool
+
+	// rodeGen is the peer relay session generation the current (or most recent)
+	// peer edge rode, assigned when that edge was installed. A session-scoped
+	// link re-presents only once the peer has built a newer generation (see
+	// mayPresent): the state the consumer registered with the peer was scoped to
+	// the session that edge rode, so presenting over the same one would ride a
+	// session the peer no longer holds the state for. The engine bumps
+	// sessionGen on every relay session build, so no embedder input is involved.
+	rodeGen uint64
+	// parkSince is when the presenter first held off presenting because the
+	// generation had not moved. It bounds the hold: a link that is itself the
+	// only traffic a peer sees would otherwise leave the generation frozen and
+	// stall on its own buffer.
+	parkSince time.Time
+	closed    bool
 	// edgeGen is bumped every time a peer edge is installed. serveEdge
 	// captures it and stops feeding the local conn once it moves on: closing a
 	// superseded edge is not the same as silencing it, because streamConn.Read
@@ -109,6 +123,15 @@ var channelTagTimeout = 2 * time.Second
 // Only an outright open failure (peer unreachable) backs off.
 const channelRetryMin = 2 * time.Second
 
+// scopedRePresentGrace bounds how long a session-scoped link holds off
+// presenting while the peer's relay session generation stays put. The
+// generation is the signal that the peer holds fresh state for this link, but a
+// link that is itself the only traffic a peer sees would leave it frozen — the
+// bytes it is holding sit in the link's buffer rather than reaching the peer —
+// so the hold has to give way eventually. Presenting over the same session is
+// what the consumer asked for; staying parked is not.
+var scopedRePresentGrace = 10 * time.Second
+
 // channelRetryDelay returns the next presentation reconnect delay: open
 // failures grow towards the punch backoff, everything else resets to the floor.
 func channelRetryDelay(prev time.Duration, openFailed bool) time.Duration {
@@ -120,8 +143,10 @@ func channelRetryDelay(prev time.Duration, openFailed bool) time.Duration {
 
 // newLink creates the datagram link of one datagram dial and starts its
 // presenter. The caller registers it on the engine so inbound edges can find it.
-// sessionScoped marks an "ip" (tun) link: it ends on a lost peer session rather
-// than re-presenting, so the consumer re-dials (see retireEdge).
+// sessionScoped marks a link whose consumer registered state with the peer per
+// session (the "ip"/tun case): it waits for a fresh peer session before
+// presenting an edge it lost, rather than riding a stale one. The link still
+// lives as long as its local carrier does either way (see retireEdge).
 func newLink(e *engine, peer derpclient.PublicKey, sessionScoped bool) *link {
 	l := &link{
 		e:             e,
@@ -200,6 +225,20 @@ func (l *link) presentLoop() {
 		}
 
 		openFailed := false
+		// A session-scoped link that has already ridden an edge holds off until
+		// the peer builds a newer relay session: the state the consumer
+		// registered with the peer was scoped to the session that edge rode
+		// (see mayPresent). It does not spin: the hold is bounded, and an
+		// outright open failure still backs off.
+		if !l.mayPresent() {
+			l.noteParked()
+			select {
+			case <-l.stop:
+				return
+			case <-time.After(channelRetryMin):
+			}
+			continue
+		}
 		c, err := l.e.openTaggedStream(pname)
 		if err == nil {
 			if !l.publishOwn(c) {
@@ -237,6 +276,50 @@ func (l *link) presentLoop() {
 	}
 }
 
+// mayPresent reports whether the presenter may open an edge now.
+//
+// A session-scoped link waits for the peer's relay session generation to move
+// past the edge it last rode: the engine bumps it on every session build
+// (peerConn.sessionLocked), so a move means the peer holds fresh state for this
+// link. Before the first edge there is nothing stale to ride, so it presents —
+// that is how a peer that starts late converges.
+//
+// The hold is bounded (scopedRePresentGrace) so a link that is itself the only
+// traffic a peer sees cannot stall on a frozen generation.
+func (l *link) mayPresent() bool {
+	if !l.sessionScoped {
+		return true
+	}
+	l.mu.Lock()
+	had, rode, parkedAt := l.hadEdge, l.rodeGen, l.parkSince
+	l.mu.Unlock()
+	if !had {
+		return true
+	}
+	if rode < l.e.peerSessionGen(l.peer) {
+		return true
+	}
+	return !parkedAt.IsZero() && time.Since(parkedAt) > scopedRePresentGrace
+}
+
+// noteRidden records the peer session generation the newly installed edge rode,
+// and clears any park: an edge is up, so the link is no longer holding off.
+func (l *link) noteRidden() {
+	l.mu.Lock()
+	l.rodeGen = l.e.peerSessionGen(l.peer)
+	l.parkSince = time.Time{}
+	l.mu.Unlock()
+}
+
+// noteParked marks the start of a hold-off, unless one is already running.
+func (l *link) noteParked() {
+	l.mu.Lock()
+	if l.parkSince.IsZero() {
+		l.parkSince = time.Now()
+	}
+	l.mu.Unlock()
+}
+
 // publishOwn makes c the link's presentation edge and starts its reader. It
 // returns false when the link is closed or already holds an adopted edge (an
 // adopt raced the open) — the caller still owns c and must close it.
@@ -250,6 +333,7 @@ func (l *link) publishOwn(c net.Conn) bool {
 	l.edgeGen++
 	gen := l.edgeGen
 	l.mu.Unlock()
+	l.noteRidden()
 	go l.serveEdge(c, gen)
 	// Asynchronous: a flush can block on a peer that is not reading yet, and
 	// the presenter must stay free to react to the edge dying. wmu keeps the
@@ -279,6 +363,7 @@ func (l *link) adopt(c net.Conn, transport string) bool {
 	l.edgeGen++
 	gen := l.edgeGen
 	l.mu.Unlock()
+	l.noteRidden()
 	// Our presentation is superseded; its reader retires it.
 	if own != nil && own != c {
 		own.Close()
@@ -455,6 +540,15 @@ func isEdgeEndError(err error) bool {
 // retireEdge clears c if it is still the link's edge and wakes the presenter.
 // An adopted edge that dies is replaced by a fresh presentation; our own edge
 // dying is the presenter's cue to reopen it.
+//
+// A lost peer edge never ends the link. The link lives as long as its local
+// carrier does: the carrier's stream ending is the dial ending (pumpLocal), and
+// that is the only thing that closes the link. The carrier cannot tell "my
+// tunnel is over" from "this link's edge died", so a link that ended here left
+// it waiting forever for a re-dial it had no reason to make — the 45-minute
+// blackhole. A session-scoped link still waits for a fresh peer session before
+// presenting again (mayPresent), because the state the consumer registered with
+// the peer was scoped to the session that edge rode.
 func (l *link) retireEdge(c net.Conn) {
 	l.mu.Lock()
 	current := l.peerEdge == c
@@ -466,18 +560,8 @@ func (l *link) retireEdge(c net.Conn) {
 		l.own = nil
 	}
 	closed := l.closed
-	// A session-scoped link (an "ip"/tun link) does not re-present: once a peer
-	// session existed and is gone, the state this side registered with the peer
-	// — the tun addresses — went with it, so end the link and let the consumer
-	// re-dial, which re-registers. Before the first edge the presenter still
-	// reopens, so a peer that starts late still converges.
-	end := current && l.sessionScoped && l.hadEdge
 	l.mu.Unlock()
 	if closed {
-		return
-	}
-	if end {
-		l.close()
 		return
 	}
 	select {
@@ -610,6 +694,20 @@ func (e *engine) removeLink(l *link) {
 	n := len(ls)
 	e.mu.Unlock()
 	e.log.Debug("link unregistered", "peer", keyName(l.peer), "links", n)
+}
+
+// peerSessionGen returns the peer's relay session generation, or 0 when the
+// engine holds no session for it. The generation advances on every relay
+// session build (peerConn.sessionLocked), which is the embedder-agnostic signal
+// that a peer holds fresh state: a link uses it to decide when it may present
+// again (link.mayPresent).
+func (e *engine) peerSessionGen(peer derpclient.PublicKey) uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if pc, ok := e.peers[peer]; ok {
+		return pc.sessionGen.Load()
+	}
+	return 0
 }
 
 // adoptableLink returns the link that may adopt an inbound edge from peer, or
