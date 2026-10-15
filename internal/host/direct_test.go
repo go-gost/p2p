@@ -346,8 +346,8 @@ func seedHandshakeUDPPair(t *testing.T, a, b *net.UDPConn, pa, pb netip.AddrPort
 			err error
 		}
 		ra, rb := make(chan res, 1), make(chan res, 1)
-		go func() { tok, err := seedHandshakeUDPToken(a, pb, 2*time.Second); ra <- res{tok, err} }()
-		go func() { tok, err := seedHandshakeUDPToken(b, pa, 2*time.Second); rb <- res{tok, err} }()
+		go func() { tok, _, err := seedHandshakeUDPToken(a, pb, 2*time.Second); ra <- res{tok, err} }()
+		go func() { tok, _, err := seedHandshakeUDPToken(b, pa, 2*time.Second); rb <- res{tok, err} }()
 		x, y := <-ra, <-rb
 		ta, tb, errA, errB = x.tok, y.tok, x.err, y.err
 		if errA == nil && errB == nil {

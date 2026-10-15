@@ -868,14 +868,35 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 	// uninterrupted silence fires onDirectIdle exactly once. It lives on the
 	// pump's own goroutine and needs no lock.
 	idleFired := false
+	// hbDue throttles heartbeats to at most one per silence tick: the tick
+	// itself is the 1s granularity, and a heartbeat per tick keeps NAT
+	// bindings warm without flooding the path.
 	for {
 		n, err := u.readFrom(buf)
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				// Silence tick: on the first silent tick of an episode, hand
-				// the underlay to the engine outside p.mu. A tick with a
-				// callback already in flight reports false and is retried on
-				// the next tick, so dispatch stays bounded.
+				// Silence tick: prove the path before judging it. Past the
+				// heartbeat interval with no inbound datagram, send one
+				// heartbeat per tick: it keeps NAT bindings warm and its
+				// echo proves the path without carrying KCP traffic.
+				p.mu.Lock()
+				silentFor := time.Since(p.lastDirectRecv)
+				p.mu.Unlock()
+				if silentFor >= directHeartbeatInterval {
+					u.sendHeartbeat()
+				}
+				// A live heartbeat answer means the underlay is healthy
+				// with no KCP traffic: re-arm its recency so the session
+				// keeps preferring it, and never retire it for idle. Only
+				// a path whose heartbeats also go unanswered is dead.
+				if u.hbLive() {
+					p.mu.Lock()
+					if p.direct == u {
+						p.lastDirectRecv = time.Now()
+					}
+					p.mu.Unlock()
+					continue
+				}
 				if !idleFired && p.reportDirectIdle(u) {
 					idleFired = true
 				}

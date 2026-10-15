@@ -2,6 +2,7 @@ package host
 
 import (
 	"bytes"
+	"crypto/rand"
 	"io"
 	"net"
 	"net/netip"
@@ -22,6 +23,13 @@ var seedProbeMagic = [4]byte{0x50, 0x32, 0x50, 0x53} // "P2PS"
 // returns os.ErrDeadlineExceeded, which the pair's direct pump reads as an idle
 // tick rather than a failure. It is the watchdog's granularity.
 const directUnderlayReadTimeout = time.Second
+
+// directHeartbeatInterval is how long a direct underlay may go without
+// delivering an inbound datagram before the pump proves it with a heartbeat.
+// It must stay below directUnderlayIdle so a live path answers before the
+// idle watchdog judges it; tests may shrink both together (see
+// directUnderlayIdle's test precedent).
+var directHeartbeatInterval = 3 * time.Second
 
 // directUnderlay is one direct (raw UDP) path of a pair: it owns the punched
 // socket and the peer's address, filters inbound datagrams by source, echoes
@@ -45,6 +53,22 @@ type directUnderlay struct {
 	// returning echo, so it drops seed magic rather than risk the H2 ping-pong.
 	localToken [seedTokenLen]byte
 	hasToken   bool
+
+	// hbToken is this underlay's direct-path heartbeat token, drawn once at
+	// registration and distinct from localToken. A heartbeat is a seed-magic
+	// packet carrying hbToken: the peer echoes it (it is not the peer's own
+	// token), while this side recognizes its own echo and records it instead
+	// of re-echoing — so heartbeats prove the path without ping-ponging and
+	// never reach KCP. hasHb says whether hbToken is meaningful: only a
+	// token-registered underlay heartbeats.
+	hbToken [seedTokenLen]byte
+	hasHb   bool
+
+	// lastHbRecv is when this side last saw its own heartbeat echoed back, as
+	// unix nanos. The pair's idle watchdog reads it: an underlay whose
+	// heartbeats are answered is live even with no KCP traffic, so silence
+	// alone must not retire it.
+	lastHbRecv atomic.Int64
 
 	// seedEchoes counts seed probes this underlay has echoed. Diagnostic, and
 	// the two-underlay quiesce test's observable: a ping-pong would keep it
@@ -79,6 +103,23 @@ func newDirectUnderlayToken(sock *net.UDPConn, peer netip.AddrPort, token [seedT
 	u := newDirectUnderlay(sock, peer)
 	u.localToken = token
 	u.hasToken = true
+	// A zero heartbeat token would be indistinguishable from an empty probe,
+	// so redraw while unlucky. A weak token only weakens a liveness signal,
+	// never authentication: the seed token already proved the peer.
+	for {
+		var hb [seedTokenLen]byte
+		if _, err := rand.Read(hb[:]); err != nil {
+			break // no heartbeat without entropy; the idle watchdog still applies
+		}
+		var zero [seedTokenLen]byte
+		if hb == zero || hb == token {
+			continue
+		}
+		u.hbToken = hb
+		u.hasHb = true
+		u.lastHbRecv.Store(time.Now().UnixNano())
+		break
+	}
 	return u
 }
 
@@ -106,6 +147,32 @@ func (u *directUnderlay) echoSeed(pkt []byte) bool {
 
 // name identifies the underlay for stats and preferred-path selection.
 func (u *directUnderlay) name() string { return "direct" }
+
+// sendHeartbeat probes the direct path with a seed-magic packet carrying this
+// underlay's heartbeat token. The peer echoes it (it matches neither the
+// peer's seed token nor its heartbeat token); our own echo is recognized on
+// receipt and recorded, never re-echoed. Magic packets never reach KCP, so a
+// heartbeat is pure liveness signal. It reports whether a heartbeat applies.
+func (u *directUnderlay) sendHeartbeat() bool {
+	if !u.hasHb {
+		return false
+	}
+	pkt := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
+	pkt = append(pkt, seedProbeMagic[:]...)
+	pkt = append(pkt, u.hbToken[:]...)
+	_, _ = u.sock.WriteToUDP(pkt, net.UDPAddrFromAddrPort(u.peer))
+	return true
+}
+
+// hbLive reports whether the path recently answered our heartbeat. An
+// underlay without a heartbeat token is never live by this measure, so the
+// idle watchdog falls back to pure silence for it.
+func (u *directUnderlay) hbLive() bool {
+	if !u.hasHb {
+		return false
+	}
+	return time.Since(time.Unix(0, u.lastHbRecv.Load())) < directUnderlayIdle
+}
 
 // readFrom blocks for the next datagram from the punched peer. Datagrams from
 // any other source are dropped (kcp-go's own source lock cannot apply because
@@ -150,7 +217,14 @@ func (u *directUnderlay) readFrom(p []byte) (int, error) {
 			// (magic without a full token) is dropped; it is never surfaced to
 			// KCP either way. echoSeed decides whether to echo (token-aware).
 			if n >= len(seedProbeMagic)+seedTokenLen {
-				u.echoSeed(p[:n])
+				var tok [seedTokenLen]byte
+				copy(tok[:], p[len(seedProbeMagic):len(seedProbeMagic)+seedTokenLen])
+				if u.hasHb && tok == u.hbToken {
+					// Our own heartbeat coming back: the path is live.
+					// Record it, never re-echo it.
+					u.lastHbRecv.Store(time.Now().UnixNano())
+				} else if u.echoSeed(p[:n]) {
+				}
 			}
 			continue
 		}

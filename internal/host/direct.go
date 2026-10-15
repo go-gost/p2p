@@ -1320,7 +1320,7 @@ func (dc *directConn) punch() {
 		}
 		e.log.Debug("direct punch: seed", "peer", pname, "family", f.name, "addr", dial.String())
 		dc.noteRound("%s seed %s", f.name, dial.String())
-		token, err := seedHandshakeUDPToken(f.sock, dial, seedTimeout)
+		token, answer, err := seedHandshakeUDPToken(f.sock, dial, seedTimeout)
 		if err != nil {
 			dc.noteErr(fmt.Sprintf("seed failed: %v", err))
 			dc.noteRound("%s seed failed: %v", f.name, err)
@@ -1341,10 +1341,13 @@ func (dc *directConn) punch() {
 		dc.mu.Lock()
 		dc.mine = f.mine
 		dc.mu.Unlock()
-		dc.markUp(sock, dial, token)
+		// Register the endpoint that actually answered the seed, not the stale
+		// candidate that was dialed: the steady-state underlay filters by
+		// source, so it must follow the completed path.
+		dc.markUp(sock, answer, token)
 		dc.noteRound("%s up", f.name)
 		e.log.Debug("direct established", "peer", pname, "family", f.name,
-			"mine", candAddrs(f.mine), "peerAddr", dial.String())
+			"mine", candAddrs(f.mine), "peerAddr", answer.String())
 		return
 	}
 
@@ -1358,12 +1361,16 @@ func (dc *directConn) punch() {
 // seedHandshakeUDPToken instead: the underlay needs the token to tell the
 // peer's probe from this side's own returning echo (the H2 loop guard).
 func seedHandshakeUDP(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) error {
-	_, err := seedHandshakeUDPToken(sock, peer, timeout)
+	_, _, err := seedHandshakeUDPToken(sock, peer, timeout)
 	return err
 }
 
 // seedHandshakeUDPToken runs the symmetric token echo over a raw UDP socket and
-// returns the local token it used. It mirrors the KCP seed handshake's semantics
+// returns the local token it used, plus the source address the successful echo
+// came from. The source is the path that actually completed — a peer behind a
+// per-destination NAT answers from an endpoint that is rarely the one dialed,
+// so callers registering a data underlay must use the source, not the dialed
+// candidate, or the steady-state source filter drops every data datagram.
 // without a reliability layer: it writes its own token to peer every seedRetransmit
 // until it reads that same token back, and it echoes each of the peer's probes
 // so the peer's own handshake can complete. A raw UDP socket has no retransmit,
@@ -1384,10 +1391,10 @@ func seedHandshakeUDP(sock *net.UDPConn, peer netip.AddrPort, timeout time.Durat
 // never echoed (an echo of our echo can only carry the peer's token, which
 // this side re-echoes to the peer, never back to itself). Termination is the
 // handshake deadline, not a per-token count.
-func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) ([seedTokenLen]byte, error) {
+func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) ([seedTokenLen]byte, netip.AddrPort, error) {
 	var token [seedTokenLen]byte
 	if _, err := rand.Read(token[:]); err != nil {
-		return token, err
+		return token, netip.AddrPort{}, err
 	}
 	probe := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
 	probe = append(probe, seedProbeMagic[:]...)
@@ -1404,11 +1411,11 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 	for {
 		now := time.Now()
 		if !now.Before(deadline) {
-			return token, errSeedTimeout
+			return token, netip.AddrPort{}, errSeedTimeout
 		}
 		if !now.Before(next) {
 			if _, err := sock.WriteToUDP(probe, dst); err != nil {
-				return token, err
+				return token, netip.AddrPort{}, err
 			}
 			next = now.Add(seedRetransmit)
 		}
@@ -1417,14 +1424,14 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 			readBy = deadline
 		}
 		if err := sock.SetReadDeadline(readBy); err != nil {
-			return token, err
+			return token, netip.AddrPort{}, err
 		}
 		n, src, err := sock.ReadFromUDP(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue // time to retransmit or to give up
 			}
-			return token, err
+			return token, netip.AddrPort{}, err
 		}
 		// No source filter: the token authenticates the peer, the source
 		// address cannot — a per-destination NAT maps a different public
@@ -1438,7 +1445,7 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 		var got [seedTokenLen]byte
 		copy(got[:], buf[len(seedProbeMagic):len(seedProbeMagic)+seedTokenLen])
 		if got == token {
-			return token, nil // the peer echoed our probe
+			return token, src.AddrPort(), nil // the peer echoed our probe
 		}
 		// A probe from an unexpected source: the peer answers from where it
 		// is reachable, not from where it advertised — a per-destination NAT
