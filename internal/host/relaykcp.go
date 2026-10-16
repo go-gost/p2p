@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
@@ -137,6 +138,32 @@ var directUnderlayIdle = 6 * time.Second
 // the window exists only to ride out a transient gap (a burst of retransmits
 // the peer's window could not accept yet, say).
 var directOneWayWindow = 60 * time.Second
+
+// directOneWayWindowEnv overrides directOneWayWindow at process start. It is a
+// debug/test affordance, not a deployment knob: an unset or unparseable value
+// leaves the 60s production default in place, and the unit tests pin the real
+// semantics independently. The e2e uses it because a container cannot produce
+// 60s of continuous one-way sending — the peer's smux session gives up after
+// 15s of silence, so KCP retransmits (not application writes) are what keep the
+// send counter moving, and RTO backoff makes those gappy past ~43s — so the
+// scenario shrinks the window to fit the run.
+const directOneWayWindowEnv = "P2P_DIRECT_ONE_WAY_WINDOW"
+
+func init() {
+	v := os.Getenv(directOneWayWindowEnv)
+	if v == "" {
+		return
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		slog.Warn("ignoring invalid window override",
+			"env", directOneWayWindowEnv, "value", v)
+		return
+	}
+	directOneWayWindow = d
+	slog.Warn("direct one-way window overridden",
+		"env", directOneWayWindowEnv, "value", d.String(), "default", "1m0s")
+}
 
 // relayIdleWindow is how long the pair may go without delivering an inbound
 // datagram on either underlay before its idle watchdog reports it. It is 2x
