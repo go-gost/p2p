@@ -365,6 +365,176 @@ func TestRelayLinkLossKeepsLiveDirectPair(t *testing.T) {
 	}
 }
 
+// relayTeardownEngine builds an engine with a real relay connection and a peer
+// whose relay session has settled and whose pair KCP session is built, so
+// teardown runs for real. teardown is a no-op on an engine with no relay client,
+// and the live-direct H1 guard lives in the kill loop it reaches only then.
+func relayTeardownEngine(t *testing.T, capture *logCapture, peer derpclient.PublicKey) (*engine, *peerConn, *relayKCPPair) {
+	t.Helper()
+	rs := &relayServer{}
+	url := rs.start(t)
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine(url, "", priv, slog.New(capture))
+	t.Cleanup(e.Close)
+	if err := e.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	pc := relaySessionFor(t, e, peer, settled)
+	pair := e.relayKCPPairGet(peer)
+	if pair == nil {
+		t.Fatal("no pair KCP session built")
+	}
+	return e, pc, pair
+}
+
+// TestRelayTeardownKeepsLiveDirectSession is the H1 guard in teardown's kill
+// loop: a peer whose direct path is live must not have its mux session killed
+// when the relay goes away. The keys and the pair were already spared; the
+// session was not, so the consumer's conn was orphaned while its direct
+// underlay kept running (the field case: a 55-minute black hole after a relay
+// loss on a peer that was carrying direct moments earlier).
+func TestRelayTeardownKeepsLiveDirectSession(t *testing.T) {
+	capture := &logCapture{}
+	peer := derpclient.PublicKey{61}
+	e, pc, pair := relayTeardownEngine(t, capture, peer)
+	liveDirectFor(t, e, peer)
+
+	e.mu.Lock()
+	c := e.client
+	e.mu.Unlock()
+	if c == nil {
+		t.Fatal("no relay connection to lose")
+	}
+	e.teardown(c, errors.New("test: relay silent"))
+
+	if got := capture.count("peer session killed"); got != 0 {
+		t.Fatalf("peer session killed lines = %d, want 0: a live direct path must spare the session", got)
+	}
+	pc.mu.Lock()
+	closed, sess := pc.closed, pc.sess
+	pc.mu.Unlock()
+	if closed {
+		t.Fatal("teardown killed the adapter despite a live direct path")
+	}
+	if sess == nil || sess.IsClosed() {
+		t.Fatal("teardown closed the mux session despite a live direct path")
+	}
+	if got := e.relayKCPPairGet(peer); got != pair {
+		t.Fatal("teardown dropped the pair despite a live direct path")
+	}
+	// The relay-loss signal survives the skipped kill: the O1/O2 surface must
+	// still report that a live direct path suppressed the loss.
+	if got := pair.diag().relayLossSuppressed; got != 1 {
+		t.Fatalf("relayLossSuppressed = %d, want 1: teardown must still emit the suppression", got)
+	}
+}
+
+// TestRelayTeardownKillsPeerWithoutLiveDirect is the regression guard against
+// over-sparing: the same teardown must still end a peer that has no live direct
+// path anywhere, exactly as before. That end is what makes a dead peer recover
+// (the consumer re-dials, and the peer's keys are dropped for a re-handshake).
+func TestRelayTeardownKillsPeerWithoutLiveDirect(t *testing.T) {
+	capture := &logCapture{}
+	peer := derpclient.PublicKey{62}
+	e, pc, _ := relayTeardownEngine(t, capture, peer)
+
+	e.mu.Lock()
+	c := e.client
+	e.mu.Unlock()
+	if c == nil {
+		t.Fatal("no relay connection to lose")
+	}
+	e.teardown(c, errors.New("test: relay silent"))
+
+	if got := capture.count("peer session killed"); got != 1 {
+		t.Fatalf("peer session killed lines = %d, want 1 for a peer with no live path", got)
+	}
+	if kill := capture.nth("peer session killed", 0); kill["relayReason"] != string(reasonLinkLost) {
+		t.Fatalf("kill reason = %q, want %q", kill["relayReason"], reasonLinkLost)
+	}
+	pc.mu.Lock()
+	closed := pc.closed
+	pc.mu.Unlock()
+	if !closed {
+		t.Fatal("teardown left a session with no live direct path alive")
+	}
+	if got := e.relayKCPPairGet(peer); got != nil {
+		t.Fatal("teardown kept the pair for a peer with no live direct path")
+	}
+	e.mu.Lock()
+	_, cached := e.secure[secureKey{peer: peer, transport: secureTransportRelay}]
+	e.mu.Unlock()
+	if cached {
+		t.Fatal("teardown left the relay secure session cached for a peer with no live path")
+	}
+}
+
+// TestRelayTeardownKeepsCarryingOverLiveDirect pins the other half of H1: a
+// peer whose pair had migrated to the relay (reason=direct-idle: the direct
+// underlay is installed but its recency is stale, so it is not preferred) must
+// still carry traffic over that direct underlay once the relay is gone. The
+// pair must not be left selecting a relay path that was just torn down, and it
+// must not be shut down for want of a *preferred* direct.
+func TestRelayTeardownKeepsCarryingOverLiveDirect(t *testing.T) {
+	capture := &logCapture{}
+	peer := derpclient.PublicKey{63}
+	e, _, pair := relayTeardownEngine(t, capture, peer)
+
+	// A live direct path is registered (dc.live(): the socket exists), but the
+	// pair had migrated to the relay — its direct recency is stale — so before
+	// the fix the pair would keep writing into the relay it just lost.
+	dc := e.directConn(peer)
+	sock := mustListenUDP(t)
+	t.Cleanup(func() { sock.Close() })
+	dc.mu.Lock()
+	dc.sock = sock
+	dc.sessAt = time.Now()
+	dc.state = directUp
+	dc.mu.Unlock()
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	t.Cleanup(func() { b.Close() })
+	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
+	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+	if pair.preferredDirect() {
+		t.Fatal("test setup: the pair must have migrated to the relay before the teardown")
+	}
+
+	e.mu.Lock()
+	c := e.client
+	e.mu.Unlock()
+	if c == nil {
+		t.Fatal("no relay connection to lose")
+	}
+	e.teardown(c, errors.New("test: relay silent"))
+
+	if got := e.relayKCPPairGet(peer); got != pair {
+		t.Fatal("teardown dropped the pair despite a live direct path")
+	}
+
+	// The traffic must cross the direct underlay: the relay the pair had
+	// preferred is gone, so a write that still rode it would be lost.
+	payload := []byte("the direct underlay carried this")
+	if _, err := pair.WriteTo(payload, nil); err != nil {
+		t.Fatalf("pair WriteTo: %v", err)
+	}
+	if err := b.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(payload))
+	n, _, err := b.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("the pair did not write over the live direct underlay after the relay loss: %v", err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("direct payload = %q, want %q", buf[:n], payload)
+	}
+}
+
 // TestRelayLossServesNewStreamOverDirect pins the follow-up T14: a relay loss
 // with a live direct path keeps the pair (H1) but closes the per-build mux
 // session on both ends (killSession). The dialing side rebuilds its mux on its

@@ -255,11 +255,17 @@ type relayKCPPair struct {
 	mu      sync.Mutex
 	sess    *kcp.UDPSession  // the pair's KCP session; built on first use
 	ep      *relayPacketConn // the current registered adapter endpoint
-	stream  *relayKCPStream  // the stream view the live mux session reads
-	pending []byte           // bytes a retired view read but could not deliver
-	closed  bool
-	wake    chan struct{} // closed and replaced on every endpoint/end change
-	idle    chan struct{} // closed and replaced on every read/write completion
+	// relayRetired is set when the relay transport is gone and the relay half is
+	// unregistered (retireRelay): an installed direct underlay then becomes the
+	// pair's only path, so preferredDirect must prefer it however stale its
+	// recency is. It is cleared when a fresh relay endpoint registers. Guarded by
+	// mu.
+	relayRetired bool
+	stream       *relayKCPStream // the stream view the live mux session reads
+	pending      []byte          // bytes a retired view read but could not deliver
+	closed       bool
+	wake         chan struct{} // closed and replaced on every endpoint/end change
+	idle         chan struct{} // closed and replaced on every read/write completion
 	// recv is the pair's fan-in: the relay pump and the direct pump hand it
 	// datagrams, and the pair's ReadFrom serves KCP from it. done is closed
 	// exactly once by shutdown; both pumps select on it so neither can outlive
@@ -476,6 +482,35 @@ func (p *relayKCPPair) register(pc *peerConn) {
 	// a read parked on this adapter's queue (see relayPacketConn.ReadFrom).
 	ep.kick = p.wake
 	p.ep = ep
+	// A relay endpoint is back, so relaying is a fallback path again: the direct
+	// underlay must earn its preference by recency, not by the loss that retired
+	// the previous relay half (retireRelay).
+	p.relayRetired = false
+}
+
+// retireRelay unregisters the pair's relay endpoint: the relay transport is
+// gone, so writes must stop going into the dead connection and fall back to an
+// installed direct underlay instead (preferredDirectLocked). The pair itself
+// keeps running (H1) — only its relay half is unregistered, and a rebuild
+// registers a fresh adapter through register just as an adapter swap does. The
+// wake swap readRelay already relies on wakes a read parked in the retired
+// endpoint, so the relay pump parks until then rather than spinning on it.
+func (p *relayKCPPair) retireRelay() {
+	p.mu.Lock()
+	if p.closed || (p.ep == nil && p.relayRetired) {
+		p.mu.Unlock()
+		return
+	}
+	p.ep = nil
+	p.relayRetired = true
+	close(p.wake)
+	p.wake = make(chan struct{})
+	// With a direct underlay installed this is a relay->direct preference flip
+	// (preferredDirectLocked), so the session's congestion control must follow
+	// it and the flip must be visible like any other (O1/O5).
+	ev := p.applyPathTuningLocked(pathChangeRelayLost)
+	p.mu.Unlock()
+	p.logPathChange(ev)
 }
 
 // newStream claims a fresh per-mux-session view of the pair's KCP stream,
@@ -1125,10 +1160,13 @@ func (p *relayKCPPair) reportDirectInbound() bool {
 }
 
 // preferredDirect reports whether the direct underlay is the path WriteTo should
-// use: an underlay is installed and it delivered an inbound datagram within
-// directUnderlayIdle. A direct that has gone silent past that bound is no longer
-// preferred, so writes fall back to the relay even before the watchdog retires
-// the socket (Task 4). This is also the H1 "live direct" predicate (Task 0).
+// use: an underlay is installed and either it delivered an inbound datagram
+// within directUnderlayIdle, or the pair's relay half has been retired
+// (retireRelay). A direct that has gone silent past that bound is no longer
+// preferred while a relay path exists, so writes fall back to the relay even
+// before the watchdog retires the socket (Task 4); once the relay is gone the
+// installed underlay is the only path, so it is preferred however stale its
+// recency. This is also the H1 "live direct" predicate (Task 0).
 func (p *relayKCPPair) preferredDirect() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1137,7 +1175,17 @@ func (p *relayKCPPair) preferredDirect() bool {
 
 // preferredDirectLocked is preferredDirect for callers already holding p.mu.
 func (p *relayKCPPair) preferredDirectLocked() bool {
-	return p.direct != nil && time.Since(p.lastDirectRecv) < directUnderlayIdle
+	if p.direct == nil {
+		return false
+	}
+	// The relay half is gone: the installed direct underlay is the pair's only
+	// path, so it is preferred even if its recency has gone stale — a relay loss
+	// retires the relay half (retireRelay) and must not leave writes selecting a
+	// path that is gone.
+	if p.relayRetired {
+		return true
+	}
+	return time.Since(p.lastDirectRecv) < directUnderlayIdle
 }
 
 // pathName names the pair's current preferred path for stats and diagnostics:
@@ -1167,11 +1215,12 @@ func pathNC(path string) int {
 }
 
 // Path-change reasons (O1): a closed enum, never free text, so a reader can
-// group flips by reason without parsing prose. relay-lost and relay-restored are
-// part of the enum the design fixes and are reserved here, but the pair's
-// preference is driven by direct recency alone — a relay endpoint swap never
-// flips it (the event's relayAlive attr carries that state instead), so only the
-// three below are emitted today.
+// group flips by reason without parsing prose. relay-lost is emitted when a
+// live-direct pair's relay half is retired (retireRelay) and its preference
+// flips to the installed direct underlay; relay-restored is reserved and not
+// emitted — the pair's preference is driven by direct recency and the relay
+// endpoint's presence, and a relay endpoint swap alone never flips it (the
+// event's relayAlive attr carries that state instead).
 const (
 	// pathChangeFirstDirect is a relay->direct flip: a direct underlay was
 	// installed, or a datagram re-elected one after a silence.

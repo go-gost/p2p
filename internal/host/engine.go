@@ -2415,6 +2415,19 @@ func (e *engine) teardown(c *derpclient.Client, cause error) {
 	e.log.Error("derp connection lost", "error", cause)
 	c.Close()
 	for _, pc := range peers {
+		if liveDirect[pc.peer] {
+			// A live direct path keeps the pair, its keys AND its mux session
+			// across the relay loss (H1) — the comment above the key loop states
+			// the intent, and this is where it held for the keys but not for the
+			// session. Retire only the pair's relay half so its writes fall back
+			// to the direct underlay instead of into the dead relay, and emit the
+			// O1/O2 suppression signal the skipped kill would have produced.
+			if pair := e.relayKCPPairGet(pc.peer); pair != nil {
+				pair.retireRelay()
+				pair.noteRelayLoss(true, string(reasonLinkLost))
+			}
+			continue
+		}
 		pc.killSession(cause, true, reasonLinkLost)
 	}
 	// The peers' kills cover the pairs their adapters built; every other pair's
