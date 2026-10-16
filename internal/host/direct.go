@@ -1105,7 +1105,9 @@ func (dc *directConn) retryFrom(d time.Duration, failed bool, fromNone bool) {
 	dc.mine = nil
 	dc.mu.Unlock()
 	dc.e.log.Debug("direct punch: backoff", "peer", keyName(dc.peer), "retryIn", d.String())
-	dc.noteRound("backoff %s", d.String())
+	// The trace line rounds to 10ms so it never prints a long tail of
+	// fractional seconds; the scheduler above still waits the exact d.
+	dc.noteRound("backoff %s", d.Round(10*time.Millisecond).String())
 	go func() {
 		select {
 		case <-dc.e.stop:
