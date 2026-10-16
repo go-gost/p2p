@@ -1302,6 +1302,11 @@ func (e *engine) registerDirectUnderlay(peer derpclient.PublicKey, sock *net.UDP
 	}
 	pair.mu.Unlock()
 	u := newDirectUnderlayToken(sock, addr, token)
+	// An armed fault has to silence the path's liveness traffic too, not only its
+	// KCP plane (see directUnderlay.muted). The closure reads the faults pointer
+	// at call time, so a fault armed after the punch — the fault tests' shape —
+	// takes effect on the next datagram.
+	u.muted = func() bool { return e.faults.Load().silencesUnderlay(time.Now()) }
 	pair.setDirectUnderlay(u)
 	go e.ensureDirectConsumer(peer, pair, u)
 }

@@ -173,6 +173,19 @@ func (f *faults) muteDirect() bool {
 	return f != nil && f.dropDirect.Load()
 }
 
+// silencesUnderlay reports whether an armed fault must silence the direct
+// underlay's liveness traffic as well as its KCP plane. Every fault that stops
+// the direct path carrying has to be named here: the per-path mute (DropDirect),
+// the all-path data mute (DropData) and the timed whole-link silence all leave
+// the heartbeat flowing, and an answered heartbeat keeps a dead path looking
+// alive forever — the path would never stale, so a test that arms one of these
+// to make direct die would watch the relay never be reached. The pair's own
+// faults are not enough: the heartbeat is read inside the underlay, below every
+// check the pair makes.
+func (f *faults) silencesUnderlay(now time.Time) bool {
+	return f != nil && (f.muteData(now) || f.muteDirect())
+}
+
 // muteDataArmed reports whether muteData can drop anything at all. Every packet
 // path asks before building the timestamp muteData needs: with no fault
 // configured — the shipping case — muteData is false whatever the time is, so

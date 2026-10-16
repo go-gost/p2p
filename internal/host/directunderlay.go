@@ -64,6 +64,16 @@ type directUnderlay struct {
 	hbToken [seedTokenLen]byte
 	hasHb   bool
 
+	// muted, when non-nil, reports whether a fault currently silences this
+	// underlay. While it returns true readFrom drops the path's liveness traffic
+	// along with its data: it neither records its own heartbeat echo nor echoes
+	// the peer's heartbeat. An armed fault has to reach here, or it would silence
+	// only the KCP plane and leave the heartbeats flowing — which keeps an
+	// otherwise dead path looking alive forever (see faults.silencesUnderlay).
+	// nil means never silenced: a bare newDirectUnderlay, as the underlay tests
+	// build.
+	muted func() bool
+
 	// lastHbRecv is when this side last saw its own heartbeat echoed back, as
 	// unix nanos. The pair's idle watchdog reads it: an underlay whose
 	// heartbeats are answered is live even with no KCP traffic, so silence
@@ -215,6 +225,12 @@ func (u *directUnderlay) readFrom(p []byte) (int, error) {
 			continue
 		}
 		if bytes.HasPrefix(p[:n], seedProbeMagic[:]) {
+			// An armed fault silences the path, liveness included. Heartbeats
+			// travel below the pair's fault checks, so without this a mute would
+			// stop only KCP and the answers would keep the path alive.
+			if u.muted != nil && u.muted() {
+				continue
+			}
 			// Late seed responder: echo the peer's probe so a peer whose own
 			// echo was lost can still complete its seed. A malformed packet
 			// (magic without a full token) is dropped; it is never surfaced to
