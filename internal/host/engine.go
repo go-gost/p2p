@@ -2642,7 +2642,15 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	}
 
 	pc.mu.Lock()
+	// A build that replaces a session the pair already had (sessAt set, and the
+	// generation moving) is a rebuild: the recovery path a network change makes,
+	// where the old session dies and the rebuild — unlike an outbound open —
+	// carries no punch of its own. A first build is not one: a peer that has not
+	// engaged must not get a speculative round (Warm promises none).
+	wasBuilt := !pc.sessAt.IsZero()
+	genBefore := pc.sessionGen.Load()
 	sess, err := pc.sessionLocked()
+	rebuilt := wasBuilt && pc.sessionGen.Load() != genBefore
 	pc.mu.Unlock()
 	if pc.takeChurnTripped() {
 		// This pair is rebuilding sessions far faster than a working one ever
@@ -2663,7 +2671,13 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 			"peer", keyName(pc.peer), "builds", relayChurnMax+1, "window", relayChurnWindow.String())
 		pc.e.curePeerRelayChurn(pc.peer, pc)
 	}
-	if err == nil && punch {
+	// A rebuild starts a punch so the pair can leave the relay as soon as it is
+	// possible. maybeStartDirect is idempotent — start() runs only from
+	// directNone, so a round already in flight or a backoff already armed is
+	// left alone — and it is called after pc.mu is released because it takes
+	// e.mu, which pc.mu is taken under elsewhere (see the handshake comment
+	// above).
+	if err == nil && (punch || rebuilt) {
 		pc.e.maybeStartDirect(pc.peer)
 	}
 	return sess, err

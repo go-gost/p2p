@@ -2165,6 +2165,62 @@ func TestUDPDialStartsPunch(t *testing.T) {
 	}
 }
 
+// TestSessionRebuildStartsPunch pins the recovery-path trigger: when a peer's
+// relay session is rebuilt — the shape of a phone changing network, where the
+// old session dies and the rebuild carries no punch of its own — a direct punch
+// must start for that peer. Without it the pair rode the relay for ~19s (once
+// ~30s, a backoff period) until some incidental trigger happened to fire.
+//
+// Only a rebuild is covered: the presence-only paths (Warm) promise no
+// speculative round for a peer that has not engaged, so a first build must not
+// punch. TestWarmConnectsWithoutStream pins that half.
+func TestSessionRebuildStartsPunch(t *testing.T) {
+	e := newTestEngine(t)
+	// A candidate source so a punch is possible at all. The punch itself fails
+	// fast (the relay is absent), which is all this test observes.
+	e.stunAddr = "127.0.0.1:3478"
+	peer := derpclient.PublicKey{77}
+
+	settled, _ := settledSecurePair(t, secureTransportRelay)
+	e.mu.Lock()
+	e.secure[secureKey{peer: peer, transport: secureTransportRelay}] = settled
+	e.mu.Unlock()
+	pc := e.peerConn(peer)
+	pc.mu.Lock()
+	pc.secure = settled
+	pc.mu.Unlock()
+
+	// The first build (punch=false, as Warm does) must not punch.
+	if _, err := pc.ensureSession(false, true); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	if dc := e.getDirect(peer); dc != nil {
+		t.Fatalf("a first build with punch=false started a punch (state %v)", dc.stateOf())
+	}
+
+	// Rebuild the session the way the recovery path does: the old session is
+	// gone and the rebuild passes punch=false. The rebuild itself must start a
+	// punch.
+	pc.mu.Lock()
+	old := pc.sess
+	pc.sess = nil
+	pc.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+	if _, err := pc.ensureSession(false, true); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+
+	dc := e.getDirect(peer)
+	if dc == nil {
+		t.Fatal("a session rebuild did not start a direct punch")
+	}
+	if got := dc.stateOf(); got == directNone {
+		t.Fatalf("session rebuild left the punch unstarted (state %v)", got)
+	}
+}
+
 // directUpNow reports the punch state without going through session(): that
 // call is itself a re-punch trigger, and the point of the test below is the
 // death being one.
