@@ -105,6 +105,14 @@ func status(addr, token string) error {
 func httpEcho(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// An upload must be able to finish. Answering without reading the body
+		// replies mid-stream: curl reports a broken pipe and aborts, so a
+		// workload that looks like a multi-megabyte upload only ever moves a few
+		// hundred bytes into the tunnel. ⑤ is judged by a send counter that has
+		// to be running, so this drain is what makes the generator real.
+		if r.Body != nil {
+			io.Copy(io.Discard, r.Body)
+		}
 		if r.URL.Path == "/bulk" {
 			w.Header().Set("Content-Type", "application/octet-stream")
 			buf := make([]byte, 64*1024)

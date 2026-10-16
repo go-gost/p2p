@@ -43,7 +43,7 @@ DERPER_BIN="${DERPER_BIN:-}"
 # Scenario registry: --list, --scenario validation and the runner all read this
 # single list, so a new scenario just needs an entry here and a scenario_<name>
 # function below.
-SCENARIOS=(stub derp-relay relay-peer-restart derp-direct forward inner-matrix udp-tun udp-tun-loss udp-outlet ipv6-direct)
+SCENARIOS=(stub derp-relay relay-peer-restart derp-direct forward inner-matrix udp-tun udp-tun-loss udp-outlet ipv6-direct oneway-direct)
 
 usage() {
 	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
@@ -885,6 +885,266 @@ scenario_ipv6_direct() {
 }
 
 # --- runner ------------------------------------------------------------------
+
+# The shape measured on the phone/hub pair that took 45 minutes to recover from:
+# the direct underlay's heartbeat was answered, so every recency-based check
+# read the path healthy, while its KCP plane returned nothing at all. ⑤ closes
+# it without recency — a dead path and an idle one show the same silence, so no
+# timestamp can tell them apart — by reading the per-underlay byte counters
+# instead: a path that keeps sending while receiving nothing is not carrying.
+#
+# The unit tests (direct_oneway_test.go) hold the predicate's false positives,
+# which matters more than its true positive: a predicate that retired
+# one-directional traffic, or a healthy path between ACKs, would turn the
+# sticky-direct fix into a flap. This scenario holds what only a real network
+# can produce — the shape itself, at the packet level.
+#
+# A heartbeat is a 4-byte magic plus an 8-byte token: 12 bytes of payload, 40
+# bytes on the wire counting the IP and UDP headers, and it is consumed inside
+# the underlay's read loop so it never reaches KCP's byte counters. A KCP
+# segment is at least 25 bytes of payload — 53 on the wire — and cannot be
+# mistaken for one. So the fault, armed on A's inbound from B only, passes
+# exactly the heartbeat and drops the rest of what B sends on the direct path:
+# heartbeats still round-trip, KCP gets nothing back, and nothing about the
+# underlay looks dead to anything but the counters.
+#
+# The killer detail is where the send counter sits: relayKCPPair.WriteTo bumps
+# directBytesSent *before* handing the datagram to the socket, so a datagram
+# the kernel drops on its way out still advances it. That is what makes a
+# network-level drop produce the production shape exactly, rather than a
+# quieter cousin of it.
+#
+# The window is production's 60s, but the scenario runs it at 25s via
+# P2P_DIRECT_ONE_WAY_WINDOW (see relaykcp.go). A container cannot sustain 60s
+# of continuous one-way sending: A's peer smux session gives up after 15s of
+# silence (the same 15s the loss scenario pins), so once the app stream dies it
+# is KCP retransmits — not application writes — that keep directBytesSent
+# moving, and IKCP's RTO backoff turns those into 1-2s gaps well before 60s.
+# The longest continuous run measured here is ~43s, so 25s trips with margin.
+# The predicate's exact 60s semantics stay pinned by direct_oneway_test.go; the
+# e2e is the only place the full path — pumpDirect -> directOneWayDead -> the
+# engine's retirement -> relay fallback -> recovery — is exercised end to end.
+scenario_oneway_direct() {
+	step "one-way-dead direct path: the byte counters retire it, the relay catches it"
+	local dir="$RUNDIR/oneway"
+	start_echo - echo "$NET_GW:18081"
+	start_peer_gost B peer http 127.0.0.1:18080
+	# Shrink ⑤'s window for the run (see the header). The p2p processes
+	# inherit it at fork; unset immediately after so no later scenario sees it.
+	export P2P_DIRECT_ONE_WAY_WINDOW=25s
+	start_derp_pair oneway on true 127.0.0.1:18080
+	local pair_rc=$?
+	unset P2P_DIRECT_ONE_WAY_WINDOW
+	[ "$pair_rc" = 0 ] || return
+	local bkey
+	bkey=$(cat "$dir/b.pub")
+
+	# A plain UDP echo on B's host address. It measures the fault's own shape
+	# with nothing from p2p in the way, so "heartbeats still survive the fault"
+	# is a measurement rather than an assumption — the alternative is asserting
+	# a retirement without being able to see why it fired.
+	ns_bg B udpecho "$HELPER_BIN" udp "$HOST_B_IP:19999"
+
+	gost_client_cfg "$dir/client.yaml" 127.0.0.1:8003 "$bkey" tcp "" 127.0.0.1:8080
+	start_gost A client -C "$dir/client.yaml"
+	wait_tcp A 127.0.0.1 8080 15 || fail "client proxy did not listen"
+
+	# The upload starts before anything is asserted, because the punch is
+	# driven by the peer's registration plus traffic, not by the hosts merely
+	# knowing about each other. derp-direct waits the same way for the same
+	# reason; a pair punched and then left idle for 40s proves nothing.
+	head -c 8M /dev/zero >"$dir/body.bin"
+	( ns_run A curl -s --max-time 400 --limit-rate 64k -x http://127.0.0.1:8080 \
+		--data-binary @"$dir/body.bin" "http://$NET_GW:18081/" \
+		>"$dir/up.body" ) &
+	local bulkpid=$!
+	PIDS+=("$bulkpid"); SCENARIO_PIDS+=("$bulkpid")
+
+	if wait_status_ge A 127.0.0.1:8003 direct_peers 1 40; then
+		ok "the transfer rides a punched direct session"
+	else
+		fail "no direct session established for the transfer"; return
+	fi
+
+	# The probe answers before the fault, or a silence afterwards proves
+	# nothing about the filter.
+	probe_reply "$dir/pre.reply" 12
+	check "the probe echo answers before the fault" \
+		test "$(wc -c <"$dir/pre.reply")" -eq 12
+
+	# Baseline: the direct plane really carries bytes before anything is
+	# filtered, so a silent data plane afterwards is the fault and not the
+	# topology. direct_bytes_rcvd is not exposed over gRPC (the proto is
+	# frozen), so this is the log's own accounting rather than a status field.
+	save_status A 127.0.0.1:8003 "$dir/status-before.json"
+	check_grep "the direct plane is carrying before the fault" \
+		'"direct_peers":[1-9]' "$dir/status-before.json"
+
+	# Escape hatch for the Phase-1 control run: with P2P_E2E_NO_FAULT=1 the
+	# fault is never armed, so the same workload runs with a healthy pair. It
+	# exists to answer one question — is the 15s relay-session churn the filter,
+	# or the workload? — and it is not a scenario, so it asserts nothing.
+	if [ "${P2P_E2E_NO_FAULT:-0}" = 1 ]; then
+		ok "fault skipped (P2P_E2E_NO_FAULT): control run, healthy direct pair"
+	else
+		# One end only: A's inbound from B. The upload still reaches B and B
+		# stays healthy; only A's receive counter freezes. See ONEWAY_MAX_CTRL.
+		arm_oneway_fault A "$HOST_B_IP" || return
+		ok "one-way fault armed on A: from B only a heartbeat-sized datagram passes"
+	fi
+
+	# The fault's shape, measured directly. The 12-byte probe must still
+	# round-trip — that is the heartbeat, and its survival is what makes this
+	# ⑤ rather than a dead path: the underlay sees an answered echo and never
+	# retires the path for idle. Everything KCP-shaped must be swallowed,
+	# including a datagram the size of a KCP ACK, because a receive counter
+	# that still moves is a path that still looks two-way.
+	sleep 2
+	probe_reply "$dir/hb.reply" 12
+	check "a heartbeat-sized datagram still round-trips under the fault" \
+		test "$(wc -c <"$dir/hb.reply")" -eq 12
+	probe_reply "$dir/ctrl.reply" 64
+	check "a KCP-control-sized datagram is swallowed by the fault" \
+		test "$(wc -c <"$dir/ctrl.reply")" -eq 0
+	probe_reply "$dir/big.reply" 512
+	check "a data-sized datagram is swallowed by the fault" \
+		test "$(wc -c <"$dir/big.reply")" -eq 0
+
+	# The whole point: the direct path's heartbeat is answered — the 12-byte
+	# probe above just proved it on the same filter — while its data plane
+	# returns nothing. Nothing recency-based can act on that, because an idle
+	# path reads identically. The counters can.
+	local alog="$LOGDIR/p2p-oneway-a.log"
+	if wait_log "$alog" '"event":"path-change".*"to":"relay".*"reason":"direct-idle"' 150; then
+		ok "the answered-heartbeat, data-silent direct path was retired"
+	else
+		fail "no direct-idle fallback after 150s of a one-way-dead direct path"
+		save_status A 127.0.0.1:8003 "$dir/status-stuck.json"
+	fi
+
+	# ⑤ is time-gated: the tracker trips only after directOneWayWindow of a
+	# moving send counter against a frozen receive counter — 25s here, the
+	# production 60s shrunk for the run (see the header). A direct path retired
+	# seconds after it installed is the heartbeat-unanswered path — a different
+	# failure wearing the same "direct-idle" reason — so the time between the
+	# underlay's install and that idle is the only thing separating the two.
+	# Without this the scenario passes on the very defect it exists to catch,
+	# which is exactly what happened before the threshold was narrowed: the
+	# heartbeat-unanswered retirement fired at ~11s, the one-way one now fires
+	# past the 25s window, so 20s separates them.
+	local iln idln t_inst t_idle
+	read -r iln idln < <(awk '
+		/"event":"direct-underlay"/ && /"state":"installed"/ { iln = NR }
+		/"reason":"direct-idle"/ { print iln, NR; exit }
+	' "$alog")
+	if [ "${iln:-0}" -gt 0 ] && [ "${idln:-0}" -gt 0 ]; then
+		t_inst=$(date -d "$(sed -n "${iln}p" "$alog" | sed -n 's/.*"time":"\([^"]*\)".*/\1/p')" +%s)
+		t_idle=$(date -d "$(sed -n "${idln}p" "$alog" | sed -n 's/.*"time":"\([^"]*\)".*/\1/p')" +%s)
+		check "the direct path outlived the one-way window before retiring ($((t_idle - t_inst))s)" \
+			test $((t_idle - t_inst)) -ge 20
+	else
+		fail "could not locate the underlay install preceding the direct-idle"
+	fi
+
+	# And it recovers without a human flipping the direct toggle. With the
+	# fault still armed the pair flaps rather than settling: every re-punch is
+	# re-elected direct on the first inbound heartbeat, so a request issued
+	# during a direct phase reaches B and has B's reply dropped, while one
+	# issued during a relay phase completes end to end. Retrying across several
+	# windows makes the relay fallback observable instead of a coin flip —
+	# success inside the fault is the assertion the 45-minute field case could
+	# not make. (The bulk upload is not a recovery signal: it stalls at the KCP
+	# window once B's acknowledgements stop, so its response never comes.)
+	kill "$bulkpid" 2>/dev/null
+	wait "$bulkpid" 2>/dev/null || true
+	local i relay_ok=0
+	for i in $(seq 1 15); do
+		if [ "$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/" 4)" = "hello-p2p" ]; then
+			relay_ok=$((relay_ok + 1))
+		fi
+	done
+	check "requests complete over the relay while the fault is still armed ($relay_ok/15)" \
+		test "$relay_ok" -ge 1
+
+	# Clearing the fault has to leave the sticky-direct behaviour intact —
+	# ⑤ must not become a reason to punch-hole every healthy pair on a timer.
+	# Once data actually flows again the pair re-elects direct, and a later
+	# transfer rides it.
+	clear_oneway_fault A "$HOST_B_IP"
+	ok "fault cleared"
+	( ns_run A curl -s --max-time 30 -x http://127.0.0.1:8080 \
+		"http://$NET_GW:18081/" >"$dir/after.body" ) &
+	local afterpid=$!
+	PIDS+=("$afterpid"); SCENARIO_PIDS+=("$afterpid")
+	wait "$afterpid" 2>/dev/null
+	check "the tunnel carries a request after the fault clears" \
+		test "$(cat "$dir/after.body" 2>/dev/null)" = "hello-p2p"
+	if wait_log "$alog" '"event":"path-change".*"reason":"first-direct-datagram"' 90; then
+		ok "the pair re-elected direct once the data plane flowed again"
+	else
+		fail "the pair never returned to direct after the fault cleared"
+	fi
+}
+
+# probe_reply <outfile> [len]: send one datagram of len bytes to B's UDP echo
+# and keep what comes back. Used to measure the fault's shape directly.
+probe_reply() {
+	local out=$1 n=${2:-12}
+	head -c "$n" /dev/urandom |
+		ns_run A nc -u -w2 "$HOST_B_IP" 19999 >"$out" 2>/dev/null || true
+}
+
+# The threshold has to be exactly one heartbeat wide — 40 bytes on the wire,
+# including the IP and UDP headers — because that is the only datagram that may
+# survive:
+#   - the 12-byte heartbeat (4-byte magic + 8-byte token) is consumed inside the
+#     underlay's own read loop, so it never reaches KCP's byte counters. An
+#     answered heartbeat keeps hbLive() true — the path reads as alive — while
+#     directBytesRcvd stays frozen. That is the whole shape ⑤ is defined on:
+#     alive by echo, dead by counters.
+#   - everything else is dropped, the control plane included. An earlier filter
+#     passed anything up to 200 bytes "so the KCP keepalives survive", and that
+#     is exactly what kept ⑤ from ever latching: KCP's ACKs and window probes
+#     are 52-76 bytes on the wire, slipped under the 200-byte ceiling, advanced
+#     directBytesRcvd, and tripped directOneWayDead's `rcvd >` clear on every
+#     tick. Measured over a 168s run with that filter: ⑤ did not fire once.
+# A KCP-control-sized datagram being swallowed is the point here, not a defect:
+# a one-way path that still gets KCP back is not one-way.
+#
+# The fault is armed on ONE end only. Arming both ends starves the pair's smux
+# session from the side that sends the keepalives, the relay session churns every
+# 15s, and the engine replaces the pair's registration on the churn threshold
+# (engine.go:2657) — retiring the underlay ~90s in and abandoning the direct path
+# before the 60s window it was armed to exercise. Leaving A->B open keeps the
+# observed pair fed from the direction that must stay healthy, so the only thing
+# the counters see is the one-way shape.
+ONEWAY_MAX_CTRL=40
+
+arm_oneway_fault() {
+	local ns=$1 peerip=$2 t src err
+	for t in iptables ip6tables; do
+		# ip6tables rejects a bare v4 address, so the v6 pass uses the
+		# v4-mapped spelling. Without it the v6 leg cannot be armed at all,
+		# and a peer whose direct socket is a mapped v6 one would slip past
+		# the fault entirely.
+		src=$peerip
+		[ "$t" = ip6tables ] && src="::ffff:$peerip"
+		err=$(ns_run "$ns" "$t" -A INPUT -s "$src" -p udp -m length --length "0:$ONEWAY_MAX_CTRL" -j ACCEPT 2>&1) ||
+			{ fail "could not arm the heartbeat pass-through in $ns ($t): $err"; return 1; }
+		err=$(ns_run "$ns" "$t" -A INPUT -s "$src" -p udp -j DROP 2>&1) ||
+			{ fail "could not arm the data-plane drop in $ns ($t): $err"; return 1; }
+	done
+}
+
+clear_oneway_fault() {
+	local ns=$1 peerip=$2 t src
+	for t in iptables ip6tables; do
+		src=$peerip
+		[ "$t" = ip6tables ] && src="::ffff:$peerip"
+		ns_run "$ns" "$t" -D INPUT -s "$src" -p udp -j DROP 2>/dev/null || true
+		ns_run "$ns" "$t" -D INPUT -s "$src" -p udp -m length --length "0:$ONEWAY_MAX_CTRL" -j ACCEPT 2>/dev/null || true
+	done
+}
 
 run_scenario() {
 	local name=$1 rc=0
