@@ -165,8 +165,9 @@ func normalizeNetwork(network string) string {
 // rode an edge waits for the peer to build a newer relay session before
 // re-presenting (see link.mayPresent), since the consumer registered per-session
 // state with the peer and re-pushes it on the session event
-// (engine.peerSessionEvents). It does not end on that wait: the consumer's conn
-// carries on, and only the consumer ending its own stream ends the link.
+// (engine.peerSessionEvents). If that session does not come back within the
+// re-present grace the link ends, so the consumer's conn ends and it re-dials —
+// the only signal it has to re-register (see link.presentLoop).
 func datagramNetwork(network string) bool {
 	return network == "udp" || network == "ip"
 }

@@ -162,8 +162,9 @@ func (s *server) allocateTunnel(network, peer string, attached bool) (*tunnelRec
 			// responder half of the key orders). An "ip" link is session-scoped:
 			// it does not re-present onto the session an edge it already rode
 			// died on, because that session's state is stale for it (see
-			// link.mayPresent and engine.peerSessionEvents). It still survives
-			// the edge loss and re-presents once the peer builds a new session.
+			// link.mayPresent and engine.peerSessionEvents); it re-presents once
+			// the peer builds a new session, and ends if none arrives within the
+			// re-present grace so the consumer re-dials and re-registers.
 			s.engine.maybeStartDirect(key)
 			lnk := newLink(s.engine, key, network == "ip")
 			s.engine.addLink(lnk)

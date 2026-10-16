@@ -175,3 +175,46 @@ func TestScopedLinkStillEndsWhenLocalCarrierEnds(t *testing.T) {
 		t.Fatal("the link did not end when its local carrier ended")
 	}
 }
+
+// A session-scoped ("ip") link whose peer session stays gone past the re-present
+// grace ENDS, so the consumer's conn ends and it re-dials — re-registering the
+// per-session state the dead edge rode. d58096a instead kept the link alive by
+// re-presenting into the stale session, so the consumer's conn never ended and it
+// never re-dialed: the 56-minute blackhole, where 23 rebuilt edges all logged
+// read=0 written=0 and the consumer wrote into a link nothing carried.
+//
+// The quick-recovery half — the peer session comes back, so the link re-attaches
+// rather than ending — is pinned by TestScopedLinkRePresentsAfterNewPeerSession.
+func TestScopedLinkEndsWhenPeerSessionStaysGone(t *testing.T) {
+	old := scopedRePresentGrace
+	scopedRePresentGrace = 100 * time.Millisecond
+	t.Cleanup(func() { scopedRePresentGrace = old })
+
+	e := newTestEngine(t)
+	_, peerKey, _ := derpclient.Generate()
+
+	open, sides := scopedEdgeOpener()
+	l := newScopedTestLink(t, e, peerKey, open, true)
+	local := attachLocal(t, l)
+
+	first := <-sides
+	waitFor(t, 3*time.Second, l.hasEdge)
+
+	first.Close() // the peer edge is lost; the peer session never comes back
+
+	select {
+	case <-l.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a session-scoped link whose peer session stayed gone never ended: the consumer would write into it forever")
+	}
+	// The consumer observes the end on its own conn: the link closed the local
+	// stream, so a read errors instead of blocking and a write fails instead of
+	// silently queueing into the link's buffer.
+	local.SetDeadline(time.Now().Add(time.Second))
+	if _, err := local.Read(make([]byte, 4)); err == nil {
+		t.Fatal("Read on the ended link's local edge returned no error, want the link's end to be observable")
+	}
+	if _, err := local.Write([]byte("x")); err == nil {
+		t.Fatal("Write on the ended link's local edge succeeded, want it closed")
+	}
+}

@@ -43,8 +43,9 @@ type link struct {
 	// onto the session it died on — the consumer's registered state (the
 	// addresses an "ip"/tun side registers, per session) is stale for it, so the
 	// presenter waits for a newer session (see mayPresent and
-	// engine.peerSessionEvents). The link itself is unaffected: it lives as long
-	// as its local carrier does (see retireEdge).
+	// engine.peerSessionEvents). If that session does not come back within
+	// scopedRePresentGrace the link ends, so the consumer re-dials and
+	// re-registers (see presentLoop).
 	sessionScoped bool
 
 	stop     chan struct{} // closed by close(); ends the presenter and the pumps
@@ -74,10 +75,11 @@ type link struct {
 	// session the peer no longer holds the state for. The engine bumps
 	// sessionGen on every relay session build, so no embedder input is involved.
 	rodeGen uint64
-	// parkSince is when the presenter first held off presenting because the
-	// generation had not moved. It bounds the hold: a link that is itself the
-	// only traffic a peer sees would otherwise leave the generation frozen and
-	// stall on its own buffer.
+	// parkSince anchors the bound on the hold-off: the moment the link lost the
+	// peer edge that made it hold off. A session-scoped link whose peer session
+	// never comes back ends once the hold-off passes scopedRePresentGrace (see
+	// presentLoop), so the consumer re-dials. It is cleared whenever an edge is
+	// installed (noteRidden), so the grace always runs from the latest loss.
 	parkSince time.Time
 	closed    bool
 	// edgeGen is bumped every time a peer edge is installed. serveEdge
@@ -127,11 +129,15 @@ const channelRetryMin = 2 * time.Second
 
 // scopedRePresentGrace bounds how long a session-scoped link holds off
 // presenting while the peer's relay session generation stays put. The
-// generation is the signal that the peer holds fresh state for this link, but a
-// link that is itself the only traffic a peer sees would leave it frozen — the
-// bytes it is holding sit in the link's buffer rather than reaching the peer —
-// so the hold has to give way eventually. Presenting over the same session is
-// what the consumer asked for; staying parked is not.
+// generation is the signal that the peer holds fresh state for this link: once
+// it moves the presenter re-presents (mayPresent) and the link carries on.
+// While it stays put the session the consumer registered against is gone, and
+// the link has to end — presenting over that same session would ride state the
+// peer no longer holds, and parking forever is the blackhole where the
+// consumer's conn never ends so it never re-dials. The grace therefore runs
+// from the moment the link loses its peer edge (anchored in retireEdge) and
+// bounds every wait until a fresh session arrives; once it passes the link ends
+// (see presentLoop).
 var scopedRePresentGrace = 10 * time.Second
 
 // channelRetryDelay returns the next presentation reconnect delay: open
@@ -147,8 +153,8 @@ func channelRetryDelay(prev time.Duration, openFailed bool) time.Duration {
 // presenter. The caller registers it on the engine so inbound edges can find it.
 // sessionScoped marks a link whose consumer registered state with the peer per
 // session (the "ip"/tun case): it waits for a fresh peer session before
-// presenting an edge it lost, rather than riding a stale one. The link still
-// lives as long as its local carrier does either way (see retireEdge).
+// presenting an edge it lost, rather than riding a stale one, and ends if that
+// session does not arrive within scopedRePresentGrace (see presentLoop).
 func newLink(e *engine, peer derpclient.PublicKey, sessionScoped bool) *link {
 	l := &link{
 		e:             e,
@@ -234,6 +240,16 @@ func (l *link) presentLoop() {
 		// outright open failure still backs off.
 		if !l.mayPresent() {
 			l.noteParked()
+			// The peer session the link rode never came back within the grace:
+			// end the link so the consumer's conn ends and it re-dials,
+			// re-registering the per-session state the dead edge rode. d58096a
+			// instead presented into the stale session and kept the link alive,
+			// which left the consumer writing into a link nothing carried.
+			if l.parkExpired(time.Now()) {
+				l.e.log.Info("datagram link ended", "peer", pname, "reason", "peer session not rebuilt")
+				l.close()
+				return
+			}
 			select {
 			case <-l.stop:
 				return
@@ -241,7 +257,7 @@ func (l *link) presentLoop() {
 			// 2s floor is the worst case, and a consumer re-registering on a new
 			// session is waiting on this lane becoming usable.
 			case <-l.e.peerSessionEvents(l.peer):
-			case <-time.After(channelRetryMin):
+			case <-time.After(l.graceWait(channelRetryMin, time.Now())):
 			}
 			continue
 		}
@@ -276,7 +292,7 @@ func (l *link) presentLoop() {
 		select {
 		case <-l.stop:
 			return
-		case <-time.After(delay):
+		case <-time.After(l.graceWait(delay, time.Now())):
 		}
 		delay = channelRetryDelay(delay, openFailed)
 	}
@@ -288,24 +304,65 @@ func (l *link) presentLoop() {
 // past the edge it last rode: the engine bumps it on every session build
 // (peerConn.sessionLocked), so a move means the peer holds fresh state for this
 // link. Before the first edge there is nothing stale to ride, so it presents —
-// that is how a peer that starts late converges.
-//
-// The hold is bounded (scopedRePresentGrace) so a link that is itself the only
-// traffic a peer sees cannot stall on a frozen generation.
+// that is how a peer that starts late converges. A link that waits past
+// scopedRePresentGrace without a move ends instead (see presentLoop): the peer
+// session is not coming back, so the consumer must re-dial to re-register.
 func (l *link) mayPresent() bool {
 	if !l.sessionScoped {
 		return true
 	}
 	l.mu.Lock()
-	had, rode, parkedAt := l.hadEdge, l.rodeGen, l.parkSince
+	had, rode := l.hadEdge, l.rodeGen
 	l.mu.Unlock()
 	if !had {
 		return true
 	}
-	if rode < l.e.peerSessionGen(l.peer) {
-		return true
+	return rode < l.e.peerSessionGen(l.peer)
+}
+
+// parkExpired reports whether a session-scoped link has held off presenting
+// past scopedRePresentGrace: the fresh peer session it waits for never came, so
+// the link ends and the consumer re-dials.
+func (l *link) parkExpired(now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return !l.parkSince.IsZero() && now.Sub(l.parkSince) >= scopedRePresentGrace
+}
+
+// graceWait bounds a wait while a session-scoped link is holding off presenting:
+// the usual d, or whatever is left of scopedRePresentGrace when that is shorter,
+// so the link ends within the grace of losing its peer edge rather than up to a
+// retry interval late. It returns d unchanged when the link is not holding off —
+// an unscoped link, one that has lost no edge, or one whose peer session has
+// already come back (that one must keep retrying, not end).
+func (l *link) graceWait(d time.Duration, now time.Time) time.Duration {
+	left, holding := l.holdLeft(now)
+	if !holding || left >= d {
+		return d
 	}
-	return !parkedAt.IsZero() && time.Since(parkedAt) > scopedRePresentGrace
+	if left <= 0 {
+		// The park is spent; presentLoop ends the link before it waits again.
+		// This only keeps the timer positive in the meantime.
+		return time.Millisecond
+	}
+	return left
+}
+
+// holdLeft reports how much of scopedRePresentGrace is left and whether the link
+// is holding off presenting at all: session-scoped, having already ridden an
+// edge, and waiting on a peer session generation that has not moved on. It is
+// mayPresent's hold-off condition, read under one lock so a caller can size a
+// wait to the remaining grace.
+func (l *link) holdLeft(now time.Time) (time.Duration, bool) {
+	if !l.sessionScoped {
+		return 0, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.parkSince.IsZero() || !l.hadEdge || l.rodeGen < l.e.peerSessionGen(l.peer) {
+		return 0, false
+	}
+	return scopedRePresentGrace - now.Sub(l.parkSince), true
 }
 
 // noteRidden records the peer session generation the newly installed edge rode,
@@ -547,14 +604,12 @@ func isEdgeEndError(err error) bool {
 // An adopted edge that dies is replaced by a fresh presentation; our own edge
 // dying is the presenter's cue to reopen it.
 //
-// A lost peer edge never ends the link. The link lives as long as its local
-// carrier does: the carrier's stream ending is the dial ending (pumpLocal), and
-// that is the only thing that closes the link. The carrier cannot tell "my
-// tunnel is over" from "this link's edge died", so a link that ended here left
-// it waiting forever for a re-dial it had no reason to make — the 45-minute
-// blackhole. A session-scoped link still waits for a fresh peer session before
-// presenting again (mayPresent), because the state the consumer registered with
-// the peer was scoped to the session that edge rode.
+// A lost peer edge does not end the link here. For an unscoped link the presenter
+// simply re-presents. For a session-scoped link the state the consumer
+// registered with the peer was scoped to the session that edge rode, so the
+// presenter waits for a fresh session (mayPresent) and ends the link only once
+// that wait passes scopedRePresentGrace (presentLoop). Ending the link is the
+// consumer's cue to re-dial — the only one it has.
 func (l *link) retireEdge(c net.Conn) {
 	l.mu.Lock()
 	current := l.peerEdge == c
@@ -565,10 +620,17 @@ func (l *link) retireEdge(c net.Conn) {
 	if l.own == c {
 		l.own = nil
 	}
-	closed := l.closed
+	closed, scoped := l.closed, l.sessionScoped
 	l.mu.Unlock()
 	if closed {
 		return
+	}
+	if current && scoped {
+		// Anchor the grace at the loss, not at whenever the presenter next parks:
+		// a session-scoped link whose peer session never comes back must end
+		// within scopedRePresentGrace of its edge dying (see presentLoop), and
+		// the presenter may first pass through a retry wait before it parks.
+		l.noteParked()
 	}
 	select {
 	case l.edgeGone <- struct{}{}:

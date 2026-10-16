@@ -124,19 +124,23 @@ func linkToHubStub(t *testing.T, scoped bool) (l *link, hub, spoke *engine, stub
 	return l, hub, spoke, stub
 }
 
-// TestScopedLinkSurvivesAndRecoversUnderBlackhole pins the link's liveness
-// ownership: the link lives as long as its local carrier does. When the peer
-// path goes dead in both directions — the "network switch / blackhole" shape,
-// where no frame gets through and the smux keepalive is dropped too — the link
-// holds on and recovers by itself once the session is rebuilt, instead of ending
-// and leaving the consumer to re-dial.
+// TestScopedLinkEndsUnderBlackhole pins the link's liveness bound: a
+// session-scoped link ends when the peer path goes dead in both directions —
+// the "network switch / blackhole" shape, where no frame gets through and the
+// smux keepalive is dropped too — because the peer session it waits for never
+// comes back. That end is what makes the tun consumer re-dial and re-register.
 //
-// It used to end instead, on the theory that the consumer would re-dial and
-// re-register. It would not: the consumer's only signal that the tunnel was over
-// was the link ending, so nothing re-dialed and the route stayed gone for the
-// best part of an hour. Recovery is the link's job now — see link.mayPresent,
-// which waits for a fresh peer session rather than presenting over a stale one.
-func TestScopedLinkSurvivesAndRecoversUnderBlackhole(t *testing.T) {
+// Without it the consumer's conn never ends: it keeps writing into a link
+// nothing carries, so a hub that lost the spoke's route stays a black hole until
+// the process restarts — the 56-minute field outage, where 23 rebuilt edges all
+// logged read=0 written=0 and the consumer never re-dialed. d58096a rewrote this
+// test to pin the opposite (a link that survives the blackhole); this restores
+// the end assertion while keeping the bound (the re-present grace rather than
+// the old immediate end).
+//
+// Recovery when the peer session DOES come back is the other half, pinned at the
+// unit level by TestScopedLinkRePresentsAfterNewPeerSession.
+func TestScopedLinkEndsUnderBlackhole(t *testing.T) {
 	l, hub, spoke, _ := linkToHubStub(t, true)
 
 	// Blackhole both directions: no data frame either way, smux keepalives
@@ -145,19 +149,14 @@ func TestScopedLinkSurvivesAndRecoversUnderBlackhole(t *testing.T) {
 	hub.faults.Store(newFaults(&p2p.FaultsConfig{DropData: true}))
 	spoke.faults.Store(newFaults(&p2p.FaultsConfig{DropData: true}))
 
-	// It does not end: the carrier is still there, so the tunnel is not over.
-	// That is the whole fix — an ending link was the consumer's only cue to
-	// re-dial, and it never made it.
+	start := time.Now()
 	select {
 	case <-l.done:
-		t.Fatal("the link ended under a blackhole while its local carrier lived")
-	case <-time.After(60 * time.Second):
-		// survived the whole blackhole.
+		t.Logf("session-scoped link ended %s after the path went dead (the re-present grace bound)",
+			time.Since(start).Round(time.Second))
+	case <-time.After(90 * time.Second):
+		t.Fatal("a session-scoped link never ended under a blackhole — the tun would not re-register")
 	}
-	// Recovery is pinned at the unit level, not here: it needs a session gen
-	// bump this scenario produces only by incidentally rebuilding the relay,
-	// which the churn guard may tear down first. See
-	// TestScopedLinkRePresentsAfterNewPeerSession.
 }
 
 // TestScopedLinkSurvivesPacketLoss: under a lossy path that still carries the
