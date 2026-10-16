@@ -350,7 +350,7 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 			d.SessionAge = now.Sub(at)
 		}
 		d.Attempts, d.Ups, d.Drops = dc.punchCounters()
-		d.Trace = dc.traceLines()
+		d.Trace, d.TraceTimes = dc.traceSnapshot()
 		// The pair's O2/O4/O5 migration history and the punch backoff (O4).
 		e.fillPairDiag(&d, dc.peer)
 		d.NextPunchIn = dc.nextPunchIn()

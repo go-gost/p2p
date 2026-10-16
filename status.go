@@ -74,6 +74,12 @@ type PeerDiagnostic struct {
 	// oldest first, capped at the ring's size (the newest are kept). Nil for a
 	// peer with no direct punch state (a relay-only peer).
 	Trace []string
+	// TraceTimes is the wall-clock stamp of each line in Trace, same order and
+	// length, so TraceTimes[i] is when Trace[i] happened. It rides beside the
+	// lines rather than inside them, which keeps the line text the short,
+	// parseable string the doctor and the punch-trace tests read. Nil whenever
+	// Trace is.
+	TraceTimes []time.Time
 	// PathTrace is this peer's recent pair path-change history (O5): short
 	// human-readable lines, oldest first, capped at the same ring size as
 	// Trace. It answers "how did this pair get where it is" — the flips a

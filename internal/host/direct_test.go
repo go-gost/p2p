@@ -2430,3 +2430,35 @@ func TestPunchTraceRing(t *testing.T) {
 		t.Fatal("traceLines aliases the ring")
 	}
 }
+
+// TestPunchTraceTimes: the time ring stays parallel to the line ring — same
+// length, oldest first, and a copy that does not alias.
+func TestPunchTraceTimes(t *testing.T) {
+	dc := &directConn{}
+	if got := dc.traceTimes(); got != nil {
+		t.Fatalf("fresh times = %v, want nil", got)
+	}
+	for i := 1; i <= punchTraceCap; i++ {
+		dc.noteRound("line %d", i)
+	}
+	times := dc.traceTimes()
+	if len(times) != len(dc.traceLines()) {
+		t.Fatalf("times len = %d, want %d (parallel to lines)", len(times), len(dc.traceLines()))
+	}
+	for i := 1; i < len(times); i++ {
+		if times[i].Before(times[i-1]) {
+			t.Fatalf("times not oldest-first: [%d]=%v before [%d]=%v", i, times[i], i-1, times[i-1])
+		}
+	}
+	// One more line drops the oldest stamp along with the oldest line.
+	dc.noteRound("line %d", punchTraceCap+1)
+	times = dc.traceTimes()
+	if len(times) != punchTraceCap {
+		t.Fatalf("times len after wrap = %d, want %d", len(times), punchTraceCap)
+	}
+	// A copy: mutating it must not change the ring.
+	times[0] = time.Time{}
+	if again := dc.traceTimes(); again[0].IsZero() {
+		t.Fatal("traceTimes aliases the ring")
+	}
+}

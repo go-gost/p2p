@@ -266,6 +266,10 @@ type directConn struct {
 	// no growing state; tracePos is the next write slot and traceN the count
 	// written (saturating at the cap). Guarded by dc.mu.
 	traceRing [punchTraceCap]string
+	// traceTime is traceRing's parallel ring: traceTime[i] is when the line in
+	// the same slot was written, so a reader can say when each step happened.
+	// Allocated once with the ring, like it.
+	traceTime [punchTraceCap]time.Time
 	tracePos  int
 	traceN    int
 
@@ -610,8 +614,10 @@ func (dc *directConn) punchCounters() (attempts, ups, drops int64) {
 // that matter for diagnosing a punch; never per packet.
 func (dc *directConn) noteRound(format string, args ...any) {
 	line := fmt.Sprintf(format, args...)
+	now := time.Now()
 	dc.mu.Lock()
 	dc.traceRing[dc.tracePos] = line
+	dc.traceTime[dc.tracePos] = now
 	dc.tracePos = (dc.tracePos + 1) % punchTraceCap
 	if dc.traceN < punchTraceCap {
 		dc.traceN++
@@ -619,20 +625,39 @@ func (dc *directConn) noteRound(format string, args ...any) {
 	dc.mu.Unlock()
 }
 
-// traceLines returns this peer's punch trace oldest-first, as a copy so a
-// caller (a status builder) never aliases the ring.
-func (dc *directConn) traceLines() []string {
+// traceSnapshot returns this peer's punch trace oldest-first — the lines and
+// their parallel stamps — as copies, so a caller (a status builder) never
+// aliases the ring. Both halves are read under one lock: a round appending
+// between two separate reads would hand the reader a line list and a stamp
+// list one step apart, and the UI zips them by index.
+func (dc *directConn) traceSnapshot() ([]string, []time.Time) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	if dc.traceN == 0 {
-		return nil
+		return nil, nil
 	}
-	out := make([]string, dc.traceN)
+	lines := make([]string, dc.traceN)
+	times := make([]time.Time, dc.traceN)
 	start := (dc.tracePos - dc.traceN + punchTraceCap) % punchTraceCap
-	for i := range out {
-		out[i] = dc.traceRing[(start+i)%punchTraceCap]
+	for i := range lines {
+		j := (start + i) % punchTraceCap
+		lines[i] = dc.traceRing[j]
+		times[i] = dc.traceTime[j]
 	}
-	return out
+	return lines, times
+}
+
+// traceLines returns this peer's punch-trace lines, oldest-first.
+func (dc *directConn) traceLines() []string {
+	lines, _ := dc.traceSnapshot()
+	return lines
+}
+
+// traceTimes returns this peer's punch-trace stamps, oldest-first and parallel
+// to traceLines (same length, same order).
+func (dc *directConn) traceTimes() []time.Time {
+	_, times := dc.traceSnapshot()
+	return times
 }
 
 func (dc *directConn) onCandidates(cands []candidate) {
