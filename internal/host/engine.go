@@ -2570,7 +2570,9 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 			}
 		}
 		reason, deadSince, silentFor = pc.lastEndReason, pc.deadSince, pc.silentFor
-		pc.deadSince, pc.silentFor = time.Time{}, time.Duration(0)
+		// Do not clear deadSince here: sessionLocked needs it for the C1
+		// rebuild delay. It is cleared by sessionLocked once the delay has
+		// passed and the rebuild actually happens.
 		pc.mu.Unlock()
 	}
 
@@ -2765,16 +2767,27 @@ func (e *engine) reconnectRelay(cause error) {
 // sessionLocked brings up the peer's relay mux session if it is not already
 // live. The role is fixed by public-key ordering so both ends converge on one
 // session per pair. Caller must hold pc.mu.
+// selfDeathRebuildDelay is how long a self-dead relay session waits before
+// rebuilding, so the peer's session (which dies on its own keepalive timeout
+// ~15s later) has also ended and the two tables do not diverge. Tests may
+// override this to a small value.
+var selfDeathRebuildDelay = 20 * time.Second
+
 func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	if pc.sess != nil && pc.sess.IsClosed() {
-		// The dead session died on its own — any kill closes the adapter too
-		// (killSession), so a killed session rebuilds through peerConn, not
-		// here. Its keys were therefore kept, and the rebuild is transparent
-		// over the surviving pair KCP session. The reason-driven key drop lives
-		// in killSession (see resetsPairKCP) and could not run here anyway:
-		// dropRelaySecure takes e.mu, which is taken before pc.mu elsewhere
-		// (see peerConn).
+		// C1: do not rebuild transparently. A one-sided transparent rebuild
+		// leaves the peer's stale session alive, whose stream table collides
+		// with the new session's IDs (silent SYN drop) and wedges the tunnel.
+		// Delay the rebuild so the peer's session dies on its own too, then
+		// both rebuild fresh. No signal, no relay dependency.
+		if pc.deadSince.IsZero() {
+			pc.deadSince = time.Now()
+		}
+		if time.Since(pc.deadSince) < selfDeathRebuildDelay {
+			return nil, errRelaySessionStale
+		}
 		pc.sess = nil
+		pc.deadSince = time.Time{}
 	}
 	if pc.sess != nil {
 		return pc.sess, nil

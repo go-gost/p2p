@@ -1008,6 +1008,7 @@ func TestDirectSurvivesPunchTimeout(t *testing.T) {
 // TestDirectFallbackToRelay proves that after the direct session is torn down,
 // new streams fall back to the relay path.
 func TestDirectFallbackToRelay(t *testing.T) {
+	selfDeathRebuildDelay = 0
 	rs := &relayServer{}
 	url := rs.start(t)
 	stun := startFakeSTUN(t, "")
@@ -1143,6 +1144,7 @@ func TestDirectRepunchAfterSessionDeath(t *testing.T) {
 // -race, and is not a product race (see the docs note). Re-run and report it;
 // it is not your change.
 func TestDirectRepunchAfterMissedPeerGone(t *testing.T) {
+	selfDeathRebuildDelay = 0
 	rs := &relayServer{}
 	url := rs.start(t)
 	stun := startFakeSTUN(t, "")

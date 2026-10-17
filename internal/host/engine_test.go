@@ -825,6 +825,7 @@ func TestTransportCounts(t *testing.T) {
 // but a log grep showed it: a peer reads as healthy while its session is
 // rebuilt every few seconds.
 func TestRelayRebuildCounters(t *testing.T) {
+	selfDeathRebuildDelay = 0
 	e := &engine{
 		log:     slog.Default(),
 		stop:    make(chan struct{}),

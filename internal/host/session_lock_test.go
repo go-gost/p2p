@@ -288,6 +288,7 @@ func TestRelaySessionReplaceRehandshakes(t *testing.T) {
 // so nothing is re-handshaken. This is the path that does not pass through
 // pc.kill.
 func TestRelaySessionReplaceDeadSessionKeepsKeys(t *testing.T) {
+	selfDeathRebuildDelay = 0
 	eA, eB, _ := newEncryptedPair(t)
 
 	// B's adapter up front: the half exchange below settles B's security

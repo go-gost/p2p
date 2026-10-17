@@ -23,6 +23,8 @@ import (
 // untouched: tests that need a live gate stamp it themselves.
 func buildRelaySession(t *testing.T, capture *logCapture, peer derpclient.PublicKey) (*engine, *peerConn, *relayKCPPair) {
 	t.Helper()
+	selfDeathRebuildDelay = 1 * time.Millisecond
+	selfDeathRebuildDelay = 1 * time.Millisecond
 	priv, _, err := derpclient.Generate()
 	if err != nil {
 		t.Fatal(err)
@@ -80,6 +82,9 @@ func TestSessionEndReportedWithoutKill(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		return capture.count("peer relay session ended") == 1
 	})
+	// C1: rebuild is delayed; trigger it after the delay.
+	time.Sleep(5 * time.Millisecond)
+	_, _ = pc.ensureSession(false, false)
 	waitFor(t, 5*time.Second, func() bool {
 		pc.mu.Lock()
 		defer pc.mu.Unlock()
@@ -174,12 +179,16 @@ func TestDeathHandlerRebuildsOnFreshPair(t *testing.T) {
 	old := pc.sess
 	pc.mu.Unlock()
 
-	if err := e.peerRelaySessionEnded(old, peer, errors.New("test: read error")); err != nil {
-		t.Fatalf("report over a live pair: %v", err)
+	err := e.peerRelaySessionEnded(old, peer, errors.New("test: read error"))
+	if !errors.Is(err, errRelaySessionStale) {
+		t.Fatalf("report over a live pair: %v, want %v", err, errRelaySessionStale)
 	}
 	if !old.IsClosed() {
 		t.Fatal("the dead session was never force-closed")
 	}
+	// C1: rebuild is delayed; trigger it after the delay.
+	time.Sleep(5 * time.Millisecond)
+	_, _ = pc.ensureSession(false, false)
 	pc.mu.Lock()
 	cur := pc.sess
 	pc.mu.Unlock()
@@ -322,10 +331,11 @@ func TestDuplicateDeathReportIsIdempotent(t *testing.T) {
 	sess := pc.sess
 	pc.mu.Unlock()
 
-	if err := e.peerRelaySessionEnded(sess, peer, errors.New("test: read error")); err != nil {
-		t.Fatalf("first report: %v", err)
-	}
 	err := e.peerRelaySessionEnded(sess, peer, errors.New("test: read error"))
+	if !errors.Is(err, errRelaySessionStale) {
+		t.Fatalf("first report: %v, want %v", err, errRelaySessionStale)
+	}
+	err = e.peerRelaySessionEnded(sess, peer, errors.New("test: read error"))
 	if !errors.Is(err, errRelaySessionSuperseded) {
 		t.Fatalf("second report = %v, want %v", err, errRelaySessionSuperseded)
 	}
