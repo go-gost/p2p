@@ -2693,7 +2693,15 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 	// e.mu, which pc.mu is taken under elsewhere (see the handshake comment
 	// above).
 	if err == nil && (punch || rebuilt) {
-		pc.e.maybeStartDirect(pc.peer)
+		if rebuilt {
+			// A rebuilt session is the recovery path a network change makes:
+			// the punch state may be in backoff, where maybeStartDirect's
+			// start() is a no-op and the round would not run until the backoff
+			// elapses. Kick instead, so the returning link can punch now.
+			pc.e.maybeKickDirect(pc.peer)
+		} else {
+			pc.e.maybeStartDirect(pc.peer)
+		}
 	}
 	return sess, err
 }

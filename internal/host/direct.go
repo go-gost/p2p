@@ -338,6 +338,25 @@ func (e *engine) maybeStartDirect(peer derpclient.PublicKey) {
 	dc.start()
 }
 
+// maybeKickDirect is the rebuild-path counterpart of maybeStartDirect: a session
+// that died and was rebuilt (a network change) may have left the punch state in
+// backoff, where start() is a no-op and the next round would not run until the
+// backoff elapses — up to ~30s, which is what makes a returning device wait a
+// minute before it punches. kick() clears that backoff (and the control-miss
+// bookkeeping that armed it) and starts a round now, so a returning link can
+// go direct within a second instead of waiting out the stale backoff.
+func (e *engine) maybeKickDirect(peer derpclient.PublicKey) {
+	if !e.directEnabled() {
+		return
+	}
+	dc := e.directConn(peer)
+	if dc.peerDirectOff() {
+		dc.noteRound("peer has the direct path off")
+		return
+	}
+	dc.kick()
+}
+
 // peerLive reports whether the peer currently has a live data path: a built
 // relay session or a live direct one — the same definition of "connected" the
 // status surfaces use (see peerTransports). It is NOT the gate for whether a
