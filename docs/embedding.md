@@ -92,21 +92,19 @@ endpoint is created, and a later endpoint inherits the values already applied.
 One endpoint per process is the model — a process that builds two must give them
 identical timeouts (or none). Internal mechanism timeouts are not configurable.
 
-The two smux keepalives are separate: `smux` is the relay session's, `directSmux`
-the hole-punched session's. The direct one pings more often (2s against the
-relay's 3s) and its timeout is **not** tighter than the relay's — both are 15s.
-That is a measured choice: a phone on Wi-Fi lost its direct session at exactly
-18.000s to ~12s of one-way silence from RF batching, which the 6s timeout it
-then was could not survive, and the relay's 15s (with its 60s silence watchdog)
-did. The pair is **negotiated**: smux answers a NOP with nothing, so a session is
-kept alive by the frames the *peer* sends, and a timeout shorter than the peer's
-ping interval tears the session down on a loop. Both ends advertise the pair
-through the capability bitfield and a peer that does not set the bit gets the
-relay's pair instead — so the tighter values apply only when both sides run a
-version that has them. With both on it, smux notices a silent session after
-roughly 2-3x the timeout, so the direct default gives ~30-45s. Widening it
-further costs latency in that window; narrowing it risks giving up a path that a
-burst of loss merely stalled, at the price of a relay fallback and a re-punch.
+`smux` tunes the pair's session (the relay's smux, which the direct plane now
+also rides). `directSmux` is accepted for config compatibility but no longer affects
+any session: the direct plane no longer runs a second smux session, and the
+hole-punched path has its own underlay idle watchdog instead. The pair pings
+every 3s with a 15s timeout. That is a measured choice: a phone on Wi-Fi lost
+its direct session at exactly 18.000s to ~12s of one-way silence from RF
+batching, which the 6s timeout it then was could not survive, and 15s did. smux
+answers a NOP with nothing, so a session is kept alive by the frames the *peer*
+sends, and a timeout shorter than the peer's ping interval tears the session
+down on a loop. smux notices a silent session after roughly 2-3x the timeout, so
+the default gives ~30-45s. Widening it further costs latency in that window;
+narrowing it risks giving up a path that a burst of loss merely stalled, at the
+price of a relay fallback and a re-punch.
 
 ## Direct path
 

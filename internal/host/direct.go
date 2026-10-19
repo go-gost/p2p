@@ -56,15 +56,11 @@ const (
 // negotiation; the receiver ORs the bits.
 const capsIPv6 uint8 = 1 << 0
 
-// capsTightKeepalive marks a peer that runs the direct session's own, tighter
-// keepalive (timeouts.directSmux). It has to be negotiated, not assumed: smux
-// answers a NOP with nothing, so a session's liveness is fed only by the frames
-// the *peer* sends — a peer pinging every 10s cannot keep a 6s timeout alive,
-// and would see its direct sessions torn down and re-punched every 6s. A peer
-// that does not set this bit gets the relay's pair instead, which is what every
-// peer got before the tighter one existed.
-const capsTightKeepalive uint8 = 1 << 1
-
+// Bit 1 was capsTightKeepalive: it used to select the direct session's own,
+// tighter smux keepalive. The KCP path migration removed that second session —
+// the direct plane now rides the pair's session — so the bit is retired and
+// ignored. Do not reuse it: an older peer may still advertise it.
+//
 // capsNoDirect marks a peer that has turned the direct path OFF
 // (Config.Direct=false): it will neither start a round nor answer one. It
 // exists so the other end stops asking. Without it, a host with direct on and
@@ -613,9 +609,6 @@ func (dc *directConn) capNames() []string {
 	if bits&capsIPv6 != 0 {
 		out = append(out, "ipv6")
 	}
-	if bits&capsTightKeepalive != 0 {
-		out = append(out, "tightKeepalive")
-	}
 	if bits&capsNoDirect != 0 {
 		out = append(out, "no-direct")
 	}
@@ -912,12 +905,9 @@ func (dc *directConn) repunchBackoffAfterLocked(lifetime time.Duration) time.Dur
 	return dc.repunchBackoff
 }
 
-// addCaps records the capability bits the peer advertised. The IPv6 and
-// tight-keepalive bits are sticky: they describe a capability, and a frame that
-// omits one must not clear it. The frame rides every candidate broadcast, so it
-// logs only when the set changes — which is the line that says whether this
-// peer's direct sessions get the tighter keepalive (capsTightKeepalive) or the
-// relay's pair.
+// addCaps records the capability bits the peer advertised. IPv6 is sticky: it
+// describes a capability, and a frame that omits it must not clear it. The
+// frame rides every candidate broadcast, so it logs only when the set changes.
 //
 // capsNoDirect is the exception: it is a setting, not a capability, so it is
 // level-triggered (see its definition).
@@ -935,7 +925,6 @@ func (dc *directConn) addCaps(bits uint8) {
 	if after != before {
 		dc.e.log.Debug("direct punch: peer caps", "peer", keyName(dc.peer),
 			"ipv6", after&capsIPv6 != 0,
-			"tightKeepalive", after&capsTightKeepalive != 0,
 			"noDirect", after&capsNoDirect != 0)
 	}
 }
@@ -963,8 +952,8 @@ func (dc *directConn) peerDirectOff() bool {
 }
 
 // supports reports whether the peer has advertised all of the given capability
-// bits. IPv6 selection does not depend on it (the candidate list is the in-band
-// signal there); the direct session's keepalive pair does.
+// bits. IPv6 selection does not depend on it: the candidate list is the in-band
+// signal there.
 func (dc *directConn) supports(bits uint8) bool {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -1269,7 +1258,7 @@ func (dc *directConn) punch() {
 	// The direct underlay rides the pair's existing secure session (tag 0x00,
 	// negotiated with the relay session); there is no separate direct secure
 	// session to negotiate or rekey (Task 9 removes the direct half entirely).
-	if err := e.sendCaps(dc.peer, capsIPv6|capsTightKeepalive); err != nil {
+	if err := e.sendCaps(dc.peer, capsIPv6); err != nil {
 		e.log.Debug("direct punch: send caps failed", "peer", pname, "error", err)
 	}
 	if err := e.sendCandidates(dc.peer, mine); err != nil {

@@ -804,8 +804,8 @@ var (
 	// The timeout must stay above the ping interval of a peer that has not
 	// adopted this pair — 10s, what this pair used to be — or a peer pinging
 	// every 10s would have its healthy session torn down on a tick. 15s is that
-	// floor for a mixed fleet; 3s pings leave room for a tighter timeout once
-	// both ends negotiate one (see capsTightKeepalive's shape).
+	// floor for a mixed fleet. The direct plane rides this same session, so
+	// there is no second smux keepalive to negotiate.
 	smuxKeepAliveInterval = 3 * time.Second
 	smuxKeepAliveTimeout  = 15 * time.Second
 

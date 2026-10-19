@@ -23,7 +23,7 @@ type PeerDiagnostic struct {
 	// dials). Candidates is how many the peer announced.
 	PeerAddr   string
 	Candidates int
-	// Caps is the peer's advertised capabilities ("ipv6", "tightKeepalive").
+	// Caps is the peer's advertised capabilities ("ipv6", "no-direct").
 	Caps []string
 	// SessionAge is how long the live direct session has been up (0 when none);
 	// LastRecvAge is how long since this host last saw *traffic* from the peer,

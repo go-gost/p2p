@@ -273,7 +273,7 @@ Handshake: the server greets with `ServerKey`, the client replies `ClientInfo` (
 | `0x00` | control frame: `[0x00][kind 1B][NaCl-boxed payload]` |
 | `0x01` | data frame: `[0x01][session ciphertext]` — the peer's smux session, wrapped in AEAD records (see [Security](#security)) |
 
-Control kinds: `0x02` punch candidates (sealed `[count]([family][addr][port])*`), `0x04` capability bitfield (sealed 1 byte; bit 0 = IPv6-aware, re-sent with each broadcast and OR'd by the receiver), `0x05` session handshake (sealed `[transport 1B][ephemeral public key 32B][want 1B]` — the per-peer data-plane key agreement, see [Security](#security)). (`0x03`, the udp-tunnel dial notice, is retired: a datagram link presents its own edge, so no notice is sent and none is acted on.) All control payloads are sealed to the peer key (`PrivateKey.SealTo`), so the relay can route but not forge them. Control frames are consumed by the engine; data frames feed the per-peer smux session.
+Control kinds: `0x02` punch candidates (sealed `[count]([family][addr][port])*`), `0x04` capability bitfield (sealed 1 byte; bit 0 = IPv6-aware, bit 2 = direct path off; re-sent with each broadcast and OR'd by the receiver, except bit 2 which is level-triggered. Bit 1 was the direct session's tight keepalive, retired with that session and ignored), `0x05` session handshake (sealed `[transport 1B][ephemeral public key 32B][want 1B]` — the per-peer data-plane key agreement, see [Security](#security)). (`0x03`, the udp-tunnel dial notice, is retired: a datagram link presents its own edge, so no notice is sent and none is acted on.) All control payloads are sealed to the peer key (`PrivateKey.SealTo`), so the relay can route but not forge them. Control frames are consumed by the engine; data frames feed the per-peer smux session.
 
 ### Hole punching
 
@@ -447,7 +447,7 @@ it outranks the peer's own; empty on a live direct session), `state` (the punch
 state machine `none`/`attempting`/`up`/`backoff`), `failed`, `last_error` (the
 last punch failure, e.g. `seed failed: timeout`), `peer_addr` (the endpoint
 dialled for the direct path), `candidates` (how many the peer announced), `caps`
-(`ipv6`/`tightKeepalive`), `session_age_ms`/`last_recv_age_ms` (the live direct
+(`ipv6`/`no-direct`), `session_age_ms`/`last_recv_age_ms` (the live direct
 session's age, 0 when none; time since this host last saw *traffic* from the
 peer, on either path — an inbound relay packet or bytes off a stream. Keepalive
 NOPs never reach the pump, so a connected but idle peer ages here: read it as
@@ -495,7 +495,7 @@ peers:
     last error:  (none)
     peer addr:   10.99.0.3:39028
     candidates:  1
-    caps:        ipv6, tightKeepalive
+    caps:        ipv6
     session age: 122ms
     last traffic: 21ms (a connected idle peer ages here: keepalives carry no traffic)
     trace:

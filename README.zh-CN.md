@@ -253,7 +253,7 @@ relay 链路是一条承载 DERP 二进制帧的 WebSocket。值得了解的有�
 | `0x00` | 控制帧：`[0x00][kind 1B][NaCl-box 载荷]` |
 | `0x01` | 数据帧：`[0x01][会话密文]` —— 该 peer 的 smux 会话，外包 AEAD 记录（见[安全](#安全)） |
 
-控制 kind：`0x02` 打洞候选（sealed `[count]([family][addr][port])*`）、`0x04` 能力位域（sealed 1 字节；bit 0 = 支持 IPv6，随每次广播重发、接收方 OR）、`0x05` 会话握手（sealed `[transport 1B][临时公钥 32B][want 1B]`——peer 间数据面的密钥协商，见[安全](#安全)）。（`0x03` udp 隧道拨号通知已废弃：数据报链路自己呈现边，不再发送、也不再消费该通知。）所有控制载荷都用对端公钥 seal（`PrivateKey.SealTo`），relay 只能路由、无法伪造。控制帧由 engine 消费；数据帧携带会话密文，喂给每个 peer 的 smux 会话。
+控制 kind：`0x02` 打洞候选（sealed `[count]([family][addr][port])*`）、`0x04` 能力位域（sealed 1 字节；bit 0 = 支持 IPv6，bit 2 = 关闭直连；随每次广播重发、接收方 OR，bit 2 例外为电平触发。bit 1 曾是直连会话的 tight keepalive，已随该会话移除并被忽略）、`0x05` 会话握手（sealed `[transport 1B][临时公钥 32B][want 1B]`——peer 间数据面的密钥协商，见[安全](#安全)）。（`0x03` udp 隧道拨号通知已废弃：数据报链路自己呈现边，不再发送、也不再消费该通知。）所有控制载荷都用对端公钥 seal（`PrivateKey.SealTo`），relay 只能路由、无法伪造。控制帧由 engine 消费；数据帧携带会话密文，喂给每个 peer 的 smux 会话。
 
 ### 打洞
 
@@ -374,7 +374,7 @@ grpcurl -plaintext 127.0.0.1:8003 proto.P2P/Status
 `reason`（主机级原因压过该 peer 自身时给出；直连会话活跃时为空）、`state`（打洞
 状态机 `none`/`attempting`/`up`/`backoff`）、`failed`、`last_error`（最近一次打洞
 失败，如 `seed failed: timeout`）、`peer_addr`（直连路径实际拨的端点）、
-`candidates`（对端广播的候选数）、`caps`（`ipv6`/`tightKeepalive`）、
+`candidates`（对端广播的候选数）、`caps`（`ipv6`/`no-direct`）、
 `session_age_ms`/`last_recv_age_ms`（活跃直连会话的时长，无会话为 0；距对端最后一个
 帧的时长，relay 或直连皆可）、`trace`（该 peer 最近的打洞步骤，最早的在前——固定
 环形缓冲，最多 16 行短文本，这是单次快照装不下的历史，也正是*抖动*的打洞所需要的；
@@ -417,7 +417,7 @@ peers:
     last error:  (none)
     peer addr:   10.99.0.3:39028
     candidates:  1
-    caps:        ipv6, tightKeepalive
+    caps:        ipv6
     session age: 122ms
     last traffic: 21ms (a connected idle peer ages here: keepalives carry no traffic)
     trace:

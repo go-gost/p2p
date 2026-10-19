@@ -82,20 +82,15 @@ type TimeoutsConfig struct {
 	Backoff       time.Duration `yaml:"backoff,omitempty"`
 	DerpKeepAlive time.Duration `yaml:"derpKeepAlive,omitempty"`
 	Smux          *SmuxTimeouts `yaml:"smux,omitempty"`
-	// DirectSmux tunes the direct (hole-punched) session's keepalive, which runs
-	// tighter than the relay's by default. It is negotiated: smux answers a NOP
-	// with nothing, so a session is kept alive by the frames the peer sends, and
-	// a timeout shorter than the peer's ping interval would tear the session
-	// down on a loop. Both ends advertise the pair (ctrlCaps) and a peer that
-	// does not gets the relay's, so the tighter values apply only when both
-	// sides run this version. Until a dead session is noticed it is served as
-	// live — the peer reads as "direct" and a new stream goes to the dead path
-	// instead of the relay. Widen it for slow or lossy direct paths.
+	// DirectSmux is retained for config compatibility: the direct (hole-punched)
+	// plane no longer runs its own smux session, so these values are accepted
+	// for compatibility but no longer affect any session. The direct path rides
+	// the pair's session and has its own underlay idle watchdog.
 	DirectSmux *SmuxTimeouts `yaml:"directSmux,omitempty"`
 }
 
-// SmuxTimeouts tunes a smux keepalive: the relay session's under "smux", the
-// direct session's under "directSmux". Timeout must be >= 2x Interval
+// SmuxTimeouts tunes a smux keepalive: the pair's session under "smux".
+// "directSmux" is a compatibility no-op. Timeout must be >= 2x Interval
 // (validated when the endpoint is created).
 type SmuxTimeouts struct {
 	Interval time.Duration `yaml:"interval,omitempty"`

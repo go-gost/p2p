@@ -874,20 +874,6 @@ func TestDirectPunchRoundTrip(t *testing.T) {
 		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
 	})
 
-	// The direct session's tighter keepalive is negotiated, and both ends of a
-	// punch run this version, so each must have seen the other's bit. The caps
-	// frame rides the control channel, so it can land just after the session.
-	for _, e := range []*engine{engineA, engineB} {
-		peer := pubB
-		if e == engineB {
-			peer = engineA.pub
-		}
-		waitFor(t, 5*time.Second, func() bool {
-			dc := e.getDirect(peer)
-			return dc != nil && dc.supports(capsTightKeepalive)
-		})
-	}
-
 	// Cut relay data frames; control frames still flow. The direct path must
 	// now carry the traffic.
 	rs.setDropData(true)
