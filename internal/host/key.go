@@ -4,60 +4,38 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
+	"github.com/go-gost/p2p"
 	"github.com/go-gost/p2p/internal/derpclient"
 )
 
-// defaultKeyPath is where the DERP key lives unless Config.Key or Config.KeyHex
-// sets it.
-func defaultKeyPath() string {
-	if dir, err := os.UserConfigDir(); err == nil {
-		return filepath.Join(dir, "p2p", "key-v1")
+// loadKey returns the DERP identity from key: either a 64-character hex private
+// key or a path to a key file. p2p never creates an identity or writes a key
+// file: the caller owns generation and persistence (see p2p.GenerateKey). Bare
+// mode (Derp unset) does not need an identity at all.
+func loadKey(key string) (derpclient.PrivateKey, derpclient.PublicKey, error) {
+	if p2p.IsHexKey(key) {
+		return keyFromHex(key)
 	}
-	return "p2p-key-v1"
-}
-
-// loadOrCreateKey returns the DERP identity. hexKey (32 bytes hex) takes
-// precedence and is used as-is; otherwise the hex-encoded private key is read
-// from path, generating and storing a new one (0600) if the file is missing. An
-// empty path falls back to defaultKeyPath. Setting both path and hexKey is an
-// error: the caller must pick one source.
-func loadOrCreateKey(path, hexKey string) (derpclient.PrivateKey, derpclient.PublicKey, error) {
-	if hexKey != "" {
-		if path != "" {
-			return derpclient.PrivateKey{}, derpclient.PublicKey{},
-				fmt.Errorf("p2p: set either Key or KeyHex, not both")
-		}
-		return keyFromHex(hexKey)
+	if strings.TrimSpace(key) == "" {
+		return derpclient.PrivateKey{}, derpclient.PublicKey{},
+			fmt.Errorf("p2p: identity required: set Key to a 64-character hex key or a key file path")
 	}
-	if path == "" {
-		path = defaultKeyPath()
-	}
-	if b, err := os.ReadFile(path); err == nil {
-		return keyFromHex(strings.TrimSpace(string(b)))
-	}
-	priv, pub, err := derpclient.Generate()
+	b, err := os.ReadFile(strings.TrimSpace(key))
 	if err != nil {
-		return priv, pub, err
+		return derpclient.PrivateKey{}, derpclient.PublicKey{},
+			fmt.Errorf("p2p: read key %s: %w", key, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return priv, pub, err
-	}
-	if err := os.WriteFile(path, []byte(hex.EncodeToString(priv[:])+"\n"), 0o600); err != nil {
-		return priv, pub, err
-	}
-	return priv, pub, nil
+	return keyFromHex(string(b))
 }
 
-// PublicKeyFile returns the base64 public key of the identity at path (empty
-// means the default key path), read-only. Unlike loadOrCreateKey it never
-// creates one, so a diagnostic can name the local identity without a side
-// effect; it fails when the file is missing or malformed.
+// PublicKeyFile returns the base64 public key of the identity at path,
+// read-only. It never creates one, so a diagnostic can name the local identity
+// without a side effect; it fails when path is empty, missing or malformed.
 func PublicKeyFile(path string) (string, error) {
 	if path == "" {
-		path = defaultKeyPath()
+		return "", fmt.Errorf("p2p: key path is required")
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {

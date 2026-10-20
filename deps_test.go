@@ -26,16 +26,16 @@ func TestContractsAreStdlibOnly(t *testing.T) {
 		{pkg: "./doctor", allow: []string{"github.com/go-gost/p2p/doctor"}},
 	}
 	for _, tc := range cases {
-		out, err := exec.Command(goTool, "list", "-deps", tc.pkg).Output()
+		// .Standard is the go tool's own answer to "is this the standard
+		// library?". A path test would misclassify versioned stdlib packages
+		// such as crypto/internal/entropy/v1.0.0 as third-party.
+		out, err := exec.Command(goTool, "list", "-deps", "-f", "{{if not .Standard}}{{.ImportPath}}{{end}}", tc.pkg).Output()
 		if err != nil {
 			t.Fatalf("go list -deps %s: %v", tc.pkg, err)
 		}
 		for dep := range strings.FieldsSeq(string(out)) {
 			if dep == "github.com/go-gost/p2p" || slices.Contains(tc.allow, dep) {
 				continue // this package, or the contract package
-			}
-			if !strings.Contains(dep, ".") {
-				continue // a standard-library path
 			}
 			t.Errorf("%s depends on %s; keep it stdlib-only", tc.pkg, dep)
 		}

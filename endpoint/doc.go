@@ -4,9 +4,10 @@
 //
 // A transport (github.com/go-gost/p2p/grpc) serves the same endpoint, so a
 // process that both serves the plugin protocol and dials in-process uses one
-// identity, one relay connection and one datagram link per udp dial. One endpoint per
-// process is the model: the timing knobs are process-wide (see
-// p2p.TimeoutsConfig).
+// identity, one relay connection and one datagram link per udp dial. Several
+// endpoints may share a process (for example one per relay, with the same
+// identity); the timing knobs are process-wide (see p2p.TimeoutsConfig), so
+// they must use identical timeouts.
 //
 // Trust boundary: nothing here authenticates a peer — reachability is this
 // package's job, confidentiality is the inner protocol's (a tls/mtls/wss dialer

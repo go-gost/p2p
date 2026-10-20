@@ -342,7 +342,7 @@ func TestSilenceShorterThanTimeoutIsSurvived(t *testing.T) {
 func TestHostAppliesFaultsToEngine(t *testing.T) {
 	h, err := New(&p2p.Config{
 		Derp:   "wss://127.0.0.1:1/derp",
-		KeyHex: strings.Repeat("cc", 32),
+		Key:    strings.Repeat("cc", 32),
 		Faults: &p2p.FaultsConfig{DropDataRate: 0.5},
 	})
 	if err != nil {

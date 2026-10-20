@@ -33,7 +33,8 @@ func applyDefaults(cfg *p2p.Config) {
 //
 // The timings are process-wide, not per-Host: a second New merges its non-zero
 // values into those already applied, so a Host with zero timeouts inherits the
-// first Host's. One endpoint per process is the model (see p2p.TimeoutsConfig).
+// first Host's. A process may run several Hosts, but they must share one
+// timeouts configuration (see p2p.TimeoutsConfig).
 func applyTimeouts(t *p2p.TimeoutsConfig) error {
 	if t == nil {
 		return nil

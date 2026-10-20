@@ -113,7 +113,7 @@ func TestListenWithTargetsErrors(t *testing.T) {
 	rs := &relayServer{}
 	url := rs.start(t)
 	direct := false
-	h, err := New(&Config{Derp: url, KeyHex: strings.Repeat("cc", 32), Direct: &direct, Targets: []string{"tcp://127.0.0.1:9"}})
+	h, err := New(&Config{Derp: url, Key: strings.Repeat("cc", 32), Direct: &direct, Targets: []string{"tcp://127.0.0.1:9"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestListenWithTargetsErrors(t *testing.T) {
 func newListenTestHost(t *testing.T, url, keyHex string) *Host {
 	t.Helper()
 	direct := false
-	h, err := New(&Config{Derp: url, KeyHex: keyHex, Direct: &direct})
+	h, err := New(&Config{Derp: url, Key: keyHex, Direct: &direct})
 	if err != nil {
 		t.Fatalf("new host: %v", err)
 	}

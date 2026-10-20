@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/go-gost/p2p"
@@ -26,13 +27,13 @@ import (
 func runDoctor(args []string) {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprint(fs.Output(), "usage: p2p doctor --addr <host:port> [--token <t>] [--peer <key>] [-C <config>] [--key <file>] [--derp <url>] [--stun <addr>]\n")
+		fmt.Fprint(fs.Output(), "usage: p2p doctor --addr <host:port> [--token <t>] [--peer <key>] [-C <config>] [--key <hex|file>] [--derp <url>] [--stun <addr>]\n")
 		fs.PrintDefaults()
 	}
 	addr := fs.String("addr", "", "running host's gRPC control-plane address (host:port)")
 	token := fs.String("token", "", "control-plane auth token; empty when the host checks none")
 	peer := fs.String("peer", "", "narrow the report to one peer (base64 public key)")
-	keyFile := fs.String("key", "", "identity key file, to name the local key; overrides the config's key")
+	keyFile := fs.String("key", "", "identity: 64-character hex key or key file path, to name the local key; overrides the config's key")
 	derpURL := fs.String("derp", "", "relay URL to name; overrides the config's derp")
 	stunAddr := fs.String("stun", "", "STUN address to name; overrides the config's stun")
 	configFile := fs.String("C", "", "config file (YAML) for the local identity and the relay/STUN names")
@@ -64,10 +65,23 @@ func runDoctor(args []string) {
 		// today) is structurally zero here, and the report must name the field
 		// as not reported instead of asserting the relay measured nothing.
 	}
-	if key, err := host.PublicKeyFile(firstNonEmpty(*keyFile, cfg.Key)); err == nil {
-		opts.Identity = key
-	} else {
-		opts.Identity = "(unresolved: " + err.Error() + ")"
+	switch key := strings.TrimSpace(firstNonEmpty(*keyFile, cfg.Key)); {
+	case key == "":
+		opts.Identity = "(unresolved: no key configured)"
+	case p2p.IsHexKey(key):
+		pub, err := p2p.PublicKeyFromHex(key)
+		if err != nil {
+			opts.Identity = "(unresolved: " + err.Error() + ")"
+		} else {
+			opts.Identity = pub
+		}
+	default:
+		pub, err := host.PublicKeyFile(key)
+		if err != nil {
+			opts.Identity = "(unresolved: " + err.Error() + ")"
+		} else {
+			opts.Identity = pub
+		}
 	}
 
 	st, err := fetchStatus(*addr, *token)

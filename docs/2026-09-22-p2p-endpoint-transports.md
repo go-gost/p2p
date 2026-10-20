@@ -189,7 +189,7 @@ Rules that keep the layout honest:
 
 ### Config and CLI
 
-The root `Config` carries only what the host reads: `Derp`, `Key`, `KeyHex`,
+The root `Config` carries only what the host reads: `Derp`, `Key`,
 `Target`/`Targets`, `Stun`, `Direct`, `TLS`, `Timeouts`, `Forwards` (+ the
 `TargetList` helper). Everything that is really the *deployment's* — `Addr`,
 `Token`, `Log`/`LogConfig`/`LogRotationConfig`, and the YAML file reader

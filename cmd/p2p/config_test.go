@@ -1,10 +1,16 @@
 package main
 
 import (
+	"encoding/hex"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-gost/p2p"
 )
 
 // TestLoadConfig covers parsing the full YAML schema — the endpoint keys stay
@@ -170,4 +176,85 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestLoadConfigRejectsLegacyKeyHex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "derp: wss://example.invalid/derp\nkeyHex: " + strings.Repeat("11", 32) + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadConfig(path)
+	if err == nil {
+		t.Fatal("loadConfig accepted the removed keyHex field")
+	}
+	if !strings.Contains(err.Error(), "keyHex") {
+		t.Fatalf("error = %v, want it to name keyHex", err)
+	}
+}
+
+func TestEnsureIdentityCreatesMissingKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p2p", "key-v1")
+	c := &config{Config: p2p.Config{Derp: "wss://example.invalid/derp", Key: path}}
+	if err := ensureIdentity(c); err != nil {
+		t.Fatalf("ensureIdentity: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("key file: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("key file mode = %o, want 600", perm)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatalf("key is not hex: %v", err)
+	}
+	if len(raw) != 32 {
+		t.Fatalf("key is %d bytes, want 32", len(raw))
+	}
+
+	// A second call must leave the existing identity alone.
+	if err := ensureIdentity(c); err != nil {
+		t.Fatalf("second ensureIdentity: %v", err)
+	}
+	again, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != string(b) {
+		t.Fatal("ensureIdentity rewrote an existing key")
+	}
+}
+
+func TestEnsureIdentityDoesNotCreateWhenInlineKeySet(t *testing.T) {
+	hexKey := strings.Repeat("11", 32)
+	c := &config{Config: p2p.Config{
+		Derp: "wss://example.invalid/derp",
+		Key:  hexKey,
+	}}
+	if err := ensureIdentity(c); err != nil {
+		t.Fatalf("ensureIdentity: %v", err)
+	}
+	if c.Key != hexKey {
+		t.Fatalf("ensureIdentity changed the inline key to %q", c.Key)
+	}
+	if _, err := os.Stat(hexKey); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ensureIdentity used the inline key as a file path: stat err = %v", err)
+	}
+}
+
+func TestEnsureIdentityStubModeNeedsNoKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key")
+	c := &config{Config: p2p.Config{Key: path}}
+	if err := ensureIdentity(c); err != nil {
+		t.Fatalf("ensureIdentity: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stub mode created a key file: stat err = %v", err)
+	}
 }

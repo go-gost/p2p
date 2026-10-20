@@ -68,7 +68,7 @@ func New(cfg *p2p.Config, opts ...Option) (*Host, error) {
 	}
 
 	if cfg.Derp != "" {
-		priv, _, err := loadOrCreateKey(cfg.Key, cfg.KeyHex)
+		priv, _, err := loadKey(cfg.Key)
 		if err != nil {
 			return nil, err
 		}

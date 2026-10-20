@@ -7,9 +7,15 @@ import "time"
 // config-file schema, but the file itself is read by the binary that deploys
 // the library (cmd/p2p), not by this package.
 type Config struct {
-	Derp     string          `yaml:"derp,omitempty"`
-	Key      string          `yaml:"key,omitempty"`
-	KeyHex   string          `yaml:"keyHex,omitempty"`
+	Derp string `yaml:"derp,omitempty"`
+	// Key is the endpoint identity, in one of two forms: a 64-character
+	// hex-encoded curve25519 private key held in memory, or a path to an
+	// existing key file. p2p only reads the file and never creates or writes
+	// one; the caller owns persistence (see GenerateKey). A 64-hex value is
+	// always treated as key material, so prefix a file path that looks like one
+	// with "./". Relay mode needs a key; stub mode does not.
+	Key string `yaml:"key,omitempty"`
+	// Target is the default forwarding target for inbound connections.
 	Target   string          `yaml:"target,omitempty"`
 	Targets  []string        `yaml:"targets,omitempty"`
 	Stun     string          `yaml:"stun,omitempty"`
@@ -72,9 +78,9 @@ type FaultsConfig struct {
 // built-in defaults; internal mechanism timeouts stay hardcoded.
 //
 // The timings are process-wide: they are applied when an endpoint is created
-// and a later endpoint inherits the values already applied. One endpoint per
-// process is the model; a process that builds two must give them identical
-// timeouts (or none).
+// and a later endpoint inherits the values already applied. A process may run
+// several endpoints (for example one per relay, sharing one identity); they
+// must give identical timeouts (or none).
 type TimeoutsConfig struct {
 	PunchWait     time.Duration `yaml:"punchWait,omitempty"`
 	Punch         time.Duration `yaml:"punch,omitempty"`

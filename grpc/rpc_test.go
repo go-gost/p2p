@@ -318,8 +318,8 @@ func TestStartFailsOnBadForward(t *testing.T) {
 // and returns the address; only a forward failure is fatal.
 func TestStartServesWhenRelayUnreachable(t *testing.T) {
 	srv, _ := newTestServer(t, &p2p.Config{
-		Derp:   "wss://127.0.0.1:1/derp", // refused: nothing listens on port 1
-		KeyHex: strings.Repeat("11", 32), // in-memory key: no key file is written
+		Derp: "wss://127.0.0.1:1/derp", // refused: nothing listens on port 1
+		Key:  strings.Repeat("11", 32), // in-memory key: no key file is written
 	})
 	addr, err := srv.Start()
 	if err != nil {

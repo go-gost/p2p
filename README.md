@@ -50,7 +50,7 @@ go build -o p2p ./cmd/p2p
 | `--addr` | *(empty: no control plane)* | gRPC control-plane listen address; set it only when a GOST client will dial this node (`p2ps:` plugin). A `--target`/`--forward` node has no such client |
 | `--token` | *(empty)* | control-plane auth token; empty disables checking |
 | `--derp` | *(empty)* | DERP relay URL (`wss://host/derp`); enables engine mode |
-| `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 private key file (hex); created if missing |
+| `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | identity: 64-character hex key or key file path; a missing file is created by this command |
 | `--target` | *(empty)* | inbound bridge target (repeatable; bare `"host:port"` feeds the tcp pool, `"udp://host:port"` the udp pool; DERP mode) |
 | `--forward` | *(empty)* | static port forward `"listen-addr=peer-key"` (repeatable; DERP mode) |
 | `--stun` | *(empty)* | STUN server (host:port) for the IPv4 direct path; IPv6 direct works without STUN |
@@ -153,15 +153,24 @@ unimportable). Identity handling, the timing knobs and the trust boundary are co
 Upgrading from v0.4.x: `p2p.New`/`p2p.Host` are now `endpoint.New`/`endpoint.Endpoint`, and the
 `Host.Tunnel()` facade is gone — `Dial`/`Listen` live on the endpoint itself.
 
+`Config.KeyHex` is gone: pass the hex value as `Config.Key`. A value that is exactly 64 hex
+characters is used as an in-memory private key; anything else is a read-only path to a key file.
+
 ```go
 import (
 	"github.com/go-gost/p2p"
 	"github.com/go-gost/p2p/endpoint"
 )
 
+// The embedder owns the identity: generate one once with p2p.GenerateKey and
+// store it. Config.Key accepts the hex key in memory or a read-only file path.
+hexKey, _, err := p2p.GenerateKey()
+if err != nil {
+	return err
+}
 ep, err := endpoint.New(&p2p.Config{
 	Derp:   "wss://derp.example.com/derp", // empty = stub mode (peer is a plain host:port)
-	Key:    "peer.key",                    // curve25519 key file; created if missing
+	Key:    hexKey,                        // p2p never creates or writes a key file
 	Target: "127.0.0.1:18080",             // inbound tunnels bridge here (DERP mode)
 })
 if err != nil {
@@ -244,7 +253,7 @@ derper -c /etc/derper/derper.json -hostname derp.example.com -certmode manual -c
 ./p2p --derp wss://derp.example.com/derp --key client.key --addr 127.0.0.1:8003
 ```
 
-Each host generates a curve25519 keypair on first run and prints its **public key** (base64) at startup. In DERP mode the GOST chain node's `addr` is the *peer host's public key*, not a `host:port`. Everything else on the GOST side is unchanged.
+The standalone command creates each host's curve25519 keypair on first run and prints its **public key** (base64) at startup. Embedders own the identity instead: generate it once with `p2p.GenerateKey`, store it yourself, and pass the 64-character hex key (or a path to the key file) as `Config.Key`; p2p never creates or writes a key file. In DERP mode the GOST chain node's `addr` is the *peer host's public key*, not a `host:port`. Everything else on the GOST side is unchanged.
 
 ### DERP wire frames
 
@@ -522,7 +531,7 @@ A peer on the relay instead reads, in `verdicts:`, the reason it is there:
 | `--addr` | *(required)* | the running host's control-plane address |
 | `--token` | *(empty)* | control-plane token, when the host checks one |
 | `--peer` | *(empty)* | narrow the report to one peer (base64 public key) |
-| `--key` | *(empty: the default key path)* | identity key file, to name the local key. Read-only — unlike the host path it never creates one |
+| `--key` | *(empty)* | identity: 64-character hex key or key file path, to name the local key. A path is read-only — unlike the host path it never creates one |
 | `--derp` / `--stun` | *(empty)* | the relay/STUN names to print: a host does not report its own config over `Status` |
 | `-C` | *(empty)* | config file supplying the values above |
 

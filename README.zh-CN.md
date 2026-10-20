@@ -50,7 +50,7 @@ go build -o p2p ./cmd/p2p
 | `--addr` | `127.0.0.1:8003` | gRPC 控制面监听地址 |
 | `--token` | *(空)* | 控制面认证 token；为空则不做校验 |
 | `--derp` | *(空)* | DERP relay URL（`wss://host/derp`）；启用 engine 模式 |
-| `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | curve25519 私钥文件（hex）；缺失则自动生成 |
+| `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | 身份：64 位 hex 私钥或密钥文件路径；缺失文件由本命令创建 |
 | `--target` | *(空)* | 入站隧道桥接目标（可重复；裸 `"host:port"` 进 tcp 池，`"udp://host:port"` 进 udp 池；DERP 模式） |
 | `--forward` | *(空)* | 预配置静态端口转发 `"listen-addr=peer-key"`（可重复；DERP 模式） |
 | `--stun` | *(空)* | STUN 服务器（host:port），用于 IPv4 直连路径；IPv6 直连无需 STUN |
@@ -142,15 +142,23 @@ engine、forward、`Dial`/`Listen`）、
 从 v0.4.x 升级：`p2p.New`/`p2p.Host` 变成 `endpoint.New`/`endpoint.Endpoint`，`Host.Tunnel()`
 facade 已删除——`Dial`/`Listen` 直接在 endpoint 上。
 
+`Config.KeyHex` 已移除：把 hex 私钥直接传给 `Config.Key`。恰好 64 位 hex 的值按内存私钥
+处理，其他值按只读密钥文件路径处理。
+
 ```go
 import (
 	"github.com/go-gost/p2p"
 	"github.com/go-gost/p2p/endpoint"
 )
 
+// 身份由嵌入方生成并保存：Key 接受内存中的 hex 私钥或只读文件路径。
+hexKey, _, err := p2p.GenerateKey()
+if err != nil {
+	return err
+}
 ep, err := endpoint.New(&p2p.Config{
 	Derp:   "wss://derp.example.com/derp", // 留空 = stub 模式（peer 即普通 host:port）
-	Key:    "peer.key",                    // curve25519 密钥文件；缺失时自动创建
+	Key:    hexKey,                        // p2p 不会创建或写入密钥文件
 	Target: "127.0.0.1:18080",             // 入站隧道桥接到此处（DERP 模式）
 })
 if err != nil {
@@ -444,7 +452,7 @@ verdicts:
 | `--addr` | *（必填）* | 运行中宿主的控制面地址 |
 | `--token` | *（空）* | 控制面 token，宿主校验时使用 |
 | `--peer` | *（空）* | 只报告某一个 peer（base64 公钥） |
-| `--key` | *（空：默认密钥路径）* | 身份密钥文件，用于给出本机公钥。只读——与宿主路径不同，它绝不会顺手创建一个 |
+| `--key` | *（空）* | 身份：64 位 hex 私钥或密钥文件路径，用于给出本机公钥。路径只读，绝不会顺手创建一个 |
 | `--derp` / `--stun` | *（空）* | 报告中要打印的 relay/STUN 名字：宿主不会通过 `Status` 汇报自己的配置 |
 | `-C` | *（空）* | 用配置文件提供上述取值 |
 

@@ -36,7 +36,7 @@ func main() {
 	addr := flag.String("addr", "", "gRPC listen address (control plane); empty runs none — a --target/--forward node has no GOST client to serve")
 	token := flag.String("token", "", "control-plane auth token; empty disables checking (loopback default)")
 	derpURL := flag.String("derp", "", "DERP relay server URL (wss://host/derp); enables DERP engine mode")
-	keyFile := flag.String("key", "", "curve25519 private key file for DERP mode (hex); created if missing")
+	keyFile := flag.String("key", "", "identity for DERP mode: 64-character hex key or key file path (a missing file is created)")
 	var targets []string
 	flag.Func("target", `inbound bridge target (repeatable; "host:port" = tcp, "udp://host:port" = udp; DERP mode)`, func(v string) error {
 		targets = append(targets, v)
@@ -144,6 +144,12 @@ func main() {
 	// Set up the logger from the resolved config before creating the endpoint.
 	if err := setupLogger(cfg.Log.Output, cfg.Log.Format, cfg.Log.Level, cfg.Log.Rotation); err != nil {
 		slog.Error("setup logger", "error", err)
+		os.Exit(1)
+	}
+
+	// The library never creates an identity; the standalone command does.
+	if err := ensureIdentity(cfg); err != nil {
+		slog.Error("identity", "error", err)
 		os.Exit(1)
 	}
 

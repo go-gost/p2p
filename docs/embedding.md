@@ -40,12 +40,19 @@ failed forward registration wraps `p2p.ErrForward` and is returned from
 
 - The endpoint's address is its curve25519 public key: `PublicKey()` is the
   base64 string peers put in their own configuration.
-- `Config.Key` is a key file, created (0600) on first use if missing;
-  `Config.KeyHex` is a 32-byte hex key held in memory — for tests and
-  short-lived processes. No relay configured (stub mode) means no identity and
-  an empty `PublicKey()`.
-- One endpoint per process is the model (see Timings). Two endpoints sharing one
-  key file in one process is not a supported configuration.
+- The embedder owns generation and storage. `p2p.GenerateKey()` returns a new
+  private key as hex plus its base64 public key;
+  `p2p.PublicKeyFromHex()` derives the public half of a stored key. p2p never
+  creates or writes a key file.
+- `Config.Key` accepts either that 64-character hex private key in memory or a
+  read-only path to an existing key file. A 64-hex value is always treated as
+  key material; prefix a path that looks like one with `./`. Passing the same
+  hex key to several endpoints is the simplest way to guarantee they share one
+  identity. With a relay configured, a key is required. No relay (stub mode)
+  means no identity and an empty `PublicKey()`.
+- Several endpoints may run in one process, for example one per relay with the
+  same identity. They are independent except for the process-wide timing knobs:
+  give every endpoint identical `Timeouts` (or none). See Timings.
 
 ## Shapes
 
