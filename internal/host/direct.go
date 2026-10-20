@@ -849,6 +849,11 @@ func (dc *directConn) underlayDead(u *directUnderlay) {
 		dc.mine = nil // a round in flight owns its own candidate list
 	}
 	repunch := dc.state == directUp
+	// A muted direct path is never coming back while the fault is armed: the
+	// punch would just build another muted underlay that dies the same way.
+	// Count the death (so callers waiting on it still see it) but do not
+	// re-punch — the pair stays on the relay instead of flapping.
+	muted := u != nil && u.muted != nil && u.muted()
 	var backoff time.Duration
 	if repunch {
 		dc.state = directNone
@@ -858,6 +863,9 @@ func (dc *directConn) underlayDead(u *directUnderlay) {
 	dc.mu.Unlock()
 	if !repunch {
 		return // a round or a backoff is already rebuilding: it decides next
+	}
+	if muted {
+		return // do not re-punch a muted path; stay on the relay
 	}
 	if dc.e.dropIfGone(dc.peer, dc) {
 		// The peer is gone from the relay, so there is nothing to re-punch

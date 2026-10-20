@@ -222,6 +222,7 @@ func TestDropDataStarvesADirectSession(t *testing.T) {
 // complement of the all-path mute, which retires direct without a relay to
 // recover onto.
 func TestFaultMuteDirectFallsBackToRelay(t *testing.T) {
+	selfDeathRebuildDelay = 0
 	a, b, _ := startPunchedPair(t)
 
 	dcB := watchDirect(t, b, a)

@@ -753,6 +753,15 @@ func (p *relayKCPPair) pumpRelay() {
 func (p *relayKCPPair) reportRelayIdle() (strike int, silentFor time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// A muted direct underlay is a deliberate fault: the pair is not dead, it is
+	// being kept on the relay, so the relay watchdog must not kill it for the
+	// silence the mute produces. Re-arm the relay idle stamp and stand down.
+	if p.direct != nil && p.direct.muted != nil && p.direct.muted() {
+		p.lastRelayRecv = time.Now()
+		p.relayIdleFired = false
+		p.relayStrikes = 0
+		return 0, 0
+	}
 	// Pair silence, not relay silence: the freshest of the two underlays is
 	// what says the link is carrying. silentFor below stays relay-measured
 	// — it is the evidence, not the decision.
@@ -1114,6 +1123,12 @@ func (p *relayKCPPair) reportDirectIdle(u *directUnderlay) bool {
 	var ev *pathChangeEvent
 	if ok {
 		ev = p.applyPathTuningLocked(pathChangeDirectIdle)
+		// The path just switched to the relay: give it a fresh idle window so
+		// the relay watchdog does not kill a session that has not had a chance
+		// to carry traffic on the new path yet (a direct that died mid-flight).
+		p.lastRelayRecv = time.Now()
+		p.relayIdleFired = false
+		p.relayStrikes = 0
 	}
 	cb := p.onDirectIdle
 	p.mu.Unlock()
@@ -1176,6 +1191,13 @@ func (p *relayKCPPair) preferredDirect() bool {
 // preferredDirectLocked is preferredDirect for callers already holding p.mu.
 func (p *relayKCPPair) preferredDirectLocked() bool {
 	if p.direct == nil {
+		return false
+	}
+	// A muted underlay is not a usable path: its liveness traffic is silenced,
+	// so it would never be retired by the watchdog and writes would black-hole.
+	// Prefer the relay (or, if the relay is gone, the mute still wins nothing —
+	// there is no other path, but a muted direct carries nothing either).
+	if p.direct.muted != nil && p.direct.muted() {
 		return false
 	}
 	// The relay half is gone: the installed direct underlay is the pair's only
