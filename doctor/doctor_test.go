@@ -8,6 +8,135 @@ import (
 	"github.com/go-gost/p2p"
 )
 
+// natStatus is a snapshot with one peer's NAT shape observed.
+func natStatus(shape string, observedAge, oneWay time.Duration) p2p.Status {
+	return p2p.Status{
+		PeerDiagnostics: map[string]p2p.PeerDiagnostic{
+			"peerKey": {
+				Path:           "derp",
+				State:          "backoff",
+				PeerAddr:       "203.0.113.9:51000",
+				NATShape:       shape,
+				NATObservedAge: observedAge,
+				OneWayFor:      oneWay,
+			},
+		},
+	}
+}
+
+// verdictLine returns the one-liner the report gives a peer.
+func verdictLine(t *testing.T, out string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "peer peerKey:") {
+			return strings.TrimSpace(line)
+		}
+	}
+	t.Fatalf("no peer verdict in the report:\n%s", out)
+	return ""
+}
+
+// TestPeerBlockShowsNATShape: the shape reaches the per-peer block, with the
+// endpoint the peer answered from and how long ago that was seen — the
+// evidence behind the word, not the word alone.
+func TestPeerBlockShowsNATShape(t *testing.T) {
+	out := Report(natStatus("peer-endpoint-differs", 2*time.Minute, 0), Options{InProcess: true})
+	for _, want := range []string{"nat shape", "peer-endpoint-differs", "203.0.113.9:51000", "2m0s"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the report is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestPeerVerdictNamesPeerEndpoint: the verdict says which endpoint the peer
+// answered from and that it is not the one it announced.
+func TestPeerVerdictNamesPeerEndpoint(t *testing.T) {
+	out := Report(natStatus("peer-endpoint-differs", 2*time.Minute, 0), Options{InProcess: true})
+	for _, want := range []string{"answers from 203.0.113.9:51000", "did not announce"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the report is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestPeerVerdictNamesOneWay: a one-way path is named as such — and it is a
+// path-health fact, so the verdict must not present it as a NAT conclusion.
+func TestPeerVerdictNamesOneWay(t *testing.T) {
+	out := Report(natStatus("one-way", 0, 3*time.Minute), Options{InProcess: true})
+	line := verdictLine(t, out)
+	for _, want := range []string{"one-way", "3m0s"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("the peer verdict is missing %q:\n%s", want, line)
+		}
+	}
+	if strings.Contains(line, "NAT") {
+		t.Fatalf("the peer verdict calls a one-way path a NAT conclusion: %s", line)
+	}
+}
+
+// TestPeerVerdictDatesAnEndedOneWay: the one-way episode outlives the path,
+// so the verdict says it happened and when — the moment a peer is back on the
+// relay is when the reader needs to know the path was one-way.
+func TestPeerVerdictDatesAnEndedOneWay(t *testing.T) {
+	st := natStatus("one-way", 0, 3*time.Minute)
+	d := st.PeerDiagnostics["peerKey"]
+	d.OneWayAge = 40 * time.Second
+	st.PeerDiagnostics["peerKey"] = d
+
+	out := Report(st, Options{InProcess: true})
+	line := verdictLine(t, out)
+	for _, want := range []string{"was one-way for 3m0s", "40s ago"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("the peer verdict is missing %q:\n%s", want, line)
+		}
+	}
+}
+
+// TestReportNATShapeSummary: the host-level line counts the peers that were
+// observed and the ones that answer from an endpoint they did not announce. A
+// peer nobody observed is in neither count.
+func TestReportNATShapeSummary(t *testing.T) {
+	st := p2p.Status{
+		PeerDiagnostics: map[string]p2p.PeerDiagnostic{
+			"peerA": {
+				Path:           "derp",
+				PeerAddr:       "203.0.113.9:51000",
+				NATShape:       "peer-endpoint-differs",
+				NATObservedAge: 2 * time.Minute,
+			},
+			"peerB": {
+				Path:           "derp",
+				NATShape:       "one-way",
+				NATObservedAge: time.Minute,
+				OneWayFor:      3 * time.Minute,
+			},
+			"peerC": {Path: "derp"}, // never observed
+		},
+	}
+	out := Report(st, Options{InProcess: true})
+	want := "NAT shape: 1 of 2 observed peers answer from an endpoint they did not announce"
+	if !strings.Contains(out, want) {
+		t.Fatalf("the report is missing %q:\n%s", want, out)
+	}
+}
+
+// TestReportSaysNATShapeNotReportedOverWire: the control plane does not carry
+// the shape, so a wire-sourced report must say so rather than let a zero read
+// as "nothing was observed".
+func TestReportSaysNATShapeNotReportedOverWire(t *testing.T) {
+	st := natStatus("peer-endpoint-differs", 2*time.Minute, 0)
+
+	wire := Report(st, Options{})
+	if !strings.Contains(wire, "NAT shape: not reported by the control plane") {
+		t.Fatalf("the wire report does not say the shape was not reported:\n%s", wire)
+	}
+
+	local := Report(st, Options{InProcess: true})
+	if strings.Contains(local, "NAT shape: not reported by the control plane") {
+		t.Fatalf("the in-process report claims the control plane did not report the shape:\n%s", local)
+	}
+}
+
 // TestReport pins the report's shape and its verdicts against a hand-built
 // snapshot — two peers, one relay-only with a punch trace and one direct — so
 // the formatter is verified without a live host.

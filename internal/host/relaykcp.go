@@ -291,10 +291,26 @@ type relayKCPPair struct {
 	direct         *directUnderlay
 	directStop     chan struct{}
 	lastDirectRecv time.Time
-	// directOneWay state (see directOneWayDead): the per-underlay byte counters
-	// last seen, and when the send-without-receive shape started holding. A
-	// zero oneWayAt means the shape is not holding. Guarded by mu.
-	oneWayAt               time.Time
+	// The pair's one-way episode: when it started, when it ended (zero while
+	// it is still going), whether it is still going, whether it ever reached
+	// the death window, and which underlay it belongs to.
+	//
+	// The episode outlives the path. A peer that falls back to the relay is
+	// exactly when the reader needs to know the direct path was one-way, and
+	// the duration is dated — the age says when — so it reports a fact about a
+	// moment rather than a claim about a path that is still there. Ending the
+	// episode when the underlay is replaced also means a fresh path starts a
+	// fresh window instead of being judged against the old timestamp.
+	//
+	// Every stamp here is the real clock, taken under p.mu, so the episode's
+	// length and age are always measured against the same clock that wrote
+	// them and can never come out negative.
+	// Guarded by mu.
+	oneWayStart            time.Time
+	oneWayEnd              time.Time
+	oneWayActive           bool
+	oneWayReached          bool
+	oneWayU                *directUnderlay
 	oneWaySent, oneWayRcvd uint64
 
 	// onDirectIdle, when set by the engine (Task 7), is invoked once per idle
@@ -852,6 +868,13 @@ func (p *relayKCPPair) setDirectUnderlay(u *directUnderlay) {
 	p.directStop = stop
 	p.directPumpDone = done
 	p.lastDirectRecv = time.Now()
+	// The path being replaced ends any one-way episode it was in: the episode
+	// is dated, so it survives as a fact about the old path, and the new path
+	// starts its own window instead of being judged against the old
+	// timestamp (which would declare it dead on its first tick).
+	if old != nil && p.oneWayU == old {
+		p.endOneWayLocked(time.Now())
+	}
 	// A freshly installed direct path is preferred immediately, so the
 	// session's congestion control must follow it there.
 	ev := p.applyPathTuningLocked(pathChangeFirstDirect)
@@ -906,6 +929,12 @@ func (p *relayKCPPair) clearDirectUnderlayIf(want *directUnderlay, reason string
 	}
 	p.direct = nil
 	p.directStop = nil
+	// The path being retired ends any one-way episode it was in. The episode
+	// stays as a dated fact — the peer is about to fall back to the relay,
+	// which is when the reader needs to know the path was one-way.
+	if u != nil && p.oneWayU == u {
+		p.endOneWayLocked(time.Now())
+	}
 	// No underlay is preferred any more: fall the session's congestion control
 	// back to the relay.
 	ev := p.applyPathTuningLocked(reason)
@@ -962,35 +991,100 @@ func underlayRetireReason(pathReason string) string {
 // declared dead, because declaring it earlier re-punches every healthy path
 // going through a burst of retransmits.
 //
-// An idle pair clears the tracker instead of latching. Once the sender stops the
-// shape no longer applies, and holding it would retire the pair a window later
-// for traffic that has already ended.
-func (p *relayKCPPair) directOneWayDead(now time.Time) bool {
+// An idle pair ends the episode instead of latching it. Once the sender stops
+// the shape no longer applies, and holding it would retire the pair a window
+// later for traffic that has already ended.
+//
+// u is the underlay the shape was observed on, and it is recorded with the
+// episode: the episode outlives the path (see directOneWayEpisode), and a
+// reader needs to know which path it was about.
+//
+// A tick from an underlay that is no longer the installed one is ignored: a
+// retiring or replaced pump can still be inside a tick when its path goes
+// away, and a tick that opened an episode nothing could end would report the
+// path as one-way forever.
+func (p *relayKCPPair) directOneWayDead(u *directUnderlay) bool {
 	sent := p.directBytesSent.Load()
 	rcvd := p.directBytesRcvd.Load()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.direct != u {
+		return false // a retiring path's tick must not touch the episode state
+	}
+	now := time.Now()
+
 	switch {
 	case sent == p.oneWaySent && rcvd == p.oneWayRcvd:
-		// No movement either way: idle, not dead. Clear the shape so a stopped
+		// No movement either way: idle, not dead. End the episode so a stopped
 		// sender is never judged by traffic that has already ended.
-		p.oneWayAt, p.oneWaySent, p.oneWayRcvd = time.Time{}, sent, rcvd
+		p.endOneWayLocked(now)
+		p.oneWaySent, p.oneWayRcvd = sent, rcvd
 		return false
 	case rcvd > p.oneWayRcvd:
 		// Receiving: the KCP plane is answering, so the path is carrying.
-		p.oneWayAt, p.oneWaySent, p.oneWayRcvd = time.Time{}, sent, rcvd
+		p.endOneWayLocked(now)
+		p.oneWaySent, p.oneWayRcvd = sent, rcvd
 		return false
 	}
 
 	// Sending without receiving. The window opens here and is not restarted by a
 	// later tick: the shape has to hold continuously from the first send.
-	if p.oneWayAt.IsZero() {
-		p.oneWayAt = now
+	if !p.oneWayActive {
+		p.oneWayStart = now
+		p.oneWayActive = true
+		p.oneWayReached = false
+		p.oneWayU = u
 	}
 	p.oneWaySent, p.oneWayRcvd = sent, rcvd
-	return now.Sub(p.oneWayAt) >= directOneWayWindow
+	if now.Sub(p.oneWayStart) < directOneWayWindow {
+		return false
+	}
+	// The shape held past the window: the path is declared dead, and the
+	// episode is the fact that matters — it is what the report explains.
+	p.oneWayReached = true
+	return true
+}
+
+// endOneWayLocked closes the one-way episode if one is running. The episode's
+// start and end are kept: the fact survives the path, dated, because the
+// moment a peer falls back to the relay is when the reader needs it.
+func (p *relayKCPPair) endOneWayLocked(now time.Time) {
+	if !p.oneWayActive {
+		return
+	}
+	p.oneWayEnd = now
+	p.oneWayActive = false
+}
+
+// directOneWayEpisode reports the pair's one-way episode: how long the direct
+// path was one-way, and how long ago it ended (zero while it is still going).
+//
+// The episode survives the path's retirement — a peer that falls back to the
+// relay is exactly when the reader needs to know the path was one-way — and
+// the age dates it, so the duration is a fact about a moment rather than a
+// claim about a path that is still there.
+//
+// An episode that never reached the death window is not reported: it was a
+// hiccup of the receive counter, not a path that was declared dead, and
+// reporting it would leave the peer labelled one-way forever.
+//
+// The clock is read under the same lock that wrote the stamps, so the length
+// and the age can never come out negative.
+func (p *relayKCPPair) directOneWayEpisode() (length, age time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.oneWayStart.IsZero() {
+		return 0, 0
+	}
+	if p.oneWayActive {
+		return time.Since(p.oneWayStart), 0
+	}
+	if !p.oneWayReached {
+		return 0, 0 // a blip: it never declared a path dead
+	}
+	return p.oneWayEnd.Sub(p.oneWayStart), time.Since(p.oneWayEnd)
 }
 
 func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
@@ -1029,7 +1123,7 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 				// carrying, and letting its echo keep it fixed the sticky-direct
 				// problem by building a second one: the underlay lived forever
 				// under an answered heartbeat while nothing came back.
-				if u.hbLive() && !p.directOneWayDead(time.Now()) {
+				if u.hbLive() && !p.directOneWayDead(u) {
 					p.mu.Lock()
 					if p.direct == u {
 						p.lastDirectRecv = time.Now()

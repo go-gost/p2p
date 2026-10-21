@@ -19,8 +19,11 @@ type PeerDiagnostic struct {
 	Failed bool
 	// LastError is the last punch failure's reason (empty after a success).
 	LastError string
-	// PeerAddr is the endpoint dialled for the direct path (empty until a round
-	// dials). Candidates is how many the peer announced.
+	// PeerAddr is the endpoint the peer answered the seed from — the one the
+	// direct path uses, not the candidate that was dialled: a peer behind a
+	// per-destination NAT answers from a different endpoint than the one it
+	// advertised, and the path follows the one that answered. Empty until a
+	// round dials. Candidates is how many the peer announced.
 	PeerAddr   string
 	Candidates int
 	// Caps is the peer's advertised capabilities ("ipv6", "no-direct").
@@ -107,6 +110,40 @@ type PeerDiagnostic struct {
 	RepunchAfterIdle            int64
 	SeedFailures                int64
 	RelayLossSuppressedByDirect int64
+	// NATShape is what the punch observed about this pair's address
+	// translation, as one word:
+	//
+	//	""                             nothing observed (no punch yet, or nothing to see)
+	//	"peer-endpoint-differs"        the peer answered the seed from an endpoint
+	//	                               it never announced: its mapping varies by
+	//	                               destination, or changed since its own STUN
+	//	                               probe. The punch still works — the learned
+	//	                               address is what gets dialled — so this does
+	//	                               NOT mean the peer is unreachable.
+	//	"one-way"                      the direct path is sending while receiving
+	//	                               nothing. This is a PATH HEALTH fact, not a
+	//	                               NAT shape: the usual cause is a half-dead
+	//	                               session, not a translator.
+	//	"one-way+peer-endpoint-differs" both of the above.
+	//
+	// It is a verdict about what was observed, and it decides nothing: no
+	// behaviour reads it. In-process only (the gRPC transport's proto is
+	// frozen), like the fields above it.
+	NATShape string
+	// NATObservedAge is how long ago the latest seed observation was made (0
+	// when there was none). The observation is the latest one, so a peer whose
+	// mapping changed back reads as a match, and one whose shape was seen an
+	// hour ago says so here.
+	NATObservedAge time.Duration
+	// OneWayFor is how long the direct path was one-way (the episode's
+	// length: how long it has been, while it is still going; how long it
+	// lasted, once it has ended). 0 means no one-way episode was seen.
+	OneWayFor time.Duration
+	// OneWayAge is how long ago that one-way episode ended; 0 means it is
+	// still going. The pair falls back to the relay when the path is retired,
+	// and the episode survives that: the moment a peer is on the relay is
+	// when the reader needs to know the path was one-way.
+	OneWayAge time.Duration
 }
 
 // RelayKCPStats is one peer's relay-plane KCP session health, as far as

@@ -525,6 +525,12 @@ scenario_derp_direct() {
 	save_status A 127.0.0.1:8003 "$dir/status.json"
 	check_grep "status shows a live direct peer" '"direct_peers":[1-9]' "$dir/status.json"
 	check_grep "the diagnostic carries a punch trace" '"trace":\["' "$dir/status.json"
+	# The two ends share a bridge here, with no NAT in between, so a peer can
+	# only answer from an endpoint it announced. The shape verdict rides the
+	# trace, which is on the wire, so this is a real assertion over the control
+	# plane and not only in-process — and it needs a scenario where the punch
+	# actually ran, which the relay-only one does not.
+	check_not_grep "no peer answers from an endpoint it did not announce" "not announced" "$dir/status.json"
 
 	local body
 	body=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/")
@@ -544,6 +550,10 @@ scenario_derp_direct() {
 	check_grep "doctor names the local identity" "^local key: *[A-Za-z0-9_-]{20}" "$report"
 	check_grep "doctor reports the peer's direct path" "peer $bkey: direct path up" "$report"
 	check_grep "doctor carries the punch trace" "^ +trace:" "$report"
+	# The control plane's proto is frozen: it does not carry the NAT shape, so
+	# the report says so rather than letting a zero read as "not observed".
+	check_grep "doctor says the control plane does not carry the NAT shape" \
+		"NAT shape: not reported by the control plane" "$report"
 
 	# Kill the relay. A live direct path keeps the pair across the loss (H1):
 	# the relay loss is counted and logged as suppressed, and the pair stays on

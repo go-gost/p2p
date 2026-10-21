@@ -207,12 +207,31 @@ type directConn struct {
 	// (see relayKCPPair); directConn tracks it for status and re-punch
 	// bookkeeping only. There is no separate direct smux session any more.
 	sock     *net.UDPConn
-	peerAddr netip.AddrPort // peer's dialed endpoint (public cross-NAT, local same-NAT)
+	peerAddr netip.AddrPort // the endpoint the peer answered the seed from
 	mine     []candidate    // our candidates for the current punch, answered to the peer
 	lastPeer []candidate    // peer candidates already acted on (dedupes re-announcements)
 	peerCaps uint8          // capability bits the peer advertised via ctrlCaps
 	lastErr  string         // the last punch failure's reason, cleared when one succeeds
 	sessAt   time.Time      // when the current direct underlay came up (zero when none)
+
+	// The peer's NAT shape, as the seed handshake saw it: the endpoint it
+	// actually answered from, and whether that endpoint is one it announced.
+	// A peer that answers from an endpoint it never announced has a mapping
+	// that varies by destination (a per-destination NAT), or one that changed
+	// since its own STUN probe. The punch still works — the learned address
+	// is what gets dialled — so this is a shape fact, not a failure.
+	//
+	// peerEndpointDiffers is the verdict, and peerEndpointObservedAt when the
+	// latest successful seed made the observation. The endpoint the peer
+	// answered from is not kept here: the direct path already registers it
+	// (markUp), and that is the value the report shows.
+	//
+	// The observation is sticky: a failed round makes none and leaves the
+	// last one standing, because the question being answered is "why is this
+	// peer still on the relay".
+	// Guarded by mu like the rest of the round's state.
+	peerEndpointDiffers    bool
+	peerEndpointObservedAt time.Time
 
 	// repunchBackoff is the hysteresis (H3) for a direct that dies shortly after
 	// it came up: the re-punch wait grows geometrically from backoffPeriod up to
@@ -968,7 +987,11 @@ func (dc *directConn) supports(bits uint8) bool {
 	return dc.peerCaps&bits == bits
 }
 
-// peerAddrString returns the peer's dialed endpoint, or "" when not punched.
+// peerAddrString returns the endpoint the peer answered the seed from — the
+// one the direct path actually uses, not the candidate that was dialled: a
+// peer behind a per-destination NAT answers from a different endpoint than
+// the one it advertised, and the path follows the one that answered. This is
+// the "peer addr" line of the peer block.
 func (dc *directConn) peerAddrString() string {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -976,6 +999,44 @@ func (dc *directConn) peerAddrString() string {
 		return ""
 	}
 	return dc.peerAddr.String()
+}
+
+// notePeerEndpoint records the endpoint a peer answered the seed from, and
+// whether that endpoint is one it announced.
+//
+// The observation is the latest successful seed: a later one replaces the
+// earlier verdict entirely, and a failed round makes no observation and
+// leaves the last one standing — a shape seen an hour ago is still the reason
+// a peer is on the relay.
+//
+// The trace line is written outside dc.mu: noteRound takes the same lock, so
+// calling it under the lock would deadlock.
+func (dc *directConn) notePeerEndpoint(answered netip.AddrPort, announced []netip.AddrPort) {
+	differs := !containsAddr(announced, answered)
+
+	dc.mu.Lock()
+	dc.peerEndpointDiffers = differs
+	dc.peerEndpointObservedAt = time.Now()
+	dc.mu.Unlock()
+
+	if differs {
+		dc.noteRound("peer answered from %s (not announced)", answered)
+	}
+}
+
+// natEndpoint returns the peer's NAT shape observation: whether the endpoint
+// it answered from is one it announced, and how long ago the observation was
+// made (zero when there was none).
+//
+// The age is measured under the same lock that wrote the stamp, against the
+// same clock, so it can never come out negative.
+func (dc *directConn) natEndpoint() (differs bool, age time.Duration) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if dc.peerEndpointObservedAt.IsZero() {
+		return dc.peerEndpointDiffers, 0
+	}
+	return dc.peerEndpointDiffers, time.Since(dc.peerEndpointObservedAt)
 }
 
 // silentPeerWait returns how long to wait before the next punch round, given
@@ -1379,6 +1440,14 @@ func (dc *directConn) punch() {
 		if pair := e.relayKCPPairGet(dc.peer); pair != nil {
 			pair.noteSeed("ok", f.name, dial.String())
 		}
+		// The peer's NAT shape, as this round saw it: the endpoint it answered
+		// from, against the endpoints it announced (the freshest list, in this
+		// round's family). A peer that answers from somewhere else has a
+		// mapping that varies by destination, or one that changed since its own
+		// STUN probe. The punch still works — the learned address is what gets
+		// dialled — so this is a shape fact to report, not a failure.
+		announced := announcedFor(f.v6, peerV4, peerV6)
+		dc.notePeerEndpoint(answer, announced)
 		// Only the winner's socket is still bound, so only its candidates are
 		// ours to answer a peer's announcement with.
 		dc.mu.Lock()
@@ -1573,6 +1642,31 @@ func v6Addrs(cands []candidate) []netip.AddrPort {
 		}
 	}
 	return out
+}
+
+// announcedFor returns the peer's announced endpoints for the family this
+// round dialled. The comparison must stay inside one family: a v4 answer
+// judged against the v6 list would read as a mismatch on every IPv6 punch.
+func announcedFor(v6Family bool, v4, v6 []netip.AddrPort) []netip.AddrPort {
+	if v6Family {
+		return v6
+	}
+	return v4
+}
+
+// containsAddr reports whether addr is one of the listed endpoints.
+//
+// It compares with sameAddrPort, so a v4-mapped v6 address matches its v4
+// form: the underlay's source filter treats them as the same endpoint, and a
+// stricter comparison here would report every healthy IPv4 direct path as a
+// mapping that differs from what the peer announced.
+func containsAddr(list []netip.AddrPort, addr netip.AddrPort) bool {
+	for _, a := range list {
+		if sameAddrPort(a, addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // candAddrs renders candidate endpoints as strings for logs.

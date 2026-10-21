@@ -518,6 +518,7 @@ verdicts:
   encryption: every connected peer
   STUN 10.99.0.254:3478: configured
   peer 6Fg4Wtn6SpaOQms96jFxL2r4CVJGIkhrEmWxpCsU-xg: direct path up (session 122ms, last traffic 21ms)
+  NAT shape: not reported by the control plane
 ```
 
 A peer on the relay instead reads, in `verdicts:`, the reason it is there:
@@ -541,6 +542,40 @@ A peer on the relay instead reads, in `verdicts:`, the reason it is there:
 than inferred; the report itself lives in
 [`p2p/doctor`](doctor/doctor.go), which depends on nothing but the contract
 package and the standard library.
+
+### The NAT shape of a pair
+
+A punch observes two things about the ends' address translation, and the report
+names them when they are observed:
+
+- **the peer answered from an endpoint it never announced** — its mapping
+  varies by destination (a per-destination NAT) or changed since its own STUN
+  probe. The punch still works, because the path uses the endpoint that
+  answered; it is the *advertised* candidate that is not the endpoint to reach
+  the peer at. The trace line `peer answered from <addr> (not announced)` says
+  the same thing on the wire;
+- **the direct path is one-way** — we send, nothing comes back. That is a
+  path's health, not a translator's shape, so it is reported under `path
+  health:` and never as a NAT conclusion.
+
+```text
+    nat shape:    peer-endpoint-differs (peer answers from 198.51.100.7:62000, an endpoint it did not announce; its mapping varies by destination or changed, observed 2m0s ago)
+    path health:  one-way (the direct path was one-way for 1m0s, 40s ago; we sent and nothing came back)
+```
+
+The one-way episode outlives the path: the peer falls back to the relay when
+the path is retired, and that is exactly when the report needs to say the path
+was one-way — dated, so it is a fact about a moment and not a claim about a
+path that is still there. A one-way spell that never held long enough to
+declare a path dead is a hiccup of the receive counter, and it is not reported
+at all.
+
+The verdict is diagnostic: it states what was observed, and no behaviour reads
+it. It is also **in-process only** — the control plane's proto is frozen, so
+the `p2p doctor` CLI does not carry it and says `NAT shape: not reported by the
+control plane`; a caller that reads the status in process (wisper's Settings →
+Diagnostics) sees the shape, provided it sets `doctor.Options.InProcess` and
+runs a p2p version that carries it.
 
 ## Fault injection (debug only)
 

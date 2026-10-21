@@ -351,6 +351,17 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 		}
 		d.Attempts, d.Ups, d.Drops = dc.punchCounters()
 		d.Trace, d.TraceTimes = dc.traceSnapshot()
+		// The pair's NAT shape: what the punch observed about the two ends'
+		// address translation. The peer's own observation is on the
+		// directConn; the one-way episode is on the pair, and it is reported
+		// even after the path is retired — that is when the peer falls back to
+		// the relay and the reader needs to know why.
+		if pair := e.relayKCPPairGet(dc.peer); pair != nil {
+			d.OneWayFor, d.OneWayAge = pair.directOneWayEpisode()
+		}
+		differs, observedAge := dc.natEndpoint()
+		d.NATObservedAge = observedAge
+		d.NATShape = natShape(differs, d.OneWayFor > 0 || d.OneWayAge > 0)
 		// The pair's O2/O4/O5 migration history and the punch backoff (O4).
 		e.fillPairDiag(&d, dc.peer)
 		d.NextPunchIn = dc.nextPunchIn()

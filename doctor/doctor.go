@@ -214,6 +214,16 @@ func peerBlock(b *strings.Builder, key string, d p2p.PeerDiagnostic) {
 			d.RelayKCP.BytesSent, d.RelayKCP.BytesRcvd))
 	}
 	field(b, "    peer addr", orNone(d.PeerAddr))
+	// The two facts get their own labels: the endpoint one is about the
+	// peer's address translation, the one-way one is about the path's health
+	// and is not a NAT conclusion.
+	endpointFact, oneWayFact := natFacts(d)
+	if endpointFact != "" {
+		field(b, "    nat shape", "peer-endpoint-differs ("+endpointFact+")")
+	}
+	if oneWayFact != "" {
+		field(b, "    path health", "one-way ("+oneWayFact+")")
+	}
 	field(b, "    candidates", fmt.Sprintf("%d", d.Candidates))
 	field(b, "    caps", orNone(strings.Join(d.Caps, ", ")))
 	// The three layers, each attributed separately. They used to be one word:
@@ -266,10 +276,108 @@ func verdicts(st p2p.Status, opts Options) []string {
 		}
 	}
 	for _, k := range peerKeys(st, opts.Peer) {
-		out = append(out, peerVerdict(k, st.PeerDiagnostics[k]))
+		d := st.PeerDiagnostics[k]
+		line := peerVerdict(k, d)
+		// The shape's evidence rides with the verdict: what was observed, in
+		// the reader's terms, so the one-liner says why the peer is where it
+		// is and not just where.
+		endpointFact, oneWayFact := natFacts(d)
+		var facts []string
+		if endpointFact != "" {
+			facts = append(facts, endpointFact)
+		}
+		if oneWayFact != "" {
+			facts = append(facts, oneWayFact)
+		}
+		if len(facts) > 0 {
+			line += "; " + strings.Join(facts, "; ")
+		}
+		out = append(out, line)
+	}
+	if v := natShapeVerdict(st, opts); v != "" {
+		out = append(out, v)
 	}
 	out = append(out, peerDownPairingRule())
 	return out
+}
+
+// natHasEndpointFact reports whether a shape verdict carries the endpoint
+// fact — the one that is about the peer's address translation. The verdict
+// word is a closed vocabulary, so it is matched exactly.
+func natHasEndpointFact(shape string) bool {
+	switch shape {
+	case "peer-endpoint-differs", "one-way+peer-endpoint-differs":
+		return true
+	default:
+		return false
+	}
+}
+
+// natFacts splits a peer's shape verdict into the facts it carries, each
+// with its evidence. An empty result means the verdict carries none of them
+// (or is a word this doctor does not know).
+//
+// The two facts are kept apart on purpose. "The peer answers from an endpoint
+// it did not announce" is about its address translation; "the direct path has
+// been one-way" is about the path's health, and a one-way path is not a NAT
+// conclusion — so it is never filed under a NAT label, here or in the peer
+// block.
+//
+// The verdict word is a closed vocabulary owned by the engine, so it is
+// matched exactly: a word this doctor does not know yields no facts rather
+// than being half-parsed into the wrong one.
+func natFacts(d p2p.PeerDiagnostic) (endpointFact, oneWayFact string) {
+	switch d.NATShape {
+	case "peer-endpoint-differs", "one-way+peer-endpoint-differs":
+		endpointFact = fmt.Sprintf(
+			"peer answers from %s, an endpoint it did not announce; its mapping varies by destination or changed, observed %s ago",
+			orNone(d.PeerAddr), d.NATObservedAge)
+	}
+	switch d.NATShape {
+	case "one-way", "one-way+peer-endpoint-differs":
+		if d.OneWayAge > 0 {
+			// The episode is over: the path was retired, or the shape stopped
+			// on a live path. The age dates it either way.
+			oneWayFact = fmt.Sprintf(
+				"the direct path was one-way for %s, %s ago; we sent and nothing came back",
+				d.OneWayFor, d.OneWayAge)
+		} else {
+			oneWayFact = fmt.Sprintf(
+				"the direct path has been one-way for %s; we send and nothing comes back", d.OneWayFor)
+		}
+	}
+	return endpointFact, oneWayFact
+}
+
+// natShapeVerdict is the host-level line about the pairs' address
+// translation: how many of the peers that were observed answer from an
+// endpoint they did not announce.
+//
+// A wire-sourced report says the control plane does not carry the shape
+// rather than let a zero read as "nothing was observed" — the same discipline
+// the relay state and the relay RTT follow. The line is omitted when no peer
+// shows the fact: a one-way path is a path's health, not a translator's
+// shape, and it is reported per peer.
+func natShapeVerdict(st p2p.Status, opts Options) string {
+	if !opts.InProcess {
+		return "NAT shape: not reported by the control plane"
+	}
+	observed, differs := 0, 0
+	for _, k := range peerKeys(st, opts.Peer) {
+		d := st.PeerDiagnostics[k]
+		if d.NATObservedAge <= 0 {
+			continue // never observed: nothing was checked
+		}
+		observed++
+		if natHasEndpointFact(d.NATShape) {
+			differs++
+		}
+	}
+	if differs == 0 {
+		return ""
+	}
+	return fmt.Sprintf("NAT shape: %d of %d observed peers answer from an endpoint they did not announce",
+		differs, observed)
 }
 
 // peerDownPairingRule is how to read the relay-session down/up lines, carried
