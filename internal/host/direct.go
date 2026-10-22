@@ -1424,11 +1424,10 @@ func (dc *directConn) punch() {
 		}
 		e.log.Debug("direct punch: seed", "peer", pname, "family", f.name, "addr", dial.String())
 		dc.noteRound("%s seed %s", f.name, dial.String())
-		token, answer, err := seedHandshakeUDPToken(f.sock, dial, seedTimeout)
+		out, err := seedHandshakeUDPToken(f.sock, dial, seedTimeout)
 		if err != nil {
-			dc.noteErr(fmt.Sprintf("seed failed: %v", err))
-			dc.noteRound("%s seed failed: %v", f.name, err)
-			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", dial.String(), "error", err)
+			dc.noteSeedFailure(f.name, err, out.ProbeFrom)
+			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", dial.String(), "error", err, "probe_from", probeFromText(out.ProbeFrom))
 			if pair := e.relayKCPPairGet(dc.peer); pair != nil {
 				pair.noteSeed("timeout", f.name, dial.String())
 			}
@@ -1447,7 +1446,7 @@ func (dc *directConn) punch() {
 		// STUN probe. The punch still works — the learned address is what gets
 		// dialled — so this is a shape fact to report, not a failure.
 		announced := announcedFor(f.v6, peerV4, peerV6)
-		dc.notePeerEndpoint(answer, announced)
+		dc.notePeerEndpoint(out.Answer, announced)
 		// Only the winner's socket is still bound, so only its candidates are
 		// ours to answer a peer's announcement with.
 		dc.mu.Lock()
@@ -1456,10 +1455,10 @@ func (dc *directConn) punch() {
 		// Register the endpoint that actually answered the seed, not the stale
 		// candidate that was dialed: the steady-state underlay filters by
 		// source, so it must follow the completed path.
-		dc.markUp(sock, answer, token)
+		dc.markUp(sock, out.Answer, out.Token)
 		dc.noteRound("%s up", f.name)
 		e.log.Debug("direct established", "peer", pname, "family", f.name,
-			"mine", candAddrs(f.mine), "peerAddr", answer.String())
+			"mine", candAddrs(f.mine), "peerAddr", out.Answer.String())
 		return
 	}
 
@@ -1473,21 +1472,76 @@ func (dc *directConn) punch() {
 // seedHandshakeUDPToken instead: the underlay needs the token to tell the
 // peer's probe from this side's own returning echo (the H2 loop guard).
 func seedHandshakeUDP(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) error {
-	_, _, err := seedHandshakeUDPToken(sock, peer, timeout)
+	_, err := seedHandshakeUDPToken(sock, peer, timeout)
 	return err
 }
 
+// probeFromText renders the source of a peer probe for a log field: the
+// address, or "(none)" when no probe arrived.
+func probeFromText(probeFrom netip.AddrPort) string {
+	if !probeFrom.IsValid() {
+		return "(none)"
+	}
+	return probeFrom.String()
+}
+
+// probeOutcomeNote describes what the seed round saw of the peer's side: the
+// source of the peer's last probe, or that none arrived.
+//
+// The two cases are different faults with different fixes. Nothing of the
+// peer's reached us means the path is blocked before us — our own NAT, the
+// network, or the peer's. A probe that did arrive means the arrival worked
+// and the rest of the round did not: our echo, or the peer's filter, dropped
+// it. A failed round that does not say which one it was leaves the reader
+// guessing, and the two guesses lead to opposite fixes.
+func probeOutcomeNote(probeFrom netip.AddrPort) string {
+	if !probeFrom.IsValid() {
+		return "no peer probe arrived"
+	}
+	return "peer probe arrived from " + probeFromText(probeFrom)
+}
+
+// noteSeedFailure records a failed seed round: its reason, and what the round
+// saw of the peer's side.
+//
+// The reason carries the note, because the reason is what a status reader
+// sees first: a "seed failed" line that does not say whether the peer's
+// packet reached us leaves the reader with two indistinguishable faults.
+func (dc *directConn) noteSeedFailure(family string, err error, probeFrom netip.AddrPort) {
+	note := probeOutcomeNote(probeFrom)
+	dc.noteErr(fmt.Sprintf("seed failed: %v (%s)", err, note))
+	dc.noteRound("%s seed failed: %v (%s)", family, err, note)
+}
+
+// seedOutcome is what one seed handshake learned about the peer's path.
+type seedOutcome struct {
+	// Token is the token this side sent, which the peer echoed back.
+	Token [seedTokenLen]byte
+	// Answer is the source the peer's echo of our token came from: the
+	// endpoint that answered, which is not necessarily the one we dialled —
+	// a peer behind a per-destination NAT answers from somewhere else.
+	// Valid only when the handshake succeeded.
+	Answer netip.AddrPort
+	// ProbeFrom is the source of the last peer probe that arrived. It is
+	// valid even when the handshake failed: a valid value means the peer's
+	// packet reached us and the round still did not complete, which is a
+	// different fault from "nothing of the peer's arrived".
+	ProbeFrom netip.AddrPort
+}
+
 // seedHandshakeUDPToken runs the symmetric token echo over a raw UDP socket and
-// returns the local token it used, plus the source address the successful echo
-// came from. The source is the path that actually completed — a peer behind a
+// returns what the round learned: the local token it used, the source address
+// the successful echo came from, and the source the peer's own probe came
+// from. The answer is the path that actually completed — a peer behind a
 // per-destination NAT answers from an endpoint that is rarely the one dialed,
 // so callers registering a data underlay must use the source, not the dialed
 // candidate, or the steady-state source filter drops every data datagram.
-// without a reliability layer: it writes its own token to peer every seedRetransmit
-// until it reads that same token back, and it echoes each of the peer's probes
-// so the peer's own handshake can complete. A raw UDP socket has no retransmit,
-// so the resend loop stands in for KCP's send window; the read deadline between
-// sends is short so a retransmit interleaves with waiting for a reply.
+//
+// It writes its own token to peer every seedRetransmit until it reads that
+// same token back, and it echoes each of the peer's probes so the peer's own
+// handshake can complete. A raw UDP socket has no retransmit, so the resend
+// loop stands in for KCP's send window; the read deadline between sends is
+// short so a retransmit interleaves with waiting for a reply.
 //
 // Only a datagram carrying seedProbeMagic with a full token is considered,
 // from any source address: the token authenticates the peer, the source
@@ -1503,14 +1557,14 @@ func seedHandshakeUDP(sock *net.UDPConn, peer netip.AddrPort, timeout time.Durat
 // never echoed (an echo of our echo can only carry the peer's token, which
 // this side re-echoes to the peer, never back to itself). Termination is the
 // handshake deadline, not a per-token count.
-func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) ([seedTokenLen]byte, netip.AddrPort, error) {
-	var token [seedTokenLen]byte
-	if _, err := rand.Read(token[:]); err != nil {
-		return token, netip.AddrPort{}, err
+func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) (seedOutcome, error) {
+	var out seedOutcome
+	if _, err := rand.Read(out.Token[:]); err != nil {
+		return out, err
 	}
 	probe := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
 	probe = append(probe, seedProbeMagic[:]...)
-	probe = append(probe, token[:]...)
+	probe = append(probe, out.Token[:]...)
 	dst := net.UDPAddrFromAddrPort(peer)
 	// The underlay that later owns this socket sets its own read deadline per
 	// read, so this is only hygiene; clear it so no stale short deadline
@@ -1523,11 +1577,11 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 	for {
 		now := time.Now()
 		if !now.Before(deadline) {
-			return token, netip.AddrPort{}, errSeedTimeout
+			return out, errSeedTimeout
 		}
 		if !now.Before(next) {
 			if _, err := sock.WriteToUDP(probe, dst); err != nil {
-				return token, netip.AddrPort{}, err
+				return out, err
 			}
 			next = now.Add(seedRetransmit)
 		}
@@ -1536,14 +1590,14 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 			readBy = deadline
 		}
 		if err := sock.SetReadDeadline(readBy); err != nil {
-			return token, netip.AddrPort{}, err
+			return out, err
 		}
 		n, src, err := sock.ReadFromUDP(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue // time to retransmit or to give up
 			}
-			return token, netip.AddrPort{}, err
+			return out, err
 		}
 		// No source filter: the token authenticates the peer, the source
 		// address cannot — a per-destination NAT maps a different public
@@ -1556,15 +1610,21 @@ func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.
 		}
 		var got [seedTokenLen]byte
 		copy(got[:], buf[len(seedProbeMagic):len(seedProbeMagic)+seedTokenLen])
-		if got == token {
-			return token, src.AddrPort(), nil // the peer echoed our probe
+		if got == out.Token {
+			out.Answer = src.AddrPort()
+			return out, nil // the peer echoed our probe
 		}
-		// A probe from an unexpected source: the peer answers from where it
-		// is reachable, not from where it advertised — a per-destination NAT
-		// maps a different public endpoint per destination. Learn that
-		// endpoint so the resend loop carries our token to it, letting the
-		// peer echo our probe and complete this side's round trip; the echo
-		// below answers the peer's own handshake on the same path.
+		// A probe from the peer. Remember where it came from: a round that
+		// does not complete still has to say whether the peer's packet
+		// reached us at all, which is the difference between a path blocked
+		// before us and a path that broke after the arrival.
+		out.ProbeFrom = src.AddrPort()
+		// The endpoint the peer answers from is rarely the one it advertised:
+		// a per-destination NAT maps a different public endpoint per
+		// destination. Learn that endpoint so the resend loop carries our
+		// token to it, letting the peer echo our probe and complete this
+		// side's round trip; the echo below answers the peer's own handshake
+		// on the same path.
 		if !sameAddrPort(src.AddrPort(), peer) {
 			learned := *src
 			dst = &learned

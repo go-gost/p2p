@@ -37,8 +37,8 @@ func TestSeedHandshakeReportsAnswerSource(t *testing.T) {
 	}
 	done := make(chan res, 1)
 	go func() {
-		tok, addr, err := seedHandshakeUDPToken(a, udpAddrPort(t, advertised), 2*time.Second)
-		done <- res{tok, addr, err}
+		out, err := seedHandshakeUDPToken(a, udpAddrPort(t, advertised), 2*time.Second)
+		done <- res{out.Token, out.Answer, err}
 	}()
 
 	// The peer behaves as a real one: it probes us and echoes what it gets.
