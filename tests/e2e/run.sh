@@ -356,7 +356,7 @@ YAML
 # shared DERP topology: A=client side, B=service side (peer gost + target).
 # start_derp_pair <tag> <stun:on|off> <direct:true|false> <b-target>
 start_derp_pair() {
-	local tag=$1 stun=$2 direct=$3 btarget=$4
+	local tag=$1 stun=$2 direct=$3 btarget=$4 ipv6=${5:-}
 	local dir="$RUNDIR/$tag"
 	mkdir -p "$dir/keys"
 	start_derper "$tag" "$stun" || return 1
@@ -366,12 +366,18 @@ start_derp_pair() {
 	[ -n "$btarget" ] && bargs+=(--target "$btarget")
 	[ "$direct" = false ] && bargs+=(--direct=false)
 	[ "$stun" = on ] && bargs+=(--stun "$DERP_IP:3478")
+	if [ "$ipv6" = true ]; then
+		bargs+=(--ipv6)
+	fi
 	start_p2p B "p2p-$tag-b" "${bargs[@]}"
 	# A: client side control plane.
 	local aargs=(--addr 127.0.0.1:8003 --derp "wss://$DERP_IP:443/derp"
 		--key "$dir/keys/a" --tls.secure=false)
 	[ "$direct" = false ] && aargs+=(--direct=false)
 	[ "$stun" = on ] && aargs+=(--stun "$DERP_IP:3478")
+	if [ "$ipv6" = true ]; then
+		aargs+=(--ipv6)
+	fi
 	start_p2p A "p2p-$tag-a" "${aargs[@]}"
 	p2p_pubkey "p2p-$tag-a" >"$dir/a.pub" || { fail "no A pubkey"; return 1; }
 	p2p_pubkey "p2p-$tag-b" >"$dir/b.pub" || { fail "no B pubkey"; return 1; }
@@ -870,8 +876,9 @@ scenario_ipv6_direct() {
 
 	start_echo - echo "$NET_GW:18081"
 	start_peer_gost B peer http 127.0.0.1:18080
-	# stun=off: the only direct candidate source is the v6 egress.
-	start_derp_pair v6 off true 127.0.0.1:18080 || return
+	# stun=off: the only direct candidate source is the v6 egress, and the
+	# family is opt-in, so both hosts must ask for it.
+	start_derp_pair v6 off true 127.0.0.1:18080 true || return
 	local bkey
 	bkey=$(cat "$dir/b.pub")
 
