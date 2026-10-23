@@ -1400,59 +1400,120 @@ func (dc *directConn) punch() {
 		return
 	}
 
-	// 4. Try each family once, in order, with the raw-UDP token seed handshake
-	// (Task 6). Per-family sockets keep one socket per attempt; both families
-	// failing backs off. The seed requires a full own->peer->own round trip on
-	// both sides, so a one-way v6 path fails on both peers and both fall back to
-	// v4 in this round. A winning socket is registered as the pair's direct
-	// underlay; the encryption it rides is the pair's relay secure session, so
-	// there is no separate direct secure gate here.
+	// 4. Attempt every family at once, then adjudicate: a family outranks the
+	// ones after it, so v6 wins whenever it completes and a completed v4
+	// handshake is held until v6 has reported a failure.
+	//
+	// Running them concurrently is what keeps a blind v6 from starving v4.
+	// Sequentially, each side spent its seed timeout on v6 before dialling v4,
+	// so two peers whose v6 paths were both blind could keep their v4 windows
+	// offset and never meet: their seeds timed out at each other forever and
+	// the pair stayed on the relay. Every attempt here starts from the same
+	// candidate list, so the two sides' windows overlap by construction.
+	//
+	// The seed requires a full own->peer->own round trip on both sides, so a
+	// one-way path fails on both peers. A winning socket is registered as the
+	// pair's direct underlay; the encryption it rides is the pair's relay
+	// secure session, so there is no separate direct secure gate here.
+	type attempt struct {
+		dial netip.AddrPort
+		out  seedOutcome
+		err  error
+	}
+	dials := make(map[int]netip.AddrPort, len(order))
+	done := make(map[int]<-chan attempt, len(order))
 	for _, idx := range order {
 		f := &fams[idx]
 		dial := dialFor(f, peerV4, peerV6)
+		dials[idx] = dial
+		ch := make(chan attempt, 1)
+		done[idx] = ch
 		e.log.Debug("direct punch: seed", "peer", pname, "family", f.name, "addr", dial.String())
 		dc.noteRound("%s seed %s", f.name, dial.String())
-		out, err := seedHandshakeUDPToken(f.sock, dial, seedTimeout)
-		if err != nil {
-			dc.noteSeedFailure(f.name, err, out.ProbeFrom)
-			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", dial.String(), "error", err, "probe_from", probeFromText(out.ProbeFrom))
+		go func(f *family, dial netip.AddrPort, ch chan<- attempt) {
+			out, err := seedHandshakeUDPToken(f.sock, dial, seedTimeout)
+			ch <- attempt{dial: dial, out: out, err: err}
+		}(f, dial, ch)
+	}
+
+	// Adjudicate in preference order, waiting only on the families that can
+	// still outrank the current best: the wait on an already-started attempt
+	// costs nothing when it has finished.
+	winner := -1
+	var winOut seedOutcome
+	waited := make(map[int]bool, len(order))
+	for _, idx := range order {
+		f := &fams[idx]
+		res := <-done[idx]
+		waited[idx] = true
+		if res.err != nil {
+			dc.noteSeedFailure(f.name, res.err, res.out.ProbeFrom)
+			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", res.dial.String(), "error", res.err, "probe_from", probeFromText(res.out.ProbeFrom))
 			if pair := e.relayKCPPairGet(dc.peer); pair != nil {
-				pair.noteSeed("timeout", f.name, dial.String())
+				pair.noteSeed("timeout", f.name, res.dial.String())
 			}
 			continue
 		}
-		sock := f.sock
-		f.sock = nil // owned by the pair's direct underlay
-		closeFams()  // drop the unused family's socket
-		if pair := e.relayKCPPairGet(dc.peer); pair != nil {
-			pair.noteSeed("ok", f.name, dial.String())
-		}
-		// The peer's NAT shape, as this round saw it: the endpoint it answered
-		// from, against the endpoints it announced (the freshest list, in this
-		// round's family). A peer that answers from somewhere else has a
-		// mapping that varies by destination, or one that changed since its own
-		// STUN probe. The punch still works — the learned address is what gets
-		// dialled — so this is a shape fact to report, not a failure.
-		announced := announcedFor(f.v6, peerV4, peerV6)
-		dc.notePeerEndpoint(out.Answer, announced)
-		// Only the winner's socket is still bound, so only its candidates are
-		// ours to answer a peer's announcement with.
-		dc.mu.Lock()
-		dc.mine = f.mine
-		dc.mu.Unlock()
-		// Register the endpoint that actually answered the seed, not the stale
-		// candidate that was dialed: the steady-state underlay filters by
-		// source, so it must follow the completed path.
-		dc.markUp(sock, out.Answer, out.Token)
-		dc.noteRound("%s up", f.name)
-		e.log.Debug("direct established", "peer", pname, "family", f.name,
-			"mine", candAddrs(f.mine), "peerAddr", out.Answer.String())
+		winner = idx
+		winOut = res.out
+		break
+	}
+	if winner < 0 {
+		// Every available family failed this round.
+		closeFams()
+		dc.backoff()
 		return
 	}
 
-	// Every available family failed this round.
-	closeFams()
-	dc.backoff()
+	// The families below the winner are abandoned, not failed: close their
+	// sockets and wait for their goroutines to exit before any socket here is
+	// touched again (closeFams and markUp both move sockets). An abandoned
+	// attempt never records a seed failure — the v4 leg of a healthy v6 round
+	// is not a failure, and counting it would poison the failure rate — but a
+	// handshake that had already completed records its success truthfully.
+	for _, idx := range order {
+		if waited[idx] {
+			continue
+		}
+		if fams[idx].sock != nil {
+			fams[idx].sock.Close()
+		}
+		res := <-done[idx]
+		dc.noteRound("%s cancelled (%s up)", fams[idx].name, fams[winner].name)
+		if res.err == nil {
+			if pair := e.relayKCPPairGet(dc.peer); pair != nil {
+				pair.noteSeed("ok", fams[idx].name, res.dial.String())
+			}
+		}
+	}
+
+	win := &fams[winner]
+	sock := win.sock
+	win.sock = nil // owned by the pair's direct underlay
+	closeFams()    // drop the cancelled families' sockets
+	if pair := e.relayKCPPairGet(dc.peer); pair != nil {
+		pair.noteSeed("ok", win.name, dials[winner].String())
+	}
+	// The peer's NAT shape, as this round saw it: the endpoint it answered
+	// from, against the endpoints it announced (the freshest list, in this
+	// round's family). A peer that answers from somewhere else has a mapping
+	// that varies by destination, or one that changed since its own STUN
+	// probe. The punch still works — the learned address is what gets
+	// dialled — so this is a shape fact to report, not a failure.
+	announced := announcedFor(win.v6, peerV4, peerV6)
+	dc.notePeerEndpoint(winOut.Answer, announced)
+	// Only the winner's socket is still bound, so only its candidates are ours
+	// to answer a peer's announcement with.
+	dc.mu.Lock()
+	dc.mine = win.mine
+	dc.mu.Unlock()
+	// Register the endpoint that actually answered the seed, not the stale
+	// candidate that was dialed: the steady-state underlay filters by source,
+	// so it must follow the completed path.
+	dc.markUp(sock, winOut.Answer, winOut.Token)
+	dc.noteRound("%s up", win.name)
+	e.log.Debug("direct established", "peer", pname, "family", win.name,
+		"mine", candAddrs(win.mine), "peerAddr", winOut.Answer.String())
 }
 
 // family is one address family's attempt in a punch round: the socket it

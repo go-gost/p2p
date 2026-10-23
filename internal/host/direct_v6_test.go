@@ -249,13 +249,16 @@ func TestDirectV6FallbackToV4(t *testing.T) {
 	roundTrip(t, s, "hi")
 	s.Close()
 
-	// The fallback is not a latency claim: each round tries v6 first and pays
-	// its seed timeout before v4, and the two sides' rounds drift apart, so a
-	// pair can need several rounds to meet on v4. Wait for the convergence,
-	// not for a particular round count.
-	waitFor(t, 30*time.Second, func() bool {
+	// Both families are attempted at once, so the blind v6 costs one seed
+	// timeout — not one per family, and not a round each time the two sides'
+	// windows drift apart: the pair converges in the first round that has the
+	// peer's candidates.
+	waitFor(t, 10*time.Second, func() bool {
 		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
 	})
+	if got := engineA.directConn(pubB).attempts.Load(); got != 1 {
+		t.Fatalf("punch attempts = %d, want 1 (a blind v6 must not cost extra rounds)", got)
+	}
 	assertDirectFamily(t, engineA, pubB, false)
 	assertDirectFamily(t, engineB, engineA.pub, false)
 
