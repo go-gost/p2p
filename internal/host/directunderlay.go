@@ -29,7 +29,10 @@ const directUnderlayReadTimeout = time.Second
 // It must stay below directUnderlayIdle so a live path answers before the
 // idle watchdog judges it; tests may shrink both together (see
 // directUnderlayIdle's test precedent).
-var directHeartbeatInterval = 3 * time.Second
+//
+// Atomic for the same reason as resendInterval: the pair's pump reads it
+// while a test shortens it.
+var directHeartbeatInterval = newAtomicDuration(3 * time.Second)
 
 // directUnderlay is one direct (raw UDP) path of a pair: it owns the punched
 // socket and the peer's address, filters inbound datagrams by source, echoes
@@ -184,7 +187,7 @@ func (u *directUnderlay) hbLive() bool {
 	if !u.hasHb {
 		return false
 	}
-	return time.Since(time.Unix(0, u.lastHbRecv.Load())) < directUnderlayIdle
+	return time.Since(time.Unix(0, u.lastHbRecv.Load())) < time.Duration(directUnderlayIdle.Load())
 }
 
 // readFrom blocks for the next datagram from the punched peer. Datagrams from

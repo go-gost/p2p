@@ -52,8 +52,14 @@ func TestNowNeverGoesBackwards(t *testing.T) {
 // upper bound is deliberately loose because it measures the *scheduler*, not
 // the clock — time.Sleep overshoots by an unbounded amount under load, so
 // asserting a tight ceiling here would only measure how busy the machine was.
+//
+// The window covers many ticks for the same reason: the clock is refreshed by
+// a background ticker, so a starved scheduler can leave it a tick behind for
+// longer than a short sleep, and the lower bound would then measure the
+// scheduler rather than the clock. Two hundred ticks is long enough that only
+// a pathological stall can break it.
 func TestSinceUsesThisClock(t *testing.T) {
-	const sleep = 5 * Resolution
+	const sleep = 200 * Resolution
 	start := Now()
 	time.Sleep(sleep)
 	d := Since(start)

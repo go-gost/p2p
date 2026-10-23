@@ -259,7 +259,7 @@ func TestRelaySessionReplaceRehandshakes(t *testing.T) {
 
 	// Both ends settle again on the fresh key within the handshake bound, and
 	// the pair carries data again.
-	waitFor(t, handshakeTimeout, func() bool {
+	waitFor(t, time.Duration(handshakeTimeout.Load()), func() bool {
 		return eA.peerSecureForTest(eB.pub) && eB.peerSecureForTest(eA.pub)
 	})
 	waitFor(t, 10*time.Second, func() bool {
@@ -288,7 +288,7 @@ func TestRelaySessionReplaceRehandshakes(t *testing.T) {
 // so nothing is re-handshaken. This is the path that does not pass through
 // pc.kill.
 func TestRelaySessionReplaceDeadSessionKeepsKeys(t *testing.T) {
-	selfDeathRebuildDelay = 0
+	selfDeathRebuildDelay.Store(0)
 	eA, eB, _ := newEncryptedPair(t)
 
 	// B's adapter up front: the half exchange below settles B's security
@@ -306,7 +306,7 @@ func TestRelaySessionReplaceDeadSessionKeepsKeys(t *testing.T) {
 	if err := eA.sendSecureHalf(eB.pub, old); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, handshakeTimeout, func() bool { return old.settled() })
+	waitFor(t, time.Duration(handshakeTimeout.Load()), func() bool { return old.settled() })
 
 	// A dead smux session standing in for one that expired in place: closed,
 	// but built over its own pipe instead of this adapter's underlay, so the

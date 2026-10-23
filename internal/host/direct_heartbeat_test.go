@@ -14,16 +14,16 @@ import (
 // idle peer flapped direct↔relay every ~6.6s (probe-pod/vscode-docker live,
 // 2026-10-14): seed ok, then retire reason=idle, re-punch, repeat.
 func TestDirectHeartbeatKeepsIdlePath(t *testing.T) {
-	oldIdle := directUnderlayIdle
-	oldHb := directHeartbeatInterval
+	oldIdle := directUnderlayIdle.Load()
+	oldHb := directHeartbeatInterval.Load()
 	// Both stay above the pump's 1s silence-tick granularity
 	// (directUnderlayReadTimeout is a const): shrinking idle below one tick
 	// would judge before any heartbeat round trip can complete.
-	directUnderlayIdle = 2500 * time.Millisecond
-	directHeartbeatInterval = 200 * time.Millisecond
+	directUnderlayIdle.Store(int64(2500 * time.Millisecond))
+	directHeartbeatInterval.Store(int64(200 * time.Millisecond))
 	defer func() {
-		directUnderlayIdle = oldIdle
-		directHeartbeatInterval = oldHb
+		directUnderlayIdle.Store(oldIdle)
+		directHeartbeatInterval.Store(oldHb)
 	}()
 
 	e := newTestEngine(t)
@@ -90,13 +90,13 @@ func TestDirectHeartbeatKeepsIdlePath(t *testing.T) {
 // the idle watchdog must fire once past the window. Heartbeats add a proof
 // step, not an exemption from death.
 func TestDirectHeartbeatDeadPathRetires(t *testing.T) {
-	oldIdle := directUnderlayIdle
-	oldHb := directHeartbeatInterval
-	directUnderlayIdle = 2500 * time.Millisecond
-	directHeartbeatInterval = 200 * time.Millisecond
+	oldIdle := directUnderlayIdle.Load()
+	oldHb := directHeartbeatInterval.Load()
+	directUnderlayIdle.Store(int64(2500 * time.Millisecond))
+	directHeartbeatInterval.Store(int64(200 * time.Millisecond))
 	defer func() {
-		directUnderlayIdle = oldIdle
-		directHeartbeatInterval = oldHb
+		directUnderlayIdle.Store(oldIdle)
+		directHeartbeatInterval.Store(oldHb)
 	}()
 
 	e := newTestEngine(t)

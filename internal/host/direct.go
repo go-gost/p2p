@@ -99,7 +99,11 @@ var (
 	// (it opens on the pair and lets the stream migrate when the underlay lands),
 	// so there is no wait to bound.
 	punchWaitTimeout = 5 * time.Second
-	backoffPeriod    = 30 * time.Second
+	// backoffPeriod is the floor of the punch's retry schedule. Atomic for the
+	// same reason as resendInterval: the punch goroutine reads it when it
+	// schedules a retry, and a test that overrides it (or restores it) while
+	// an engine is still live would race that read.
+	backoffPeriod = newAtomicDuration(30 * time.Second)
 	// directRepunchBackoffCap caps the H3 hysteresis: the re-punch wait for a
 	// direct that keeps dying shortly after registration grows from
 	// backoffPeriod and stops here, so a flapping path settles into a slow
@@ -917,12 +921,12 @@ func (dc *directConn) underlayDead(u *directUnderlay) {
 // once (0). A younger one grows the stored backoff geometrically from
 // backoffPeriod, capped at directRepunchBackoffCap. Caller must hold dc.mu.
 func (dc *directConn) repunchBackoffAfterLocked(lifetime time.Duration) time.Duration {
-	if lifetime >= 2*directUnderlayIdle {
+	if lifetime >= 2*time.Duration(directUnderlayIdle.Load()) {
 		dc.repunchBackoff = 0
 		return 0
 	}
 	if dc.repunchBackoff == 0 {
-		dc.repunchBackoff = backoffPeriod
+		dc.repunchBackoff = time.Duration(backoffPeriod.Load())
 	} else {
 		dc.repunchBackoff *= 2
 	}
@@ -1079,7 +1083,9 @@ func (dc *directConn) silentPeerWait(d time.Duration) time.Duration {
 }
 
 // backoff marks a failed punch and schedules a retry.
-func (dc *directConn) backoff() { dc.retry(dc.silentPeerWait(backoffPeriod), true) }
+func (dc *directConn) backoff() {
+	dc.retry(dc.silentPeerWait(time.Duration(backoffPeriod.Load())), true)
+}
 
 // resetControlMisses forgets the counted control failures: control demonstrably
 // works again (or the channel they were counted on is gone), so the old misses

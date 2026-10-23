@@ -274,7 +274,7 @@ func TestKillRecordsItsDeathBeforeTheAdapterReadsAsDead(t *testing.T) {
 // increasing generation, so two peers never collide and a rebuild advances it.
 // It asserts on the field values (pc.sessionGen), not on log text.
 func TestSessionGenerationMonotonicAndDistinct(t *testing.T) {
-	selfDeathRebuildDelay = 0
+	selfDeathRebuildDelay.Store(0)
 	e := &engine{
 		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		stop:    make(chan struct{}),
@@ -407,7 +407,7 @@ func TestSessionGenerationOnRebuildLog(t *testing.T) {
 // kill-driven rebuild goes through peerConn (killSession closed the adapter), a
 // self-died one through ensureSession's replacement branch.
 func TestSessionRebuildLogCarriesReasonAndDownDurations(t *testing.T) {
-	selfDeathRebuildDelay = 0
+	selfDeathRebuildDelay.Store(0)
 	// A pair whose last underlay datagram is backdated, so silentFor has a real
 	// recency to measure from instead of "heard from microseconds ago".
 	const quiet = 2 * time.Second

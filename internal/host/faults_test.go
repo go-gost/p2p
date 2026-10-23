@@ -195,6 +195,16 @@ func TestDropPongMakesALiveRelayLookSilent(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool { return !e.relayConnected() })
 }
 
+// starveBudget bounds a wait for the pair to retire a direct path starved of
+// traffic. The retirement is driven by the pair session's own smux keepalive —
+// the direct plane rides the pair's relay session, so smuxKeepAliveTimeout is
+// the bound (the directSmux knobs only parse and apply now) — and the idle
+// bound is added because that is what separates a starved path from a merely
+// idle one, then a round of slack for the re-punch.
+func starveBudget() time.Duration {
+	return time.Duration(smuxKeepAliveTimeout.Load()) + 2*directIdleBound()
+}
+
 // TestDropDataStarvesADirectSession: dropData is the in-process reproduction of
 // the field failure that killed direct sessions at 18s — the peer's frames stop
 // arriving while the path stays up. smux is fed only by the frames the peer
@@ -209,9 +219,12 @@ func TestDropDataStarvesADirectSession(t *testing.T) {
 	// on both planes at once, since dropData is applied at the pair's write path.
 	a.faults.Store(newFaults(&p2p.FaultsConfig{DropData: true}))
 
-	// 1-2x the direct idle bound plus a tick: the bound is what separates a
-	// starved path from one that is merely idle.
-	waitFor(t, 2*directUnderlayIdle, func() bool { return dcB.drops.Load() >= 1 })
+	// The drop comes from the pair session's own keepalive, not from the idle
+	// watchdog: the direct plane rides the pair's relay session, so the bound
+	// is the smux keepalive timeout (15s in tests — the directSmux knobs are
+	// no longer read) plus the idle bound that separates a starved path from
+	// a merely idle one.
+	waitFor(t, starveBudget(), func() bool { return dcB.drops.Load() >= 1 })
 }
 
 // TestFaultMuteDirectFallsBackToRelay pins the per-path mute (Task 12 / O7):
@@ -222,13 +235,18 @@ func TestDropDataStarvesADirectSession(t *testing.T) {
 // complement of the all-path mute, which retires direct without a relay to
 // recover onto.
 func TestFaultMuteDirectFallsBackToRelay(t *testing.T) {
-	selfDeathRebuildDelay = 0
+	selfDeathRebuildDelay.Store(0)
 	a, b, _ := startPunchedPair(t)
 
 	dcB := watchDirect(t, b, a)
 	pairB := b.relayKCPPairFor(a.pub)
-	if !pairB.preferredDirect() {
-		t.Fatal("B must prefer direct before a direct-only mute")
+	// The stream below is opened on A, so A's pair is the one that must have
+	// fallen back before it is opened: a stream opened while A's pair still
+	// prefers a direct path that is muted rides that path and dies with it
+	// (the reader sees EOF) instead of being carried by the relay.
+	pairA := a.relayKCPPairFor(b.pub)
+	if !pairB.preferredDirect() || !pairA.preferredDirect() {
+		t.Fatal("both sides must prefer direct before a direct-only mute")
 	}
 
 	// A mutes the direct underlay only: its relay control and data stay up.
@@ -236,9 +254,11 @@ func TestFaultMuteDirectFallsBackToRelay(t *testing.T) {
 
 	// A stops sending on direct (so B stales) and drops what B sends (so A
 	// stales). B's direct underlay is retired by its idle watchdog while the
-	// relay stays up — "direct dies" without the relay going with it.
-	waitFor(t, 3*directUnderlayIdle, func() bool {
-		return dcB.drops.Load() >= 1 && !pairB.preferredDirect()
+	// relay stays up — "direct dies" without the relay going with it. Both
+	// sides must have retired their direct path: each side's watchdog runs on
+	// its own clock, and the stream below is opened on A.
+	waitFor(t, 3*directIdleBound(), func() bool {
+		return dcB.drops.Load() >= 1 && !pairB.preferredDirect() && !pairA.preferredDirect()
 	})
 	if !b.relayConnected() {
 		t.Fatal("the relay connection died with the direct-only mute")
@@ -312,14 +332,14 @@ func TestSilenceShorterThanTimeoutIsSurvived(t *testing.T) {
 	// even though the mute ended before the threshold. The window opens when the
 	// fault is built.
 	short := newFaults(&p2p.FaultsConfig{
-		SilenceFor:   directUnderlayIdle / 3,
+		SilenceFor:   directIdleBound() / 3,
 		SilenceEvery: time.Minute,
 	})
 	a.faults.Store(short)
 	if !short.silenced(time.Now()) {
 		t.Fatal("the silence window must be open at the fault's creation")
 	}
-	time.Sleep(directUnderlayIdle + directUnderlayReadTimeout)
+	time.Sleep(directIdleBound() + directUnderlayReadTimeout)
 	if got := dcB.drops.Load(); got != 0 {
 		t.Fatalf("a silence shorter than the idle bound retired the direct path %d time(s)", got)
 	}
@@ -329,10 +349,12 @@ func TestSilenceShorterThanTimeoutIsSurvived(t *testing.T) {
 
 	// Well beyond the idle bound: the path must be retired and the drop counted.
 	a.faults.Store(newFaults(&p2p.FaultsConfig{
-		SilenceFor:   3 * directUnderlayIdle,
+		SilenceFor:   3 * directIdleBound(),
 		SilenceEvery: time.Minute,
 	}))
-	waitFor(t, 3*directUnderlayIdle, func() bool { return dcB.drops.Load() >= 1 })
+	// Retiring a starved path is the pair session's keepalive, not the idle
+	// watchdog: see starveBudget.
+	waitFor(t, starveBudget(), func() bool { return dcB.drops.Load() >= 1 })
 }
 
 // TestHostAppliesFaultsToEngine pins the config→engine wiring the embedder path

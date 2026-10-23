@@ -499,7 +499,7 @@ func TestRelayTeardownKeepsCarryingOverLiveDirect(t *testing.T) {
 	b := mustListenUDP(t)
 	t.Cleanup(func() { b.Close() })
 	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
-	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+	setPairDirectRecency(pair, time.Now().Add(-2*directIdleBound()))
 	if pair.preferredDirect() {
 		t.Fatal("test setup: the pair must have migrated to the relay before the teardown")
 	}
@@ -825,7 +825,7 @@ func TestTransportCounts(t *testing.T) {
 // but a log grep showed it: a peer reads as healthy while its session is
 // rebuilt every few seconds.
 func TestRelayRebuildCounters(t *testing.T) {
-	selfDeathRebuildDelay = 0
+	selfDeathRebuildDelay.Store(0)
 	e := &engine{
 		log:     slog.Default(),
 		stop:    make(chan struct{}),
@@ -1133,7 +1133,7 @@ func TestPeerDiagnosticsPerUnderlayAttribution(t *testing.T) {
 
 	// Let the direct path go stale: the pair falls back to the relay, and the
 	// next write counts on the relay side. Ages now differ by construction.
-	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+	setPairDirectRecency(pair, time.Now().Add(-2*directIdleBound()))
 	if n, err := pair.WriteTo(make([]byte, 20), nil); err != nil || n != 20 {
 		t.Fatalf("relay WriteTo = %d, %v; want 20, nil", n, err)
 	}
@@ -1154,11 +1154,11 @@ func TestPeerDiagnosticsPerUnderlayAttribution(t *testing.T) {
 	if k.BytesSent != 60 || k.BytesRcvd != 30 {
 		t.Fatalf("totals = sent %d / rcvd %d, want 60 / 30 (per-underlay sums)", k.BytesSent, k.BytesRcvd)
 	}
-	if k.DirectLastRecvAge < directUnderlayIdle {
-		t.Fatalf("DirectLastRecvAge = %v, want a stale (>= %v) direct age", k.DirectLastRecvAge, directUnderlayIdle)
+	if k.DirectLastRecvAge < directIdleBound() {
+		t.Fatalf("DirectLastRecvAge = %v, want a stale (>= %v) direct age", k.DirectLastRecvAge, directIdleBound())
 	}
-	if k.RelayLastRecvAge <= 0 || k.RelayLastRecvAge >= directUnderlayIdle {
-		t.Fatalf("RelayLastRecvAge = %v, want a fresh (0, %v) relay age", k.RelayLastRecvAge, directUnderlayIdle)
+	if k.RelayLastRecvAge <= 0 || k.RelayLastRecvAge >= directIdleBound() {
+		t.Fatalf("RelayLastRecvAge = %v, want a fresh (0, %v) relay age", k.RelayLastRecvAge, directIdleBound())
 	}
 	if k.DirectLastRecvAge <= k.RelayLastRecvAge {
 		t.Fatalf("ages not attributed per underlay: direct %v, relay %v", k.DirectLastRecvAge, k.RelayLastRecvAge)
@@ -1266,12 +1266,28 @@ func TestPeerDiagnosticsSnapshot(t *testing.T) {
 	}
 	defer conn.Close()
 
-	st := newServer(eA).status()
+	// The open starts the punch, and the round is what the diagnostic counts:
+	// wait for the attempt to be reported rather than racing the round's
+	// first tick.
+	srv := newServer(eA)
+	waitFor(t, 5*time.Second, func() bool {
+		d, ok := srv.status().PeerDiagnostics[eB.PublicKey()]
+		return ok && d.Attempts > 0
+	})
+
+	st := srv.status()
 	d, ok := st.PeerDiagnostics[eB.PublicKey()]
 	if !ok {
 		t.Fatal("no diagnostic for the peer")
 	}
-	if d.Path != "direct" && d.Path != "derp" {
+	// The path word names where the peer's traffic goes. It is the pair's own
+	// path when a direct underlay carries it ("direct"), and otherwise the
+	// punch's word: "derp" when no round has failed, "failed" when one has
+	// (the sandbox denies the punch's UDP sends, so that is the usual case
+	// here), "punching" while a round is in flight.
+	switch d.Path {
+	case "direct", "derp", "failed", "punching":
+	default:
 		t.Fatalf("path = %q", d.Path)
 	}
 	if d.Attempts == 0 {
@@ -2082,8 +2098,8 @@ func TestEncryptionState(t *testing.T) {
 // session is built. Every ctrlSecure frame is dropped in both directions, so
 // neither end settles; the shortened handshake timeout keeps the test prompt.
 func TestRelayRefusesUnencryptedPeer(t *testing.T) {
-	defer func(d time.Duration) { handshakeTimeout = d }(handshakeTimeout)
-	handshakeTimeout = 300 * time.Millisecond
+	defer func(d int64) { handshakeTimeout.Store(d) }(handshakeTimeout.Load())
+	handshakeTimeout.Store(int64(300 * time.Millisecond))
 	defer resendInterval.Store(resendInterval.Load())
 	resendInterval.Store(int64(50 * time.Millisecond))
 
@@ -2149,8 +2165,8 @@ func TestPeerEncryptionsSkipsSessionless(t *testing.T) {
 // routing for every peer. With a large handshakeTimeout a non-blocking call on
 // an unsettled adapter returns at once with a refusal, not after the timeout.
 func TestEnsureSessionInboundDoesNotBlock(t *testing.T) {
-	defer func(d time.Duration) { handshakeTimeout = d }(handshakeTimeout)
-	handshakeTimeout = 30 * time.Second // a blocking call would take this long
+	defer func(d int64) { handshakeTimeout.Store(d) }(handshakeTimeout.Load())
+	handshakeTimeout.Store(int64(30 * time.Second)) // a blocking call would take this long
 
 	e := &engine{
 		peers:  make(map[derpclient.PublicKey]*peerConn),
@@ -2174,6 +2190,6 @@ func TestEnsureSessionInboundDoesNotBlock(t *testing.T) {
 		t.Fatalf("inbound call error = %v, want errEncryptionRequired", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("inbound call took %v with handshakeTimeout=%v: it blocked on the round trip", elapsed, handshakeTimeout)
+		t.Fatalf("inbound call took %v with handshakeTimeout=%v: it blocked on the round trip", elapsed, time.Duration(handshakeTimeout.Load()))
 	}
 }

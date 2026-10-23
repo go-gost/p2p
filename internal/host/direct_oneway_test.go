@@ -94,8 +94,8 @@ func TestDirectOneWayDeadIgnoresAStoppedSender(t *testing.T) {
 // the receive counter, which a healthy path produces routinely.
 func TestDirectUnderlayOneWayDead(t *testing.T) {
 	pair := &relayKCPPair{}
-	defer func(w time.Duration) { directOneWayWindow = w }(directOneWayWindow)
-	directOneWayWindow = 20 * time.Millisecond
+	defer func(w int64) { directOneWayWindow.Store(w) }(directOneWayWindow.Load())
+	directOneWayWindow.Store(int64(20 * time.Millisecond))
 
 	// One tick of one-way traffic: sending, receiving nothing back.
 	pair.directBytesSent.Add(2048)
@@ -121,8 +121,8 @@ func TestDirectUnderlayOneWayDead(t *testing.T) {
 // the episode is open — it has a length and no end yet.
 func TestDirectOneWayEpisodeIsCurrentWhileHolding(t *testing.T) {
 	pair := &relayKCPPair{}
-	defer func(w time.Duration) { directOneWayWindow = w }(directOneWayWindow)
-	directOneWayWindow = time.Minute
+	defer func(w int64) { directOneWayWindow.Store(w) }(directOneWayWindow.Load())
+	directOneWayWindow.Store(int64(time.Minute))
 
 	u := &directUnderlay{}
 	pair.direct = u
@@ -153,8 +153,8 @@ func TestDirectOneWayEpisodeSurvivesRetirement(t *testing.T) {
 	peer := derpclient.PublicKey{65}
 	pair := e.relayKCPPairFor(peer)
 	t.Cleanup(pair.shutdown)
-	defer func(w time.Duration) { directOneWayWindow = w }(directOneWayWindow)
-	directOneWayWindow = 20 * time.Millisecond
+	defer func(w int64) { directOneWayWindow.Store(w) }(directOneWayWindow.Load())
+	directOneWayWindow.Store(int64(20 * time.Millisecond))
 
 	a := mustListenUDP(t)
 	b := mustListenUDP(t)
@@ -195,8 +195,8 @@ func TestDirectOneWayEpisodeSurvivesRetirement(t *testing.T) {
 // routinely. Reporting it would leave the peer labelled one-way forever.
 func TestDirectOneWayBlipIsNotReported(t *testing.T) {
 	pair := &relayKCPPair{}
-	defer func(w time.Duration) { directOneWayWindow = w }(directOneWayWindow)
-	directOneWayWindow = time.Minute
+	defer func(w int64) { directOneWayWindow.Store(w) }(directOneWayWindow.Load())
+	directOneWayWindow.Store(int64(time.Minute))
 
 	u := &directUnderlay{}
 	pair.direct = u
@@ -223,8 +223,8 @@ func TestDirectOneWayIgnoresARetiredUnderlay(t *testing.T) {
 	peer := derpclient.PublicKey{66}
 	pair := e.relayKCPPairFor(peer)
 	t.Cleanup(pair.shutdown)
-	defer func(w time.Duration) { directOneWayWindow = w }(directOneWayWindow)
-	directOneWayWindow = 20 * time.Millisecond
+	defer func(w int64) { directOneWayWindow.Store(w) }(directOneWayWindow.Load())
+	directOneWayWindow.Store(int64(20 * time.Millisecond))
 
 	a := mustListenUDP(t)
 	b := mustListenUDP(t)
@@ -271,8 +271,8 @@ func TestDirectOneWayDoesNotDeclareANewPathDeadOnItsFirstTick(t *testing.T) {
 	peer := derpclient.PublicKey{67}
 	pair := e.relayKCPPairFor(peer)
 	t.Cleanup(pair.shutdown)
-	defer func(w time.Duration) { directOneWayWindow = w }(directOneWayWindow)
-	directOneWayWindow = 20 * time.Millisecond
+	defer func(w int64) { directOneWayWindow.Store(w) }(directOneWayWindow.Load())
+	directOneWayWindow.Store(int64(20 * time.Millisecond))
 
 	a := mustListenUDP(t)
 	b := mustListenUDP(t)

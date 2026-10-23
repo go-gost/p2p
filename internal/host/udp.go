@@ -144,7 +144,7 @@ var scopedRePresentGrace = 10 * time.Second
 // failures grow towards the punch backoff, everything else resets to the floor.
 func channelRetryDelay(prev time.Duration, openFailed bool) time.Duration {
 	if openFailed {
-		return min(2*prev, backoffPeriod)
+		return min(2*prev, time.Duration(backoffPeriod.Load()))
 	}
 	return channelRetryMin
 }

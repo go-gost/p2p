@@ -23,8 +23,7 @@ import (
 // untouched: tests that need a live gate stamp it themselves.
 func buildRelaySession(t *testing.T, capture *logCapture, peer derpclient.PublicKey) (*engine, *peerConn, *relayKCPPair) {
 	t.Helper()
-	selfDeathRebuildDelay = 1 * time.Millisecond
-	selfDeathRebuildDelay = 1 * time.Millisecond
+	selfDeathRebuildDelay.Store(int64(1 * time.Millisecond))
 	priv, _, err := derpclient.Generate()
 	if err != nil {
 		t.Fatal(err)

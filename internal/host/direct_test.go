@@ -22,14 +22,24 @@ import (
 )
 
 // TestMain shortens the timing globals for the whole package — direct punch and
-// the relay keepalive probe alike. It is set once here, never mutated per-test,
-// so no test writes these globals while a background punch/backoff/keepalive
-// goroutine reads them. The relay-only tests never trigger punching, so they are
-// unaffected.
+// the relay keepalive probe alike.
+//
+// The plain vars are set once here, before any engine exists, and never
+// mutated per-test, so no test writes them while a background
+// punch/backoff/keepalive goroutine reads them. The knobs a test does override
+// per-test (the direct idle bound, the heartbeat interval) are atomic for that
+// reason: an engine from an earlier test can still be reading them. The
+// relay-only tests never trigger punching, so they are unaffected.
 func TestMain(m *testing.M) {
 	punchTimeout = 2 * time.Second
 	punchWaitTimeout = 2 * time.Second
-	backoffPeriod = 500 * time.Millisecond
+	backoffPeriod.Store(int64(500 * time.Millisecond))
+	// The seed handshake bounds a failed family attempt. It was left at its
+	// production value (5s) while punchTimeout was shortened to 2s, so a
+	// failed seed overran the punch's own budget by three seconds and blew
+	// the five-second budgets the tests wait on. Half a second leaves the
+	// punch room for both families and the tests room for a retry.
+	seedTimeout = 500 * time.Millisecond
 	// The silent-peer growth doubles from backoffPeriod and stops here, so a
 	// test can reach the cap in a few rounds instead of minutes.
 	deadPeerWaitCap = 4 * time.Second
@@ -37,6 +47,13 @@ func TestMain(m *testing.M) {
 	// reach the cap in a few short-lived directs instead of minutes.
 	directRepunchBackoffCap = 4 * time.Second
 	stunTimeout = 500 * time.Millisecond
+	// The direct idle bound and the heartbeat interval keep their production
+	// values (6s/3s). They are not knobs a test may shorten: the pump notices
+	// an answered heartbeat one tick (1s) after it was sent, so a live path is
+	// only kept alive while the idle bound leaves room for that tick plus the
+	// one after it. Shortening the bound to seconds retires healthy paths
+	// that are merely quiet — the heartbeat's answer arrives after the tick
+	// that would have noticed it, and the path is judged idle first.
 	// The direct session's keepalive is the thing TestDirectSilentPeerIsNoticed
 	// measures, so it runs at test speed here (production is 2s/6s).
 	directSmuxKeepAliveInterval = 500 * time.Millisecond
@@ -48,6 +65,13 @@ func TestMain(m *testing.M) {
 	keepAlivePeriod = 100 * time.Millisecond
 	relayDeadPeriod = 400 * time.Millisecond
 	os.Exit(m.Run())
+}
+
+// directIdleBound returns the current direct-underlay idle bound. The knob is
+// atomic — a test overrides it while other engines are live — so every read
+// goes through the atomic.
+func directIdleBound() time.Duration {
+	return time.Duration(directUnderlayIdle.Load())
 }
 
 // startFakeSTUN runs an in-process STUN server. When mapped is non-empty it
@@ -540,7 +564,7 @@ func TestDirectUnderlayDeadClearsAndRepunches(t *testing.T) {
 	// Make the underlay look long-lived so the re-punch is immediate (no H3
 	// backoff): its lifetime is what keys the hysteresis.
 	dc.mu.Lock()
-	dc.sessAt = time.Now().Add(-3 * directUnderlayIdle)
+	dc.sessAt = time.Now().Add(-3 * directIdleBound())
 	dc.mu.Unlock()
 
 	pair := e.relayKCPPairFor(peer)
@@ -552,7 +576,7 @@ func TestDirectUnderlayDeadClearsAndRepunches(t *testing.T) {
 	}
 	// The idle callback only runs after the watchdog observed silence, so the
 	// underlay must read as stale for the clear to be valid.
-	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+	setPairDirectRecency(pair, time.Now().Add(-2*directIdleBound()))
 
 	e.directUnderlayDead(peer, u)
 
@@ -698,7 +722,7 @@ func TestClearDirectUnderlayIfLeavesReplacement(t *testing.T) {
 	// The current identity clears once it is genuinely stale — an idle clear of
 	// a *fresh* underlay is refused (see the sibling test) — and closes exactly
 	// that underlay.
-	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+	setPairDirectRecency(pair, time.Now().Add(-2*directIdleBound()))
 	if !pair.clearDirectUnderlayIf(u2, pathChangeDirectIdle) {
 		t.Fatal("clearDirectUnderlayIf(u2) did not clear the current underlay")
 	}
@@ -740,7 +764,7 @@ func TestClearDirectUnderlayIfKeepsFreshIdleUnderlay(t *testing.T) {
 	}
 
 	// Once it has truly gone silent past the idle bound, the idle clear retires it.
-	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+	setPairDirectRecency(pair, time.Now().Add(-2*directIdleBound()))
 	if !pair.clearDirectUnderlayIf(u, pathChangeDirectIdle) {
 		t.Fatal("clearDirectUnderlayIf did not retire a stale underlay on an idle clear")
 	}
@@ -752,8 +776,8 @@ func TestClearDirectUnderlayIfKeepsFreshIdleUnderlay(t *testing.T) {
 // async pair-session ensure refuses the unsettled cipher and retires it — the
 // replacement for the deleted direct encryption gate (I4).
 func TestRegisterDirectUnderlayRetiresWhenSecureFails(t *testing.T) {
-	defer func(d time.Duration) { handshakeTimeout = d }(handshakeTimeout)
-	handshakeTimeout = 300 * time.Millisecond
+	defer func(d int64) { handshakeTimeout.Store(d) }(handshakeTimeout.Load())
+	handshakeTimeout.Store(int64(300 * time.Millisecond))
 
 	rs := &relayServer{}
 	url := rs.start(t)
@@ -821,7 +845,7 @@ func TestDirectShortLivedBacksOff(t *testing.T) {
 		// Young underlay: its lifetime is ~0, well under 2×directUnderlayIdle.
 		// The idle callback only runs after observed silence, so age the
 		// recency for the clear to be valid.
-		setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+		setPairDirectRecency(pair, time.Now().Add(-2*directIdleBound()))
 		e.directUnderlayDead(peer, u)
 		waits = append(waits, lastBackoffWait(t, dc))
 	}
@@ -994,7 +1018,7 @@ func TestDirectSurvivesPunchTimeout(t *testing.T) {
 // TestDirectFallbackToRelay proves that after the direct session is torn down,
 // new streams fall back to the relay path.
 func TestDirectFallbackToRelay(t *testing.T) {
-	selfDeathRebuildDelay = 0
+	selfDeathRebuildDelay.Store(0)
 	rs := &relayServer{}
 	url := rs.start(t)
 	stun := startFakeSTUN(t, "")
@@ -1130,7 +1154,7 @@ func TestDirectRepunchAfterSessionDeath(t *testing.T) {
 // -race, and is not a product race (see the docs note). Re-run and report it;
 // it is not your change.
 func TestDirectRepunchAfterMissedPeerGone(t *testing.T) {
-	selfDeathRebuildDelay = 0
+	selfDeathRebuildDelay.Store(0)
 	rs := &relayServer{}
 	url := rs.start(t)
 	stun := startFakeSTUN(t, "")
@@ -1224,13 +1248,13 @@ func TestDirectSilentPeerIsNoticed(t *testing.T) {
 	}
 	sockB.Close()
 
-	// The direct idle bound (directUnderlayIdle, 6s) plus a read tick. The
+	// The direct idle bound (directUnderlayIdle) plus a read tick. The
 	// relay keepalive this replaced would take 30-60s, so the bound proves
 	// which one is in play.
 	closed := time.Now()
 	waitFor(t, 12*time.Second, func() bool { return !engineA.directConn(pubB).isUp() })
 	t.Logf("silent direct path noticed after %v (idle %v)",
-		time.Since(closed).Round(time.Millisecond), directUnderlayIdle)
+		time.Since(closed).Round(time.Millisecond), directIdleBound())
 }
 
 // TestPeerGoneKeepsLiveDirectSession: a PeerGone is a notice about the peer's
@@ -1286,7 +1310,7 @@ func TestPeerGoneKeepsLiveDirectSession(t *testing.T) {
 
 	// Longer than the direct idle detection window: a path that survives this
 	// is genuinely alive, not just unexamined.
-	time.Sleep(3 * directUnderlayIdle)
+	time.Sleep(3 * directIdleBound())
 	if !hasDirect(engineA, pubB) {
 		t.Fatal("a PeerGone tore down the live direct path")
 	}
@@ -1997,7 +2021,7 @@ func TestSilentPeerWaitGrows(t *testing.T) {
 
 		var got []time.Duration
 		for i := 0; i < 6; i++ {
-			got = append(got, dc.silentPeerWait(backoffPeriod))
+			got = append(got, dc.silentPeerWait(time.Duration(backoffPeriod.Load())))
 		}
 		// Monotonic up to the cap, and flat at it: reaching the cap is the point,
 		// so the tail of the sequence must not keep climbing.
@@ -2024,7 +2048,7 @@ func TestSilentPeerWaitGrows(t *testing.T) {
 
 		// A gate re-arm passes the previous wait, not backoffPeriod: growth has
 		// to continue from it or the two paths would fight over the value.
-		first := dc.silentPeerWait(backoffPeriod)
+		first := dc.silentPeerWait(time.Duration(backoffPeriod.Load()))
 		second := dc.silentPeerWait(first)
 		if second <= first {
 			t.Errorf("re-armed wait = %v, want more than the %v it was given", second, first)
@@ -2061,7 +2085,7 @@ func TestSilentPeerWaitGrows(t *testing.T) {
 		dc.e.peers[dc.peer] = &peerConn{peer: dc.peer, sess: newTestSess(t)}
 
 		for i := 0; i < 4; i++ {
-			dc.silentPeerWait(backoffPeriod)
+			dc.silentPeerWait(time.Duration(backoffPeriod.Load()))
 		}
 
 		// The peer comes back. Its wait is the one asked for, and the growth a

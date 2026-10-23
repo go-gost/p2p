@@ -336,7 +336,7 @@ func TestPairPreferredFollowsInboundRecency(t *testing.T) {
 
 	// Force the recency stamp past the idle bound: a direct that has gone silent
 	// is no longer preferred.
-	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+	setPairDirectRecency(pair, time.Now().Add(-2*directIdleBound()))
 	if pair.preferredDirect() {
 		t.Fatal("preferredDirect() = true for a stale direct underlay, want false")
 	}
@@ -403,7 +403,7 @@ func TestPairWriteToUsesPreferredPath(t *testing.T) {
 	}
 
 	// A stale direct falls back to the relay adapter.
-	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+	setPairDirectRecency(pair, time.Now().Add(-2*directIdleBound()))
 	if _, err := pair.WriteTo([]byte("over relay"), nil); err != nil {
 		t.Fatalf("WriteTo (relay): %v", err)
 	}
@@ -501,7 +501,7 @@ func TestPairCongestionFollowsPreferredPath(t *testing.T) {
 	// The idle watchdog observing the direct go stale flips it back to relay.
 	// The watchdog is invoked directly so the assertion does not depend on the
 	// 1s read-tick granularity.
-	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+	setPairDirectRecency(pair, time.Now().Add(-2*directIdleBound()))
 	pair.reportDirectIdle(u)
 	if got := appliedNC(pair); got != 1 {
 		t.Fatalf("applied nc after idle = %d, want 1 (relay)", got)
@@ -571,9 +571,9 @@ func TestPairDirectPumpStopsOnShutdown(t *testing.T) {
 // the underlay: if clear self-joined the invoking pump, the callback would never
 // signal and the test would time out.
 func TestPairDirectIdleFiresCallbackOnce(t *testing.T) {
-	oldIdle := directUnderlayIdle
-	directUnderlayIdle = 150 * time.Millisecond
-	defer func() { directUnderlayIdle = oldIdle }()
+	oldIdle := directUnderlayIdle.Load()
+	directUnderlayIdle.Store(int64(150 * time.Millisecond))
+	defer func() { directUnderlayIdle.Store(oldIdle) }()
 
 	e := newTestEngine(t)
 	before := runtime.NumGoroutine()
@@ -727,9 +727,9 @@ func TestPairCloseReturnsEOF(t *testing.T) {
 // callback is held across three re-armed idle episodes; while it is held,
 // exactly one invocation must have run and exactly one must be in flight.
 func TestPairDirectIdleSlowCallbackDoesNotAccumulate(t *testing.T) {
-	oldIdle := directUnderlayIdle
-	directUnderlayIdle = 150 * time.Millisecond
-	defer func() { directUnderlayIdle = oldIdle }()
+	oldIdle := directUnderlayIdle.Load()
+	directUnderlayIdle.Store(int64(150 * time.Millisecond))
+	defer func() { directUnderlayIdle.Store(oldIdle) }()
 
 	e := newTestEngine(t)
 	before := runtime.NumGoroutine()

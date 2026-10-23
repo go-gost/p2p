@@ -352,7 +352,11 @@ func (c *cryptoConn) clearDesync() {
 // handshakeTimeout bounds waiting for the peer's handshake half. Both peers
 // send their half eagerly, so a healthy wait is one control round trip
 // (sub-second); the bound only bites for a peer that does not support it.
-var handshakeTimeout = 3 * time.Second
+//
+// Atomic for the same reason as resendInterval: a test shortens it while
+// other engines are live, and the handshake loop reads it from the engine's
+// goroutine.
+var handshakeTimeout = newAtomicDuration(3 * time.Second)
 
 // secureSession drives one (peer, transport) handshake and owns its keys. It
 // outlives any one smux session: a rebuilt mux session reuses the same keys and

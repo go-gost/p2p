@@ -91,8 +91,8 @@ func TestPeerDiagnosticsCarryAnEndedOneWayEpisode(t *testing.T) {
 	}
 	e := newEngine("", "", priv, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	t.Cleanup(e.Close)
-	defer func(w time.Duration) { directOneWayWindow = w }(directOneWayWindow)
-	directOneWayWindow = 20 * time.Millisecond
+	defer func(w int64) { directOneWayWindow.Store(w) }(directOneWayWindow.Load())
+	directOneWayWindow.Store(int64(20 * time.Millisecond))
 
 	peer := derpclient.PublicKey{64}
 	e.directConn(peer) // the peer must exist to be reported

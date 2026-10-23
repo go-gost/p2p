@@ -118,7 +118,7 @@ func TestPairDirectIdleFallbackDiagnostic(t *testing.T) {
 
 	// Let the direct path go silent past the idle bound, then report it exactly
 	// as the pump's watchdog does.
-	setPairDirectRecency(pair, time.Now().Add(-2*directUnderlayIdle))
+	setPairDirectRecency(pair, time.Now().Add(-2*directIdleBound()))
 	pair.reportDirectIdle(u)
 
 	pd := pair.diag()

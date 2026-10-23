@@ -817,8 +817,11 @@ var (
 	// every 10s would have its healthy session torn down on a tick. 15s is that
 	// floor for a mixed fleet. The direct plane rides this same session, so
 	// there is no second smux keepalive to negotiate.
-	smuxKeepAliveInterval = 3 * time.Second
-	smuxKeepAliveTimeout  = 15 * time.Second
+	// Atomic for the same reason as resendInterval: a test overrides them (and
+	// restores them) while engines are live, and a session is built from them
+	// in the engine's goroutine.
+	smuxKeepAliveInterval = newAtomicDuration(3 * time.Second)
+	smuxKeepAliveTimeout  = newAtomicDuration(15 * time.Second)
 
 	// directSmuxKeepAliveInterval/Timeout are retained for config compatibility
 	// (timeouts.directSmux still parses and applies) but are no longer read: the
@@ -2636,7 +2639,7 @@ func (pc *peerConn) ensureSession(punch bool, wait bool) (*smux.Session, error) 
 		// what makes the peer answer again — otherwise we would stay plaintext
 		// while it encrypts, and both mux sessions would churn. The loop ends the
 		// moment we settle, or once the deadline passes.
-		total := handshakeTimeout
+		total := time.Duration(handshakeTimeout.Load())
 		if pc.e.isGone(pc.peer) {
 			// The peer's relay dropped: it answers only if it is already back.
 			// Bound the whole attempt well under handshakeTimeout so an open to a
@@ -2790,7 +2793,12 @@ func (e *engine) reconnectRelay(cause error) {
 // rebuilding, so the peer's session (which dies on its own keepalive timeout
 // ~15s later) has also ended and the two tables do not diverge. Tests may
 // override this to a small value.
-var selfDeathRebuildDelay = 20 * time.Second
+//
+// Atomic for the same reason as resendInterval: a test overrides it while
+// other engines are live, and the peer's death handler reads it from the
+// engine's goroutine, so a plain var is a data race that takes the whole
+// package's -race run down with it.
+var selfDeathRebuildDelay = newAtomicDuration(20 * time.Second)
 
 func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 	if pc.sess != nil && pc.sess.IsClosed() {
@@ -2802,7 +2810,7 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 		if pc.deadSince.IsZero() {
 			pc.deadSince = time.Now()
 		}
-		if time.Since(pc.deadSince) < selfDeathRebuildDelay {
+		if time.Since(pc.deadSince) < time.Duration(selfDeathRebuildDelay.Load()) {
 			return nil, errRelaySessionStale
 		}
 		pc.sess = nil
@@ -2812,8 +2820,8 @@ func (pc *peerConn) sessionLocked() (*smux.Session, error) {
 		return pc.sess, nil
 	}
 	cfg := smux.DefaultConfig()
-	cfg.KeepAliveInterval = smuxKeepAliveInterval
-	cfg.KeepAliveTimeout = smuxKeepAliveTimeout
+	cfg.KeepAliveInterval = time.Duration(smuxKeepAliveInterval.Load())
+	cfg.KeepAliveTimeout = time.Duration(smuxKeepAliveTimeout.Load())
 	roleIsClient := bytes.Compare(pc.e.pub[:], pc.peer[:]) < 0
 	// KCP under the record layer, mirroring the direct plane's
 	// KCP -> secure -> smux stack: the relay is a lossy datagram path, and one

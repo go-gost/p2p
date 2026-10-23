@@ -128,7 +128,11 @@ const (
 // second miss. The same bound is the H1 "live direct" predicate (Task 0) and the
 // watchdog's fire threshold (Task 4). It is a var so tests can shorten it; the
 // production default is 6s.
-var directUnderlayIdle = 6 * time.Second
+//
+// Atomic for the same reason as resendInterval: the watchdog goroutines read
+// it while a test shortens it, and a test's shorten/restore must not race a
+// pair that outlived the test.
+var directUnderlayIdle = newAtomicDuration(6 * time.Second)
 
 // directOneWayWindow is how long a direct path must keep sending without
 // receiving anything before it is treated as one-way dead and re-punched.
@@ -137,7 +141,10 @@ var directUnderlayIdle = 6 * time.Second
 // receive-counter gap means the KCP plane is not returning anything at all, and
 // the window exists only to ride out a transient gap (a burst of retransmits
 // the peer's window could not accept yet, say).
-var directOneWayWindow = 60 * time.Second
+//
+// Atomic for the same reason as resendInterval: a test shortens it while
+// other engines are live, and the pair's pump reads it from its goroutine.
+var directOneWayWindow = newAtomicDuration(60 * time.Second)
 
 // directOneWayWindowEnv overrides directOneWayWindow at process start. It is a
 // debug/test affordance, not a deployment knob: an unset or unparseable value
@@ -160,7 +167,7 @@ func init() {
 			"env", directOneWayWindowEnv, "value", v)
 		return
 	}
-	directOneWayWindow = d
+	directOneWayWindow.Store(int64(d))
 	slog.Warn("direct one-way window overridden",
 		"env", directOneWayWindowEnv, "value", d.String(), "default", "1m0s")
 }
@@ -921,7 +928,7 @@ func (p *relayKCPPair) clearDirectUnderlayIf(want *directUnderlay, reason string
 		p.mu.Unlock()
 		return false
 	}
-	if reason == pathChangeDirectIdle && time.Since(p.lastDirectRecv) < directUnderlayIdle {
+	if reason == pathChangeDirectIdle && time.Since(p.lastDirectRecv) < time.Duration(directUnderlayIdle.Load()) {
 		// A datagram re-armed the path since the watchdog observed silence:
 		// not ours to retire.
 		p.mu.Unlock()
@@ -1038,7 +1045,7 @@ func (p *relayKCPPair) directOneWayDead(u *directUnderlay) bool {
 		p.oneWayU = u
 	}
 	p.oneWaySent, p.oneWayRcvd = sent, rcvd
-	if now.Sub(p.oneWayStart) < directOneWayWindow {
+	if now.Sub(p.oneWayStart) < time.Duration(directOneWayWindow.Load()) {
 		return false
 	}
 	// The shape held past the window: the path is declared dead, and the
@@ -1108,7 +1115,7 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 				p.mu.Lock()
 				silentFor := time.Since(p.lastDirectRecv)
 				p.mu.Unlock()
-				if silentFor >= directHeartbeatInterval {
+				if silentFor >= time.Duration(directHeartbeatInterval.Load()) {
 					u.sendHeartbeat()
 				}
 				// A live heartbeat answer means the underlay is healthy
@@ -1213,7 +1220,7 @@ func (p *relayKCPPair) pumpDirect(u *directUnderlay, stop <-chan struct{}) {
 // longer using.
 func (p *relayKCPPair) reportDirectIdle(u *directUnderlay) bool {
 	p.mu.Lock()
-	ok := p.direct == u && !p.closed && time.Since(p.lastDirectRecv) >= directUnderlayIdle
+	ok := p.direct == u && !p.closed && time.Since(p.lastDirectRecv) >= time.Duration(directUnderlayIdle.Load())
 	var ev *pathChangeEvent
 	if ok {
 		ev = p.applyPathTuningLocked(pathChangeDirectIdle)
@@ -1301,7 +1308,7 @@ func (p *relayKCPPair) preferredDirectLocked() bool {
 	if p.relayRetired {
 		return true
 	}
-	return time.Since(p.lastDirectRecv) < directUnderlayIdle
+	return time.Since(p.lastDirectRecv) < time.Duration(directUnderlayIdle.Load())
 }
 
 // pathName names the pair's current preferred path for stats and diagnostics:

@@ -30,12 +30,15 @@ func TestDirectKeepAliveCoversTheMeasuredSilence(t *testing.T) {
 // zero values keep defaults, invalid values are rejected, and a valid set is
 // applied to the package-level timing vars.
 func TestApplyTimeouts(t *testing.T) {
-	oldPunchWait, oldBackoff := punchWaitTimeout, backoffPeriod
-	oldI, oldT := smuxKeepAliveInterval, smuxKeepAliveTimeout
+	oldPunchWait := punchWaitTimeout
+	oldBackoff := backoffPeriod.Load()
+	oldI, oldT := smuxKeepAliveInterval.Load(), smuxKeepAliveTimeout.Load()
 	oldDI, oldDT := directSmuxKeepAliveInterval, directSmuxKeepAliveTimeout
 	t.Cleanup(func() {
-		punchWaitTimeout, backoffPeriod = oldPunchWait, oldBackoff
-		smuxKeepAliveInterval, smuxKeepAliveTimeout = oldI, oldT
+		punchWaitTimeout = oldPunchWait
+		backoffPeriod.Store(oldBackoff)
+		smuxKeepAliveInterval.Store(oldI)
+		smuxKeepAliveTimeout.Store(oldT)
 		directSmuxKeepAliveInterval, directSmuxKeepAliveTimeout = oldDI, oldDT
 	})
 
@@ -46,7 +49,7 @@ func TestApplyTimeouts(t *testing.T) {
 	if err := applyTimeouts(&p2p.TimeoutsConfig{}); err != nil {
 		t.Fatalf("zero: %v", err)
 	}
-	if punchWaitTimeout != oldPunchWait || smuxKeepAliveInterval != oldI || directSmuxKeepAliveInterval != oldDI {
+	if punchWaitTimeout != oldPunchWait || smuxKeepAliveInterval.Load() != oldI || directSmuxKeepAliveInterval != oldDI {
 		t.Fatal("zero config changed defaults")
 	}
 
@@ -68,7 +71,7 @@ func TestApplyTimeouts(t *testing.T) {
 	}
 	// A rejected direct block leaves the relay pair alone too: both are
 	// validated before either is applied.
-	if smuxKeepAliveInterval != oldI || smuxKeepAliveTimeout != oldT {
+	if smuxKeepAliveInterval.Load() != oldI || smuxKeepAliveTimeout.Load() != oldT {
 		t.Fatal("a rejected directSmux block changed the relay keepalive")
 	}
 
@@ -81,11 +84,11 @@ func TestApplyTimeouts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if punchWaitTimeout != 7*time.Second || backoffPeriod != 45*time.Second {
-		t.Fatalf("punchWait=%v backoff=%v", punchWaitTimeout, backoffPeriod)
+	if punchWaitTimeout != 7*time.Second || time.Duration(backoffPeriod.Load()) != 45*time.Second {
+		t.Fatalf("punchWait=%v backoff=%v", punchWaitTimeout, time.Duration(backoffPeriod.Load()))
 	}
-	if smuxKeepAliveInterval != 5*time.Second || smuxKeepAliveTimeout != 10*time.Second {
-		t.Fatalf("smux=%v/%v", smuxKeepAliveInterval, smuxKeepAliveTimeout)
+	if smuxKeepAliveInterval.Load() != int64(5*time.Second) || smuxKeepAliveTimeout.Load() != int64(10*time.Second) {
+		t.Fatalf("smux=%v/%v", time.Duration(smuxKeepAliveInterval.Load()), time.Duration(smuxKeepAliveTimeout.Load()))
 	}
 	if directSmuxKeepAliveInterval != time.Second || directSmuxKeepAliveTimeout != 3*time.Second {
 		t.Fatalf("directSmux=%v/%v", directSmuxKeepAliveInterval, directSmuxKeepAliveTimeout)

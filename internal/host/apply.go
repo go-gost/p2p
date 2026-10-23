@@ -56,7 +56,7 @@ func applyTimeouts(t *p2p.TimeoutsConfig) error {
 
 	// Resolve and validate both keepalive pairs before applying anything, so a
 	// rejected value never leaves half-applied state behind.
-	relayInterval, relayTimeout, err := resolveSmuxTimeouts(t.Smux, "smux", smuxKeepAliveInterval, smuxKeepAliveTimeout)
+	relayInterval, relayTimeout, err := resolveSmuxTimeouts(t.Smux, "smux", time.Duration(smuxKeepAliveInterval.Load()), time.Duration(smuxKeepAliveTimeout.Load()))
 	if err != nil {
 		return err
 	}
@@ -76,12 +76,13 @@ func applyTimeouts(t *p2p.TimeoutsConfig) error {
 		seedTimeout = t.Seed
 	}
 	if t.Backoff != 0 {
-		backoffPeriod = t.Backoff
+		backoffPeriod.Store(int64(t.Backoff))
 	}
 	if t.DerpKeepAlive != 0 {
 		keepAlivePeriod = t.DerpKeepAlive
 	}
-	smuxKeepAliveInterval, smuxKeepAliveTimeout = relayInterval, relayTimeout
+	smuxKeepAliveInterval.Store(int64(relayInterval))
+	smuxKeepAliveTimeout.Store(int64(relayTimeout))
 	directSmuxKeepAliveInterval, directSmuxKeepAliveTimeout = directInterval, directTimeout
 	return nil
 }

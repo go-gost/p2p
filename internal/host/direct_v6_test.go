@@ -249,7 +249,11 @@ func TestDirectV6FallbackToV4(t *testing.T) {
 	roundTrip(t, s, "hi")
 	s.Close()
 
-	waitFor(t, 10*time.Second, func() bool {
+	// The fallback is not a latency claim: each round tries v6 first and pays
+	// its seed timeout before v4, and the two sides' rounds drift apart, so a
+	// pair can need several rounds to meet on v4. Wait for the convergence,
+	// not for a particular round count.
+	waitFor(t, 30*time.Second, func() bool {
 		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
 	})
 	assertDirectFamily(t, engineA, pubB, false)

@@ -456,17 +456,18 @@ func TestEngineIdleStreamBridged(t *testing.T) {
 // failure doubles towards the punch backoff and never exceeds it. Assertions
 // derive from the ambient backoffPeriod (TestMain shortens it for the package).
 func TestLinkRetryDelay(t *testing.T) {
-	if got := channelRetryDelay(backoffPeriod, false); got != channelRetryMin {
+	backoff := time.Duration(backoffPeriod.Load())
+	if got := channelRetryDelay(backoff, false); got != channelRetryMin {
 		t.Fatalf("after a live stream: delay = %v, want %v (fast reconnect)", got, channelRetryMin)
 	}
-	if got, want := channelRetryDelay(channelRetryMin, true), min(2*channelRetryMin, backoffPeriod); got != want {
+	if got, want := channelRetryDelay(channelRetryMin, true), min(2*channelRetryMin, backoff); got != want {
 		t.Fatalf("first open failure: delay = %v, want %v", got, want)
 	}
-	if got := channelRetryDelay(backoffPeriod, true); got != backoffPeriod {
-		t.Fatalf("open failure at the cap: delay = %v, want %v", got, backoffPeriod)
+	if got := channelRetryDelay(backoff, true); got != backoff {
+		t.Fatalf("open failure at the cap: delay = %v, want %v", got, backoff)
 	}
-	if got := channelRetryDelay(backoffPeriod*4, true); got > backoffPeriod {
-		t.Fatalf("open failure grew past the cap: %v > %v", got, backoffPeriod)
+	if got := channelRetryDelay(backoff*4, true); got > backoff {
+		t.Fatalf("open failure grew past the cap: %v > %v", got, backoff)
 	}
 }
 
