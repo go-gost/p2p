@@ -320,14 +320,22 @@ func (e *engine) getDirect(peer derpclient.PublicKey) *directConn {
 	return e.directs[peer]
 }
 
-// directEnabled reports whether a punch has any candidate source: a configured
-// STUN server (IPv4), a usable global IPv6 egress, or an explicit v6 override.
+// directEnabled reports whether a punch could have a candidate source: a
+// configured STUN server (IPv4), or the IPv6 family's switch.
+//
+// The v6 *egress* is deliberately not required here. It is probed per round, so
+// an enabled family is a candidate source before the probe has found anything:
+// gating on a usable address would keep a v6-only host from ever starting the
+// round that discovers the egress — the DAD/DHCPv6-late case. A host with no
+// egress still punches, fails, and backs off, which is exactly the retry that
+// finds the egress when it appears.
+//
 // Side-effect free, so it is safe on the OpenStream/status paths.
 func (e *engine) directEnabled() bool {
 	if !e.direct {
 		return false
 	}
-	return e.stunAddr != "" || (e.v6Enabled && e.v6Usable())
+	return e.stunAddr != "" || e.v6Enabled
 }
 
 // relayConnected reports whether the relay connection is up: the punch's
