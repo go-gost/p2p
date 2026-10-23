@@ -1,3 +1,6 @@
 /p2p
 /p2p.exe
 /dist/
+
+# superpowers scratch (per-plan workspaces/ledgers)
+.superpowers/
