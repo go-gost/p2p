@@ -363,3 +363,29 @@ func TestV6ProbeAddrResolves(t *testing.T) {
 		t.Fatalf("v6ProbeAddr %q does not resolve: %v", v6ProbeAddr, err)
 	}
 }
+
+// TestDialForFamilyAndHairpin pins the per-family dial rule the punch used to
+// inline: v6 dials the peer's single egress ("first"), while v4 dials the
+// peer's public candidate ("last") unless both ends share a public address —
+// the hairpin case, where the peer's local candidate is the one that answers.
+func TestDialForFamilyAndHairpin(t *testing.T) {
+	v6 := []netip.AddrPort{netip.MustParseAddrPort("[2001:db8::5]:3478")}
+	peer := []netip.AddrPort{
+		netip.MustParseAddrPort("127.0.0.1:1111"),
+		netip.MustParseAddrPort("203.0.113.9:2222"),
+	}
+	if got := dialFor(&family{v6: true}, peer, v6); got != v6[0] {
+		t.Fatalf("v6 dial = %v, want %v", got, v6[0])
+	}
+	f := &family{mine: []candidate{
+		{addr: netip.MustParseAddrPort("198.51.100.1:1")},
+		{addr: netip.MustParseAddrPort("198.51.100.2:2")},
+	}}
+	if got := dialFor(f, peer, v6); got != peer[1] {
+		t.Fatalf("v4 dial = %v, want %v", got, peer[1])
+	}
+	f.mine[len(f.mine)-1].addr = netip.MustParseAddrPort("203.0.113.9:9999")
+	if got := dialFor(f, peer, v6); got != peer[0] {
+		t.Fatalf("hairpin dial = %v, want %v", got, peer[0])
+	}
+}

@@ -1270,12 +1270,6 @@ func (dc *directConn) punch() {
 	// 1. Collect one socket + candidate set per available family. A family that
 	// cannot be set up is dropped and the round continues on whatever remains,
 	// so an unreachable STUN server no longer aborts a v6-capable punch.
-	type family struct {
-		name string
-		v6   bool
-		sock *net.UDPConn
-		mine []candidate
-	}
 	var fams []family
 	if e.stunAddr != "" {
 		if sock, mine, err := e.collectV4(); err != nil {
@@ -1415,19 +1409,7 @@ func (dc *directConn) punch() {
 	// there is no separate direct secure gate here.
 	for _, idx := range order {
 		f := &fams[idx]
-		var dial netip.AddrPort
-		if f.v6 {
-			// Both sides advertise their single egress address, so "first" is
-			// unambiguous.
-			dial = peerV6[0]
-		} else {
-			// Same hairpin rule as before: prefer the peer's public address,
-			// but dial its local one when both share a NAT (same public IP).
-			dial = peerV4[len(peerV4)-1]
-			if len(peerV4) > 1 && f.mine[len(f.mine)-1].addr.Addr() == dial.Addr() {
-				dial = peerV4[0]
-			}
-		}
+		dial := dialFor(f, peerV4, peerV6)
 		e.log.Debug("direct punch: seed", "peer", pname, "family", f.name, "addr", dial.String())
 		dc.noteRound("%s seed %s", f.name, dial.String())
 		out, err := seedHandshakeUDPToken(f.sock, dial, seedTimeout)
@@ -1471,6 +1453,32 @@ func (dc *directConn) punch() {
 	// Every available family failed this round.
 	closeFams()
 	dc.backoff()
+}
+
+// family is one address family's attempt in a punch round: the socket it
+// punched on, the candidates it announced, and the word the trace and the logs
+// use for it. A round has at most one v4 and one v6 family.
+type family struct {
+	name string
+	v6   bool
+	sock *net.UDPConn
+	mine []candidate
+}
+
+// dialFor picks the peer endpoint a family's seed handshake dials. IPv6 peers
+// advertise a single egress address, so "first" is unambiguous. IPv4 prefers
+// the peer's public candidate, except when both ends sit behind the same public
+// address (the hairpin case): there the peer's local candidate is the one that
+// answers, because a NAT rarely hairpins its own mapping back.
+func dialFor(f *family, peerV4, peerV6 []netip.AddrPort) netip.AddrPort {
+	if f.v6 {
+		return peerV6[0]
+	}
+	dial := peerV4[len(peerV4)-1]
+	if len(peerV4) > 1 && f.mine[len(f.mine)-1].addr.Addr() == dial.Addr() {
+		dial = peerV4[0]
+	}
+	return dial
 }
 
 // seedHandshakeUDP runs the raw-UDP token-echo seed handshake and discards the
