@@ -50,7 +50,9 @@ type engine struct {
 	direct      bool                                   // master direct switch (--direct); false = relay-only
 	stunAddr    string                                 // STUN server (host:port); "" disables the IPv4 direct path
 	v6Addr      *net.UDPAddr                           // explicit IPv6 egress override (tests); nil = probe each round
-	v6Available bool                                   // host had a global IPv6 egress at startup (gates direct)
+	v6Enabled   bool                                   // Config.IPv6: the IPv6 family is opt-in (off by default)
+	v6Probe     func() *net.UDPAddr                    // egress probe; v6Egress, injectable for tests
+	v6Available bool                                   // last round's egress probe found a global IPv6 address (status)
 	v6Announce  v6AnnounceFunc                         // test seam: overrides the advertised IPv6 endpoint
 	openStream  func(peerB64 string) (net.Conn, error) // test seam: overrides OpenStream for link presentation
 	tlsCfg      *tls.Config                            // relay TLS options; nil = default verification
@@ -493,12 +495,52 @@ func encryptionState(pc *peerConn) string {
 // the engine's fields.
 func (e *engine) directConfig() p2p.DirectConfig {
 	return p2p.DirectConfig{
-		Direct:     e.direct,
-		Stun:       e.stunAddr,
-		StunFailed: e.stunFailed.Load(),
-		IPv6:       e.v6Available || e.v6Addr != nil,
-		Reason:     e.directReason(),
+		Direct:      e.direct,
+		Stun:        e.stunAddr,
+		StunFailed:  e.stunFailed.Load(),
+		IPv6:        e.v6Enabled && e.v6Usable(),
+		IPv6Enabled: e.v6Enabled,
+		Reason:      e.directReason(),
 	}
+}
+
+// v6Usable reports whether the IPv6 family has a source address to work with
+// this round: an explicit override (tests) or the egress the last probe found.
+// The caller still checks v6Enabled; this is the address half of the question.
+func (e *engine) v6Usable() bool { return e.v6Addr != nil || e.v6Available }
+
+// resolveV6 resolves this round's IPv6 source, or nil when the family is off
+// or the host has no global IPv6 egress. The probe runs every round while the
+// family is enabled, so an egress that appears or disappears (DAD finishing,
+// DHCPv6 arriving late, a laptop moving between v6 networks) is picked up by
+// the next attempt without a restart; v6Available is only the status of the
+// last probe.
+func (e *engine) resolveV6() *net.UDPAddr {
+	if !e.v6Enabled {
+		return nil
+	}
+	if e.v6Addr != nil {
+		e.v6Available = true
+		return e.v6Addr
+	}
+	probe := e.v6Probe
+	if probe == nil {
+		probe = v6Egress
+	}
+	v6 := probe()
+	e.v6Available = v6 != nil
+	return v6
+}
+
+// caps returns the capability bits this host advertises. The IPv6 bit is a
+// statement about what this host can use right now: a host that has the family
+// off, or has it on without an egress, must not claim it.
+func (e *engine) caps() uint8 {
+	var caps uint8
+	if e.v6Enabled && e.v6Usable() {
+		caps |= capsIPv6
+	}
+	return caps
 }
 
 // directReason names what stands between this host and a direct path when
@@ -510,7 +552,7 @@ func (e *engine) directReason() string {
 	if !e.direct {
 		return transportDisabled
 	}
-	hasV6 := e.v6Addr != nil || e.v6Available
+	hasV6 := e.v6Enabled && e.v6Usable()
 	switch {
 	case e.stunAddr == "" && !hasV6:
 		return transportNoCandidates
@@ -846,6 +888,7 @@ func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger)
 		gone:      make(map[derpclient.PublicKey]bool),
 		secure:    make(map[secureKey]*secureSession),
 		relayKCPs: make(map[derpclient.PublicKey]*relayKCPPair),
+		v6Probe:   v6Egress,
 		log:       log,
 		stop:      make(chan struct{}),
 	}

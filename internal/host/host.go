@@ -78,6 +78,7 @@ func New(cfg *p2p.Config, opts ...Option) (*Host, error) {
 		}
 		h.engine.direct = *cfg.Direct
 		h.engine.stunAddr = cfg.Stun
+		h.engine.v6Enabled = cfg.IPv6
 		h.engine.tlsCfg = buildTLSConfig(*cfg.TLS.Secure, cfg.TLS.CAFile, h.log)
 		// Debug-only fault injection (p2p.FaultsConfig). Stub mode has no relay
 		// or direct plane to break, so the state lives on the engine alone.
@@ -107,10 +108,11 @@ func New(cfg *p2p.Config, opts ...Option) (*Host, error) {
 func (h *Host) Connect() error {
 	h.prepareOnce.Do(func() {
 		if h.engine != nil {
-			if *h.cfg.Direct {
-				// Probe once to gate direct; each punch round re-probes, so a
-				// changed egress does not require a restart.
-				h.engine.v6Available = v6Egress() != nil
+			if *h.cfg.Direct && h.engine.v6Enabled {
+				// Probe once so the startup line can report an egress; each
+				// punch round re-probes, so a changed egress does not require a
+				// restart.
+				h.engine.v6Available = h.engine.resolveV6() != nil
 			}
 			// The effective direct configuration, once, in a form a reader can
 			// copy: every "why is this host not punching" question comes down to
@@ -122,7 +124,7 @@ func (h *Host) Connect() error {
 				"on", *h.cfg.Direct,
 				"stun", h.engine.stunAddr,
 				"stunFailed", h.engine.stunFailed.Load(),
-				"ipv6", h.engine.v6Available || h.engine.v6Addr != nil)
+				"ipv6", h.engine.v6Enabled && h.engine.v6Usable())
 			h.prepareErr = h.engine.Connect()
 		}
 		for _, f := range h.cfg.Forwards {

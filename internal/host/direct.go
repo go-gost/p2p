@@ -327,7 +327,7 @@ func (e *engine) directEnabled() bool {
 	if !e.direct {
 		return false
 	}
-	return e.stunAddr != "" || e.v6Addr != nil || e.v6Available
+	return e.stunAddr != "" || (e.v6Enabled && e.v6Usable())
 }
 
 // relayConnected reports whether the relay connection is up: the punch's
@@ -1283,14 +1283,10 @@ func (dc *directConn) punch() {
 			fams = append(fams, family{name: "v4", sock: sock, mine: mine})
 		}
 	}
-	// Resolve the IPv6 source for this round: an explicit override wins (tests),
-	// otherwise re-probe — an egress that appeared or changed since startup is
-	// then picked up on the next backoff retry without a restart.
-	v6 := e.v6Addr
-	if v6 == nil && e.v6Available {
-		v6 = v6Egress()
-	}
-	if v6 != nil {
+	// Resolve the IPv6 source for this round. The family is opt-in and the
+	// egress is re-probed every round: an egress that appeared or changed since
+	// startup is picked up without a restart (see resolveV6).
+	if v6 := e.resolveV6(); v6 != nil {
 		if sock, mine, err := e.collectV6(v6); err != nil {
 			e.log.Debug("direct punch: v6 unavailable", "peer", pname, "error", err)
 		} else {
@@ -1327,7 +1323,7 @@ func (dc *directConn) punch() {
 	// The direct underlay rides the pair's existing secure session (tag 0x00,
 	// negotiated with the relay session); there is no separate direct secure
 	// session to negotiate or rekey (Task 9 removes the direct half entirely).
-	if err := e.sendCaps(dc.peer, capsIPv6); err != nil {
+	if err := e.sendCaps(dc.peer, e.caps()); err != nil {
 		e.log.Debug("direct punch: send caps failed", "peer", pname, "error", err)
 	}
 	if err := e.sendCandidates(dc.peer, mine); err != nil {

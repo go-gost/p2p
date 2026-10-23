@@ -323,7 +323,7 @@ func TestReportDirectConfig(t *testing.T) {
 		"direct path:", "on",
 		"direct config:", "on=true",
 		"derp.example:3478", "(does not answer)",
-		"ipv6=false",
+		"ipv6=off",
 		"direct reason:", "stun-unreachable",
 	} {
 		if !strings.Contains(out, want) {
@@ -474,5 +474,29 @@ func TestReportMentionsRelaySilentStrikes(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("report missing the two-strike rule %q\n---\n%s", want, out)
 		}
+	}
+}
+
+// TestReportDirectConfigIPv6States: the direct-config line tells a host that
+// turned IPv6 off apart from one that turned it on and found no egress. The
+// two look identical from the outside (no v6 candidates either way), so the
+// report has to name which one is in play or the reader debugs the wrong one.
+func TestReportDirectConfigIPv6States(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  p2p.DirectConfig
+		want string
+	}{
+		{name: "off", cfg: p2p.DirectConfig{Direct: true}, want: "ipv6=off"},
+		{name: "on without egress", cfg: p2p.DirectConfig{Direct: true, IPv6Enabled: true}, want: "ipv6=on (no egress)"},
+		{name: "on", cfg: p2p.DirectConfig{Direct: true, IPv6Enabled: true, IPv6: true}, want: "ipv6=on\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := Report(p2p.Status{DirectConfig: tc.cfg}, Options{InProcess: true})
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("the report is missing %q:\n%s", tc.want, out)
+			}
+		})
 	}
 }

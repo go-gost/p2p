@@ -37,6 +37,7 @@ func startV6Engines(t *testing.T, stunA, stunB string) (a, b *engine, pubB derpc
 	a = newEngine(url, "", privA, slog.Default())
 	b = newEngine(url, echo, privB, slog.Default())
 	a.stunAddr, b.stunAddr = startFakeSTUN(t, stunA), startFakeSTUN(t, stunB)
+	a.v6Enabled, b.v6Enabled = true, true
 	a.v6Addr, b.v6Addr = loopbackV6(), loopbackV6()
 	t.Cleanup(func() {
 		a.Close()

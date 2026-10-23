@@ -16,10 +16,15 @@ type Config struct {
 	// with "./". Relay mode needs a key; stub mode does not.
 	Key string `yaml:"key,omitempty"`
 	// Target is the default forwarding target for inbound connections.
-	Target   string          `yaml:"target,omitempty"`
-	Targets  []string        `yaml:"targets,omitempty"`
-	Stun     string          `yaml:"stun,omitempty"`
-	Direct   *bool           `yaml:"direct,omitempty"`
+	Target  string   `yaml:"target,omitempty"`
+	Targets []string `yaml:"targets,omitempty"`
+	Stun    string   `yaml:"stun,omitempty"`
+	Direct  *bool    `yaml:"direct,omitempty"`
+	// IPv6 enables the IPv6 direct-path family: the egress probe, the v6
+	// candidate collection and the v6 capability bit. Off by default, so a host
+	// never looks for, advertises or dials an IPv6 path unless its operator
+	// asked for one.
+	IPv6     bool            `yaml:"ipv6,omitempty"`
 	TLS      *TLSConfig      `yaml:"tls,omitempty"`
 	Timeouts *TimeoutsConfig `yaml:"timeouts,omitempty"`
 	Forwards []ForwardConfig `yaml:"forwards,omitempty"`

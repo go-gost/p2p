@@ -2137,7 +2137,10 @@ func TestDirectPunchStaggeredStart(t *testing.T) {
 	// B starts late; its candidates reach A mid-wait, and A must answer.
 	engineB.maybeStartDirect(engineA.pub)
 
-	waitFor(t, 5*time.Second, func() bool {
+	// Convergence, not latency: A's first round can sit out punchTimeout's
+	// candidate wait before B exists, and the retry then has to run, so the
+	// budget covers a failed round plus a successful one with room to spare.
+	waitFor(t, 10*time.Second, func() bool {
 		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
 	})
 

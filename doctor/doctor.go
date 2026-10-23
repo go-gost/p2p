@@ -96,8 +96,15 @@ func Report(st p2p.Status, opts Options) string {
 		default:
 			stun += " (answered)"
 		}
-		field(&b, "direct config", fmt.Sprintf("on=%v, stun=%s, ipv6=%v",
-			c.Direct, stun, c.IPv6))
+		ipv6 := "off"
+		switch {
+		case c.IPv6Enabled && c.IPv6:
+			ipv6 = "on"
+		case c.IPv6Enabled:
+			ipv6 = "on (no egress)"
+		}
+		field(&b, "direct config", fmt.Sprintf("on=%v, stun=%s, ipv6=%s",
+			c.Direct, stun, ipv6))
 		if c.Reason != "" {
 			field(&b, "direct reason", c.Reason)
 		}

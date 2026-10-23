@@ -1013,6 +1013,7 @@ func TestPeerTransportReasons(t *testing.T) {
 		{"STUN silent", func(e *engine) { e.stunFailed.Store(true) }, transportStunUnreachable},
 		{"STUN silent but IPv6 exists", func(e *engine) {
 			e.stunFailed.Store(true)
+			e.v6Enabled = true
 			e.v6Available = true
 		}, transportRelay},
 		{"peer has the direct path off", func(e *engine) {

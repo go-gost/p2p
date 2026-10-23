@@ -208,8 +208,14 @@ type DirectConfig struct {
 	Stun string
 	// StunFailed is whether the last IPv4 candidate collection failed.
 	StunFailed bool
-	// IPv6 is whether a usable global IPv6 egress was found (or configured).
+	// IPv6 is whether a usable global IPv6 egress was found (or configured)
+	// and the IPv6 family is enabled: the effective answer to "is this host
+	// using v6?".
 	IPv6 bool
+	// IPv6Enabled is Config.IPv6: whether the operator asked for the IPv6
+	// family at all. A host with this true and IPv6 false is not misconfigured
+	// — it simply found no egress.
+	IPv6Enabled bool
 	// Reason is the host-wide transport word: "disabled", "no-candidates",
 	// "stun-unreachable", or "" while a punch is possible.
 	Reason string
