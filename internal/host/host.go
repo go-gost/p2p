@@ -111,8 +111,8 @@ func (h *Host) Connect() error {
 			if *h.cfg.Direct && h.engine.v6Enabled {
 				// Probe once so the startup line can report an egress; each
 				// punch round re-probes, so a changed egress does not require a
-				// restart.
-				h.engine.v6Available = h.engine.resolveV6() != nil
+				// restart. resolveV6 keeps the result itself.
+				h.engine.resolveV6()
 			}
 			// The effective direct configuration, once, in a form a reader can
 			// copy: every "why is this host not punching" question comes down to

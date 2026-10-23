@@ -1014,7 +1014,7 @@ func TestPeerTransportReasons(t *testing.T) {
 		{"STUN silent but IPv6 exists", func(e *engine) {
 			e.stunFailed.Store(true)
 			e.v6Enabled = true
-			e.v6Available = true
+			e.v6Available.Store(true)
 		}, transportRelay},
 		{"peer has the direct path off", func(e *engine) {
 			// A prior round failed, and the peer then advertised that its direct

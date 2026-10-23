@@ -10,6 +10,7 @@ package host
 import (
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -48,7 +49,7 @@ func TestIPv6OnProbesEveryRound(t *testing.T) {
 	if got := e.resolveV6(); got != nil {
 		t.Fatalf("first round resolved %v, want no egress", got)
 	}
-	if e.v6Available {
+	if e.v6Available.Load() {
 		t.Fatal("v6Available = true after a round that found no egress")
 	}
 	if got := e.caps(); got&capsIPv6 != 0 {
@@ -57,7 +58,7 @@ func TestIPv6OnProbesEveryRound(t *testing.T) {
 	if got := e.resolveV6(); got == nil || !got.IP.Equal(net.IPv6loopback) {
 		t.Fatalf("second round resolved %v, want the egress that appeared", got)
 	}
-	if !e.v6Available {
+	if !e.v6Available.Load() {
 		t.Fatal("v6Available = false after a round that found an egress")
 	}
 	if got := e.caps(); got&capsIPv6 == 0 {
@@ -135,5 +136,70 @@ func TestIPv6ConfigDefaultsOff(t *testing.T) {
 	}
 	if !h.engine.v6Enabled {
 		t.Fatal("ipv6: true did not reach the engine")
+	}
+}
+
+// TestV6AvailableIsRaceFree pins the concurrency contract of the per-round
+// probe: resolveV6 writes the egress result from the punch goroutine while the
+// status and control paths read it. Before the switch existed the field was
+// written once at Connect, so a plain bool was fine; now it is written every
+// round and must be atomic. Meaningless without -race, where it is the gate.
+func TestV6AvailableIsRaceFree(t *testing.T) {
+	e := newTestEngine(t)
+	e.v6Enabled = true
+	e.v6Probe = func() *net.UDPAddr { return &net.UDPAddr{IP: net.IPv6loopback} }
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			e.resolveV6()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			_ = e.directConfig()
+			_ = e.directEnabled()
+			_ = e.caps()
+		}
+	}()
+	wg.Wait()
+}
+
+// TestIPv6OnlyHostPunchesBeforeAnEgressAppears: a host with no STUN server and
+// the IPv6 family enabled must be allowed to punch while no egress exists yet.
+// If the punch gate asks for a *usable* source, nothing ever triggers a round,
+// the per-round probe never runs, and the egress that appears after startup
+// (DAD finishing, DHCPv6 arriving, a laptop moving onto a v6 network) is never
+// picked up — the very case the per-round probe exists for.
+func TestIPv6OnlyHostPunchesBeforeAnEgressAppears(t *testing.T) {
+	e := newTestEngine(t)
+	e.direct = true
+	e.stunAddr = ""
+	e.v6Enabled = true
+	var up atomic.Bool
+	e.v6Probe = func() *net.UDPAddr {
+		if up.Load() {
+			return &net.UDPAddr{IP: net.IPv6loopback}
+		}
+		return nil
+	}
+	if got := e.resolveV6(); got != nil {
+		t.Fatalf("resolveV6 = %v with no egress, want nil", got)
+	}
+	if !e.directEnabled() {
+		t.Fatal("a v6-enabled host must be allowed to punch while it waits for an egress")
+	}
+	up.Store(true)
+	if got := e.resolveV6(); got == nil {
+		t.Fatal("the egress that appeared after startup was not picked up")
+	}
+	if !e.directEnabled() {
+		t.Fatal("a v6-enabled host with a usable egress must punch")
+	}
+	if got, want := e.directReason(), ""; got != want {
+		t.Fatalf("directReason = %q, want %q once the egress is usable", got, want)
 	}
 }

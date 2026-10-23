@@ -52,7 +52,7 @@ type engine struct {
 	v6Addr      *net.UDPAddr                           // explicit IPv6 egress override (tests); nil = probe each round
 	v6Enabled   bool                                   // Config.IPv6: the IPv6 family is opt-in (off by default)
 	v6Probe     func() *net.UDPAddr                    // egress probe; v6Egress, injectable for tests
-	v6Available bool                                   // last round's egress probe found a global IPv6 address (status)
+	v6Available atomic.Bool                            // last round's egress probe found a global IPv6 address (status)
 	v6Announce  v6AnnounceFunc                         // test seam: overrides the advertised IPv6 endpoint
 	openStream  func(peerB64 string) (net.Conn, error) // test seam: overrides OpenStream for link presentation
 	tlsCfg      *tls.Config                            // relay TLS options; nil = default verification
@@ -507,7 +507,7 @@ func (e *engine) directConfig() p2p.DirectConfig {
 // v6Usable reports whether the IPv6 family has a source address to work with
 // this round: an explicit override (tests) or the egress the last probe found.
 // The caller still checks v6Enabled; this is the address half of the question.
-func (e *engine) v6Usable() bool { return e.v6Addr != nil || e.v6Available }
+func (e *engine) v6Usable() bool { return e.v6Addr != nil || e.v6Available.Load() }
 
 // resolveV6 resolves this round's IPv6 source, or nil when the family is off
 // or the host has no global IPv6 egress. The probe runs every round while the
@@ -520,7 +520,7 @@ func (e *engine) resolveV6() *net.UDPAddr {
 		return nil
 	}
 	if e.v6Addr != nil {
-		e.v6Available = true
+		e.v6Available.Store(true)
 		return e.v6Addr
 	}
 	probe := e.v6Probe
@@ -528,7 +528,7 @@ func (e *engine) resolveV6() *net.UDPAddr {
 		probe = v6Egress
 	}
 	v6 := probe()
-	e.v6Available = v6 != nil
+	e.v6Available.Store(v6 != nil)
 	return v6
 }
 
