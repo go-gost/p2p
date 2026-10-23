@@ -21,7 +21,14 @@
 
 1. **v6 候选取自单一出口地址**,不用 STUN——v6 无地址转换,绑定并广播该出口地址即可达,且发送源确定(kcp 严格源过滤要求「回包源 == 被拨候选」)。生产用 `detectV6Egress()` 做一次路由探测(向全局 v6 目标 `DialUDP`,不发包)取出口;无全局 v6 则不打 v6。
 2. **v6 独立于 `--stun` 启用**:有可用 v6 候选就尝试直连,无需配置 STUN。
+   > **2026-10-23 起改为 opt-in**:还需 `ipv6: true`(默认关闭;CLI 是 `--ipv6`)。
+   > `--stun` 仍与 v6 无关,但「有 egress 就自动用」变成了「开了才探测」,
+   > 且每轮重探(启动时没有 v6 也能在之后用上)。
+   > 见 `docs/2026-10-23-p2p-ipv6-preference-design.md`。
 3. **同轮内换族重试**:首选族 seed 失败 → 立即用另一族重试同一轮。两族各用各的 socket,不违反 kcp「一 socket 一 session」约束;单向可达的 v6 会被 `seedHandshake` 挡住(它要求 own→peer→own 完整往返),**两侧同时判败 → 同时退到 v4 → 收敛**。跨轮降级记忆已否决(单侧 v6 坏时两侧选择会不一致)。
+   > **2026-10-23 起改为并发**:两族同时起飞,v6 仍严格优先(v4 先成功也要等 v6 的结论)。
+   > 「两侧同时判败 → 同时退到 v4」这个前提不成立:两侧轮次一错开,v4 窗口就永远不重叠,
+   > 两侧的 v4 seed 会一直互相超时。见 `docs/2026-10-23-p2p-ipv6-preference-design.md`。
 4. **能力协商作为前瞻接缝**(而非「无应答就重发」):新增 `ctrlCaps` 控制帧,sealed 能力位域,可重复广播、对端按位 OR——为将来的**破坏性**扩展留协商入口。**但 v6 不依赖它门控**:候选列表本身就是 in-band 的能力信号,族选择只看候选列表(见「族选择」)。依据:已核实 family 6 的 `decodeCandidates` 与 `ipv4Addrs` 过滤在 `v0.1.0`/`v0.2.0` 均已存在(`ecfb9d4` 同时含两个 tag),旧 host 收到 v6 候选只会解码后丢弃,不报错;故发送 v6 候选本就向后兼容,无需先确认。
 
 ## 设计
@@ -29,7 +36,7 @@
 ### 候选收集
 
 - **v4(保持原样,但改为可选)**:仅当 `e.stunAddr != ""` 时,`net.ListenUDP("udp4", bindAddrFor(e.stunAddr))` + `stun.Lookup` → `[localEP, pubEP]` 去重。**STUN 失败不再直接 `backoff()`**:若此时有 v6 候选,则本轮丢弃 v4 族(关 socket、记日志)继续走 v6。
-- **v6(新)**:`detectV6Egress() *net.UDPAddr` —— 向一个全局 v6 目标做一次 `DialUDP`(仅路由探测、不发包)取本机出口源地址;无路由 / 无 v6 栈则返回 nil。`net.ListenUDP("udp6", &net.UDPAddr{IP: egress.IP})` **绑定该出口**、广播 `socket.LocalAddr()` —— 源地址确定,`kcp` 严格源过滤能匹配回包。测试通过注入 `e.v6Addr = ::1` 提供 v6(真机不广播 loopback/ULA;`detectV6Egress` 已排除 unspecified/loopback/link-local)。
+- **v6(新,2026-10-23 起 opt-in)**:`detectV6Egress() *net.UDPAddr` —— 向一个全局 v6 目标做一次 `DialUDP`(仅路由探测、不发包)取本机出口源地址;无路由 / 无 v6 栈则返回 nil。`net.ListenUDP("udp6", &net.UDPAddr{IP: egress.IP})` **绑定该出口**、广播 `socket.LocalAddr()` —— 源地址确定,`kcp` 严格源过滤能匹配回包。测试通过注入 `e.v6Addr = ::1` 提供 v6(真机不广播 loopback/ULA;`detectV6Egress` 已排除 unspecified/loopback/link-local)。
 - `mine` 仍是单个 `[]candidate`(v4 在前,日志对齐)。
 - `encodeCandidates`(direct.go:605)按 `c.Addr()` 的族写 `4`/`6`,分别 `As4()`/`As16()`;`decodeCandidates` 不动。
 
