@@ -116,8 +116,10 @@ price of a relay fallback and a re-punch.
 ## Direct path
 
 `Config.Direct` (nil = on) attempts a hole-punched path and falls back to the
-relay; `Config.Stun` (host:port) is the IPv4 candidate source, and the IPv6 path
-needs no STUN. `endpoint.StunLookup(ctx, addr)` probes a STUN server the way the
+relay; `Config.Stun` (host:port) is the IPv4 candidate source. `Config.IPv6`
+(default **false**) enables the IPv6 family: the egress probe, the v6 candidates
+and the v6 capability bit are all gated on it, so an embedder that wants v6 must
+ask for it — v6 does not use STUN, and the egress is re-probed every round. `endpoint.StunLookup(ctx, addr)` probes a STUN server the way the
 engine does — it returns the public address the server sees, which is what a
 punch needs — so an embedder can validate a `Stun` value before starting:
 

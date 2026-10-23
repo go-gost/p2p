@@ -53,7 +53,8 @@ go build -o p2p ./cmd/p2p
 | `--key` | `$XDG_CONFIG_HOME/p2p/key-v1` | identity: 64-character hex key or key file path; a missing file is created by this command |
 | `--target` | *(empty)* | inbound bridge target (repeatable; bare `"host:port"` feeds the tcp pool, `"udp://host:port"` the udp pool; DERP mode) |
 | `--forward` | *(empty)* | static port forward `"listen-addr=peer-key"` (repeatable; DERP mode) |
-| `--stun` | *(empty)* | STUN server (host:port) for the IPv4 direct path; IPv6 direct works without STUN |
+| `--stun` | *(empty)* | STUN server (host:port) for the IPv4 direct path; IPv6 does not use STUN |
+| `--ipv6` | `false` | enable the IPv6 direct-path family (needs a global IPv6 egress); off by default |
 | `--direct` | `true` | attempt a direct (hole-punched) path; `false` forces relay-only |
 | `--tls.secure` | `true` | verify the relay's TLS certificate (`false` to trust any cert) |
 | `--tls.caFile` | *(empty)* | PEM CA file to trust the relay's self-signed certificate |
@@ -290,7 +291,9 @@ When both peers are in engine mode, the relay is only used to establish the firs
 
 The punch is **symmetric**: both peers dial the peer's candidate with the same deterministic KCP conv (mutual simultaneous open), and a session is only used once **both** sides complete the echo handshake — each peer must see its own token round-trip, so a half-open path can never produce a "false direct" session. This removes the old "one side dials, the other accepts" asymmetry, which failed when only one direction could be punched (e.g. a peer inside a k3s pod whose inbound UDP needs the peer to have sent first).
 
-On success new tunnels open streams over the direct smux session (KCP + smux); the relay session stays up so a direct-path failure silently falls back to relay and re-punches. The direct path keeps working even if the relay drops — only a *new* punch needs the relay back. A static `--forward` warms its peer's direct path at startup when `--stun` is set, so the first connection skips the punch latency. Direct is on by default (`--direct=false` forces relay-only). IPv6 is a first-class candidate family: a host with a global IPv6 egress binds and advertises that address (no STUN, no NAT), and both peers prefer IPv6 when both offer it, retrying IPv4 in the same round if the v6 path does not complete.
+On success new tunnels open streams over the direct smux session (KCP + smux); the relay session stays up so a direct-path failure silently falls back to relay and re-punches. The direct path keeps working even if the relay drops — only a *new* punch needs the relay back. A static `--forward` warms its peer's direct path at startup when `--stun` is set, so the first connection skips the punch latency. Direct is on by default (`--direct=false` forces relay-only). IPv6 is a first-class candidate family, but it is **opt-in**: with `--ipv6` (or `ipv6: true` in the config) a host binds and advertises its global v6 egress (no STUN, no NAT), and only then does it offer v6 candidates at all. It is off by default, so a host never probes for, advertises or dials v6 unless asked. The egress is re-probed every round, so an address that appears after startup (DAD finishing, DHCPv6 arriving late, a laptop moving onto a v6 network) is picked up without a restart.
+
+When both peers offer IPv6, both families are dialled **at the same time** and v6 wins whenever its echo handshake completes — a completed v4 handshake is held until v6 has reported a failure. Running them concurrently is what stops a blind v6 from starving v4: attempted one after the other, each side spent its seed timeout on v6 before dialling v4, so two peers whose v6 paths were both blind could keep their v4 windows offset and never meet at all.
 
 Timings are tunable from the config file only (not flags); unset values keep the defaults, and invalid values fail at startup:
 
@@ -487,7 +490,7 @@ host:            127.0.0.1:8003
 local key:       7D3hUOuIcplL3CCSjsiyIqolF6AkdiXqcdAUZgQzkEs
 relay:           wss://derp.example.com/derp
 relay state:     connected
-direct config:   on=true, stun=stun.example.com:3478 (answered), ipv6=true
+direct config:   on=true, stun=stun.example.com:3478 (answered), ipv6=on
 
 summary:
   tunnels:       0
