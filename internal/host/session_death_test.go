@@ -300,16 +300,32 @@ func TestDeathReportRacingKillStandsDown(t *testing.T) {
 		t.Fatal("handler/kill race did not finish: suspected deadlock")
 	}
 
-	total := capture.count("peer relay session ended") + capture.count("peer session killed")
-	if total == 0 || total > 100 {
-		t.Fatalf("ended + killed lines = %d, want in (0, 100]: every death accounted for, none invented", total)
+	// 50 reports run against a live adapter and log one ended line apiece, so
+	// the deaths are accounted for. On top of those a session's Close wakes its
+	// parked accept loop, which reports the same death again — deduped, but
+	// logged, because the line is the event the silent window never had (see
+	// peerRelaySessionEnded, and TestDuplicateDeathReportIsIdempotent, which
+	// pins that echo). At most one echo lands here: buildRelaySession's, since
+	// every kill that ends a later adapter also drops it from e.secure, and a
+	// report that finds no live adapter logs nothing. Counting the echo against
+	// the reports is what made this test flaky at exactly 101 lines: the echo
+	// is a stand-down record, not an invented death.
+	ended := capture.count("peer relay session ended")
+	if ended > 51 {
+		t.Fatalf("ended lines = %d, want <= 51: 50 reports plus at most one deduped echo", ended)
+	}
+	kills := capture.count("peer session killed")
+	if kills > 50 {
+		t.Fatalf("killed lines = %d, want <= 50: one kill per iteration, repeats on a closed adapter log nothing", kills)
+	}
+	if total := ended + kills; total == 0 {
+		t.Fatal("no death was logged at all: the race left the logs silent")
 	}
 	// Every rebuild line has a cause: an accepted report's single ensureSession
 	// call, or a dead adapter left by an effective kill (whose replacement
 	// logs the rebuild on the next lookup — repeat kills on a closed adapter
 	// return early and log nothing). A kill racing an accepted report can
 	// never conjure a rebuild from neither: kills resurrect nothing.
-	kills := capture.count("peer session killed")
 	if got := capture.count("relay session rebuilt"); got > accepted+kills {
 		t.Fatalf("rebuilt lines = %d, accepted reports + kills = %d: a rebuild without a cause", got, accepted+kills)
 	}
