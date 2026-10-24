@@ -225,7 +225,7 @@ e2e（T13）不只验「迁移发生了」：在一次真实切换（含注入�
 3. 胜出：`registerDirectUnderlay(sock, peer)` 注册 direct；`lastRecv=now` → preferred=direct。
 4. pair 的后续 KCP 段走 direct；relay underlay 仍被双读（只为回落与统计）。
 5. direct 死：`lastRecv` 老化 > 6 s → unregister + preferred=relay + re-punch。KCP 在 relay 上重传在途段；上层无感。
-6. relay 链路丢失但 direct 活：只 unregister relay underlay，pair/secure/epoch 保留，流继续（H1）。
+6. relay 链路丢失但 direct 活：只 unregister relay underlay，pair/secure/epoch 保留，流继续（H1）。**mux 会话也必须保留**：peer-gone 只注销 relay 半边，不杀 adapter、不换 mux —— 换 mux 会在同一条 pair KCP 流上再叠一个 mux，对端还握着旧的，新 secure reader 从记录中间读即 desync（2026-10-24，见 `peerGone` 的 liveDirect 分支与 `TestPeerGoneKeepsTheMuxWhenDirectIsLive`）。
 7. relay 重连：重新 `register` relay underlay，pair 不变。
 
 ## 线格式

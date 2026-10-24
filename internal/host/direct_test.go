@@ -1325,6 +1325,76 @@ func TestPeerGoneKeepsLiveDirectSession(t *testing.T) {
 	roundTrip(t, s2, "still direct")
 }
 
+// TestPeerGoneKeepsTheMuxWhenDirectIsLive pins the other half of the PeerGone
+// contract: the pair is kept (H1), so the mux session carrying it must be kept
+// too. Killing the adapter while the peer still holds its session made the next
+// build a second mux on the same pair KCP stream; the new secure reader started
+// mid-record ("bad secure record length"), the new session desynced and died on
+// its own, and sessionLocked's C1 delay then stood every rebuild down for 20s —
+// a working direct path paying for a relay blip with a 20s open window.
+func TestPeerGoneKeepsTheMuxWhenDirectIsLive(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	stun := startFakeSTUN(t, "")
+	echo := startEcho(t)
+
+	privA, _, _ := derpclient.Generate()
+	privB, pubB, _ := derpclient.Generate()
+	engineA := newEngine(url, "", privA, slog.Default())
+	engineB := newEngine(url, echo, privB, slog.Default())
+	engineA.stunAddr, engineB.stunAddr = stun, stun
+	defer engineA.Close()
+	defer engineB.Close()
+
+	engineA.Connect()
+	engineB.Connect()
+
+	s, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, s, "hi")
+	s.Close()
+	waitFor(t, 5*time.Second, func() bool {
+		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
+	})
+
+	pc := engineA.livePeerConn(pubB)
+	if pc == nil {
+		t.Fatal("A has no relay adapter to watch")
+	}
+	pc.mu.Lock()
+	sess := pc.sess
+	pc.mu.Unlock()
+	if sess == nil {
+		t.Fatal("A's adapter has no mux session")
+	}
+
+	// The notice: B's relay connection is gone. B's process — and the mux
+	// session it holds — is not, and the direct path under the pair is not
+	// either.
+	engineA.peerGone(pubB)
+
+	if sess.IsClosed() {
+		t.Fatal("a PeerGone closed the mux session a live direct path was carrying")
+	}
+	if got := engineA.livePeerConn(pubB); got != pc {
+		t.Fatal("a PeerGone replaced the adapter: the replacement builds a second mux on the same pair stream")
+	}
+	if !engineA.isGone(pubB) {
+		t.Fatal("a PeerGone did not mark the peer's relay half gone")
+	}
+
+	// The kept mux still opens and carries, with the relay out of the picture.
+	rs.setDropData(true)
+	s2, err := engineA.OpenStream(engineB.PublicKey())
+	if err != nil {
+		t.Fatalf("open after peer gone: %v", err)
+	}
+	defer s2.Close()
+	roundTrip(t, s2, "still direct")
+}
+
 // TestDirectLocalCandidateSameNetwork proves that peers on the same network
 // still punch directly even when the STUN-mapped public address is a blackhole
 // (TEST-NET-1): the local candidate is reached first.

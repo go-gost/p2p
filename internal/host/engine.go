@@ -2391,11 +2391,16 @@ func (e *engine) keepalive(c *derpclient.Client) {
 // session) alive across the notice (H1, see resetsPairKCPFor): the relay half is
 // merely unregistered. With no direct path the keys and the pair's KCP epoch go
 // with the peer's relay connection exactly as before.
+//
+// A kept pair keeps its mux session too: the adapter stays registered and its
+// session open, because replacing it would put a second mux on the pair's KCP
+// stream while the peer still holds the first (see the liveDirect branch). Only
+// the transport's registration dies, which is the relay half's whole meaning
+// here.
 func (e *engine) peerGone(peer derpclient.PublicKey) {
 	e.mu.Lock()
 	e.gone[peer] = true
 	pc := e.peers[peer]
-	delete(e.peers, peer)
 	dc := e.directs[peer]
 	e.mu.Unlock()
 
@@ -2403,25 +2408,45 @@ func (e *engine) peerGone(peer derpclient.PublicKey) {
 	// that dies in the window is still dropped by the killSession below, which
 	// re-decides on the current paths.
 	liveDirect := dc != nil && dc.live()
-	if !liveDirect {
-		e.mu.Lock()
-		// The peer's relay connection dropped: forget its security session too.
-		// The peer may have restarted (a new ephemeral will arrive), and holding
-		// a stale key would leave the next rebuild mismatched. A peer that merely
-		// blipped re-handshakes once on its return.
-		delete(e.secure, secureKey{peer: peer, transport: secureTransportRelay})
-		e.mu.Unlock()
+	if liveDirect {
+		// H1: a live direct path keeps the pair, its keys AND its mux session
+		// across the notice. The adapter stays registered and its session stays
+		// open. Killing it here, as this used to, is what the peer's own session
+		// outlives: the replacement adapter builds a second mux on the same pair
+		// KCP stream while the peer still holds the first, so its secure reader
+		// starts mid-record — a desync — and the C1 delay then stands every
+		// rebuild down for 20s. A relay blip must not cost the path that is
+		// carrying the traffic.
+		//
+		// Only the relay half is retired, so the pair's writes fall back to the
+		// direct underlay instead of into the dead relay, and the O1/O2
+		// suppression signal the skipped kill would have produced is emitted
+		// here (the same shape teardown uses for a link loss).
+		if pair := e.relayKCPPairGet(peer); pair != nil {
+			pair.retireRelay()
+			pair.noteRelayLoss(true, string(reasonPeerGone))
+		}
+		e.log.Debug("derp peer gone", "peer", keyName(peer), "suppressed", true)
+		return
 	}
+
+	e.mu.Lock()
+	delete(e.peers, peer)
+	// The peer's relay connection dropped: forget its security session too.
+	// The peer may have restarted (a new ephemeral will arrive), and holding
+	// a stale key would leave the next rebuild mismatched. A peer that merely
+	// blipped re-handshakes once on its return.
+	delete(e.secure, secureKey{peer: peer, transport: secureTransportRelay})
+	e.mu.Unlock()
+
 	gen := uint64(0)
 	if pc != nil {
 		gen = pc.sessionGen.Load()
 	}
-	if !liveDirect {
-		// The pair's KCP session goes with the peer: its sequence state is with
-		// a peer that is gone (or restarted), and a session left running would
-		// leak its read loop.
-		e.dropRelayKCP(peer, nil, errors.New("derp engine: peer gone"), gen)
-	}
+	// The pair's KCP session goes with the peer: its sequence state is with
+	// a peer that is gone (or restarted), and a session left running would
+	// leak its read loop.
+	e.dropRelayKCP(peer, nil, errors.New("derp engine: peer gone"), gen)
 	if pc != nil {
 		// A session-less adapter is a handshake in flight: killing it would fail
 		// that open before its bounded wait can decide, and the peer may already
