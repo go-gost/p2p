@@ -636,6 +636,25 @@ func (c *logCapture) count(msg string) int {
 	return n
 }
 
+// all returns the attributes of every record with the given message, in log
+// order.
+func (c *logCapture) all(msg string) []map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []map[string]string
+	for n, m := range c.messages {
+		if m != msg {
+			continue
+		}
+		attrs := make(map[string]string, len(c.attrs[n]))
+		for _, a := range c.attrs[n] {
+			attrs[a.Key] = a.Value.String()
+		}
+		out = append(out, attrs)
+	}
+	return out
+}
+
 // pairKCPSession returns the pair's current KCP session from the pair store —
 // the epoch identity, independent of any adapter's view of it.
 func pairKCPSession(e *engine, peer derpclient.PublicKey) *kcp.UDPSession {

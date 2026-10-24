@@ -113,14 +113,17 @@ for _, idx := range order:                 // order 已是 v6 在前
     dc.noteSeedFailure(f.name, res.err, res.out.ProbeFrom)
     pair.noteSeed("timeout", f.name, res.dial.String())
 if winner < 0 { closeFams(); dc.backoff(); return }
-for _, idx := range order {                // 取消其余族
+for _, idx := range order {                // 放弃其余族
     if idx == winner { continue }
     fams[idx].sock.Close()                 // 已关闭的 socket 再关是 no-op
-    if res := <-chans[idx]; res.err == nil {
+    res := <-chans[idx]
+    if res.err == nil {
         pair.noteSeed("ok", fams[idx].name, res.dial.String())  // 已完成且成功：如实记
+        dc.noteRound("%s completed, unused (v6 up)", fams[idx].name) // 握完但被弃：不能说 cancelled
+    } else {
+        // 被切断：不记 noteSeed、不记 noteSeedFailure
+        dc.noteRound("%s cancelled (v6 up)", fams[idx].name)
     }
-    // 失败/被取消：不记 noteSeed、不记 noteSeedFailure
-    dc.noteRound("%s cancelled (v6 up)", fams[idx].name)
 }
 win := fams[winner]; sock := win.sock; win.sock = nil
 closeFams(); pair.noteSeed("ok", win.name, dials[winner].String())

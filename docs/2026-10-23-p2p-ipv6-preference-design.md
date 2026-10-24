@@ -94,7 +94,7 @@ type familyAttempt struct {
   | 尝试的结局 | `noteSeed` | `noteSeedFailure` | trace | 失败计数 |
   |---|---|---|---|---|
   | 赢家成功 | `ok` | 否 | `<族> up` | 否 |
-  | 对方的 attempt 已完成且成功，但被丢弃 | `ok` | 否 | 无（赢家那条已说明） | 否 |
+  | 对方的 attempt 已完成且成功，但被丢弃 | `ok` | 否 | `<族> completed, unused (v6 up)` | 否 |
   | 已完成且失败 | `timeout` | 是（写 `lastErr`） | `<族> seed failed: …` | **是** |
   | 被取消（赢家已定，socket 被关） | **不记** | **否** | `<族> cancelled (v6 up)` | **否** |
 

@@ -13,6 +13,7 @@ package host
 import (
 	"log/slog"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,13 +29,20 @@ import (
 // reserved address makes the other side dial a blackhole).
 func startV6Engines(t *testing.T, stunA, stunB string) (a, b *engine, pubB derpclient.PublicKey) {
 	t.Helper()
+	return startV6EnginesLogged(t, stunA, stunB, slog.Default())
+}
+
+// startV6EnginesLogged is startV6Engines with A's logger supplied, so a test can
+// read the seed events A records alongside its trace.
+func startV6EnginesLogged(t *testing.T, stunA, stunB string, log *slog.Logger) (a, b *engine, pubB derpclient.PublicKey) {
+	t.Helper()
 	rs := &relayServer{}
 	url := rs.start(t)
 	echo := startEcho(t)
 
 	privA, _, _ := derpclient.Generate()
 	privB, pubB, _ := derpclient.Generate()
-	a = newEngine(url, "", privA, slog.Default())
+	a = newEngine(url, "", privA, log)
 	b = newEngine(url, echo, privB, slog.Default())
 	a.stunAddr, b.stunAddr = startFakeSTUN(t, stunA), startFakeSTUN(t, stunB)
 	a.v6Enabled, b.v6Enabled = true, true
@@ -85,13 +93,16 @@ func TestPunchPrefersV6WhenBothWork(t *testing.T) {
 	assertDirectFamily(t, a, pubB, true)
 	assertDirectFamily(t, b, a.pub, true)
 
-	// The loser was cancelled, not failed: no seed failure is recorded, and the
-	// trace says why the v4 attempt ended.
+	// The loser was abandoned, not failed: no seed failure is recorded, and the
+	// trace says what happened to the v4 attempt — "completed, unused" when its
+	// handshake had already finished, "cancelled" when it was cut short. Which
+	// one is a matter of timing; TestPunchAbandonedFamilyTraceMatchesSeedOutcome
+	// pins that the word agrees with the seed record.
 	if got := a.relayKCPPairFor(pubB).seedFailures.Load(); got != 0 {
-		t.Fatalf("seed failures = %d, want 0 (the v4 attempt was cancelled, not failed)", got)
+		t.Fatalf("seed failures = %d, want 0 (the v4 attempt was abandoned, not failed)", got)
 	}
-	if !traceHas(a.directConn(pubB), "cancelled") {
-		t.Fatalf("trace = %v, want a line naming the cancelled family", a.directConn(pubB).traceLines())
+	if !traceHas(a.directConn(pubB), "(v6 up)") {
+		t.Fatalf("trace = %v, want a line saying why the v4 attempt ended", a.directConn(pubB).traceLines())
 	}
 	if got := a.directConn(pubB).lastErrOf(); got != "" {
 		t.Fatalf("lastErr = %q, want empty after the win", got)
@@ -125,5 +136,54 @@ func TestPunchBothFamiliesFailBacksOff(t *testing.T) {
 	}
 	if got := dc.lastErrOf(); got == "" {
 		t.Fatal("a failed round must keep its reason")
+	}
+}
+
+// TestPunchAbandonedFamilyTraceMatchesSeedOutcome pins the one thing a reader
+// of the punch trace and the seed log reads together: the losing family's trace
+// word must state what actually happened to it. A handshake that had already
+// completed records a seed result=ok, so the trace may not call it "cancelled";
+// an attempt cut short records no seed line, so it may not call itself
+// "completed, unused". Which branch a round takes depends on timing — that is
+// exactly why the pairing needs pinning instead of one fixed word.
+func TestPunchAbandonedFamilyTraceMatchesSeedOutcome(t *testing.T) {
+	if !v6LoopbackAvailable(t) {
+		t.Skip("no IPv6 loopback")
+	}
+	capture := &logCapture{}
+	a, b, pubB := startV6EnginesLogged(t, "", "", slog.New(capture))
+	openRelayStream(t, a, b)
+
+	waitFor(t, 15*time.Second, func() bool {
+		return hasDirect(a, pubB) && hasDirect(b, a.pub)
+	})
+
+	var defeat string
+	for _, line := range a.directConn(pubB).traceLines() {
+		if strings.HasPrefix(line, "v4 ") && strings.HasSuffix(line, "(v6 up)") {
+			defeat = line
+		}
+	}
+	if defeat == "" {
+		t.Fatalf("trace = %v, want a line for the abandoned v4 family", a.directConn(pubB).traceLines())
+	}
+	t.Logf("abandoned family trace: %q", defeat)
+	okSeed := false
+	for _, ev := range capture.all("direct punch seed") {
+		if ev["family"] == "v4" && ev["result"] == "ok" {
+			okSeed = true
+		}
+	}
+	switch {
+	case strings.Contains(defeat, "completed, unused"):
+		if !okSeed {
+			t.Fatalf("trace %q says the v4 handshake completed, but no v4 seed result=ok was recorded", defeat)
+		}
+	case strings.Contains(defeat, "cancelled"):
+		if okSeed {
+			t.Fatalf("trace %q calls the v4 attempt cancelled, but a v4 seed result=ok was recorded", defeat)
+		}
+	default:
+		t.Fatalf("trace %q names no outcome for the abandoned family", defeat)
 	}
 }

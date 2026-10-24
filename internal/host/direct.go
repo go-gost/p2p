@@ -1483,7 +1483,16 @@ func (dc *directConn) punch() {
 			fams[idx].sock.Close()
 		}
 		res := <-done[idx]
-		dc.noteRound("%s cancelled (%s up)", fams[idx].name, fams[winner].name)
+		// The trace must agree with the seed record below: a handshake that
+		// had already completed when the other family won is discarded with
+		// its success intact, so calling it "cancelled" would contradict the
+		// seed result=ok line a reader greps next to it. Only an attempt that
+		// was actually cut short is cancelled.
+		word := "cancelled"
+		if res.err == nil {
+			word = "completed, unused"
+		}
+		dc.noteRound("%s %s (%s up)", fams[idx].name, word, fams[winner].name)
 		if res.err == nil {
 			if pair := e.relayKCPPairGet(dc.peer); pair != nil {
 				pair.noteSeed("ok", fams[idx].name, res.dial.String())
