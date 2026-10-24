@@ -594,6 +594,14 @@ type peerConn struct {
 	// (relay). An atomic so a status read never takes pc.mu.
 	lastFrameAt atomic.Int64
 
+	// inboundFullSince is the UnixNano stamp of the first inbound packet this
+	// adapter's queue could not take in the current unbroken run of overflows,
+	// or 0 when the last packet was queued. A burst overflows and drains again
+	// (one lost KCP segment, retransmitted); a wedged adapter keeps overflowing
+	// until deliverInbound kills it past inboundOverflowGrace. An atomic so the
+	// pump never takes pc.mu on the hot path.
+	inboundFullSince atomic.Int64
+
 	// Relay-session rebuilds for this peer, by cause. A pair that rebuilds often
 	// is flapping, and that was only visible by grepping the log: the field case
 	// was five "peer rekeyed" teardowns in twelve minutes, each taking the relay
@@ -794,9 +802,18 @@ func (pc *peerConn) recordRebuild(reason sessionEndReason) {
 
 const (
 	// inboundQueueSize bounds queued packets per peer (~256KiB of smux
-	// frames); overflowing kills the session rather than silently corrupting
-	// the stream.
+	// frames). A packet that does not fit is dropped — one lost KCP segment
+	// the peer retransmits — and only a queue that stays full past
+	// inboundOverflowGrace kills the session (see deliverInbound).
 	inboundQueueSize = 256
+	// inboundOverflowGrace is how long an adapter's inbound queue may stay
+	// full, unbroken, before its session is killed. It separates a burst (a
+	// fast sender, a busy receiver: the queue overflows and drains again, and
+	// KCP repairs the drops) from a wedge (nothing is draining: every packet
+	// overflows until the grace runs out). Killing on the first overflow took
+	// a healthy 2 MiB burst down with it on a loaded machine, where the
+	// receiver's pump can fall behind by more than the queue's depth.
+	inboundOverflowGrace = 2 * time.Second
 	// streamOpenTimeout caps OpenStream (SYN + ack round trip through the
 	// relay).
 	streamOpenTimeout = 10 * time.Second
@@ -2059,21 +2076,42 @@ func (e *engine) pump(c *derpclient.Client) {
 			pc.killSession(err, false, reasonBuildFailed)
 			continue
 		}
-		select {
-		case pc.inbound <- pkt:
-		case <-pc.closeCh:
-			// session already dead; drop
-		default:
-			// Queue overflow: KCP repairs ordinary loss below, but a queue
-			// that stays full means this adapter is no longer draining, so
-			// kill it as a conservative recovery and let the peer redial.
-			// The dropped packets are KCP segments the peer retransmits, not
-			// consumed records, so the pair's nonce sequence stays aligned: the
-			// kill is a clean one that keeps the settled keys and the pair's
-			// KCP session.
-			pc.killSession(errors.New("derp engine: inbound queue overflow"), false, reasonQueueOverflow)
-		}
+		pc.deliverInbound(pkt)
 	}
+}
+
+// deliverInbound queues one inbound relay packet for smux. A full queue drops
+// the packet — a KCP segment the peer retransmits, not a consumed record, so
+// the pair's nonce sequence stays aligned — and records when the queue first
+// overflowed. Only an unbroken run of overflows past inboundOverflowGrace means
+// the adapter is no longer draining, and that is killed as a conservative
+// recovery; a burst that drains again is just loss. Recording the drop and
+// killing on the drop itself are different verdicts about the same event, and
+// only the duration can tell them apart: a 2 MiB write into a healthy pair on a
+// loaded host overflows a queue this deep without anything being wrong.
+//
+// The stamp is the wall clock, not internal/clock: this is an elapsed-time
+// measurement (and runs only on overflow, so the coarse clock's per-packet
+// saving does not apply).
+func (pc *peerConn) deliverInbound(pkt []byte) {
+	select {
+	case pc.inbound <- pkt:
+		pc.inboundFullSince.Store(0)
+		return
+	case <-pc.closeCh:
+		return // session already dead; drop
+	default:
+	}
+	now := time.Now().UnixNano()
+	first := pc.inboundFullSince.Load()
+	if first == 0 {
+		pc.inboundFullSince.Store(now)
+		return
+	}
+	if time.Duration(now-first) <= inboundOverflowGrace {
+		return
+	}
+	pc.killSession(errors.New("derp engine: inbound queue overflow"), false, reasonQueueOverflow)
 }
 
 // handleControl dispatches a control frame ([kind 1B][payload]) received from
