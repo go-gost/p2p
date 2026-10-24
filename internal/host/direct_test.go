@@ -1527,7 +1527,11 @@ func TestPunchStartsWithoutStream(t *testing.T) {
 	}
 
 	// The peer answers our candidates: both sides come up, no stream opened.
-	waitFor(t, 5*time.Second, func() bool {
+	// Budget is 10s, not 5s: a first seed round can time out under load (the
+	// peer's socket is not ready yet, or its announce is delayed) and the punch
+	// backs off before retrying; 5s was eating that retry (budget mismatch,
+	// see ci-flake-verify-before-fixing).
+	waitFor(t, 10*time.Second, func() bool {
 		return hasDirect(engineA, pubB) && hasDirect(engineB, engineA.pub)
 	})
 }
