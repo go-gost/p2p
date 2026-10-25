@@ -464,6 +464,8 @@ func peerVerdict(key string, d p2p.PeerDiagnostic) string {
 		return fmt.Sprintf("peer %s: on the relay; no candidates (no STUN and no IPv6 egress)", key)
 	case "stun-unreachable":
 		return fmt.Sprintf("peer %s: on the relay; STUN unreachable", key)
+	case "server-unreachable":
+		return fmt.Sprintf("peer %s: on the relay; server unreachable", key)
 	case "":
 		return fmt.Sprintf("peer %s: no transport reported", key)
 	default:

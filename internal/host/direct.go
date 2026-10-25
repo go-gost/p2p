@@ -173,14 +173,15 @@ const (
 // session instead — and, when it does not, why not. Keep the set and the doc
 // on that field in sync.
 const (
-	transportDirect          = "direct"           // live hole-punched session
-	transportPunching        = "punching"         // a punch for this peer is in flight
-	transportFailed          = "failed"           // this peer's punch failed (usually a symmetric NAT)
-	transportPeerDirectOff   = "peer-direct-off"  // the peer has the direct path off (its Config.Direct)
-	transportRelay           = "derp"             // on the relay, nothing in the way of a punch
-	transportDisabled        = "disabled"         // the direct path is off (Config.Direct)
-	transportNoCandidates    = "no-candidates"    // no STUN server and no IPv6 egress: nothing to punch with
-	transportStunUnreachable = "stun-unreachable" // STUN configured but not answering, and no IPv6 fallback
+	transportDirect            = "direct"             // live hole-punched session
+	transportPunching          = "punching"           // a punch for this peer is in flight
+	transportFailed            = "failed"             // this peer's punch failed (usually a symmetric NAT)
+	transportPeerDirectOff     = "peer-direct-off"    // the peer has the direct path off (its Config.Direct)
+	transportRelay             = "derp"               // on the relay, nothing in the way of a punch
+	transportDisabled          = "disabled"           // the direct path is off (Config.Direct)
+	transportNoCandidates      = "no-candidates"      // no STUN server and no IPv6 egress: nothing to punch with
+	transportStunUnreachable   = "stun-unreachable"   // STUN configured but not answering, and no IPv6 fallback
+	transportServerUnreachable = "server-unreachable" // the relay (server) is unreachable, so this peer has no data path to it
 )
 
 // candidate is a single UDP endpoint offered by a peer.
