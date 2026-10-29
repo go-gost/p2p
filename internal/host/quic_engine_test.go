@@ -1,9 +1,11 @@
 package host
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -174,8 +176,12 @@ func TestQUICModeHandshakeFailureRetriesOnSamePair(t *testing.T) {
 	b := newQUICTestEngine(t, url, echo, privB)
 	// Keep the failed handshake short. The budget has to span at least one
 	// QUIC retransmission (the relay saw the first Initial), or the server's
-	// listener window can close between two of the client's retries.
-	a.quicCfg.HandshakeTimeout = 2 * time.Second
+	// listener window can close between two of the client's retries. B's budget
+	// is set explicitly too: its listener must outlive A's failure and retry,
+	// rather than depending on the package default staying longer than A's.
+	const aHandshake = 2 * time.Second
+	a.quicCfg.HandshakeTimeout = aHandshake
+	b.quicCfg.HandshakeTimeout = 2 * aHandshake
 	if err := a.Connect(); err != nil {
 		t.Fatal(err)
 	}
@@ -216,6 +222,156 @@ func TestQUICModeHandshakeFailureRetriesOnSamePair(t *testing.T) {
 	}
 }
 
+// TestQUICPairForDoesNotResurrectDeletedState pins the guard that keeps a
+// closed peer from getting a new pair: quicPairFor must re-check map identity
+// instead of recreating the state entry (which would pin a zero fingerprint).
+func TestQUICPairForDoesNotResurrectDeletedState(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newQUICTestEngine(t, url, "", priv)
+	peer := derpclient.PublicKey{0x33}
+	fp := [32]byte{0x44}
+
+	e.quicMu.Lock()
+	e.quicPeerLocked(peer)
+	e.quicMu.Unlock()
+	pair := e.quicPairFor(peer, quicRoleClient, fp)
+	if pair == nil {
+		t.Fatal("quicPairFor returned nil for a live state")
+	}
+	e.quicMu.Lock()
+	if got := e.quics[peer].pairFP; got != fp {
+		e.quicMu.Unlock()
+		t.Fatalf("pair fingerprint = %x, want %x", got, fp)
+	}
+	delete(e.quics, peer)
+	e.quicMu.Unlock()
+
+	if got := e.quicPairFor(peer, quicRoleClient, fp); got != nil {
+		t.Fatal("quicPairFor resurrected a deleted state")
+	}
+	e.quicMu.Lock()
+	_, resurrected := e.quics[peer]
+	e.quicMu.Unlock()
+	if resurrected {
+		t.Fatal("quicPairFor recreated a deleted state entry")
+	}
+	pair.close()
+}
+
+// TestQUICRelayUnderlayDoesNotResurrectDeletedState pins the same guard on the
+// underlay install path: it must fail rather than recreate a state entry for a
+// peer whose state was already dropped.
+func TestQUICRelayUnderlayDoesNotResurrectDeletedState(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newQUICTestEngine(t, url, "", priv)
+	peer := derpclient.PublicKey{0x34}
+	fp := [32]byte{0x45}
+
+	e.quicMu.Lock()
+	e.quicPeerLocked(peer)
+	e.quicMu.Unlock()
+	pair := e.quicPairFor(peer, quicRoleClient, fp)
+	if pair == nil {
+		t.Fatal("quicPairFor returned nil for a live state")
+	}
+	pc := e.peerConn(peer)
+	e.quicMu.Lock()
+	delete(e.quics, peer)
+	e.quicMu.Unlock()
+
+	if err := e.quicRelayUnderlay(peer, pair, pc); err == nil {
+		t.Fatal("quicRelayUnderlay succeeded after the state was deleted")
+	}
+	e.quicMu.Lock()
+	_, resurrected := e.quics[peer]
+	e.quicMu.Unlock()
+	if resurrected {
+		t.Fatal("quicRelayUnderlay recreated a deleted state entry")
+	}
+	pair.close()
+}
+
+// TestQUICCloseUnderlayConcurrent hammers the teardown/install interleaving.
+// closeQUIC must snapshot pair, relay and relayUp under quicMu, because
+// quicRelayUnderlay sets relayUp under that lock after installing the underlay;
+// reading the fields unlocked is the data race the race detector flags here.
+func TestQUICCloseUnderlayConcurrent(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newQUICTestEngine(t, url, "", priv)
+
+	for i := 0; i < 50; i++ {
+		peer := derpclient.PublicKey{byte(i + 1)}
+		e.quicMu.Lock()
+		e.quicPeerLocked(peer)
+		e.quicMu.Unlock()
+		pair := e.quicPairFor(peer, quicRoleClient, [32]byte{byte(i + 1)})
+		if pair == nil {
+			t.Fatal("quicPairFor returned nil for a live state")
+		}
+		pc := &peerConn{e: e, peer: peer, closeCh: make(chan struct{})}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = e.quicRelayUnderlay(peer, pair, pc)
+		}()
+		go func() {
+			defer wg.Done()
+			e.closeQUIC(peer)
+		}()
+		wg.Wait()
+
+		e.quicMu.Lock()
+		_, exists := e.quics[peer]
+		e.quicMu.Unlock()
+		if exists {
+			t.Fatal("closeQUIC left the peer state behind")
+		}
+	}
+}
+
+// TestQUICCloseCancelsInflightSetup pins the teardown fast path: a peer whose
+// state is dropped must cancel the setup context instead of leaving its waiters
+// parked through the caps/handshake budget.
+func TestQUICCloseCancelsInflightSetup(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	priv, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newQUICTestEngine(t, url, "", priv)
+	peer := derpclient.PublicKey{0x35}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	e.quicMu.Lock()
+	e.quicPeerLocked(peer).setup = &quicSetup{done: make(chan struct{}), cancel: cancel}
+	e.quicMu.Unlock()
+
+	e.closeQUIC(peer)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("closeQUIC did not cancel the in-flight setup")
+	}
+}
+
 // TestQUICModeSinkSurvivesAdapterReplacement pins the Task 6 carry-forward:
 // the data sink belongs to the adapter, so a replacement adapter must get one
 // too or its inbound relay packets would fall through to the KCP path.
@@ -243,7 +399,37 @@ func TestQUICModeSinkSurvivesAdapterReplacement(t *testing.T) {
 	if second == first {
 		t.Fatal("closed adapter was not replaced")
 	}
-	if second.dataSink.Load() == nil {
+	sink := second.dataSink.Load()
+	if sink == nil {
 		t.Fatal("no QUIC data sink on the replacement adapter")
+	}
+
+	// A non-nil pointer alone is weak: prove the replacement sink actually
+	// routes into the current pair's relay underlay (and therefore never falls
+	// through to the KCP session path).
+	in := make(chan []byte, 1)
+	relay := newRelayQUICConn(in, func([]byte) error { return nil }, nil, quicRelayOptions{})
+	pair := newQUICPair(e, peer, quicRoleClient,
+		quicTLSConfig(e.quicID, [32]byte{1}, false),
+		quicConfigFromSettings(e.quicCfg), nil)
+	if err := pair.addRelayUnderlay(relay); err != nil {
+		t.Fatal(err)
+	}
+	e.quicMu.Lock()
+	e.quicPeerLocked(peer).pair = pair
+	e.quicMu.Unlock()
+
+	payload := []byte("relay payload")
+	(*sink)(payload)
+	select {
+	case got := <-in:
+		if string(got) != string(payload) {
+			t.Fatalf("sink delivered %q, want %q", got, payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement sink did not deliver to the QUIC pair")
+	}
+	if n := relayKCPCount(e); n != 0 {
+		t.Fatalf("engine built %d KCP pairs, want 0", n)
 	}
 }

@@ -162,7 +162,6 @@ func (s *engineStats) countStream(transport string) {
 type quicPeer struct {
 	pair    *quicPair
 	pairFP  [32]byte // fingerprint the pair's TLS config pins
-	peerFP  [32]byte // fingerprint advertised in the peer's latest valid caps
 	relay   *relayQUICConn
 	relayUp bool
 
@@ -170,15 +169,22 @@ type quicPeer struct {
 	haveCaps bool
 	capsSent bool
 	capsCh   chan struct{}
+	// nextStart rate-limits background establishment attempts. A fast failure
+	// (no relay, unusable caps) must not let every inbound packet spawn another
+	// goroutine; direct OpenStream calls are not gated by it.
+	nextStart time.Time
 
 	setup *quicSetup
 }
 
 // quicSetup is one in-flight ensureTransport. done closes after err is set;
-// waiters read err after receiving from done.
+// waiters read err after receiving from done. cancel wakes the establishing
+// goroutine when the peer state is torn down (peer gone), so its waiters do not
+// sit through the caps/handshake budget for a setup whose result is discarded.
 type quicSetup struct {
-	done chan struct{}
-	err  error
+	done   chan struct{}
+	err    error
+	cancel context.CancelFunc
 }
 
 // peerTransports names each peer's current path — the value set documented on
@@ -662,6 +668,16 @@ func (e *engine) maybeStartQUIC(peer derpclient.PublicKey) {
 			return
 		}
 	}
+	// The trigger is non-blocking and may fire on every inbound packet while
+	// the pair is down. A fast failure must not turn that into a goroutine per
+	// packet, so each background start reserves the next window under the lock
+	// before it is launched.
+	now := time.Now()
+	if now.Before(qp.nextStart) {
+		e.quicMu.Unlock()
+		return
+	}
+	qp.nextStart = now.Add(quicStartBackoff)
 	e.quicMu.Unlock()
 
 	go func() { _, _ = e.ensureTransport(peer) }()
@@ -702,10 +718,13 @@ func (e *engine) ensureTransport(peer derpclient.PublicKey) (transportMode, erro
 		return transportQUIC, setup.err
 	}
 	setup := &quicSetup{done: make(chan struct{})}
+	setupCtx, cancelSetup := context.WithCancel(context.Background())
+	setup.cancel = cancelSetup
 	qp.setup = setup
 	e.quicMu.Unlock()
 
-	err := e.establishQUIC(peer, qp)
+	err := e.establishQUIC(setupCtx, peer, qp)
+	cancelSetup()
 
 	e.quicMu.Lock()
 	setup.err = err
@@ -720,10 +739,13 @@ func (e *engine) ensureTransport(peer derpclient.PublicKey) (transportMode, erro
 // establishQUIC is the body of ensureTransport's QUIC branch. It runs under
 // the per-peer setup single-flight, so it may create the pair, its relay
 // underlay and its handshake without racing another opener.
-func (e *engine) establishQUIC(peer derpclient.PublicKey, qp *quicPeer) error {
+func (e *engine) establishQUIC(ctx context.Context, peer derpclient.PublicKey, qp *quicPeer) error {
 	select {
 	case <-e.stop:
 		return fmt.Errorf("%w: peer %s: engine closed", p2p.ErrPeerUnreachable, keyName(peer))
+	case <-ctx.Done():
+		return fmt.Errorf("%w: peer %s: quic setup canceled: %v",
+			p2p.ErrPeerUnreachable, keyName(peer), ctx.Err())
 	default:
 	}
 
@@ -749,7 +771,11 @@ func (e *engine) establishQUIC(peer derpclient.PublicKey, qp *quicPeer) error {
 		}
 	}
 	if !haveCaps {
-		if _, ok := e.awaitPeerCaps(peer, qp); !ok {
+		if _, ok := e.awaitPeerCaps(ctx, peer, qp); !ok {
+			if ctx.Err() != nil {
+				return fmt.Errorf("%w: peer %s: quic setup canceled: %v",
+					p2p.ErrPeerUnreachable, keyName(peer), ctx.Err())
+			}
 			return fmt.Errorf("%w: peer %s: caps timeout",
 				p2p.ErrPeerUnreachable, keyName(peer))
 		}
@@ -773,12 +799,9 @@ func (e *engine) establishQUIC(peer derpclient.PublicKey, qp *quicPeer) error {
 	if bytes.Compare(e.pub[:], peer[:]) < 0 {
 		role = quicRoleClient
 	}
-	e.quicMu.Lock()
-	qp.peerFP = qc.Fingerprint
-	e.quicMu.Unlock()
-	pair := e.quicPairFor(peer, role)
+	pair := e.quicPairFor(peer, role, qc.Fingerprint)
 	if pair == nil {
-		return fmt.Errorf("%w: peer %s: engine closed",
+		return fmt.Errorf("%w: peer %s: quic state gone",
 			p2p.ErrPeerUnreachable, keyName(peer))
 	}
 	if err := e.quicRelayUnderlay(peer, pair, pc); err != nil {
@@ -787,7 +810,7 @@ func (e *engine) establishQUIC(peer derpclient.PublicKey, qp *quicPeer) error {
 	}
 
 	start := time.Now()
-	if err := e.quicHandshake(pair); err != nil {
+	if err := e.quicHandshake(ctx, pair); err != nil {
 		e.log.Debug("quic handshake", "peer", keyName(peer),
 			"role", quicRoleName(role), "duration", time.Since(start).String(), "error", err)
 		return fmt.Errorf("%w: peer %s: quic handshake: %v",
@@ -802,7 +825,7 @@ func (e *engine) establishQUIC(peer derpclient.PublicKey, qp *quicPeer) error {
 // reply deadline expires. The latest frame is returned; ok is false on silence.
 // A timeout clears capsSent so the next attempt re-advertises our caps instead
 // of waiting for a reply to a frame that may have been lost.
-func (e *engine) awaitPeerCaps(peer derpclient.PublicKey, qp *quicPeer) (capsInfo, bool) {
+func (e *engine) awaitPeerCaps(ctx context.Context, peer derpclient.PublicKey, qp *quicPeer) (capsInfo, bool) {
 	e.quicMu.Lock()
 	if qp.haveCaps {
 		info := qp.caps
@@ -828,6 +851,8 @@ func (e *engine) awaitPeerCaps(peer derpclient.PublicKey, qp *quicPeer) (capsInf
 		}
 		qp.capsSent = false
 		e.quicMu.Unlock()
+		return capsInfo{}, false
+	case <-ctx.Done():
 		return capsInfo{}, false
 	case <-e.stop:
 		return capsInfo{}, false
@@ -861,23 +886,31 @@ func usableQUICCaps(info capsInfo) (quicCaps, error) {
 	return q, nil
 }
 
-// quicPairFor returns the peer's pair, creating it (pinned to the peer's
-// advertised fingerprint) when absent. A pair pinned to a different
-// fingerprint — the peer restarted and rotated its certificate — is closed and
-// replaced.
-func (e *engine) quicPairFor(peer derpclient.PublicKey, role quicRole) *quicPair {
+// quicPairFor returns the peer's pair, creating it pinned to fp when absent.
+// fp is passed explicitly: it comes from the peer's caps, and a state entry
+// recreated between that read and this call must never make the pair pin the
+// zero fingerprint. A state entry that disappeared while an old pair was being
+// closed is not recreated — the peer is gone (or the engine is closing), and a
+// pair no sink can reach would only leak. When the state nonetheless exists, a
+// pair pinned to a different fingerprint — the peer restarted and rotated its
+// certificate — is closed and replaced.
+func (e *engine) quicPairFor(peer derpclient.PublicKey, role quicRole, fp [32]byte) *quicPair {
 	e.quicMu.Lock()
 	if e.quicClosed {
 		e.quicMu.Unlock()
 		return nil
 	}
-	qp := e.quicPeerLocked(peer)
-	fp := qp.peerFP
+	qp, ok := e.quics[peer]
+	if !ok {
+		e.quicMu.Unlock()
+		return nil
+	}
 	if qp.pair != nil && qp.pairFP == fp {
 		p := qp.pair
 		e.quicMu.Unlock()
 		return p
 	}
+	state := qp
 	old := qp.pair
 	if old != nil {
 		qp.pair = nil
@@ -891,8 +924,8 @@ func (e *engine) quicPairFor(peer derpclient.PublicKey, role quicRole) *quicPair
 	}
 
 	e.quicMu.Lock()
-	qp = e.quicPeerLocked(peer)
-	if e.quics[peer] != qp || e.quicClosed {
+	qp, ok = e.quics[peer]
+	if !ok || qp != state || e.quicClosed {
 		// The state was dropped (peer gone / engine close) while the old pair
 		// was closing; do not resurrect an orphan no sink can reach.
 		e.quicMu.Unlock()
@@ -905,7 +938,7 @@ func (e *engine) quicPairFor(peer derpclient.PublicKey, role quicRole) *quicPair
 	}
 	var pair *quicPair
 	onStream := func(c net.Conn) {
-		e.serveInbound(c, pair.pathName(), peer, "")
+		e.serveInbound(c, quicTransportName(pair.pathName()), peer, "")
 	}
 	pair = newQUICPair(e, peer, role,
 		quicTLSConfig(e.quicID, fp, role == quicRoleServer),
@@ -916,13 +949,22 @@ func (e *engine) quicPairFor(peer derpclient.PublicKey, role quicRole) *quicPair
 	return pair
 }
 
+// quicTransportName maps the pair's internal path name ("relay"/"direct") to
+// the public transport label ("derp"/"direct") used by streams and diagnostics.
+func quicTransportName(path string) string {
+	if path == quicPathDirect {
+		return transportDirect
+	}
+	return transportRelay
+}
+
 // quicRelayUnderlay installs (once) the peer's relay packet path on pair. The
 // underlay outlives a failed handshake: establish retries reuse it rather than
 // rebuilding the multiPathConn or the relay batching goroutine.
 func (e *engine) quicRelayUnderlay(peer derpclient.PublicKey, pair *quicPair, pc *peerConn) error {
 	e.quicMu.Lock()
-	qp := e.quicPeerLocked(peer)
-	if e.quics[peer] != qp || qp.pair != pair {
+	qp, ok := e.quics[peer]
+	if !ok || qp.pair != pair {
 		e.quicMu.Unlock()
 		return errors.New("pair replaced during setup")
 	}
@@ -946,7 +988,7 @@ func (e *engine) quicRelayUnderlay(peer derpclient.PublicKey, pair *quicPair, pc
 		return err
 	}
 	e.quicMu.Lock()
-	if qp.relay == relay {
+	if qp, ok := e.quics[peer]; ok && qp.relay == relay && qp.pair == pair {
 		qp.relayUp = true
 	}
 	e.quicMu.Unlock()
@@ -957,7 +999,7 @@ func (e *engine) quicRelayUnderlay(peer derpclient.PublicKey, pair *quicPair, pc
 // attempt leaves the pair and its relay underlay usable, so a peer that has
 // not started listening yet is covered by retrying on the same underlay within
 // quicHandshakeTimeout rather than rebuilding it.
-func (e *engine) quicHandshake(pair *quicPair) error {
+func (e *engine) quicHandshake(ctx context.Context, pair *quicPair) error {
 	timeout := e.quicCfg.HandshakeTimeout
 	if timeout <= 0 {
 		timeout = defaultQUICHandshakeTimeout
@@ -981,22 +1023,36 @@ func (e *engine) quicHandshake(pair *quicPair) error {
 		if d > remaining {
 			d = remaining
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), d)
-		err := pair.establish(ctx)
+		attemptCtx, cancel := context.WithTimeout(ctx, d)
+		err := pair.establish(attemptCtx)
 		cancel()
-		if err == nil || errors.Is(err, errQUICPairEstablished) {
+		if err == nil {
 			return nil
 		}
-		if errors.Is(err, errQUICPairClosed) {
+		if errors.Is(err, errQUICPairEstablished) {
+			// Another setup owns the transport. It is only success if that
+			// attempt finished: returning here on the sentinel alone would
+			// report a connection with conn == nil.
+			if pair.established() {
+				return nil
+			}
+			lastErr = err
+		} else if errors.Is(err, errQUICPairClosed) {
 			return err
+		} else {
+			lastErr = err
 		}
-		lastErr = err
 
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if time.Until(deadline) < wait {
 			break
 		}
 		select {
 		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-e.stop:
 			return errors.New("derp engine: closed during quic handshake")
 		}
@@ -1017,11 +1073,13 @@ func (e *engine) quicHandshake(pair *quicPair) error {
 func (e *engine) quicDataSink(pc *peerConn) func([]byte) {
 	peer := pc.peer
 	return func(pkt []byte) {
-		pc.mu.Lock()
-		closed := pc.closed
-		pc.mu.Unlock()
-		if closed {
+		// closeCh is closed by killSession, which sets pc.closed under pc.mu.
+		// Reading the channel state keeps the pump's contract: this sink never
+		// takes pc.mu on the hot path.
+		select {
+		case <-pc.closeCh:
 			return
+		default:
 		}
 
 		e.quicMu.Lock()
@@ -1038,23 +1096,39 @@ func (e *engine) quicDataSink(pc *peerConn) func([]byte) {
 	}
 }
 
+// quicPeerTeardown snapshots the resources a closing peer owns. They are
+// copied while quicMu is held: quicRelayUnderlay sets relayUp under that lock
+// after installing the underlay, so reading the fields during teardown without
+// it would race.
+type quicPeerTeardown struct {
+	pair    *quicPair
+	relay   *relayQUICConn
+	relayUp bool
+}
+
 // closeQUIC tears down and forgets the peer's pair. It does not touch the
 // peer adapter, which the engine owns.
 func (e *engine) closeQUIC(peer derpclient.PublicKey) {
 	e.quicMu.Lock()
 	qp := e.quics[peer]
 	delete(e.quics, peer)
+	var td quicPeerTeardown
+	if qp != nil {
+		td = quicPeerTeardown{pair: qp.pair, relay: qp.relay, relayUp: qp.relayUp}
+		if qp.setup != nil {
+			// Wake an in-flight establishment: its state is being discarded,
+			// and its waiters should not sit through the caps/handshake budget.
+			qp.setup.cancel()
+		}
+	}
 	e.quicMu.Unlock()
-	if qp == nil {
-		return
+	if td.pair != nil {
+		td.pair.close()
 	}
-	if qp.pair != nil {
-		qp.pair.close()
-	}
-	if qp.relay != nil && !qp.relayUp {
+	if td.relay != nil && !td.relayUp {
 		// A relay underlay whose pair never got it installed still owns its
 		// sender goroutine.
-		_ = qp.relay.Close()
+		_ = td.relay.Close()
 	}
 }
 
@@ -1062,18 +1136,25 @@ func (e *engine) closeQUIC(peer derpclient.PublicKey) {
 // close; a later QUIC request rebuilds from the relay underlay.
 func (e *engine) closeAllQUIC() {
 	e.quicMu.Lock()
-	states := make([]*quicPeer, 0, len(e.quics))
+	states := make([]quicPeerTeardown, 0, len(e.quics))
 	for _, qp := range e.quics {
-		states = append(states, qp)
+		states = append(states, quicPeerTeardown{
+			pair:    qp.pair,
+			relay:   qp.relay,
+			relayUp: qp.relayUp,
+		})
+		if qp.setup != nil {
+			qp.setup.cancel()
+		}
 	}
 	e.quics = make(map[derpclient.PublicKey]*quicPeer)
 	e.quicMu.Unlock()
-	for _, qp := range states {
-		if qp.pair != nil {
-			qp.pair.close()
+	for _, td := range states {
+		if td.pair != nil {
+			td.pair.close()
 		}
-		if qp.relay != nil && !qp.relayUp {
-			_ = qp.relay.Close()
+		if td.relay != nil && !td.relayUp {
+			_ = td.relay.Close()
 		}
 	}
 }
@@ -1389,6 +1470,10 @@ const (
 	// went out. A peer that is not QUIC-enabled fails immediately instead
 	// (caps without the QUIC bit); this only bounds silence.
 	capsReplyTimeout = 3 * time.Second
+	// quicStartBackoff rate-limits the background establishment trigger. A
+	// failed setup (relay down, unusable caps) would otherwise let the data
+	// sink spawn a new goroutine per inbound packet.
+	quicStartBackoff = 200 * time.Millisecond
 )
 
 // resendInterval is how often an unsettled handshake re-sends its half while
@@ -1661,6 +1746,11 @@ func (e *engine) OpenStream(peerB64 string) (net.Conn, error) {
 // for the whole host, so this never considers KCP: a peer without usable QUIC
 // caps or a failed handshake is an error (never a silent KCP fallback).
 func (e *engine) openQUICStream(peerB64 string, peer derpclient.PublicKey) (net.Conn, error) {
+	// Snapshot the gone mark before ensureTransport: the peer's pump may clear
+	// it while caps/handshake wait, and the open that started against a peer
+	// believed gone should keep the short stream budget rather than silently
+	// fall back to the full one.
+	wasGone := e.isGone(peer)
 	if _, err := e.ensureTransport(peer); err != nil {
 		return nil, err
 	}
@@ -1669,10 +1759,8 @@ func (e *engine) openQUICStream(peerB64 string, peer derpclient.PublicKey) (net.
 		return nil, fmt.Errorf("%w: peer %s: no quic pair", p2p.ErrPeerUnreachable, peerB64)
 	}
 
-	// A peer whose DERP connection just dropped gets the short window, as the
-	// KCP path does.
 	to := streamOpenTimeout
-	if e.isGone(peer) {
+	if wasGone {
 		to = goneOpenTimeout
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), to)
@@ -1685,10 +1773,7 @@ func (e *engine) openQUICStream(peerB64 string, peer derpclient.PublicKey) (net.
 	}
 
 	path := pair.pathName()
-	transport := transportRelay // public "derp" label
-	if path == quicPathDirect {
-		transport = transportDirect
-	}
+	transport := quicTransportName(path)
 	e.stats.countStream(transport)
 	e.log.Debug("open stream: quic", "peer", peerB64, "transport", transport, "path", path)
 	return &openedStream{

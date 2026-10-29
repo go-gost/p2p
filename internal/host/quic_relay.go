@@ -36,6 +36,12 @@ const (
 	// describe. The sender rejects anything whose framed size (2 + packet)
 	// exceeds the batch budget before it reaches the encoder.
 	quicRelayMaxPacket = 1<<16 - 1
+
+	// quicRelayMaxPayload is the largest encoded batch peerConn.Write can carry
+	// as one DERP frame. Write prefixes frameData before SendPacket, and
+	// SendPacket rejects anything above derpclient.MaxPacketSize, so the batch
+	// payload itself must reserve that one frame-type byte.
+	quicRelayMaxPayload = derpclient.MaxPacketSize - 1
 )
 
 // quicRelayOptions carries the host's batching configuration. The zero value
@@ -47,15 +53,16 @@ type quicRelayOptions struct {
 }
 
 // resolve returns the effective batch size and flush delay. The batch size
-// counts each packet's 2-byte length prefix, which keeps one encoded payload
-// within both the configured budget and DERP's MaxPacketSize.
+// counts each packet's 2-byte length prefix and reserves the frame-type byte
+// peerConn.Write prepends, which keeps one encoded payload within both the
+// configured budget and the DERP frame limit.
 func (o quicRelayOptions) resolve() (int, time.Duration) {
 	batch := o.BatchBytes
 	if batch <= 0 {
 		batch = quicRelayBatchBytes
 	}
-	if batch > derpclient.MaxPacketSize {
-		batch = derpclient.MaxPacketSize
+	if batch > quicRelayMaxPayload {
+		batch = quicRelayMaxPayload
 	}
 	flush := o.Flush
 	if flush <= 0 {
@@ -257,7 +264,8 @@ func (c *relayQUICConn) sender() {
 			// WriteTo rejects oversized packets; keep the sender defensive in
 			// case a future caller bypasses it. The 2-byte length prefix is
 			// part of the frame budget, so a batch never encodes past
-			// batchBytes (and therefore never past derpclient.MaxPacketSize).
+			// batchBytes, which reserves the frame-type byte peerConn.Write
+			// prepends to the DERP frame.
 			framed := 2 + len(pkt)
 			if len(pkt) == 0 || framed > c.batchBytes {
 				c.drops.Add(1)

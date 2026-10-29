@@ -403,17 +403,28 @@ func TestRelayQUICConnConcurrentWrites(t *testing.T) {
 	}
 }
 
-// TestRelayQUICConnHonorsFrameBudget pins the 64 KiB boundary: the configured
-// batch budget counts each packet's 2-byte length prefix, so no encoded DERP
-// payload can exceed derpclient.MaxPacketSize even when the host configures the
-// maximum batch size.
+// TestRelayQUICConnHonorsFrameBudget pins the DERP frame boundary: the
+// configured batch budget counts each packet's 2-byte length prefix and
+// reserves the frameData byte peerConn.Write prepends, so the encoded payload
+// stays at or below MaxPacketSize-1 and the final SendPacket frame stays within
+// derpclient.MaxPacketSize even when the host configures the maximum batch
+// size.
 func TestRelayQUICConnHonorsFrameBudget(t *testing.T) {
 	sends := make(chan []byte, 128)
 	c := newRelayQUICConn(make(chan []byte), func(payload []byte) error {
+		// pc.Write builds [frameData][payload] before SendPacket.
+		if len(payload)+1 > derpclient.MaxPacketSize {
+			t.Errorf("relay frame = %d bytes including the type byte, want <= %d",
+				len(payload)+1, derpclient.MaxPacketSize)
+		}
 		sends <- append([]byte(nil), payload...)
 		return nil
 	}, nil, quicRelayOptions{BatchBytes: derpclient.MaxPacketSize, Flush: time.Millisecond})
 	defer c.Close()
+	if c.batchBytes != derpclient.MaxPacketSize-1 {
+		t.Fatalf("batch budget = %d, want %d after reserving the frame byte",
+			c.batchBytes, derpclient.MaxPacketSize-1)
+	}
 
 	const packets = 200
 	pkt := bytes.Repeat([]byte{0xab}, 1200)
@@ -428,8 +439,9 @@ func TestRelayQUICConnHonorsFrameBudget(t *testing.T) {
 	for got < packets {
 		select {
 		case payload := <-sends:
-			if len(payload) > derpclient.MaxPacketSize {
-				t.Fatalf("relay payload = %d bytes, want <= %d", len(payload), derpclient.MaxPacketSize)
+			if len(payload) > derpclient.MaxPacketSize-1 {
+				t.Fatalf("relay payload = %d bytes, want <= %d",
+					len(payload), derpclient.MaxPacketSize-1)
 			}
 			pkts, err := decodeQUICBatch(payload)
 			if err != nil {
@@ -439,6 +451,41 @@ func TestRelayQUICConnHonorsFrameBudget(t *testing.T) {
 		case <-timeout:
 			t.Fatalf("only %d/%d packets sent", got, packets)
 		}
+	}
+}
+
+// TestRelayQUICConnFrameBudgetExactlyMax writes one packet whose framed batch
+// lands exactly on the payload limit: 2-byte length prefix + (MaxPacketSize-3)
+// bytes = MaxPacketSize-1 bytes, leaving the frameData byte room under
+// MaxPacketSize. The previous clamp allowed a 65536-byte payload, whose
+// prefixed frame SendPacket rejected.
+func TestRelayQUICConnFrameBudgetExactlyMax(t *testing.T) {
+	sends := make(chan []byte, 1)
+	c := newRelayQUICConn(make(chan []byte), func(payload []byte) error {
+		sends <- append([]byte(nil), payload...)
+		return nil
+	}, nil, quicRelayOptions{BatchBytes: derpclient.MaxPacketSize, Flush: time.Millisecond})
+	defer c.Close()
+
+	pkt := bytes.Repeat([]byte{0xcd}, derpclient.MaxPacketSize-3)
+	if _, err := c.WriteTo(pkt, nil); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	select {
+	case payload := <-sends:
+		if len(payload) != derpclient.MaxPacketSize-1 {
+			t.Fatalf("relay payload = %d bytes, want %d", len(payload), derpclient.MaxPacketSize-1)
+		}
+		if len(payload)+1 > derpclient.MaxPacketSize {
+			t.Fatalf("relay frame = %d bytes including the type byte, want <= %d",
+				len(payload)+1, derpclient.MaxPacketSize)
+		}
+		pkts, err := decodeQUICBatch(payload)
+		if err != nil || len(pkts) != 1 || len(pkts[0]) != len(pkt) {
+			t.Fatalf("decode boundary batch: %d packets, %v", len(pkts), err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sender did not emit the boundary batch")
 	}
 }
 
