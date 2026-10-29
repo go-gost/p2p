@@ -502,6 +502,10 @@ func peerVerdict(key string, d p2p.PeerDiagnostic) string {
 	case "server-unreachable":
 		return fmt.Sprintf("peer %s: on the relay; server unreachable", key)
 	case "":
+		if d.TransportError != "" {
+			return fmt.Sprintf("peer %s: no connected transport (%s: %s)", key,
+				orNone(d.Transport), d.TransportError)
+		}
 		return fmt.Sprintf("peer %s: no transport reported", key)
 	default:
 		return fmt.Sprintf("peer %s: on the relay (%s)", key, d.Path)

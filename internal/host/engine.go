@@ -346,8 +346,11 @@ func (e *engine) relayRTT() time.Duration {
 }
 
 // peerDiagnostics snapshots each connected peer. transports is the peer-set
-// snapshot peerTransports just computed (its only caller is status()), so it is
-// also the peer set here: the same filter, the paths read once per status tick.
+// snapshot peerTransports just computed (its only caller is status()), so for
+// connected peers it is also the peer set here: the same filter, the paths read
+// once per status tick. In QUIC mode a peer whose last establishment failed is
+// appended even though it has no transport entry; that entry carries the error
+// word and an empty Path, and never reaches PeerTransports or the gauges.
 // The host-wide reason applies to every peer it outranks — but only on a path
 // that is not already direct, matching peerTransports, where a live session
 // outranks the reason: a peer that reads Path="direct" must not also carry
@@ -364,6 +367,16 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 		directs = append(directs, dc)
 	}
 	e.mu.Unlock()
+
+	// A peer whose QUIC establishment failed has no live transport entry (it
+	// must not inflate the connected-peer gauges), but its last error is the
+	// only thing that explains why the peer never came up. Snapshot those
+	// states first, so the merge below does not hold quicMu while building the
+	// diagnostics.
+	var quicFailures []quicPeerFailure
+	if e.transport == transportQUIC {
+		quicFailures = e.quicPeerFailures()
+	}
 
 	reason := e.directReason()
 	// A live direct session outranks the host-wide reason (peerTransports), so
@@ -459,8 +472,51 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 		d.NextPunchIn = dc.nextPunchIn()
 		out[name] = d
 	}
+	// Peers whose transport never came up are diagnostic-only entries: they
+	// carry the failure word and no Path, and deliberately stay out of
+	// PeerTransports and the connected-peer gauges. A peer already in out has
+	// a live path; its diagnostic already carries its own TransportError.
+	for _, f := range quicFailures {
+		name := keyName(f.peer)
+		if _, ok := out[name]; ok {
+			continue
+		}
+		out[name] = p2p.PeerDiagnostic{
+			Transport:       transportNameQUIC,
+			DirectTransport: transportNameQUIC,
+			TransportError:  f.reason,
+			State:           "none",
+			SessionState:    quicSessionState(f.pair),
+		}
+	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+// quicPeerFailure is one peer whose last QUIC establishment failed. pair is the
+// usable-but-unestablished pair the attempt left behind, or nil when the
+// failure happened before one was built.
+type quicPeerFailure struct {
+	peer   derpclient.PublicKey
+	pair   *quicPair
+	reason string
+}
+
+// quicPeerFailures snapshots the peers whose last QUIC establishment failed.
+// The caller merges them into PeerDiagnostics as diagnostic-only entries: a
+// failed peer has no live transport entry, but hiding the error leaves the
+// operator without the one fact that explains it.
+func (e *engine) quicPeerFailures() []quicPeerFailure {
+	e.quicMu.Lock()
+	defer e.quicMu.Unlock()
+	out := make([]quicPeerFailure, 0, len(e.quics))
+	for peer, qp := range e.quics {
+		if qp == nil || qp.lastErr == "" {
+			continue
+		}
+		out = append(out, quicPeerFailure{peer: peer, pair: qp.pair, reason: qp.lastErr})
 	}
 	return out
 }
@@ -801,17 +857,30 @@ func (e *engine) ensureTransport(peer derpclient.PublicKey) (mode transportMode,
 	if e.transport != transportQUIC {
 		return transportKCP, nil
 	}
+
+	// An attempt this call owns records its outcome before publishing
+	// completion (below); a call that only waits on another attempt's setup
+	// returns that result without rewriting it. Otherwise a waiter could land
+	// a stale failure after a newer attempt had already cleared it.
+	recordOutcome := true
+	var pending *quicSetup
 	defer func() {
-		reason := quicTransportErrorReason(err)
-		e.setQUICTransportError(peer, reason)
-		if err != nil {
-			e.log.Debug("transport error", "peer", keyName(peer),
-				"reason", reason, "error", err)
+		if recordOutcome {
+			reason := quicTransportErrorReason(err)
+			e.setQUICTransportError(peer, reason)
+			e.logQUICTransportError(peer, reason, err)
+		}
+		// Publish completion only after the outcome is recorded: a waiter that
+		// wakes on done sees both the result and the state it updated.
+		if pending != nil {
+			close(pending.done)
 		}
 	}()
+
 	if e.quicID == nil {
-		return transportQUIC, fmt.Errorf("%w: peer %s: quic identity is not configured",
-			p2p.ErrTransportUnsupported, keyName(peer))
+		return transportQUIC, quicFailure("no-quic-identity",
+			fmt.Errorf("%w: peer %s: quic identity is not configured",
+				p2p.ErrTransportUnsupported, keyName(peer)))
 	}
 	if pair := e.getQUIC(peer); pair != nil && pair.established() {
 		// QUIC has no ensureSession to start a punch: the established pair is
@@ -832,26 +901,36 @@ func (e *engine) ensureTransport(peer derpclient.PublicKey) (mode transportMode,
 		return transportQUIC, nil
 	}
 	if setup := qp.setup; setup != nil {
+		// The owner records the outcome and clears the error under the same
+		// lock that publishes setup, so waiting is read-only here.
+		recordOutcome = false
 		e.quicMu.Unlock()
 		<-setup.done
 		return transportQUIC, setup.err
 	}
-	setup := &quicSetup{done: make(chan struct{})}
+	pending = &quicSetup{done: make(chan struct{})}
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
-	setup.cancel = cancelSetup
-	qp.setup = setup
+	pending.cancel = cancelSetup
+	qp.setup = pending
 	e.quicMu.Unlock()
 
 	err = e.establishQUIC(setupCtx, peer, qp)
 	cancelSetup()
 
 	e.quicMu.Lock()
-	setup.err = err
-	if qp.setup == setup {
+	pending.err = err
+	// Record the failure (or clear it on success) while setup is still
+	// published: no newer attempt can start until qp.setup is cleared, so this
+	// write cannot race ahead of a newer outcome.
+	if current := e.quics[peer]; current == qp {
+		qp.lastErr = quicTransportErrorReason(err)
+	}
+	if qp.setup == pending {
 		qp.setup = nil
 	}
 	e.quicMu.Unlock()
-	close(setup.done)
+	recordOutcome = false
+	e.logQUICTransportError(peer, quicTransportErrorReason(err), err)
 	if err == nil {
 		// The pair just established (or another setup did while this one
 		// waited). Kick the punch: QUIC mode has no KCP session build to carry
@@ -864,6 +943,32 @@ func (e *engine) ensureTransport(peer derpclient.PublicKey) (mode transportMode,
 	return transportQUIC, err
 }
 
+// logQUICTransportError emits the transport-error log line for a failed
+// establishment. Success is silent.
+func (e *engine) logQUICTransportError(peer derpclient.PublicKey, reason string, err error) {
+	if err == nil {
+		return
+	}
+	e.log.Debug("transport error", "peer", keyName(peer),
+		"reason", reason, "error", err)
+}
+
+// quicTransportFailure pins the finite PeerDiagnostic.TransportError word at
+// the error site, so the mapping does not have to infer it from the wrapped
+// message (and cannot confuse one ErrTransportUnsupported cause with another).
+type quicTransportFailure struct {
+	reason string
+	err    error
+}
+
+func (f *quicTransportFailure) Error() string { return f.err.Error() }
+func (f *quicTransportFailure) Unwrap() error { return f.err }
+
+// quicFailure wraps err with the reason word TransportError reports.
+func quicFailure(reason string, err error) error {
+	return &quicTransportFailure{reason: reason, err: err}
+}
+
 // quicTransportErrorReason maps an establishment error to the finite word
 // PeerDiagnostic.TransportError reports. The words name what an operator can
 // act on — the peer does not speak QUIC, the caps exchange timed out, the
@@ -871,6 +976,10 @@ func (e *engine) ensureTransport(peer derpclient.PublicKey) (mode transportMode,
 func quicTransportErrorReason(err error) string {
 	if err == nil {
 		return ""
+	}
+	var failure *quicTransportFailure
+	if errors.As(err, &failure) {
+		return failure.reason
 	}
 	if errors.Is(err, p2p.ErrTransportUnsupported) {
 		return "peer-no-quic"

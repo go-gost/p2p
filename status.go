@@ -76,8 +76,11 @@ type PeerDiagnostic struct {
 	DirectTransport string
 	// TransportError is the last transport-establishment failure for this
 	// peer, as a finite word ("peer-no-quic", "caps-timeout",
-	// "quic-handshake", ...), empty while the transport is healthy or has not
-	// errored since the last success. In-process only.
+	// "quic-handshake", "no-quic-identity", ...), empty while the transport is
+	// healthy or has not errored since the last success. A peer that never
+	// established appears in PeerDiagnostics with an empty Path and this word
+	// set; it has no live data path, so it is absent from PeerTransports and
+	// the connected-peer gauges. In-process only.
 	TransportError string
 	// SessionState is the relay mux session's own state — "up" or "down" — the
 	// layer the report had no field for at all. It is deliberately separate
@@ -350,8 +353,12 @@ type Status struct {
 	DirectConfig DirectConfig
 
 	// PeerDiagnostics is each connected peer's live state, keyed by base64
-	// public key. The gRPC transport carries it as the repeated
-	// peer_diagnostics message (each entry keyed by the base64 key).
+	// public key. In QUIC mode it also carries a peer whose last transport
+	// establishment failed: that entry has an empty Path and a TransportError,
+	// and is diagnostic-only (it is not in PeerTransports or the peer gauges).
+	// The gRPC transport carries it as the repeated peer_diagnostics message
+	// (each entry keyed by the base64 key); the error-only entry is in-process
+	// only because the proto is frozen.
 	PeerDiagnostics map[string]PeerDiagnostic
 
 	// EncryptedPeers counts connected peers whose live sessions settled

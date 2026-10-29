@@ -190,16 +190,22 @@ func (p *quicPair) relayDown(relay *relayQUICConn) {
 		return
 	}
 	p.mu.Lock()
-	if p.relay == relay {
+	installed := p.relay == relay
+	if installed {
 		p.relay = nil
 	}
 	p.mu.Unlock()
 
-	p.mp.removeUnderlayIf(quicPathRelay, relay)
+	removed := p.mp.removeUnderlayIf(quicPathRelay, relay)
 	// removeUnderlayIf already closed an installed underlay; this is the
 	// idempotent close for a sender that never made it into the map.
 	_ = relay.Close()
-	p.logUnderlay(quicPathRelay, "retired", "relay-down")
+	// Only an underlay that was actually attached to this pair is retired;
+	// a stale teardown (relay already replaced, or never installed) must not
+	// emit an event for an underlay this pair does not own.
+	if installed || removed {
+		p.logUnderlay(quicPathRelay, "retired", "relay-down")
+	}
 }
 
 // directUnderlay returns the installed direct underlay, or nil. The pair keeps
