@@ -221,6 +221,14 @@ func (h *Host) warm(peerB64 string, punch bool) error {
 	if err != nil {
 		return err
 	}
+	if h.engine.transport == transportQUIC {
+		// Warm means "have a data path to this peer ready". In QUIC mode that
+		// is the QUIC pair; the KCP warm path would build exactly the session
+		// the transport switch forbids. Punching is not wired into the QUIC
+		// pair here, so the punch flag is a no-op.
+		_, err := h.engine.ensureTransport(peer)
+		return err
+	}
 	return h.engine.warm(peer, punch)
 }
 

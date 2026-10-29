@@ -56,10 +56,14 @@ type quicPair struct {
 	// mu guards the establishment state and conn, which status readers and
 	// close can reach from other goroutines. The transport callbacks must never
 	// hold it.
-	mu     sync.Mutex
-	tr     *quic.Transport
-	conn   *quic.Conn
-	ln     *quic.Listener
+	mu   sync.Mutex
+	tr   *quic.Transport
+	conn *quic.Conn
+	ln   *quic.Listener
+	// relay is the installed relay underlay. It is the inbound sink for
+	// frameData payloads while the pair is alive, including during the
+	// handshake before conn exists.
+	relay  *relayQUICConn
 	closed bool
 
 	closeOnce sync.Once
@@ -113,6 +117,13 @@ func (p *quicPair) addRelayUnderlay(pc net.PacketConn) error {
 	}
 	p.mu.Lock()
 	closed := p.closed
+	if !closed {
+		// Install the inbound sink before the reader starts, so a handshake
+		// packet that arrives immediately after addUnderlay is not dropped.
+		if r, ok := pc.(*relayQUICConn); ok {
+			p.relay = r
+		}
+	}
 	p.mu.Unlock()
 	if closed {
 		_ = pc.Close()
@@ -124,6 +135,27 @@ func (p *quicPair) addRelayUnderlay(pc net.PacketConn) error {
 		pc:   pc,
 	})
 	return nil
+}
+
+// deliverRelay hands one inbound DERP data payload to the relay underlay's
+// batching decoder. It is called from the relay pump and never blocks: a full
+// queue drops the payload and QUIC retransmits the packets it carried. It
+// reports whether the payload was accepted.
+func (p *quicPair) deliverRelay(pkt []byte) bool {
+	p.mu.Lock()
+	relay, closed := p.relay, p.closed
+	p.mu.Unlock()
+	if relay == nil || closed {
+		return false
+	}
+	return relay.deliver(pkt)
+}
+
+// established reports whether the QUIC connection has completed its handshake.
+func (p *quicPair) established() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.conn != nil && !p.closed
 }
 
 // establish creates the transport and performs the QUIC/TLS handshake. The

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/go-gost/p2p/internal/derpclient"
 )
 
 // Relay batching parameters. One DERP data frame carries several QUIC
@@ -25,11 +27,42 @@ const (
 	// retransmits; it must never block a QUIC write path.
 	quicRelayWriteQueue = 1024
 
+	// quicRelayInQueue bounds inbound DERP payloads waiting to be split by
+	// ReadFrom. A full queue drops the payload; the QUIC packets inside it are
+	// retransmitted.
+	quicRelayInQueue = 256
+
 	// quicRelayMaxPacket is the largest packet the uint16 length prefix can
-	// describe. The sender rejects anything above quicRelayBatchBytes long
-	// before it reaches the encoder.
+	// describe. The sender rejects anything whose framed size (2 + packet)
+	// exceeds the batch budget before it reaches the encoder.
 	quicRelayMaxPacket = 1<<16 - 1
 )
+
+// quicRelayOptions carries the host's batching configuration. The zero value
+// keeps the package defaults, so tests and callers that do not care can pass
+// an empty struct.
+type quicRelayOptions struct {
+	BatchBytes int
+	Flush      time.Duration
+}
+
+// resolve returns the effective batch size and flush delay. The batch size
+// counts each packet's 2-byte length prefix, which keeps one encoded payload
+// within both the configured budget and DERP's MaxPacketSize.
+func (o quicRelayOptions) resolve() (int, time.Duration) {
+	batch := o.BatchBytes
+	if batch <= 0 {
+		batch = quicRelayBatchBytes
+	}
+	if batch > derpclient.MaxPacketSize {
+		batch = derpclient.MaxPacketSize
+	}
+	flush := o.Flush
+	if flush <= 0 {
+		flush = quicRelayFlush
+	}
+	return batch, flush
+}
 
 var (
 	errQUICBatchTruncated = errors.New("host: quic relay batch truncated")
@@ -80,9 +113,12 @@ func decodeQUICBatch(payload []byte) ([][]byte, error) {
 // encoded batch to peerConn.Write. It is a bridge only: the multiPathConn and
 // the QUIC Transport own lifecycle and path selection.
 type relayQUICConn struct {
-	in      <-chan []byte
+	in      chan []byte
 	send    func([]byte) error
 	closeFn func() error
+
+	batchBytes int
+	flush      time.Duration
 
 	writeCh    chan []byte
 	closedCh   chan struct{}
@@ -110,12 +146,17 @@ type relayQUICConn struct {
 var _ net.PacketConn = (*relayQUICConn)(nil)
 
 // newRelayQUICConn starts the batching sender. in and send must be non-nil;
-// closeFn may be nil. Close invokes closeFn once after the sender exits.
-func newRelayQUICConn(in <-chan []byte, send func([]byte) error, closeFn func() error) *relayQUICConn {
+// closeFn may be nil. opts carries the host's batching configuration; its zero
+// value keeps the package defaults. Close invokes closeFn once after the
+// sender exits.
+func newRelayQUICConn(in chan []byte, send func([]byte) error, closeFn func() error, opts quicRelayOptions) *relayQUICConn {
+	batchBytes, flush := opts.resolve()
 	c := &relayQUICConn{
 		in:         in,
 		send:       send,
 		closeFn:    closeFn,
+		batchBytes: batchBytes,
+		flush:      flush,
 		writeCh:    make(chan []byte, quicRelayWriteQueue),
 		closedCh:   make(chan struct{}),
 		senderDone: make(chan struct{}),
@@ -123,6 +164,24 @@ func newRelayQUICConn(in <-chan []byte, send func([]byte) error, closeFn func() 
 	}
 	go c.sender()
 	return c
+}
+
+// deliver queues one inbound DERP payload for ReadFrom without blocking. The
+// payload is owned by the relay pump and is not copied: decodeQUICBatch copies
+// each packet before returning it, and nothing else retains the slice.
+func (c *relayQUICConn) deliver(pkt []byte) bool {
+	select {
+	case <-c.closedCh:
+		return false
+	default:
+	}
+	select {
+	case c.in <- pkt:
+		return true
+	default:
+		c.drops.Add(1)
+		return false
+	}
 }
 
 // sender owns the outbound batch. It accumulates packets until they reach
@@ -156,9 +215,9 @@ func (c *relayQUICConn) sender() {
 	}()
 	startTimer := func() {
 		if timer == nil {
-			timer = time.NewTimer(quicRelayFlush)
+			timer = time.NewTimer(c.flush)
 		} else {
-			timer.Reset(quicRelayFlush)
+			timer.Reset(c.flush)
 		}
 		timerC = timer.C
 	}
@@ -196,18 +255,21 @@ func (c *relayQUICConn) sender() {
 		select {
 		case pkt := <-c.writeCh:
 			// WriteTo rejects oversized packets; keep the sender defensive in
-			// case a future caller bypasses it.
-			if len(pkt) == 0 || len(pkt) > quicRelayBatchBytes {
+			// case a future caller bypasses it. The 2-byte length prefix is
+			// part of the frame budget, so a batch never encodes past
+			// batchBytes (and therefore never past derpclient.MaxPacketSize).
+			framed := 2 + len(pkt)
+			if len(pkt) == 0 || framed > c.batchBytes {
 				c.drops.Add(1)
 				continue
 			}
-			if pendingBytes > 0 && pendingBytes+len(pkt) > quicRelayBatchBytes {
+			if pendingBytes > 0 && pendingBytes+framed > c.batchBytes {
 				flush()
 				stopTimer()
 			}
 			pending = append(pending, pkt)
-			pendingBytes += len(pkt)
-			if pendingBytes >= quicRelayBatchBytes {
+			pendingBytes += framed
+			if pendingBytes >= c.batchBytes {
 				flush()
 				stopTimer()
 				continue
@@ -237,9 +299,10 @@ func (c *relayQUICConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	default:
 	}
 
-	// Zero-length and over-batch packets cannot be framed usefully by the
-	// relay. QUIC packets stay under the path MTU and never take this branch.
-	if len(p) == 0 || len(p) > quicRelayBatchBytes {
+	// Zero-length and over-budget packets cannot be framed usefully by the
+	// relay; the budget includes the 2-byte length prefix. QUIC packets stay
+	// under the path MTU and never take this branch.
+	if len(p) == 0 || 2+len(p) > c.batchBytes {
 		c.drops.Add(1)
 		return len(p), nil
 	}

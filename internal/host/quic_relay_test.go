@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/go-gost/p2p/internal/derpclient"
 )
 
 func TestQUICBatchRoundTrip(t *testing.T) {
@@ -88,7 +90,7 @@ func readRelayPacket(t *testing.T, c *relayQUICConn, size int) []byte {
 
 func TestRelayQUICConnSplitsPayload(t *testing.T) {
 	in := make(chan []byte, 1)
-	c := newRelayQUICConn(in, func([]byte) error { return nil }, nil)
+	c := newRelayQUICConn(in, func([]byte) error { return nil }, nil, quicRelayOptions{})
 	defer c.Close()
 
 	want := [][]byte{[]byte("first"), []byte("second")}
@@ -110,7 +112,7 @@ func TestRelayQUICConnBatchesWrites(t *testing.T) {
 	c := newRelayQUICConn(make(chan []byte), func(payload []byte) error {
 		sends <- append([]byte(nil), payload...)
 		return nil
-	}, nil)
+	}, nil, quicRelayOptions{})
 	defer c.Close()
 
 	want := [][]byte{{1, 2}, {3, 4}, {5}}
@@ -155,7 +157,7 @@ func TestRelayQUICConnFlush(t *testing.T) {
 	c := newRelayQUICConn(make(chan []byte), func([]byte) error {
 		sent <- time.Now()
 		return nil
-	}, nil)
+	}, nil, quicRelayOptions{})
 	defer c.Close()
 
 	start := time.Now()
@@ -174,7 +176,7 @@ func TestRelayQUICConnFlush(t *testing.T) {
 
 func TestRelayQUICConnDropsMalformed(t *testing.T) {
 	in := make(chan []byte, 2)
-	c := newRelayQUICConn(in, func([]byte) error { return nil }, nil)
+	c := newRelayQUICConn(in, func([]byte) error { return nil }, nil, quicRelayOptions{})
 	defer c.Close()
 
 	in <- []byte{0, 5, 1, 2} // truncated batch: drop the whole payload
@@ -190,7 +192,7 @@ func TestRelayQUICConnDropsMalformed(t *testing.T) {
 
 func TestRelayQUICConnDropsOversizedPacket(t *testing.T) {
 	in := make(chan []byte, 1)
-	c := newRelayQUICConn(in, func([]byte) error { return nil }, nil)
+	c := newRelayQUICConn(in, func([]byte) error { return nil }, nil, quicRelayOptions{})
 	defer c.Close()
 
 	in <- encodeQUICBatch([][]byte{bytes.Repeat([]byte{1}, 8), []byte("ok")})
@@ -203,7 +205,7 @@ func TestRelayQUICConnDropsOversizedPacket(t *testing.T) {
 }
 
 func TestRelayQUICConnReadDeadline(t *testing.T) {
-	c := newRelayQUICConn(make(chan []byte), func([]byte) error { return nil }, nil)
+	c := newRelayQUICConn(make(chan []byte), func([]byte) error { return nil }, nil, quicRelayOptions{})
 	defer c.Close()
 
 	if err := c.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
@@ -234,7 +236,7 @@ func TestRelayQUICConnReadDeadline(t *testing.T) {
 }
 
 func TestRelayQUICConnWriteDeadline(t *testing.T) {
-	c := newRelayQUICConn(make(chan []byte), func([]byte) error { return nil }, nil)
+	c := newRelayQUICConn(make(chan []byte), func([]byte) error { return nil }, nil, quicRelayOptions{})
 	defer c.Close()
 
 	if err := c.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
@@ -252,7 +254,7 @@ func TestRelayQUICConnClose(t *testing.T) {
 	c := newRelayQUICConn(in, nil, func() error {
 		closeCalls.Add(1)
 		return closeErr
-	})
+	}, quicRelayOptions{})
 
 	readErr := make(chan error, 1)
 	go func() {
@@ -298,7 +300,7 @@ func TestRelayQUICConnCountsSendErrors(t *testing.T) {
 	c := newRelayQUICConn(make(chan []byte), func([]byte) error {
 		called <- struct{}{}
 		return sendErr
-	}, nil)
+	}, nil, quicRelayOptions{})
 	defer c.Close()
 
 	if _, err := c.WriteTo([]byte("x"), nil); err != nil {
@@ -333,7 +335,7 @@ func TestRelayQUICConnWriteQueueDrops(t *testing.T) {
 		}
 		<-release
 		return nil
-	}, nil)
+	}, nil, quicRelayOptions{})
 
 	if _, err := c.WriteTo([]byte("first"), nil); err != nil {
 		t.Fatalf("WriteTo: %v", err)
@@ -370,7 +372,7 @@ func TestRelayQUICConnConcurrentWrites(t *testing.T) {
 			badBatch.Store(true)
 		}
 		return nil
-	}, nil)
+	}, nil, quicRelayOptions{})
 	defer c.Close()
 
 	const writers = 8
@@ -398,5 +400,74 @@ func TestRelayQUICConnConcurrentWrites(t *testing.T) {
 	}
 	if badBatch.Load() {
 		t.Fatal("sender emitted a malformed batch")
+	}
+}
+
+// TestRelayQUICConnHonorsFrameBudget pins the 64 KiB boundary: the configured
+// batch budget counts each packet's 2-byte length prefix, so no encoded DERP
+// payload can exceed derpclient.MaxPacketSize even when the host configures the
+// maximum batch size.
+func TestRelayQUICConnHonorsFrameBudget(t *testing.T) {
+	sends := make(chan []byte, 128)
+	c := newRelayQUICConn(make(chan []byte), func(payload []byte) error {
+		sends <- append([]byte(nil), payload...)
+		return nil
+	}, nil, quicRelayOptions{BatchBytes: derpclient.MaxPacketSize, Flush: time.Millisecond})
+	defer c.Close()
+
+	const packets = 200
+	pkt := bytes.Repeat([]byte{0xab}, 1200)
+	for i := 0; i < packets; i++ {
+		if _, err := c.WriteTo(pkt, nil); err != nil {
+			t.Fatalf("WriteTo: %v", err)
+		}
+	}
+
+	got := 0
+	timeout := time.After(3 * time.Second)
+	for got < packets {
+		select {
+		case payload := <-sends:
+			if len(payload) > derpclient.MaxPacketSize {
+				t.Fatalf("relay payload = %d bytes, want <= %d", len(payload), derpclient.MaxPacketSize)
+			}
+			pkts, err := decodeQUICBatch(payload)
+			if err != nil {
+				t.Fatalf("decode batch: %v", err)
+			}
+			got += len(pkts)
+		case <-timeout:
+			t.Fatalf("only %d/%d packets sent", got, packets)
+		}
+	}
+}
+
+// TestRelayQUICConnDropsPacketsOverBudget proves the framing prefix is part of
+// the budget: with a 32-byte batch, a 30-byte packet fits (2+30) and a 31-byte
+// packet does not.
+func TestRelayQUICConnDropsPacketsOverBudget(t *testing.T) {
+	sends := make(chan []byte, 4)
+	c := newRelayQUICConn(make(chan []byte), func(payload []byte) error {
+		sends <- append([]byte(nil), payload...)
+		return nil
+	}, nil, quicRelayOptions{BatchBytes: 32, Flush: time.Millisecond})
+	defer c.Close()
+
+	if _, err := c.WriteTo(make([]byte, 31), nil); err != nil {
+		t.Fatalf("WriteTo oversized: %v", err)
+	}
+	if got := c.drops.Load(); got != 1 {
+		t.Fatalf("drops = %d, want 1 for an over-budget packet", got)
+	}
+	if _, err := c.WriteTo(make([]byte, 30), nil); err != nil {
+		t.Fatalf("WriteTo fitting: %v", err)
+	}
+	select {
+	case payload := <-sends:
+		if len(payload) != 32 {
+			t.Fatalf("encoded payload = %d bytes, want 32", len(payload))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fitting packet was not sent")
 	}
 }
