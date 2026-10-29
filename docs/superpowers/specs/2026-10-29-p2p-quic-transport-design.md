@@ -283,6 +283,9 @@ type 0x01 = QUIC:
 - 收到 caps 时若本地是 QUIC 模式且尚未回过 caps，回一次自己的 caps（带自己的
   FP）；用 per-peer `capsSent` 防环。FP 变化（peer 重启）时覆盖旧值并允许重新
   握手。
+- QUIC 模式下 `announceDirect`/warm 也必须带 QUIC bit + TLV，不能发 bits-only：
+  `addCaps` 对“无 QUIC bit”的 caps 会清掉已学到的 FP；一个 direct off 的 peer
+  没有 punch caps 帧来恢复它。
 - TLS：
   - 每个 engine 进程生成一个 Ed25519 自签证书（懒生成，仅 QUIC 模式）：
     CN = base64 公钥，NotBefore -1h，NotAfter +365d，KeyUsage digitalSignature，

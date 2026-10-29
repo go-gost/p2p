@@ -189,6 +189,7 @@ Expected: PASS（KCP 模式 caps 仍是 1 字节，现有测试不变）。
 - Create: `p2p/internal/host/quic_tls.go`
 - Create: `p2p/internal/host/quic_tls_test.go`
 - Modify: `p2p/internal/host/engine.go`（新增 `quicID *quicIdentity` 字段；`host.New` 在 QUIC 模式生成）
+- Modify: `p2p/internal/host/direct.go`（`announceDirect` 在 QUIC 模式下带 QUIC TLV）
 
 **Interfaces:**
 - Consumes: `crypto/ed25519`、`crypto/tls`、`crypto/x509`、`crypto/sha256`。
@@ -200,6 +201,8 @@ Expected: PASS（KCP 模式 caps 仍是 1 字节，现有测试不变）。
   - `func quicTLSConfig(id *quicIdentity, peerFP [32]byte, server bool) *tls.Config`。
   - `func pinFingerprint(want [32]byte) func([][]byte, [][]*x509.Certificate) error`。
   - `engine.quicID *quicIdentity`（仅 QUIC 模式非 nil）。
+  - `e.caps()` 在 `transport==transportQUIC && quicID!=nil` 时置 `capsQUIC` 并带 QUIC TLV。
+  - `announceDirect` 在 QUIC 模式下发送 `e.caps()`（bit+TLV），不能只发 bits：Task 2 的 `addCaps` 对“无 QUIC bit”的 caps 会清掉已学到的 FP。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -223,7 +226,7 @@ func TestQUICTLSRequiresClientCert(t *testing.T) {
 func TestQUICTLSALPN(t *testing.T) { /* mismatched NextProtos -> handshake error */ }
 func TestCapsIncludesQUICFingerprint(t *testing.T) {
     // e := &engine{transport: transportQUIC, quicID: id}
-    // ci := e.caps(); ci.QUIC != nil && ci.QUIC.Fingerprint == id.fp
+    // ci := e.caps(); ci.Bits&capsQUIC != 0 && ci.QUIC != nil && ci.QUIC.Fingerprint == id.fp
 }
 ```
 
@@ -237,7 +240,7 @@ Ed25519 自签证书：随机 serial、CN=base64 公钥、NotBefore -1h、NotAft
 
 - [ ] **Step 4: 接入 `host.New`**
 
-在 `host.New` 的 DERP 分支：若 `transport==transportQUIC`，`h.engine.quicID, err = newQUICIdentity()`；失败返回错误。KCP 模式不生成。更新 `e.caps()`：`transport==transportQUIC && quicID != nil` 时把 `QUIC` TLV（版本 1、FP、batch version 1）填进 `capsInfo`。
+在 `host.New` 的 DERP 分支：若 `transport==transportQUIC`，`h.engine.quicID, err = newQUICIdentity()`；失败返回错误。KCP 模式不生成。更新 `e.caps()`：`transport==transportQUIC && quicID != nil` 时置 `capsQUIC` 并把 `QUIC` TLV（版本 1、FP、batch version 1）填进 `capsInfo`。更新 `announceDirect`：QUIC 模式下调用 `e.caps()` 发送（含 bit+TLV；若 direct off 再 OR `capsNoDirect`），不能只发 bits，否则 `addCaps` 会清掉 peer 已学到的 FP。
 
 - [ ] **Step 5: 跑测试与 KCP 回归**
 
@@ -245,7 +248,7 @@ Ed25519 自签证书：随机 serial、CN=base64 公钥、NotBefore -1h、NotAft
 
 - [ ] **Step 6: Commit（仅用户要求时）**
 
-`git -C p2p add internal/host/quic_tls.go internal/host/quic_tls_test.go internal/host/engine.go internal/host/host.go && git -C p2p commit -m "feat: add quic tls identity and pinning"`
+`git -C p2p add internal/host/quic_tls.go internal/host/quic_tls_test.go internal/host/engine.go internal/host/host.go internal/host/direct.go && git -C p2p commit -m "feat: add quic tls identity and pinning"`
 
 ---
 
