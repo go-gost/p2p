@@ -500,6 +500,8 @@ Expected: PASS（这是 KCP 行为的回归门）。
 
 `ensureTransport` 的 caps 等待用一个 per-peer `capsWait` channel/`sync.Cond`；`handleControl` 收到 caps 时写入并唤醒。`OpenStream` 分支、`maybeStartQUIC`（server 入站 caps 时启动 `Listen`）。QUIC 模式下 data sink 由 `e.peerConn` 安装/替换时重新安装：sink 投递到 `relayQUICConn.in`，pair 未就绪则 `maybeStartQUIC` + drop，绝不走 KCP。`ctrlSecure` 的 secure 会话在 QUIC 模式下不创建。
 
+Task 7 的 `establish` 在失败时只关闭本次 conn/listener/transport，保留 `mp`/relay underlay；`ensureTransport` 在 peer 尚未 listen 的窗口内可以对**同一个 relay underlay** 重试 `establish`（有界，`quicHandshakeTimeout`），不要为每次重试重建 `multiPathConn` 或 relay underlay。
+
 同时把 Task 5 的 `relayQUICConn` 接到 `quicRelayOptions`：`newRelayQUICConn(..., quicRelayOptions{BatchBytes: e.quicCfg.RelayBatchBytes, Flush: e.quicCfg.RelayFlush})`；修正 batch 预算为 `2+len(pkt)`，并测试“配置 64 KiB 时不产生 >64 KiB 的 DERP 帧”。Task 5 的旧测试按新签名更新。
 
 - [ ] **Step 4: 跑测试与 KCP 回归**
