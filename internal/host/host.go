@@ -87,9 +87,19 @@ func New(cfg *p2p.Config, opts ...Option) (*Host, error) {
 		if err != nil {
 			return nil, err
 		}
+		// The QUIC identity is generated only in QUIC mode. It is created
+		// before newEngine so a crypto failure cannot leave the engine's
+		// reconnect goroutine running after New returns an error.
+		var quicID *quicIdentity
+		if transport == transportQUIC {
+			if quicID, err = newQUICIdentity(); err != nil {
+				return nil, fmt.Errorf("p2p: quic identity: %w", err)
+			}
+		}
 		h.engine = newEngine(cfg.Derp, "", priv, h.log)
 		h.engine.transport = transport
 		h.engine.quicCfg = quicCfg
+		h.engine.quicID = quicID
 		if err := h.engine.addTargets(cfg.TargetList()); err != nil {
 			return nil, err
 		}

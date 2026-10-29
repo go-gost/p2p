@@ -48,6 +48,7 @@ type engine struct {
 	url         string
 	transport   transportMode                          // data plane for every peer; fixed at construction
 	quicCfg     quicSettings                           // resolved QUIC settings; used when transport == transportQUIC
+	quicID      *quicIdentity                          // QUIC TLS identity; non-nil only when transport == transportQUIC
 	targets     *targetPool                            // inbound bridge targets; an empty tcp pool refuses inbound tunnels
 	direct      bool                                   // master direct switch (--direct); false = relay-only
 	stunAddr    string                                 // STUN server (host:port); "" disables the IPv4 direct path
@@ -536,12 +537,21 @@ func (e *engine) resolveV6() *net.UDPAddr {
 
 // caps returns the capabilities this host advertises. The IPv6 bit is a
 // statement about what this host can use right now: a host that has the family
-// off, or has it on without an egress, must not claim it. A host with no QUIC
-// identity advertises only these legacy bits.
+// off, or has it on without an egress, must not claim it. In QUIC mode the
+// caps frame also carries the TLS identity (version, certificate fingerprint
+// and relay batch version); a KCP host advertises only the legacy bits.
 func (e *engine) caps() capsInfo {
 	info := capsInfo{}
 	if e.v6Enabled && e.v6Usable() {
 		info.Bits |= capsIPv6
+	}
+	if e.transport == transportQUIC && e.quicID != nil {
+		info.Bits |= capsQUIC
+		info.QUIC = &quicCaps{
+			Version:      quicCapsVersion,
+			Fingerprint:  e.quicID.fingerprint(),
+			BatchVersion: quicCapsBatchVersion,
+		}
 	}
 	return info
 }

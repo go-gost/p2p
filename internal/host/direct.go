@@ -460,13 +460,19 @@ func (e *engine) warm(peer derpclient.PublicKey, punch bool) error {
 }
 
 // announceDirect sends our caps to a peer, adding capsNoDirect when the direct
-// path is off so the peer stops asking. The IPv6 and tight-keepalive bits mean
-// nothing without a punch round, so they ride it instead (see sendCaps' callers
-// in punch) and only the "off" bit travels here.
+// path is off so the peer stops asking. In QUIC mode the frame starts from
+// e.caps(), so it carries the QUIC bit and certificate TLV: addCaps treats a
+// frame without the bit as authoritative and would clear the peer's learned
+// fingerprint, and a peer with direct off has no punch frame to restore it. In
+// KCP mode the IPv6 capability keeps riding the punch broadcasts (sendCaps'
+// callers there) and only the "off" bit travels here.
 func (e *engine) announceDirect(peer derpclient.PublicKey) {
 	info := capsInfo{}
+	if e.transport == transportQUIC && e.quicID != nil {
+		info = e.caps()
+	}
 	if !e.directEnabled() {
-		info.Bits = capsNoDirect
+		info.Bits |= capsNoDirect
 	}
 	if err := e.sendCaps(peer, info); err != nil {
 		e.log.Debug("direct: announce direct-off failed", "peer", keyName(peer), "error", err)
