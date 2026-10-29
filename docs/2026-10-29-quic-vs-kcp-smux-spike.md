@@ -291,10 +291,11 @@ spike 结论已落成 opt-in 的 QUIC transport。本节是**状态记录**，�
 - 单元/集成：batching codec、帧预算、malformed、underlay 替换、Task 8
   data sink、迁移、失败/重建、严格互斥、多 peer 隔离；`-race` 通过。
 - E2E `quic-direct`（2026-10-29，真实 `gogost/derper` + 两个 netns）：
-  relay-only 首流、1 MiB 传输中途 relay→direct 迁移且 sha256 一致、阻断
-  direct UDP 后心跳判死并 direct→relay 回落、回落后的 1 MiB 传输一致、
-  两端都没有 KCP session。修复“客户端角色才记录 path-change”的断言后连续
-  4 次通过（约 23 s/次）。
+  relay-only 首流、1 MiB 传输**仍在进行时** relay→direct 迁移（先要求
+  `direct_peers==0`、快照 path-change 计数，再要求新事件且 bulk 进程仍存活）、
+  sha256 一致、阻断 direct UDP 后心跳判死并 direct→relay 回落、回落后的
+  1 MiB 传输一致、两端都没有 KCP session。修复“客户端角色才记录 path-change”
+  的断言后连续 4 次通过（约 23 s/次）。
 
 ### 10.2 未验证 / 已知限制
 
@@ -304,6 +305,8 @@ spike 结论已落成 opt-in 的 QUIC transport。本节是**状态记录**，�
   仍跑 KCP（设计 §12.2 的该项仍未验证）。
 - KCP↔QUIC 运行时切换未验证：只能改配置并重启。
 - 单 relay underlay；不与 multi-DERP 组合（设计 D11/O7）。
+- MTU 固定 1200 B 且关闭 PMTU 发现（设计 D10）：relay（DERP payload）和
+  direct（UDP MTU）共用同一个 QUIC 包大小；1400 可选但未做现场验证。
 - 无 0-RTT、无 QUIC datagram、无多路径聚合/带宽叠加。
 - 长时间迁移循环、内存/goroutine 长跑、二进制体积/启动成本未测。
 
@@ -312,9 +315,10 @@ spike 结论已落成 opt-in 的 QUIC transport。本节是**状态记录**，�
 仓库内（p2p 作为 go-gost 子目录）：
 
 ```sh
-cd p2p/tests/e2e
+cd p2p
 P2P_E2E=1 go test ./tests/e2e -run TestQUICDirect -count=1 -v
-# 或：./run.sh --scenario quic-direct
+# 或（在 p2p/tests/e2e 下）：./run.sh --scenario quic-direct
+# 或（在 p2p/tests/e2e 下）：P2P_E2E=1 go test . -run TestQUICDirect -count=1 -v
 ```
 
 本次 worktree 是独立 p2p 模块（没有同级 `gost/`），用预构建二进制运行：
@@ -326,4 +330,4 @@ P2P_E2E=1 P2P_E2E_WORK=/tmp/opencode/p2p-e2e-work \
   go test ./tests/e2e -run TestQUICDirect -count=1 -v
 ```
 
-结果：20/20 assertions PASS。
+结果：21/21 assertions PASS。

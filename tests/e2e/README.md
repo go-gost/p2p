@@ -14,7 +14,9 @@ Docker to extract the `derper` binary. `go test ./...` skips them by default.
 - Linux with `CAP_NET_ADMIN` (run as root, or where `unshare -Ur -n` works) and
   `/dev/net/tun` for the tun scenarios.
 - A Go toolchain (`go` on `PATH` or at `~/.local/go/bin/go`).
-- `docker` to extract the relay binary, `openssl` for certs, `curl`, `ping`.
+- `docker` to extract the relay binary, `openssl` for certs, `curl`, `ping`,
+  and `iptables` + `tc` (`quic-direct` phase 3 blocks the direct UDP path with
+  `iptables`, `derp-direct` shapes it with `tc`).
 - Two network namespaces. `ip netns` is used when it works; otherwise the suite
   falls back to `unshare`/`nsenter` holder processes.
 
@@ -31,12 +33,14 @@ cd p2p/tests/e2e
 ./run.sh --gost-bin /path/to/gost --p2p-bin /path/to/p2p
 ```
 
-Through `go test`:
+Through `go test` (from `p2p/`, the module root):
 
 ```sh
 P2P_E2E=1 go test ./tests/e2e -v
 P2P_E2E=1 P2P_E2E_ARGS="--scenario ipv6-direct --keep" go test ./tests/e2e -v
 ```
+
+From `p2p/tests/e2e` the package pattern is `.`: `P2P_E2E=1 go test . -v`.
 
 Artifacts land in `$P2P_E2E_WORK` (default `/tmp/p2p-e2e`): built binaries under
 `bin/`, the extracted relay under `derper-root/`, and per-run logs under
@@ -50,7 +54,7 @@ colliding with a previous run). The last five runs are kept.
 | `stub` | The loopback bridge (`peer = host:port`) carries HTTP and a 1 MiB bulk transfer; `--token` is enforced (matching token works, missing token is rejected); `-C` config behaves like the equivalent flags. |
 | `derp-relay` | With a real derper and `--direct=false`, the relay path carries traffic, `Status` reports `derp_peers`, and a finished non-mux tunnel leaves no residue (`tunnels` returns to 0). |
 | `derp-direct` | STUN + UDP hole punch establishes a direct session (`status.direct_peers`); a 1 MiB transfer opened while relay-only migrates mid-stream under packet loss and stays byte-exact, the host log shows exactly one relay→direct migration, and killing the relay is logged as a loss suppressed by the live direct path with the pair kept on direct (H1); a fresh stream opened after the relay dies is still served over direct. |
-| `quic-direct` | The `--transport quic` data plane over a real derper: the first stream is relay-only, a 1 MiB transfer migrates relay→direct mid-stream (sha256 exact), and blocking the peers' UDP path makes the direct heartbeat watchdog retire the path and QUIC fall back to the relay, where a fresh stream and a 1 MiB read still complete. Neither host ever builds a KCP relay session. |
+| `quic-direct` | The `--transport quic` data plane over a real derper: the first stream is relay-only, a 1 MiB transfer already running migrates relay→direct (the scenario requires `direct_peers==0` before launch, a path-change event newer than the pre-launch snapshot, and the bulk process still alive at that event; sha256 exact), and blocking the peers' UDP path makes the direct heartbeat watchdog retire the path and QUIC fall back to the relay, where a fresh stream and a 1 MiB read still complete. Neither host ever builds a KCP relay session. |
 | `forward` | `--forward listen=peerkey` exposes a raw TCP port bound to a peer key; a plain TCP client reaches a service on the peer. |
 | `inner-matrix` | The `tcp`, `tls`, `ws`, `mtcp`, `mtls`, and `mws` inner dialers each carry HTTP to peer gost listeners over one relay pair. |
 | `udp-tun` | The datagram link backs a point-to-point tun link (both ends tun clients, `udp` inner dialer): bidirectional ICMP across the link, and the link comes up on both sides. |

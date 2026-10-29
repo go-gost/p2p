@@ -17,7 +17,10 @@ import (
 func relayDataPump(q <-chan []byte, sink func([]byte), stop <-chan struct{}) {
 	for {
 		select {
-		case frame := <-q:
+		case frame, ok := <-q:
+			if !ok {
+				return
+			}
 			if len(frame) == 0 || frame[0] != frameData {
 				continue
 			}
@@ -78,6 +81,15 @@ func readMultiPathPacket(t *testing.T, mp *multiPathConn, size int) []byte {
 	return append([]byte(nil), buf[:n]...)
 }
 
+// head4 returns at most the first four bytes, so a short or malformed read can
+// be reported without slicing past its length.
+func head4(b []byte) []byte {
+	if len(b) > 4 {
+		return b[:4]
+	}
+	return b
+}
+
 // TestQUICRelayBatchingIntegration drives the Task 8 relay data path end to
 // end without a QUIC handshake: two fake DERP data payload queues carry the
 // batching underlays, the Task 8 data sink feeds each peer's relay conn, and
@@ -94,10 +106,12 @@ func TestQUICRelayBatchingIntegration(t *testing.T) {
 	peerB := derpclient.PublicKey{0x42}
 
 	// The configured budget is the maximum the framing can use, so the test
-	// exercises the 64 KiB boundary rather than a comfortable default.
+	// exercises the 64 KiB boundary rather than a comfortable default. The
+	// flush is deliberately long: every full batch then fills the budget, so
+	// the batch count is a property of the framing, not scheduler timing.
 	opts := quicRelayOptions{
 		BatchBytes: derpclient.MaxPacketSize,
-		Flush:      50 * time.Millisecond,
+		Flush:      time.Second,
 	}
 	toB := make(chan []byte, 256)
 	toA := make(chan []byte, 256)
@@ -137,7 +151,7 @@ func TestQUICRelayBatchingIntegration(t *testing.T) {
 		got := readMultiPathPacket(t, pairB.mp, 2*packetSz)
 		if !bytes.Equal(got, want) {
 			t.Fatalf("packet %d = %d bytes (prefix %x), want %d bytes (prefix %x)",
-				i, len(got), got[:4], len(want), want[:4])
+				i, len(got), head4(got), len(want), head4(want))
 		}
 	}
 
@@ -145,6 +159,9 @@ func TestQUICRelayBatchingIntegration(t *testing.T) {
 	batches := relayA.batches.Load()
 	if batches >= packets {
 		t.Fatalf("sent %d packets in %d batches, want fewer batches than packets", packets, batches)
+	}
+	if batches > 8 {
+		t.Fatalf("sent %d packets in %d batches, want at most 8 (about 54 packets per 64 KiB batch)", packets, batches)
 	}
 	if batches < 1 {
 		t.Fatalf("batches = %d, want at least 1", batches)
@@ -183,5 +200,38 @@ func TestQUICRelayBatchingIntegration(t *testing.T) {
 	}
 	if got := readMultiPathPacket(t, pairA.mp, 256); !bytes.Equal(got, reverse) {
 		t.Fatalf("reverse ReadFrom = %q, want %q", got, reverse)
+	}
+}
+
+// TestQUICRelayUnderlayUsesConfig pins the wiring the batching test above
+// bypasses by constructing its relay conn directly: quicRelayUnderlay must
+// build the conn from the engine's resolved settings, not package defaults.
+func TestQUICRelayUnderlayUsesConfig(t *testing.T) {
+	peer := derpclient.PublicKey{0x43}
+	e := &engine{
+		transport: transportQUIC,
+		quics:     make(map[derpclient.PublicKey]*quicPeer),
+		quicCfg: quicSettings{
+			RelayBatchBytes: 8192,
+			RelayFlush:      250 * time.Millisecond,
+		},
+	}
+	pair := newQUICPair(e, peer, quicRoleClient, nil, nil, nil)
+	t.Cleanup(pair.close)
+	pc := &peerConn{peer: peer, closeCh: make(chan struct{})}
+	e.quics[peer] = &quicPeer{pair: pair}
+
+	if err := e.quicRelayUnderlay(peer, pair, pc); err != nil {
+		t.Fatalf("quicRelayUnderlay: %v", err)
+	}
+	qp := e.quics[peer]
+	if qp.relay == nil || !qp.relayInstalled {
+		t.Fatal("quicRelayUnderlay did not install a relay underlay")
+	}
+	if got := qp.relay.batchBytes; got != 8192 {
+		t.Fatalf("relay batch budget = %d, want the configured 8192", got)
+	}
+	if got := qp.relay.flush; got != 250*time.Millisecond {
+		t.Fatalf("relay flush = %v, want the configured 250ms", got)
 	}
 }

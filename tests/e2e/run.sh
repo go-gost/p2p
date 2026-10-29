@@ -650,10 +650,22 @@ scenario_quic_direct() {
 		'"msg":"peer relay session up"' "$blog"
 
 	# Phase 2: a transfer that outlives the punch. The throttled 1 MiB read
-	# (~16 s) is opened before any direct path exists, so the punch migrates it
-	# mid-stream; the source hash comes straight from the echo server.
+	# (~16 s) must start on the relay, so first prove no direct peer exists and
+	# snapshot the path-change count. Only a count above that snapshot proves
+	# the flip happened after the bulk started; checking `kill -0` at that
+	# moment proves it happened while the transfer was still running, not
+	# after it finished (the status wait allows up to 40 s, longer than the
+	# transfer).
 	local expect
 	expect=$(curl -s --max-time 10 "http://$NET_GW:18081/bulk" | sha256sum | awk '{print $1}')
+	local pcpat='"msg":"quic path-change".*"to":"direct"'
+	if wait_status_eq A 127.0.0.1:8003 direct_peers 0 2; then
+		ok "the pair is relay-only before the bulk transfer starts"
+	else
+		fail "a direct peer existed before the bulk transfer; the scenario cannot pin a mid-stream migration"
+	fi
+	local flips
+	flips=$(grep -hE "$pcpat" "$alog" "$blog" 2>/dev/null | wc -l)
 	local bulk="$dir/bulk.sha"
 	( ns_run A curl -s --max-time 60 --limit-rate 64k -x http://127.0.0.1:8080 \
 		"http://$NET_GW:18081/bulk" | sha256sum | awk '{print $1}' >"$bulk" ) &
@@ -668,12 +680,16 @@ scenario_quic_direct() {
 	# The relay->direct event is logged by whichever end is the QUIC client:
 	# the server only changes its path once a direct datagram arrives, and at
 	# install time it is still on relay, so its path-change pair can be
-	# relay->relay (silent). Either end's event proves the migration.
-	if wait_log_any '"msg":"quic path-change".*"to":"direct".*"reason":"direct-installed"' 15 \
-		"$alog" "$blog"; then
-		ok "the pair migrated relay->direct"
+	# relay->relay (silent). Either end's event proves the migration, but only
+	# a count above the pre-launch snapshot counts.
+	if wait_log_any_count "$pcpat" $((flips + 1)) 15 "$alog" "$blog"; then
+		if kill -0 "$bulkpid" 2>/dev/null; then
+			ok "the pair migrated relay->direct while the bulk was still running"
+		else
+			fail "the relay->direct event only appeared after the bulk transfer finished"
+		fi
 	else
-		fail "no quic path-change to direct on either end"
+		fail "no new quic path-change to direct during the bulk transfer"
 	fi
 	wait "$bulkpid" 2>/dev/null
 	check "the migrated 1 MiB transfer is byte-exact (sha256)" test "$(cat "$bulk")" = "$expect"

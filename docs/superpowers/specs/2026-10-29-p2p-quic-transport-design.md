@@ -881,8 +881,9 @@ relay down (preferred relay):
   `quic underlay`、`quic path-change` 日志。
 - 集成测试 `TestQUICRelayBatchingIntegration`：fake DERP data 队列 +
   Task 8 sink，验证拆包、batching 合并、malformed 丢弃、64 KiB 帧界。
-- E2E `quic-direct`：relay-only 首流、1 MiB 迁移传输、direct 阻断后的
-  relay 回落、两端无 KCP session（2026-10-29 本地 derper，20/20 断言）。
+- E2E `quic-direct`：relay-only 首流、1 MiB 传输仍在进行时的 relay→direct
+  迁移（快照计数 + bulk 存活校验）、direct 阻断后的 relay 回落、两端无 KCP
+  session（2026-10-29 本地 derper，21/21 断言）。
 
 未完成 / 未验证：
 
@@ -891,4 +892,5 @@ relay down (preferred relay):
 - UDP/TUN datagram 路径的 QUIC E2E（§12.2 该项）。
 - 运行时 KCP↔QUIC 切换（D6/O2 已定：重启生效，未单独测）。
 - 长跑迁移循环、内存/goroutine 长跑、二进制体积/启动成本。
+- MTU 固定 1200 B、关闭 PMTU 发现（D10）；1400 未做现场验证。
 - 单 relay（D11/O7），无 0-RTT/datagram/多路径聚合（D9）。

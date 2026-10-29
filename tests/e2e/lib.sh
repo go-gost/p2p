@@ -193,6 +193,22 @@ wait_log_any() {
 	return 1
 }
 
+# wait_log_any_count <ere> <count> <timeout-seconds> <file...>: like
+# wait_log_any, but matches only when the files together hold at least <count>
+# lines matching the pattern. A caller snapshots the current count and waits for
+# snapshot+1 to prove an event happened after the snapshot, not before it.
+wait_log_any_count() {
+	local pat=$1 want=$2 t=$3
+	shift 3
+	local i n
+	for i in $(seq 1 $((t * 10))); do
+		n=$(grep -hE "$pat" "$@" 2>/dev/null | wc -l)
+		[ "$n" -ge "$want" ] && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
 # wait_tcp <ns|-> <host> <port> [timeout-seconds]
 wait_tcp() {
 	local ns=$1 h=$2 p=$3 t=${4:-15}
