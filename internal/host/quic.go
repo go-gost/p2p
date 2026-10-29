@@ -63,8 +63,12 @@ type quicPair struct {
 	// relay is the installed relay underlay. It is the inbound sink for
 	// frameData payloads while the pair is alive, including during the
 	// handshake before conn exists.
-	relay  *relayQUICConn
-	closed bool
+	relay *relayQUICConn
+	// directSock is the raw-UDP socket of the installed direct underlay, or
+	// nil. removeDirect compares against it so a delayed retire from an old
+	// punch cannot remove a newer underlay.
+	directSock *net.UDPConn
+	closed     bool
 
 	closeOnce sync.Once
 	// acceptDone is closed when the accept loop returns, so a test (or a
