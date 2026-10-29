@@ -178,11 +178,14 @@ func (h *Host) AddForward(listen, peerKey string) error {
 	return h.server.addForwardAddr(listen, peerKey)
 }
 
-// Warm brings up the peer's relay session, without opening a tunnel stream and
-// without starting a punch. It is how a caller that only answers its peers — a
-// reverse tunnel — gets them into Status' PeerTransports before any traffic,
-// with no speculative punch round that would fail for a peer that has not
-// engaged yet.
+// Warm brings up the peer's data path before any tunnel stream: in KCP mode
+// the relay session, without starting a punch; in QUIC mode the QUIC pair,
+// whose establishment also kicks the direct punch when the direct path is
+// enabled. It is how a caller that only answers its peers — a reverse tunnel —
+// gets them into Status' PeerTransports before any traffic. In KCP mode there
+// is no speculative punch round that would fail for a peer that has not
+// engaged yet; a QUIC caller that must not punch should leave Config.Direct
+// off.
 //
 // Idempotent, and a no-op in stub mode (no relay).
 func (h *Host) Warm(peerB64 string) error {

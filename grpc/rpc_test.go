@@ -455,10 +455,16 @@ func TestPeerDiagnosticsToProto(t *testing.T) {
 			LastRecvAge: 1500 * time.Millisecond, Attempts: 7, Ups: 1, Drops: 2,
 			Trace: []string{"round start", "peer candidates: 2", "v4 up"},
 		},
+		// A QUIC establishment failure is diagnostic-only: it has no live path,
+		// so the wire form must not serialize it as a peer with an empty path.
+		"peerErr": {
+			Transport: "quic", DirectTransport: "quic",
+			TransportError: "peer-no-quic", State: "none",
+		},
 	}
 	out := peerDiagnosticsToProto(in)
 	if len(out) != 1 {
-		t.Fatalf("got %d diagnostics", len(out))
+		t.Fatalf("got %d diagnostics, want only the connected peer", len(out))
 	}
 	got := out[0]
 	if got.Peer != "peerA" {

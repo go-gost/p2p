@@ -46,7 +46,9 @@ func (s *Server) Status(ctx context.Context, req *pb.StatusRequest) (*pb.StatusR
 
 // peerDiagnosticsToProto maps the status snapshot onto the wire form, ordered by
 // peer key for a stable reply. Pure, so the mapping is tested without a live
-// endpoint.
+// endpoint. Error-only entries (empty Path) are in-process only and are
+// filtered out: the frozen proto cannot carry their TransportError, and a peer
+// block with no path reads as "no transport reported" on a wire consumer.
 func peerDiagnosticsToProto(in map[string]p2p.PeerDiagnostic) []*pb.PeerDiagnostic {
 	if len(in) == 0 {
 		return nil
@@ -59,6 +61,13 @@ func peerDiagnosticsToProto(in map[string]p2p.PeerDiagnostic) []*pb.PeerDiagnost
 	out := make([]*pb.PeerDiagnostic, 0, len(in))
 	for _, k := range keys {
 		d := in[k]
+		// An error-only entry (empty Path) is in-process diagnostic state for a
+		// peer whose transport never came up. The frozen proto has no field
+		// that can explain it, so it must not appear on the wire as a peer block
+		// with no path ("no transport reported").
+		if d.Path == "" {
+			continue
+		}
 		out = append(out, &pb.PeerDiagnostic{
 			Peer:          k,
 			Path:          d.Path,

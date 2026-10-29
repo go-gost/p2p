@@ -167,7 +167,7 @@ func TestRelayQUICConnFlush(t *testing.T) {
 	select {
 	case at := <-sent:
 		if delay := at.Sub(start); delay > 100*time.Millisecond {
-			t.Fatalf("flush took %v, want near %v", delay, quicRelayFlush)
+			t.Fatalf("flush took %v, want near %v", delay, defaultQUICRelayFlush)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("single packet was not flushed")

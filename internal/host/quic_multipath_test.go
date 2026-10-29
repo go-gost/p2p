@@ -451,6 +451,30 @@ func TestMultiPathQueueDropsWhenFull(t *testing.T) {
 	}
 }
 
+func TestMultiPathReadDropsOversizedPacket(t *testing.T) {
+	c := newMultiPathConn(quicRoleClient)
+	t.Cleanup(func() { _ = c.Close() })
+
+	pc := addTestUnderlay(t, c, quicPathRelay, testRelayAddr())
+	pc.send(t, "too-large-for-the-buffer")
+	pc.send(t, "ok")
+
+	buf := make([]byte, 2)
+	n, addr, err := c.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if got := string(buf[:n]); got != "ok" {
+		t.Fatalf("ReadFrom = %q, want the next whole packet", got)
+	}
+	if quicPathName(addr) != quicPathRelay {
+		t.Fatalf("ReadFrom addr = %v, want the relay path", addr)
+	}
+	if got := c.drops.Load(); got != 1 {
+		t.Fatalf("drops = %d, want 1 for the oversized packet", got)
+	}
+}
+
 func TestMultiPathCloseWakesRead(t *testing.T) {
 	c := newMultiPathConn(quicRoleClient)
 

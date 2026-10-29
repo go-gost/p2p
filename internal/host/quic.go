@@ -89,6 +89,15 @@ type quicPair struct {
 	// QUIC status and the connection-closed log report.
 	streams atomic.Int64
 
+	// Migration history, the QUIC counterpart of relayKCPPair's O2 counters.
+	// The four atomics are bumped where the path changes (addDirect,
+	// removeDirectReason and the heartbeat watchdog) so Status can tell a
+	// healthy idle pair from a flapping one without reading logs.
+	migrations          atomic.Uint64 // relay->direct flips
+	fallbacks           atomic.Uint64 // direct->relay flips
+	directIdleEvictions atomic.Uint64 // the heartbeat subset of fallbacks
+	repunchAfterIdle    atomic.Uint64 // idle evictions that scheduled a re-punch
+
 	closeOnce sync.Once
 	// acceptDone is closed when the accept loop returns, so a test (or a
 	// future engine teardown) can prove a close did not leave AcceptStream
@@ -527,6 +536,29 @@ func (p *quicPair) stats() p2p.QUICStats {
 	return st
 }
 
+// diag returns the pair's migration history for PeerDiagnostic/Status. The
+// counters are atomics, so no pair lock is needed (or held) here.
+func (p *quicPair) diag() pairDiag {
+	return pairDiag{
+		migrations:          p.migrations.Load(),
+		fallbacks:           p.fallbacks.Load(),
+		directIdleEvictions: p.directIdleEvictions.Load(),
+		repunchAfterIdle:    p.repunchAfterIdle.Load(),
+	}
+}
+
+// directPeerAddrString returns the peer endpoint of the installed direct
+// underlay, or "" when none is installed. It is a status/log label, not a dial
+// target.
+func (p *quicPair) directPeerAddrString() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.directU == nil {
+		return ""
+	}
+	return p.directU.peer.String()
+}
+
 // releaseStream drops one active-stream count. It never goes below zero: a
 // pair close zeroes the count while stream Close calls may still be in flight.
 func (p *quicPair) releaseStream() {
@@ -571,8 +603,8 @@ func quicConfigFromSettings(s quicSettings) *quic.Config {
 	// validateConfig. Clamp to the same bound up front so the resolved config
 	// reflects what the handshake uses (and can never overflow uint16).
 	mtu := s.MTU
-	if mtu > quicMaxInitialPacketSize {
-		mtu = quicMaxInitialPacketSize
+	if mtu > maxQUICMTU {
+		mtu = maxQUICMTU
 	}
 	return &quic.Config{
 		HandshakeIdleTimeout:    s.HandshakeTimeout,
@@ -603,13 +635,16 @@ func (c *quicStreamConn) RemoteAddr() net.Addr { return c.remote }
 
 // Close shuts both directions. Stream.Close alone only sends FIN; without
 // CancelRead the peer's data would keep filling the receive window of a stream
-// nobody reads anymore. The pair's active-stream count is released once.
+// nobody reads anymore. The pair's active-stream count is released once, and a
+// duplicate Close is a no-op rather than a second FIN/CancelRead.
 func (c *quicStreamConn) Close() error {
+	var err error
 	c.closeOnce.Do(func() {
 		if c.pair != nil {
 			c.pair.releaseStream()
 		}
+		c.CancelRead(0)
+		err = c.Stream.Close()
 	})
-	c.CancelRead(0)
-	return c.Stream.Close()
+	return err
 }

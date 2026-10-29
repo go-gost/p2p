@@ -301,6 +301,42 @@ func TestQUICRelayUnderlayDoesNotResurrectDeletedState(t *testing.T) {
 	pair.close()
 }
 
+// TestQUICTransportErrorDoesNotResurrectClosedState pins the late-error guard:
+// an establishment that unwinds after closeQUIC must not recreate the state the
+// close just dropped, while the next explicit establishment still can.
+func TestQUICTransportErrorDoesNotResurrectClosedState(t *testing.T) {
+	e := &engine{quics: make(map[derpclient.PublicKey]*quicPeer)}
+	peer := derpclient.PublicKey{0x56}
+
+	e.quicMu.Lock()
+	e.quicPeerLocked(peer)
+	e.quicMu.Unlock()
+	e.closeQUIC(peer)
+
+	e.setQUICTransportError(peer, "caps-timeout")
+	e.quicMu.Lock()
+	_, resurrected := e.quics[peer]
+	e.quicMu.Unlock()
+	if resurrected {
+		t.Fatal("setQUICTransportError recreated a state closeQUIC dropped")
+	}
+
+	// A new establishment clears the tombstone: its own outcome is recorded.
+	e.quicMu.Lock()
+	e.quicPeerLocked(peer)
+	e.quicMu.Unlock()
+	e.setQUICTransportError(peer, "caps-timeout")
+	e.quicMu.Lock()
+	got := ""
+	if qp := e.quics[peer]; qp != nil {
+		got = qp.lastErr
+	}
+	e.quicMu.Unlock()
+	if got != "caps-timeout" {
+		t.Fatalf("lastErr = %q, want caps-timeout after an explicit new attempt", got)
+	}
+}
+
 // TestQUICCloseUnderlayConcurrent hammers the teardown/install interleaving.
 // closeQUIC must snapshot pair, relay and relayUp under quicMu, because
 // quicRelayUnderlay sets relayUp under that lock after installing the underlay;

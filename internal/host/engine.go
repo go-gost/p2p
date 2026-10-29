@@ -114,6 +114,11 @@ type engine struct {
 	quicMu     sync.Mutex
 	quics      map[derpclient.PublicKey]*quicPeer
 	quicClosed bool
+	// quicDead marks peers whose QUIC state closeQUIC dropped while an
+	// establishment could still be unwinding. A late error from that attempt
+	// must not resurrect the state: the peer (or the engine) already decided it
+	// is gone. An explicit quicPeerLocked creation clears the mark.
+	quicDead map[derpclient.PublicKey]struct{}
 	// relayMu serializes relay-underlay installation. An establishment and a
 	// reconnect restore can otherwise race to install the peer's relay path,
 	// and the loser would hand the pair an underlay the other just closed.
@@ -523,7 +528,21 @@ func (e *engine) quicPeerFailures() []quicPeerFailure {
 
 // fillPairDiag copies the pair's O2/O4/O5 diagnostic view onto d (in-process
 // only: the gRPC proto is frozen). A peer with no pair leaves the fields zero.
+// QUIC mode has no relay KCP pair; the same counters live on the quicPair and
+// are the pair's own migration history there.
 func (e *engine) fillPairDiag(d *p2p.PeerDiagnostic, peer derpclient.PublicKey) {
+	if e.transport == transportQUIC {
+		pair := e.getQUIC(peer)
+		if pair == nil {
+			return
+		}
+		pd := pair.diag()
+		d.PairMigrations = int64(pd.migrations)
+		d.PairFallbacks = int64(pd.fallbacks)
+		d.DirectIdleEvictions = int64(pd.directIdleEvictions)
+		d.RepunchAfterIdle = int64(pd.repunchAfterIdle)
+		return
+	}
 	pair := e.relayKCPPairGet(peer)
 	if pair == nil {
 		return
@@ -595,7 +614,12 @@ func (e *engine) setQUICTransportError(peer derpclient.PublicKey, reason string)
 	defer e.quicMu.Unlock()
 	qp := e.quics[peer]
 	if qp == nil {
-		if reason == "" {
+		if reason == "" || e.quicClosed {
+			return
+		}
+		if _, dead := e.quicDead[peer]; dead {
+			// closeQUIC dropped the state while this attempt was unwinding. A
+			// late failure must not recreate a pair no sink can reach.
 			return
 		}
 		qp = e.quicPeerLocked(peer)
@@ -639,7 +663,15 @@ func ageOf(now time.Time, nano int64) time.Duration {
 // keys, so a plaintext direct path is not masked by an encrypted relay session.
 // The *secureSession pointers are stable and keys() takes its own lock, so
 // neither the engine lock nor pc.mu/dc.mu is held across the classification.
+//
+// QUIC mode has no relay secure session at all: its data plane is TLS by
+// construction, so every established pair is secure. It is classified from the
+// pair set (the same set quicPeerTransports reports), never through the KCP
+// secure-session classifier.
 func (e *engine) peerEncryptions() map[string]string {
+	if e.transport == transportQUIC {
+		return e.quicPeerEncryptions()
+	}
 	e.mu.Lock()
 	peers := make(map[derpclient.PublicKey]*peerConn, len(e.peers))
 	for k, pc := range e.peers {
@@ -671,11 +703,38 @@ func (e *engine) peerEncryptions() map[string]string {
 	return out
 }
 
+// quicPeerEncryptions is peerEncryptions for QUIC mode. The transport selected
+// in Config applies to every peer, and QUIC always runs TLS 1.3, so an
+// established pair is a secure session regardless of which underlay (relay or
+// direct) carries it. The peer set is the same keys quicPeerTransports reports:
+// the relay adapter, the direct punch state, or both.
+func (e *engine) quicPeerEncryptions() map[string]string {
+	e.mu.Lock()
+	peers := make(map[derpclient.PublicKey]struct{}, len(e.peers)+len(e.directs))
+	for p := range e.peers {
+		peers[p] = struct{}{}
+	}
+	for p := range e.directs {
+		peers[p] = struct{}{}
+	}
+	e.mu.Unlock()
+
+	out := make(map[string]string, len(peers))
+	for p := range peers {
+		pair := e.getQUIC(p)
+		if pair == nil || !pair.established() {
+			continue
+		}
+		out[keyName(p)] = encStateSecure
+	}
+	return out
+}
+
 // encryptionState classifies one peer by its live relay session: "secure" when
 // it holds keys, else "plaintext". The direct underlay no longer has a separate
 // secure session (Task 7): it rides the pair's relay secure session, so a live
 // direct path is exactly as encrypted as the relay it shares and is not
-// consulted here.
+// consulted here. QUIC mode does not call this at all (see quicPeerEncryptions).
 func encryptionState(pc *peerConn) string {
 	considered, allSecure := false, true
 	if pc != nil {
@@ -768,6 +827,11 @@ func (e *engine) caps() capsInfo {
 func (e *engine) quicPeerLocked(peer derpclient.PublicKey) *quicPeer {
 	if e.quics == nil {
 		e.quics = make(map[derpclient.PublicKey]*quicPeer)
+	}
+	// An explicit creation (a new establishment attempt) is the one thing that
+	// legitimately revives a peer closeQUIC marked dead.
+	if e.quicDead != nil {
+		delete(e.quicDead, peer)
 	}
 	qp := e.quics[peer]
 	if qp == nil {
@@ -1225,7 +1289,17 @@ func (e *engine) quicPairFor(peer derpclient.PublicKey, role quicRole, fp [32]by
 	}
 	var pair *quicPair
 	onStream := func(c net.Conn) {
-		e.serveInbound(c, quicTransportName(pair.pathName()), peer, "")
+		path := pair.pathName()
+		// The accepted stream's peer endpoint is the punched address when the
+		// pair is on the direct path; a relay stream has no meaningful one.
+		peerAddr := ""
+		if path == quicPathDirect {
+			peerAddr = pair.directPeerAddrString()
+			if peerAddr == "" {
+				peerAddr = quicStreamPeerAddr(c)
+			}
+		}
+		e.serveInbound(c, quicTransportName(path), peer, peerAddr)
 	}
 	pair = newQUICPair(e, peer, role,
 		quicTLSConfig(e.quicID, fp, role == quicRoleServer),
@@ -1243,6 +1317,26 @@ func quicTransportName(path string) string {
 		return transportDirect
 	}
 	return transportRelay
+}
+
+// quicStreamPeerAddr extracts the numeric peer endpoint from a stream whose
+// QUIC remote address is the direct path. The pair's installed direct underlay
+// is the normal source (directPeerAddrString); this is the fallback for a
+// stream accepted while that underlay is no longer recorded.
+func quicStreamPeerAddr(c net.Conn) string {
+	if c == nil {
+		return ""
+	}
+	addr := c.RemoteAddr()
+	if addr == nil || quicPathName(addr) != quicPathDirect {
+		return ""
+	}
+	s := addr.String()
+	prefix := quicPathDirect + ":"
+	if !strings.HasPrefix(s, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(s, prefix)
 }
 
 // quicRelayUnderlay installs (once) the peer's relay packet path on pair. The
@@ -1418,6 +1512,14 @@ func (e *engine) closeQUIC(peer derpclient.PublicKey) {
 	e.quicMu.Lock()
 	qp := e.quics[peer]
 	delete(e.quics, peer)
+	if qp != nil {
+		// Only a state that actually existed needs a tombstone; a KCP host's
+		// peerGone also calls closeQUIC and must not grow this map.
+		if e.quicDead == nil {
+			e.quicDead = make(map[derpclient.PublicKey]struct{})
+		}
+		e.quicDead[peer] = struct{}{}
+	}
 	var td quicPeerTeardown
 	if qp != nil {
 		td = quicPeerTeardown{pair: qp.pair, relay: qp.relay, relayInstalled: qp.relayInstalled}
@@ -1696,10 +1798,12 @@ func (e *engine) transportCounts() (direct, derp int) {
 	return
 }
 
-// peerConn is the per-peer derp adapter the relay packet layer sits on: its
-// inbound channel is drained one datagram at a time by relayPacketConn.ReadFrom
-// (feeding KCP), and its Write turns one datagram into a single DERP
-// SendPacket.
+// peerConn is the per-peer derp adapter the relay packet layer sits on. In KCP
+// mode its inbound channel is drained one datagram at a time by
+// relayPacketConn.ReadFrom (feeding KCP), and its Write turns one datagram into
+// a single DERP SendPacket. In QUIC mode the same adapter carries raw QUIC
+// packets instead: inbound frameData goes to dataSink (the QUIC multiPathConn)
+// and Write frames one relay batch. The secure session is KCP-only.
 type peerConn struct {
 	e       *engine
 	peer    derpclient.PublicKey
@@ -1718,7 +1822,8 @@ type peerConn struct {
 	// secure is this pair's relay security session, borrowed from e.secure (one
 	// per (peer, transport), outliving this adapter). The AEAD record layer
 	// wraps the smux underlay once both halves are exchanged, and stays
-	// plaintext (peer predates encryption) otherwise.
+	// plaintext (peer predates encryption) otherwise. It is nil in QUIC mode:
+	// the QUIC connection's TLS layer is the record layer there.
 	secure *secureSession
 
 	// lastFrameAt is the UnixNano stamp of the last frame seen from this peer
@@ -2273,9 +2378,17 @@ func (e *engine) openQUICStream(peerB64 string, peer derpclient.PublicKey) (net.
 	transport := quicTransportName(path)
 	e.stats.countStream(transport)
 	e.log.Debug("open stream: quic", "peer", peerB64, "transport", transport, "path", path)
+	peerAddr := ""
+	if path == quicPathDirect {
+		peerAddr = pair.directPeerAddrString()
+		if peerAddr == "" {
+			peerAddr = quicStreamPeerAddr(c)
+		}
+	}
 	return &openedStream{
 		Conn:      c,
 		transport: transport,
+		peerAddr:  peerAddr,
 		log:       e.log,
 		peer:      peerB64,
 		lastPath:  path,
@@ -2328,8 +2441,7 @@ func (c *stampConn) Read(p []byte) (int, error) {
 type openedStream struct {
 	net.Conn
 	transport string
-	peerAddr  string // peer's dialed endpoint (direct only; empty for relay)
-
+	peerAddr  string // peer's direct endpoint (the punched address; empty on relay)
 	// Path-change observation (O6). Log and peer name the stream in the event;
 	// pair is polled for the pair's current path, and lastPath is the last path
 	// this stream saw on its own I/O. A nil pair (no pair built) makes this
@@ -3162,7 +3274,12 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		peer:    peer,
 		inbound: make(chan []byte, inboundQueueSize),
 		closeCh: make(chan struct{}),
-		secure:  e.secureSessionLocked(peer, secureTransportRelay),
+	}
+	if e.transport != transportQUIC {
+		// QUIC's data plane is TLS on the QUIC connection; there is no relay
+		// mux or record layer to key, so no secure session is created and no
+		// desync recovery is armed for this adapter.
+		pc.secure = e.secureSessionLocked(peer, secureTransportRelay)
 	}
 	e.peers[peer] = pc
 	if e.transport == transportQUIC {
@@ -3170,7 +3287,9 @@ func (e *engine) peerConn(peer derpclient.PublicKey) *peerConn {
 		// swap and a dead adapter's sink must not keep receiving packets.
 		pc.setDataSink(e.quicDataSink(pc))
 	}
-	e.armDesyncRecovery(peer, pc.secure)
+	if pc.secure != nil {
+		e.armDesyncRecovery(peer, pc.secure)
+	}
 	if dead == nil {
 		e.mu.Unlock()
 		return pc

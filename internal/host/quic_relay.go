@@ -15,9 +15,8 @@ import (
 // Relay batching parameters. One DERP data frame carries several QUIC
 // packets framed by their lengths; batching keeps the per-packet relay
 // overhead down while the flush bound keeps interactive traffic responsive.
+// The defaults live in apply.go with the rest of the QUIC settings.
 const (
-	quicRelayBatchBytes = 32 << 10
-	quicRelayFlush      = 200 * time.Microsecond
 	// quicRelayBatchVersion identifies the framing advertised in caps. Both
 	// ends must agree before any relay payload is exchanged.
 	quicRelayBatchVersion = quicCapsBatchVersion
@@ -59,14 +58,14 @@ type quicRelayOptions struct {
 func (o quicRelayOptions) resolve() (int, time.Duration) {
 	batch := o.BatchBytes
 	if batch <= 0 {
-		batch = quicRelayBatchBytes
+		batch = defaultQUICRelayBatchBytes
 	}
 	if batch > quicRelayMaxPayload {
 		batch = quicRelayMaxPayload
 	}
 	flush := o.Flush
 	if flush <= 0 {
-		flush = quicRelayFlush
+		flush = defaultQUICRelayFlush
 	}
 	return batch, flush
 }
@@ -192,9 +191,10 @@ func (c *relayQUICConn) deliver(pkt []byte) bool {
 }
 
 // sender owns the outbound batch. It accumulates packets until they reach
-// quicRelayBatchBytes or quicRelayFlush expires after the first one, then
-// encodes and writes exactly one DERP payload. It is the only goroutine that
-// calls send, so a slow relay write never blocks concurrent QUIC writers.
+// defaultQUICRelayBatchBytes or defaultQUICRelayFlush expires after the first
+// one, then encodes and writes exactly one DERP payload. It is the only
+// goroutine that calls send, so a slow relay write never blocks concurrent QUIC
+// writers.
 func (c *relayQUICConn) sender() {
 	defer close(c.senderDone)
 

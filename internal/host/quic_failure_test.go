@@ -166,6 +166,39 @@ func TestQUICDirectLossFallsBackToRelay(t *testing.T) {
 	if up, _ := relayUnderlayState(client, server.pub); !up {
 		t.Fatal("relay underlay is not installed after the direct fallback")
 	}
+	// The migration history is a Status surface, not only a log line: the
+	// direct install counted a relay->direct flip and the watchdog fallback
+	// counted the direct->relay flip, its idle subset and the re-punch.
+	srv := newServer(client)
+	t.Cleanup(srv.close)
+	st := srv.status()
+	d, ok := st.PeerDiagnostics[server.PublicKey()]
+	if !ok {
+		t.Fatalf("no diagnostic for %s after fallback: %+v",
+			server.PublicKey(), st.PeerDiagnostics)
+	}
+	if d.PairMigrations < 1 {
+		t.Fatalf("PairMigrations = %d after direct install, want >= 1", d.PairMigrations)
+	}
+	if d.PairFallbacks < 1 {
+		t.Fatalf("PairFallbacks = %d after heartbeat fallback, want >= 1", d.PairFallbacks)
+	}
+	if d.DirectIdleEvictions < 1 {
+		t.Fatalf("DirectIdleEvictions = %d after heartbeat fallback, want >= 1",
+			d.DirectIdleEvictions)
+	}
+	if d.RepunchAfterIdle < 1 {
+		t.Fatalf("RepunchAfterIdle = %d after heartbeat fallback, want >= 1",
+			d.RepunchAfterIdle)
+	}
+	if st.PairMigrations != d.PairMigrations ||
+		st.PairFallbacks != d.PairFallbacks ||
+		st.DirectIdleEvictions != d.DirectIdleEvictions ||
+		st.RepunchAfterIdle != d.RepunchAfterIdle {
+		t.Fatalf("Status sums = %d/%d/%d/%d, want the single peer's %d/%d/%d/%d",
+			st.PairMigrations, st.PairFallbacks, st.DirectIdleEvictions, st.RepunchAfterIdle,
+			d.PairMigrations, d.PairFallbacks, d.DirectIdleEvictions, d.RepunchAfterIdle)
+	}
 	for name, e := range map[string]*engine{"a": a, "b": b} {
 		if n := relayKCPCount(e); n != 0 {
 			t.Fatalf("engine %s built %d KCP pairs in QUIC mode, want 0", name, n)

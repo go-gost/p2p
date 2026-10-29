@@ -183,6 +183,12 @@ func (p *quicPair) addDirect(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 
 	p.logUnderlay(quicPathDirect, "installed", "punch")
 	p.logPathChange(from, p.pathName(), "direct-installed")
+	// A first install (or a re-install after a fallback) is a relay->direct
+	// flip. Replacing a direct underlay with a fresh one is not a migration:
+	// the pair never left the direct path.
+	if from != quicPathDirect {
+		p.migrations.Add(1)
+	}
 	return nil
 }
 
@@ -202,17 +208,20 @@ func (p *quicPair) removeDirect(sock *net.UDPConn) {
 
 // removeDirectReason is removeDirect with the reason named for the quic
 // underlay event: "retired" for an engine-driven retire, "heartbeat" for the
-// direct watchdog. It is the same identity-checked teardown either way.
-func (p *quicPair) removeDirectReason(sock *net.UDPConn, reason string) {
+// direct watchdog. It is the same identity-checked teardown either way. It
+// reports whether this call actually retired the installed underlay, so a
+// caller counting an idle eviction does not count a stale heartbeat for an
+// underlay a newer punch already replaced.
+func (p *quicPair) removeDirectReason(sock *net.UDPConn, reason string) bool {
 	if sock == nil {
-		return
+		return false
 	}
 	from := p.pathName()
 
 	p.mu.Lock()
 	if p.directSock != sock {
 		p.mu.Unlock()
-		return
+		return false
 	}
 	p.directSock = nil
 	p.directU = nil
@@ -228,6 +237,13 @@ func (p *quicPair) removeDirectReason(sock *net.UDPConn, reason string) {
 	_ = sock.Close()
 	p.logUnderlay(quicPathDirect, "retired", reason)
 	p.logPathChange(from, p.pathName(), reason)
+	// The pair was on the direct path when it retired: that is a direct->relay
+	// fallback even on the server side, whose pathName may not observe the
+	// peer's migration until the next datagram arrives.
+	if from == quicPathDirect {
+		p.fallbacks.Add(1)
+	}
+	return true
 }
 
 // hasDirect reports whether a direct underlay is installed on the pair. It is
@@ -248,7 +264,14 @@ func (p *quicPair) directHeartbeatDead(u *directUnderlay) {
 	if u == nil {
 		return
 	}
-	p.removeDirectReason(u.sock, "heartbeat")
+	if !p.removeDirectReason(u.sock, "heartbeat") {
+		return // a newer underlay replaced it: not this heartbeat's to retire
+	}
+	// The idle eviction is what schedules the re-punch (dc.underlayDead
+	// below). Count it so Status can tell "idle and recovering" from
+	// "flapping" without reading logs.
+	p.directIdleEvictions.Add(1)
+	p.repunchAfterIdle.Add(1)
 	if p.e != nil {
 		p.e.quicDirectDead(p.peer, u)
 	}

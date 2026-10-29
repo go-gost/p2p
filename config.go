@@ -123,10 +123,12 @@ type SmuxTimeouts struct {
 // 200µs, 5s, 15s and 10s respectively (see resolveQUICSettings).
 //
 // Validation: mtu >= 1200, relayBatchBytes <= 64 KiB, idle > keepAlive, and
-// handshakeTimeout > 0.
+// handshakeTimeout > 0. An mtu above 1452 is clamped to 1452 (quic-go's packet
+// buffer maximum) in quicConfigFromSettings rather than rejected.
 type QUICConfig struct {
 	// MTU is the fixed QUIC packet size. 1200 is the conservative default so a
-	// relay packet and a direct-path UDP datagram fit the same path.
+	// relay packet and a direct-path UDP datagram fit the same path. Values
+	// above 1452 are clamped to 1452, quic-go's maximum initial packet size.
 	MTU int `yaml:"mtu,omitempty"`
 	// RelayBatchBytes is the most relay payload bytes one DERP frame carries.
 	RelayBatchBytes int `yaml:"relayBatchBytes,omitempty"`

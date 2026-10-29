@@ -1,6 +1,7 @@
 package host
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -126,6 +127,38 @@ func TestTransportConfigDefaults(t *testing.T) {
 func TestTransportConfigRejectsUnknown(t *testing.T) {
 	if _, err := resolveTransport(&p2p.Config{Transport: "sctp", Derp: "ws://example"}); err == nil {
 		t.Fatal("want error")
+	}
+}
+
+// TestKCPModeBuildsNoQUICState pins the default transport's promise: KCP mode
+// creates no QUIC identity, no QUIC transport state, and advertises the legacy
+// caps byte with no QUIC bit or TLV.
+func TestKCPModeBuildsNoQUICState(t *testing.T) {
+	h, err := New(&p2p.Config{Derp: "http://127.0.0.1:1", Key: strings.Repeat("cc", 32)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	e := h.engine
+	if e == nil {
+		t.Fatal("no engine in relay mode")
+	}
+	if e.transport != transportKCP {
+		t.Fatalf("transport = %v, want kcp", e.transport)
+	}
+	if e.quicID != nil {
+		t.Fatal("KCP mode created a QUIC identity")
+	}
+	if len(e.quics) != 0 {
+		t.Fatalf("KCP mode holds %d QUIC peer states", len(e.quics))
+	}
+	info := e.caps()
+	if info.Bits&capsQUIC != 0 || info.QUIC != nil {
+		t.Fatalf("KCP caps = %+v, want no QUIC bit/TLV", info)
+	}
+	if got := encodeCaps(info); len(got) != 1 {
+		t.Fatalf("KCP caps encoded %d bytes, want the legacy one-byte form", len(got))
 	}
 }
 

@@ -260,6 +260,13 @@ func (c *multiPathConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			if timer != nil {
 				timer.Stop()
 			}
+			// A datagram larger than the caller's buffer is dropped rather
+			// than truncated: a cut QUIC packet is garbage the connection
+			// cannot recover, while a drop is retransmitted.
+			if len(r.data) > len(p) {
+				c.drops.Add(1)
+				continue
+			}
 			return copy(p, r.data), r.addr, nil
 		case <-c.closed:
 			if timer != nil {

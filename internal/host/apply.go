@@ -61,6 +61,10 @@ const (
 
 	minQUICMTU             = 1200
 	maxQUICRelayBatchBytes = 64 << 10
+	// maxQUICMTU is quic-go's initial-packet ceiling. resolveQUICSettings does
+	// not reject a larger value: quicConfigFromSettings clamps it to this, which
+	// is also the size the handshake actually uses.
+	maxQUICMTU = quicMaxInitialPacketSize
 )
 
 // quicSettings is the resolved, validated form of p2p.QUICConfig. Unlike the

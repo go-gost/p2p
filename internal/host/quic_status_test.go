@@ -207,6 +207,19 @@ func TestPeerDiagnosticsReportsQUICStats(t *testing.T) {
 		if st.DerpPeers != 1 || st.DirectPeers != 0 {
 			t.Fatalf("peers = %d direct / %d relay, want 0/1", st.DirectPeers, st.DerpPeers)
 		}
+		// The QUIC data plane is TLS on every path, so the encryption surface
+		// must say so (G4/G6) rather than falling through the KCP classifier.
+		if got := st.PeerEncryption[key]; got != encStateSecure {
+			t.Fatalf("PeerEncryption[%s] = %q, want %q", key, got, encStateSecure)
+		}
+		if st.EncryptedPeers != 1 || st.PlaintextPeers != 0 {
+			t.Fatalf("encryption = %d secure / %d plaintext, want 1/0",
+				st.EncryptedPeers, st.PlaintextPeers)
+		}
+		out := doctor.Report(st, doctor.Options{InProcess: true})
+		if !strings.Contains(out, "encryption: every connected peer") {
+			t.Fatalf("doctor report does not read the QUIC peer as encrypted:\n%s", out)
+		}
 
 		conn.Close()
 		// Both counters must fall back once the stream ends: a pair-owned
@@ -250,6 +263,19 @@ func TestPeerDiagnosticsReportsQUICStats(t *testing.T) {
 		}
 		if st.DirectPeers != 1 || st.DerpPeers != 0 {
 			t.Fatalf("peers = %d direct / %d relay, want 1/0", st.DirectPeers, st.DerpPeers)
+		}
+		// A direct QUIC peer is encrypted by the same TLS layer as a relay
+		// one; the direct path must not be counted as plaintext.
+		if got := st.PeerEncryption[key]; got != encStateSecure {
+			t.Fatalf("PeerEncryption[%s] = %q, want %q", key, got, encStateSecure)
+		}
+		if st.EncryptedPeers != 1 || st.PlaintextPeers != 0 {
+			t.Fatalf("encryption = %d secure / %d plaintext, want 1/0",
+				st.EncryptedPeers, st.PlaintextPeers)
+		}
+		out := doctor.Report(st, doctor.Options{InProcess: true})
+		if !strings.Contains(out, "encryption: every connected peer") {
+			t.Fatalf("doctor report does not read the direct QUIC peer as encrypted:\n%s", out)
 		}
 	})
 
