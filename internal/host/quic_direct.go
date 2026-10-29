@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,28 +19,85 @@ type directPacketConn struct {
 	// peer is cached because the underlay's peer address is fixed at
 	// construction and ReadFrom is on the QUIC packet hot path.
 	peer *net.UDPAddr
+
+	// onIdle is the pair's heartbeat watchdog callback. It fires once when the
+	// path has been silent (no data and no answered heartbeat) past
+	// directUnderlayIdle, which is how a QUIC direct path is retired without
+	// waiting for quic-go's connection-level idle timeout.
+	onIdle func(*directUnderlay)
+	// lastSent and lastRecv are UnixNano stamps for the heartbeat cadence and
+	// the silence window. The read loop is their only writer; atomics keep a
+	// status or shutdown read off the QUIC read path.
+	lastSent atomic.Int64
+	lastRecv atomic.Int64
+	idleOnce sync.Once
 }
 
 var _ net.PacketConn = (*directPacketConn)(nil)
 
 func newDirectPacketConn(u *directUnderlay) *directPacketConn {
-	return &directPacketConn{u: u, peer: net.UDPAddrFromAddrPort(u.peer)}
+	c := &directPacketConn{u: u, peer: net.UDPAddrFromAddrPort(u.peer)}
+	c.lastRecv.Store(time.Now().UnixNano())
+	return c
 }
 
 // ReadFrom returns the next peer datagram. The underlay already filters foreign
 // sources and consumes seed magic; this only maps the peer onto a net.Addr and
 // swallows the periodic read deadline. Close surfaces as io.EOF.
+//
+// The deadline ticks also drive the direct heartbeat watchdog: while the path
+// is silent this side sends a heartbeat (at directHeartbeatInterval) and judges
+// the path dead (past directUnderlayIdle) when neither data nor an answered
+// heartbeat has arrived. The watchdog is confined to this read loop, so
+// removing the underlay ends it; there is no separate goroutine to leak.
 func (c *directPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	for {
 		n, err := c.u.readFrom(p)
 		if err == nil {
+			c.lastRecv.Store(time.Now().UnixNano())
 			return n, c.peer, nil
 		}
 		if errors.Is(err, os.ErrDeadlineExceeded) {
+			if c.heartbeatTick() {
+				return 0, nil, net.ErrClosed
+			}
 			continue
 		}
 		return 0, nil, err
 	}
+}
+
+// heartbeatTick sends one heartbeat when the interval has elapsed and reports
+// whether the path is dead: no inbound data and no answered heartbeat within
+// directUnderlayIdle. An underlay without a heartbeat token is judged on data
+// silence alone, matching the KCP watchdog's fallback.
+func (c *directPacketConn) heartbeatTick() bool {
+	now := time.Now()
+	if last := c.lastSent.Load(); last == 0 ||
+		now.Sub(time.Unix(0, last)) >= time.Duration(directHeartbeatInterval.Load()) {
+		c.lastSent.Store(now.UnixNano())
+		c.u.sendHeartbeat()
+	}
+
+	idle := time.Duration(directUnderlayIdle.Load())
+	if now.Sub(time.Unix(0, c.lastRecv.Load())) < idle {
+		return false
+	}
+	if now.Sub(time.Unix(0, c.u.lastHbRecv.Load())) < idle {
+		return false
+	}
+	return c.fireIdle()
+}
+
+// fireIdle dispatches the watchdog callback at most once per underlay and
+// reports whether it did. A false return means there is no callback to notify
+// (a bare packet conn in a unit test).
+func (c *directPacketConn) fireIdle() bool {
+	if c.onIdle == nil {
+		return false
+	}
+	c.idleOnce.Do(func() { c.onIdle(c.u) })
+	return true
 }
 
 // WriteTo sends to the punched peer; the destination is part of the underlay,
@@ -99,10 +158,12 @@ func (p *quicPair) addDirect(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 		return nil
 	}
 	p.directSock = sock
+	dpc := newDirectPacketConn(u)
+	dpc.onIdle = p.directHeartbeatDead
 	p.mp.addUnderlay(quicUnderlay{
 		name: quicPathDirect,
 		addr: quicPathAddr{name: quicPathDirect, addr: peerAddr},
-		pc:   newDirectPacketConn(u),
+		pc:   dpc,
 	})
 	if p.role == quicRoleClient {
 		p.mp.setPreferred(quicPathDirect)
@@ -141,4 +202,28 @@ func (p *quicPair) removeDirect(sock *net.UDPConn) {
 	// this is the idempotent belt-and-braces close for a socket that had not
 	// been installed yet.
 	_ = sock.Close()
+}
+
+// hasDirect reports whether a direct underlay is installed on the pair. It is
+// the relay-loss decision: a pair with a direct path keeps its connection,
+// while a relay-only pair has no path left and must be rebuilt.
+func (p *quicPair) hasDirect() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.directSock != nil && !p.closed
+}
+
+// directHeartbeatDead is the QUIC direct underlay's idle watchdog. The
+// packet-conn read loop has already proven the path silent, so detach it,
+// prefer the relay on the client, and hand the retirement to the engine so the
+// punch state is marked down and the existing re-punch backoff runs. The QUIC
+// connection and every stream on it stay alive and migrate to the relay.
+func (p *quicPair) directHeartbeatDead(u *directUnderlay) {
+	if u == nil {
+		return
+	}
+	p.removeDirect(u.sock)
+	if p.e != nil {
+		p.e.quicDirectDead(p.peer, u)
+	}
 }

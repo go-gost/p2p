@@ -763,7 +763,15 @@ func (e *engine) establishQUIC(ctx context.Context, peer derpclient.PublicKey, q
 	pc := e.peerConn(peer)
 
 	e.quicMu.Lock()
-	sendCaps := !qp.capsSent
+	// Re-advertise whenever this is a fresh pair epoch (no pair yet, or the
+	// previous connection ended): the peer may have dropped its negotiation
+	// state with the old connection, and a side that still holds
+	// capsSent=true would otherwise silently wait for a caps frame that is
+	// never sent again. A failed handshake (pair retained with conn == nil)
+	// keeps the retry behavior: capsSent is cleared by the caps timeout, not
+	// by this condition.
+	rebuild := qp.pair == nil || !qp.pair.reusable()
+	sendCaps := !qp.capsSent || rebuild
 	if sendCaps {
 		qp.capsSent = true
 	}
@@ -902,7 +910,9 @@ func usableQUICCaps(info capsInfo) (quicCaps, error) {
 // closed is not recreated — the peer is gone (or the engine is closing), and a
 // pair no sink can reach would only leak. When the state nonetheless exists, a
 // pair pinned to a different fingerprint — the peer restarted and rotated its
-// certificate — is closed and replaced.
+// certificate — or one whose connection has already ended is closed and
+// replaced. The latter is what lets a single OpenStream rebuild after a QUIC
+// connection death even before the close watcher has dropped the state.
 func (e *engine) quicPairFor(peer derpclient.PublicKey, role quicRole, fp [32]byte) *quicPair {
 	e.quicMu.Lock()
 	if e.quicClosed {
@@ -914,7 +924,7 @@ func (e *engine) quicPairFor(peer derpclient.PublicKey, role quicRole, fp [32]by
 		e.quicMu.Unlock()
 		return nil
 	}
-	if qp.pair != nil && qp.pairFP == fp {
+	if qp.pair != nil && qp.pairFP == fp && qp.pair.reusable() {
 		p := qp.pair
 		e.quicMu.Unlock()
 		return p
@@ -940,7 +950,7 @@ func (e *engine) quicPairFor(peer derpclient.PublicKey, role quicRole, fp [32]by
 		e.quicMu.Unlock()
 		return nil
 	}
-	if qp.pair != nil && qp.pairFP == fp {
+	if qp.pair != nil && qp.pairFP == fp && qp.pair.reusable() {
 		p := qp.pair
 		e.quicMu.Unlock()
 		return p
@@ -1141,8 +1151,165 @@ func (e *engine) closeQUIC(peer derpclient.PublicKey) {
 	}
 }
 
-// closeAllQUIC tears down every peer's pair. Used on relay teardown and engine
-// close; a later QUIC request rebuilds from the relay underlay.
+// quicConnClosed handles a QUIC connection that ended on its own. The pair is
+// forgotten (the next open builds a fresh QUIC pair, never KCP), but the
+// peer's caps and fingerprint are kept: a connection death is transport state,
+// not a peer restart, and dropping the negotiation input would make both ends
+// re-exchange frames that neither side re-sends on the same connection epoch.
+// A fresh establishment is started here because the accepting side has no other
+// trigger once the relay pump has nothing to deliver.
+func (e *engine) quicConnClosed(p *quicPair, err error) {
+	e.quicMu.Lock()
+	qp := e.quics[p.peer]
+	if e.quicClosed || qp == nil || qp.pair != p {
+		e.quicMu.Unlock()
+		return
+	}
+	qp.pair = nil
+	qp.pairFP = [32]byte{}
+	relay, relayUp := qp.relay, qp.relayUp
+	qp.relay = nil
+	qp.relayUp = false
+	// Death-triggered restart is not subject to the inbound-trigger rate
+	// limit: both ends must start, and the accepting side may have just
+	// started a pair moments before the connection died.
+	qp.nextStart = time.Time{}
+	if qp.setup != nil {
+		qp.setup.cancel()
+	}
+	e.quicMu.Unlock()
+
+	if relay != nil && !relayUp {
+		// The relay underlay never reached the pair's multiPathConn, so
+		// pair.close cannot end its sender goroutine.
+		_ = relay.Close()
+	}
+	// Give the CONNECTION_CLOSE flight a moment to leave the transport:
+	// closing it synchronously discards the frame, leaving the peer on a
+	// half-open connection until its idle timeout. The engine state is already
+	// rebuilt; only the dead pair's transport is held.
+	time.AfterFunc(quicDeathCloseDelay, p.close)
+	e.log.Debug("quic connection closed", "peer", keyName(p.peer), "error", err)
+	e.maybeStartQUIC(p.peer)
+}
+
+// quicDirectDead is the QUIC direct watchdog's engine side: the pair has
+// already detached the silent underlay and returned to the relay, and this
+// marks the punch state down so the existing re-punch backoff rebuilds the
+// path. The QUIC connection is untouched; it migrated to the relay.
+func (e *engine) quicDirectDead(peer derpclient.PublicKey, u *directUnderlay) {
+	if dc := e.getDirect(peer); dc != nil {
+		dc.underlayDead(u)
+	}
+}
+
+// relayDownQUIC detaches the relay underlay from every QUIC pair without
+// closing a connection that still has a direct path. A pair with no direct
+// path has nothing left to carry it, so it is closed and forgotten; the next
+// open rebuilds QUIC from the relay when it returns. KCP pairs are not touched
+// (QUIC mode never builds one).
+func (e *engine) relayDownQUIC() {
+	type relayLoss struct {
+		pair    *quicPair
+		relay   *relayQUICConn
+		relayUp bool
+		keep    bool
+	}
+	e.quicMu.Lock()
+	states := make([]relayLoss, 0, len(e.quics))
+	for _, qp := range e.quics {
+		if qp.setup != nil {
+			// The setup rides the relay path that just died; wake its
+			// waiters instead of letting them sit out the caps/handshake
+			// budget.
+			qp.setup.cancel()
+		}
+		keep := qp.pair != nil && qp.pair.hasDirect()
+		states = append(states, relayLoss{
+			pair:    qp.pair,
+			relay:   qp.relay,
+			relayUp: qp.relayUp,
+			keep:    keep,
+		})
+		qp.relay = nil
+		qp.relayUp = false
+		if keep {
+			// The connection survives on its direct path; keep its pair so the
+			// reconnect can attach the fresh relay underlay to the same QUIC
+			// connection.
+			continue
+		}
+		// No direct path survives: forget the pair, but keep the caps and
+		// fingerprint so the post-reconnect establishment can start from the
+		// peer's known QUIC identity. The next open rebuilds from the relay.
+		qp.pair = nil
+		qp.pairFP = [32]byte{}
+		qp.nextStart = time.Time{}
+	}
+	e.quicMu.Unlock()
+
+	for _, st := range states {
+		if st.pair != nil {
+			if st.keep {
+				st.pair.relayDown()
+			} else {
+				st.pair.close()
+			}
+		}
+		if st.relay != nil && !st.relayUp {
+			_ = st.relay.Close()
+		}
+	}
+}
+
+// relayRestoredQUIC re-installs the relay underlay on every QUIC pair that
+// survived a relay outage on a live direct path. It runs after a successful
+// relay dial, outside the engine lock, and builds a fresh relayQUICConn whose
+// send closure points at the peer's current adapter rather than the dead one.
+func (e *engine) relayRestoredQUIC() {
+	if e.transport != transportQUIC {
+		return
+	}
+	select {
+	case <-e.stop:
+		return
+	default:
+	}
+
+	e.quicMu.Lock()
+	if e.quicClosed {
+		e.quicMu.Unlock()
+		return
+	}
+	type restore struct {
+		peer derpclient.PublicKey
+		pair *quicPair
+	}
+	states := make([]restore, 0, len(e.quics))
+	for peer, qp := range e.quics {
+		if qp.pair == nil || qp.relayUp || !qp.pair.established() {
+			continue
+		}
+		states = append(states, restore{peer: peer, pair: qp.pair})
+	}
+	e.quicMu.Unlock()
+
+	for _, st := range states {
+		pc := e.peerConn(st.peer)
+		if pc == nil {
+			continue
+		}
+		if err := e.quicRelayUnderlay(st.peer, st.pair, pc); err != nil {
+			e.log.Debug("quic relay restore", "peer", keyName(st.peer), "error", err)
+			continue
+		}
+		e.log.Debug("quic relay restored", "peer", keyName(st.peer))
+	}
+}
+
+// closeAllQUIC tears down every peer's pair. Used when the engine closes; a
+// relay outage goes through relayDownQUIC instead, so a pair riding a live
+// direct path keeps its connection.
 func (e *engine) closeAllQUIC() {
 	e.quicMu.Lock()
 	states := make([]quicPeerTeardown, 0, len(e.quics))
@@ -2779,6 +2946,10 @@ func (e *engine) ensureClientLocked() {
 	e.log.Debug("derp connected", "url", e.url, "server", keyName(c.ServerPublicKey()))
 	go e.pump(c)
 	go e.keepalive(c)
+	// A reconnect restores the relay underlay of every QUIC pair that survived
+	// the outage on a live direct path. Spawned because peerConn takes e.mu,
+	// which every caller of ensureClientLocked holds.
+	go e.relayRestoredQUIC()
 }
 
 // pump routes inbound packets to the owning peer adapter; a transport error
@@ -3367,12 +3538,18 @@ func (e *engine) teardown(c *derpclient.Client, cause error) {
 		}
 		pc.killSession(cause, true, reasonLinkLost)
 	}
+	if e.transport == transportQUIC {
+		// A pair on a live direct path keeps its QUIC connection (and its
+		// streams) across the relay loss; only the relay underlay is removed
+		// and re-installed after the reconnect. A relay-only pair has no path
+		// left and is forgotten here, so the next open rebuilds QUIC.
+		e.relayDownQUIC()
+		return
+	}
 	// The peers' kills cover the pairs their adapters built; every other pair's
 	// KCP session (an adapter already swapped out, its replacement never built)
 	// rides the same dead relay and goes too.
 	e.closeRelayKCPs(cause)
-	// QUIC pairs start on the relay and have no independent path binding yet,
-	// so a dead relay client takes them with it. Reconnection rebuilds them.
 	e.closeAllQUIC()
 }
 

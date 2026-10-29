@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/go-gost/p2p/internal/derpclient"
 	"github.com/quic-go/quic-go"
@@ -18,6 +19,12 @@ import (
 const (
 	quicMaxIncomingStreams    = 1024
 	quicMaxIncomingUniStreams = -1
+
+	// quicDeathCloseDelay lets a connection's CONNECTION_CLOSE leave its
+	// transport before the pair tears the transport down. Closing immediately
+	// after the connection's context ends can discard the frame and leave the
+	// peer believing the connection is alive until its idle timeout.
+	quicDeathCloseDelay = 200 * time.Millisecond
 
 	// quicMaxInitialPacketSize is quic-go's maximum packet buffer size.
 	// validateConfig clamps InitialPacketSize to this value in place; applying
@@ -113,10 +120,12 @@ func newQUICPair(e *engine, peer derpclient.PublicKey, role quicRole, tlsCfg *tl
 	}
 }
 
-// addRelayUnderlay installs the relay path. The relay address is synthetic and
-// shared by both ends: QUIC uses it as the path identity, not as a routable
-// destination.
-func (p *quicPair) addRelayUnderlay(pc net.PacketConn) error {
+// relayUp installs or replaces the relay path. The relay address is synthetic
+// and shared by both ends: QUIC uses it as the path identity, not as a routable
+// destination. Replacing an installed underlay closes the old one; the QUIC
+// connection sees the same path address and stays up, so its streams are not
+// disturbed by a relay reconnect.
+func (p *quicPair) relayUp(pc net.PacketConn) error {
 	if pc == nil {
 		return errQUICUnderlayNil
 	}
@@ -142,6 +151,33 @@ func (p *quicPair) addRelayUnderlay(pc net.PacketConn) error {
 	return nil
 }
 
+// addRelayUnderlay installs the relay path. The relay address is synthetic and
+// shared by both ends: QUIC uses it as the path identity, not as a routable
+// destination.
+func (p *quicPair) addRelayUnderlay(pc net.PacketConn) error {
+	return p.relayUp(pc)
+}
+
+// relayDown detaches the relay path without touching the QUIC connection. A
+// client that currently prefers the direct underlay keeps its connection and
+// streams; a client that has no other path lets quic-go close the connection
+// once the idle timeout expires. The caller owns the replacement underlay: a
+// reconnect calls relayUp with a fresh relayQUICConn, whose send closure points
+// at the new peer adapter.
+func (p *quicPair) relayDown() {
+	p.mu.Lock()
+	relay := p.relay
+	p.relay = nil
+	p.mu.Unlock()
+
+	p.mp.removeUnderlay(quicPathRelay)
+	if relay != nil {
+		// removeUnderlay already closed an installed underlay; this is the
+		// idempotent close for a sender that never made it into the map.
+		_ = relay.Close()
+	}
+}
+
 // deliverRelay hands one inbound DERP data payload to the relay underlay's
 // batching decoder. It is called from the relay pump and never blocks: a full
 // queue drops the payload and QUIC retransmits the packets it carried. It
@@ -156,11 +192,49 @@ func (p *quicPair) deliverRelay(pkt []byte) bool {
 	return relay.deliver(pkt)
 }
 
-// established reports whether the QUIC connection has completed its handshake.
+// established reports whether the QUIC connection has completed its handshake
+// and is still alive. A conn whose context has ended is not usable even before
+// the close watcher has dropped it from the engine.
 func (p *quicPair) established() bool {
 	p.mu.Lock()
+	conn, closed := p.conn, p.closed
+	p.mu.Unlock()
+	return conn != nil && !closed && conn.Context().Err() == nil
+}
+
+// reusable reports whether the pair can still be used for a handshake. A pair
+// that never completed one is retried in place (the relay underlay survives a
+// failed attempt). A pair whose connection has ended is not reusable: the next
+// establishment replaces it with a fresh pair and a fresh relay underlay.
+func (p *quicPair) reusable() bool {
+	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.conn != nil && !p.closed
+	return !p.closed && (p.conn == nil || p.conn.Context().Err() == nil)
+}
+
+// watchConn waits for the QUIC connection to end and reports it to the engine,
+// which forgets the pair so the next open rebuilds it. A close initiated by
+// the pair itself is ignored: close marks p.closed before closing the conn, and
+// the engine already owns that teardown.
+func (p *quicPair) watchConn(conn *quic.Conn) {
+	<-conn.Context().Done()
+
+	p.mu.Lock()
+	mine := p.conn == conn && !p.closed
+	p.mu.Unlock()
+	if !mine {
+		return
+	}
+	p.onConnClosed(conn.Context().Err())
+}
+
+// onConnClosed notifies the engine that this pair's connection ended on its
+// own. It is deliberately not called for a pair.close initiated by the engine.
+func (p *quicPair) onConnClosed(err error) {
+	if p.e == nil {
+		return
+	}
+	p.e.quicConnClosed(p, err)
 }
 
 // establish creates the transport and performs the QUIC/TLS handshake. The
@@ -206,6 +280,7 @@ func (p *quicPair) establish(ctx context.Context) error {
 	p.mu.Unlock()
 
 	if err == nil {
+		go p.watchConn(conn)
 		go p.acceptStreams()
 		return nil
 	}
