@@ -2194,3 +2194,31 @@ func TestEnsureSessionInboundDoesNotBlock(t *testing.T) {
 		t.Fatalf("inbound call took %v with handshakeTimeout=%v: it blocked on the round trip", elapsed, time.Duration(handshakeTimeout.Load()))
 	}
 }
+
+// TestPeerConnDataSinkBypassesKCP: an inbound data frame goes straight to the
+// peer's data sink when one is installed, with no KCP relay path behind it. The
+// sink is the seam a non-KCP data plane plugs into; KCP stays the default (nil
+// sink), so this test must see neither a built session nor a queued packet.
+func TestPeerConnDataSinkBypassesKCP(t *testing.T) {
+	pc := &peerConn{
+		peer:    derpclient.PublicKey{7},
+		inbound: make(chan []byte, inboundQueueSize),
+		closeCh: make(chan struct{}),
+	}
+	var got [][]byte
+	pc.setDataSink(func(pkt []byte) {
+		got = append(got, append([]byte(nil), pkt...))
+	})
+
+	pc.deliverData([]byte{1})
+
+	if len(got) != 1 || !bytes.Equal(got[0], []byte{1}) {
+		t.Fatalf("sink got %v, want exactly [[1]]", got)
+	}
+	if pc.sess != nil {
+		t.Fatal("deliverData built a KCP session for a peer with a data sink")
+	}
+	if n := len(pc.inbound); n != 0 {
+		t.Fatalf("deliverData queued %d packet(s) for the KCP underlay, want 0", n)
+	}
+}

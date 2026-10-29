@@ -597,6 +597,16 @@ type peerConn struct {
 	peer    derpclient.PublicKey
 	inbound chan []byte
 
+	// dataSink, when non-nil, receives each inbound data frame payload directly
+	// instead of the KCP relay path (deliverInbound). It is the seam a non-KCP
+	// data plane plugs into, and nil for the default KCP path. An atomic
+	// pointer because an underlay swap may replace it while the pump reads it,
+	// and the pump's hot path must never take pc.mu. The sink runs on the pump
+	// goroutine and must not block (a bounded, drop-on-full queue on its side);
+	// it must also not assume no delivery is in flight when it is replaced —
+	// setDataSink is a pointer swap, not a barrier.
+	dataSink atomic.Pointer[func([]byte)]
+
 	// secure is this pair's relay security session, borrowed from e.secure (one
 	// per (peer, transport), outliving this adapter). The AEAD record layer
 	// wraps the smux underlay once both halves are exchanged, and stays
@@ -2078,19 +2088,49 @@ func (e *engine) pump(c *derpclient.Client) {
 		// inbound path at all until some outbound open happened to replace it.
 		pc := e.peerConn(src)
 		pc.lastFrameAt.Store(clock.UnixNano())
-		// Ensure a session exists on this side too: inbound packets must be
-		// consumed by smux (which then accepts streams) even when this host
-		// never opens a tunnel to the peer itself.
-		if _, err := pc.ensureSession(true, false); err != nil {
-			// The session could not be built. Records already queued for this
-			// peer are KCP segments the peer will retransmit, not consumed
-			// records, so nothing is abandoned: the kill is a clean one that
-			// keeps the settled keys and the pair's KCP session.
-			pc.killSession(err, false, reasonBuildFailed)
-			continue
-		}
-		pc.deliverInbound(pkt)
+		pc.deliverData(pkt)
 	}
+}
+
+// setDataSink installs the per-peer data sink, or clears it when sink is nil
+// (restoring the KCP relay path). It is a pointer swap, not a barrier: a
+// delivery already in flight on the pump may still reach the sink being
+// replaced, so the caller owns the sink's lifetime. See peerConn.dataSink for
+// the sink's contract (non-blocking, called from the pump goroutine, no lock
+// held).
+func (pc *peerConn) setDataSink(sink func([]byte)) {
+	if sink == nil {
+		pc.dataSink.Store(nil)
+		return
+	}
+	pc.dataSink.Store(&sink)
+}
+
+// deliverData routes one inbound data frame payload: to the data sink when one
+// is installed, else down the KCP relay path exactly as the pump always has —
+// ensure a session exists on this side, then queue the packet for the underlay.
+//
+// The sink is called with no lock held and must not block (peerConn.dataSink).
+// The KCP branch is unchanged from when it lived in the pump: a session that
+// cannot be built kills the adapter, and a full queue drops the segment (see
+// deliverInbound).
+func (pc *peerConn) deliverData(pkt []byte) {
+	if sink := pc.dataSink.Load(); sink != nil {
+		(*sink)(pkt)
+		return
+	}
+	// Ensure a session exists on this side too: inbound packets must be
+	// consumed by smux (which then accepts streams) even when this host
+	// never opens a tunnel to the peer itself.
+	if _, err := pc.ensureSession(true, false); err != nil {
+		// The session could not be built. Records already queued for this
+		// peer are KCP segments the peer will retransmit, not consumed
+		// records, so nothing is abandoned: the kill is a clean one that
+		// keeps the settled keys and the pair's KCP session.
+		pc.killSession(err, false, reasonBuildFailed)
+		return
+	}
+	pc.deliverInbound(pkt)
 }
 
 // deliverInbound queues one inbound relay packet for smux. A full queue drops
