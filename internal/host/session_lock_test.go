@@ -1264,10 +1264,10 @@ func TestRelayToleratesDroppedDataFrames(t *testing.T) {
 	loss := newFaults(&p2p.FaultsConfig{DropDataRate: rate})
 	eA.faults.Store(loss)
 
-	// A payload well past the KCP receive window (256 packets * 1400 B ≈ 350
-	// KiB): 2 MiB forces the send window to cycle ~6 times, so retransmitted
-	// segments land in a window that has already moved on — the case that must
-	// not desync the record stream.
+	// A payload well past the KCP receive window (1024 packets * 1400 B ≈ 1.4
+	// MiB): 2 MiB forces the send window to cycle, so retransmitted segments
+	// land in a window that has already moved on — the case that must not
+	// desync the record stream.
 	const payloadSize = 2 << 20 // 2 MiB
 	payload := make([]byte, payloadSize)
 	// Stamp each 8-byte lane with a position-derived 64-bit value (big-endian

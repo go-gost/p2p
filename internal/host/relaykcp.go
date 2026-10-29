@@ -111,13 +111,17 @@ const (
 	// relayKCPRcvWnd is the peer's ceiling on ours: a slow local reader now
 	// shrinks the advertised receive window instead of drowning the relay
 	// queue — the backpressure the raw byte-stream underlay never had.
-	relayKCPSndWnd = 256
-	relayKCPRcvWnd = 256
+	//
+	// 1024 is the measured throughput knee from the 2026-10-29 sweep; 256 was
+	// the original conservative value. Raising it further gave little on the
+	// direct path and risks the relay's bounded per-client queue.
+	relayKCPSndWnd = 1024
+	relayKCPRcvWnd = 1024
 	// relayKCPRecvBuffer bounds the pair's fan-in channel: datagrams the pumps
 	// have read from their underlays but KCP has not yet consumed. It matches
 	// the receive window, so a pump can stay at most one window ahead of the
 	// session without the channel itself becoming the backpressure.
-	relayKCPRecvBuffer = 256
+	relayKCPRecvBuffer = 1024
 )
 
 // directUnderlayIdle is how long a direct underlay may go without delivering an
