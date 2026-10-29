@@ -646,7 +646,7 @@ func TestPeerDirectOffAfterPairDropIsNotDirect(t *testing.T) {
 	// The peer rebuilt its host (a rekey drops the pair), then announced that
 	// its direct path is off.
 	e.dropRelayKCP(peer, nil, errors.New("test: peer rekeyed"), 0)
-	dc.addCaps(capsNoDirect)
+	dc.addCaps(capsInfo{Bits: capsNoDirect})
 
 	if got := e.peerTransports()[keyName(peer)]; got != transportPeerDirectOff {
 		t.Errorf("transport = %q, want %q", got, transportPeerDirectOff)
@@ -2003,7 +2003,7 @@ func TestPeerDirectOffSkipsTheRound(t *testing.T) {
 	eng.client = &derpclient.Client{} // relay up, so a round would reach its STUN lookup
 
 	// The peer says it will not punch.
-	dc.addCaps(capsNoDirect)
+	dc.addCaps(capsInfo{Bits: capsNoDirect})
 	eng.maybeStartDirect(dc.peer)
 	// The decision is read from the trace, not from a counter: a skipped round
 	// is a synchronous decision, while "attempts == 0" is a race — a round that

@@ -1021,7 +1021,7 @@ func TestPeerTransportReasons(t *testing.T) {
 			// path is off — the asymmetry this word exists to name, so the bit is
 			// set on the same adapter the failed round left behind.
 			dc := &directConn{e: e, peer: peer, state: directBackoff, failed: true}
-			dc.addCaps(capsNoDirect)
+			dc.addCaps(capsInfo{Bits: capsNoDirect})
 			e.directs[peer] = dc
 		}, transportPeerDirectOff},
 		{"plain relay", func(e *engine) {}, transportRelay},

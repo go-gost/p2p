@@ -534,15 +534,16 @@ func (e *engine) resolveV6() *net.UDPAddr {
 	return v6
 }
 
-// caps returns the capability bits this host advertises. The IPv6 bit is a
+// caps returns the capabilities this host advertises. The IPv6 bit is a
 // statement about what this host can use right now: a host that has the family
-// off, or has it on without an egress, must not claim it.
-func (e *engine) caps() uint8 {
-	var caps uint8
+// off, or has it on without an egress, must not claim it. A host with no QUIC
+// identity advertises only these legacy bits.
+func (e *engine) caps() capsInfo {
+	info := capsInfo{}
 	if e.v6Enabled && e.v6Usable() {
-		caps |= capsIPv6
+		info.Bits |= capsIPv6
 	}
-	return caps
+	return info
 }
 
 // directReason names what stands between this host and a direct path when
@@ -2147,7 +2148,13 @@ func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
 			e.log.Debug("direct punch: bad caps box", "peer", keyName(src))
 			return
 		}
-		e.directConn(src).addCaps(clear[0])
+		info, err := decodeCaps(clear)
+		if err != nil {
+			// The bits stand on their own; only the TLV segment is dropped,
+			// which is how an older peer treats any tail it does not know.
+			e.log.Debug("direct punch: caps TLV ignored", "peer", keyName(src), "error", err)
+		}
+		e.directConn(src).addCaps(info)
 	case ctrlSecure:
 		clear, ok := e.priv.OpenFrom(src, body[1:])
 		if !ok || len(clear) < 1 {

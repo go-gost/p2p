@@ -216,6 +216,7 @@ type directConn struct {
 	mine     []candidate    // our candidates for the current punch, answered to the peer
 	lastPeer []candidate    // peer candidates already acted on (dedupes re-announcements)
 	peerCaps uint8          // capability bits the peer advertised via ctrlCaps
+	peerQUIC *quicCaps      // peer's QUIC identity from the latest caps frame, nil when unusable
 	lastErr  string         // the last punch failure's reason, cleared when one succeeds
 	sessAt   time.Time      // when the current direct underlay came up (zero when none)
 
@@ -463,11 +464,11 @@ func (e *engine) warm(peer derpclient.PublicKey, punch bool) error {
 // nothing without a punch round, so they ride it instead (see sendCaps' callers
 // in punch) and only the "off" bit travels here.
 func (e *engine) announceDirect(peer derpclient.PublicKey) {
-	var caps uint8
+	info := capsInfo{}
 	if !e.directEnabled() {
-		caps = capsNoDirect
+		info.Bits = capsNoDirect
 	}
-	if err := e.sendCaps(peer, caps); err != nil {
+	if err := e.sendCaps(peer, info); err != nil {
 		e.log.Debug("direct: announce direct-off failed", "peer", keyName(peer), "error", err)
 	}
 }
@@ -643,6 +644,9 @@ func (dc *directConn) capNames() []string {
 	}
 	if bits&capsNoDirect != 0 {
 		out = append(out, "no-direct")
+	}
+	if bits&capsQUIC != 0 {
+		out = append(out, "quic")
 	}
 	return out
 }
@@ -945,28 +949,51 @@ func (dc *directConn) repunchBackoffAfterLocked(lifetime time.Duration) time.Dur
 	return dc.repunchBackoff
 }
 
-// addCaps records the capability bits the peer advertised. IPv6 is sticky: it
-// describes a capability, and a frame that omits it must not clear it. The
-// frame rides every candidate broadcast, so it logs only when the set changes.
+// addCaps records the capabilities the peer advertised. The bits are sticky
+// (OR): IPv6 describes a capability, and a frame that omits it must not clear
+// it. capsNoDirect is the exception — it is a setting, not a capability, so it
+// is level-triggered (see its definition).
 //
-// capsNoDirect is the exception: it is a setting, not a capability, so it is
-// level-triggered (see its definition).
-func (dc *directConn) addCaps(bits uint8) {
+// The QUIC TLV is the peer's current identity, not a capability, so the latest
+// valid frame wins. It is stored only when that frame both sets capsQUIC and
+// carries usable parameters; otherwise it is dropped, because a stale
+// fingerprint would pin the peer to an identity it no longer holds.
+func (dc *directConn) addCaps(info capsInfo) {
 	dc.mu.Lock()
 	before := dc.peerCaps
+	hadQUIC := dc.peerQUIC != nil
 	// capsNoDirect is level-triggered — it reflects the peer's switch *now*, so
 	// the last advertisement wins and a frame without it revokes an earlier one
 	// (which is what a peer sends along with its candidate broadcasts once it
 	// starts punching again). The rest are sticky: they describe a capability,
 	// not a setting, and a frame that omits one must not clear it.
-	dc.peerCaps = (dc.peerCaps &^ capsNoDirect) | bits
+	dc.peerCaps = (dc.peerCaps &^ capsNoDirect) | info.Bits
+	if info.Bits&capsQUIC != 0 && info.QUIC != nil {
+		q := *info.QUIC
+		dc.peerQUIC = &q
+	} else {
+		dc.peerQUIC = nil
+	}
 	after := dc.peerCaps
+	hasQUIC := dc.peerQUIC != nil
 	dc.mu.Unlock()
-	if after != before {
+	if dc.e != nil && (after != before || hasQUIC != hadQUIC) {
 		dc.e.log.Debug("direct punch: peer caps", "peer", keyName(dc.peer),
 			"ipv6", after&capsIPv6 != 0,
-			"noDirect", after&capsNoDirect != 0)
+			"noDirect", after&capsNoDirect != 0,
+			"quic", hasQUIC)
 	}
+}
+
+// peerQUICInfo returns the peer's current QUIC identity. ok is false when the
+// peer has not advertised capsQUIC with a usable TLV.
+func (dc *directConn) peerQUICInfo() (quicCaps, bool) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if dc.peerQUIC == nil {
+		return quicCaps{}, false
+	}
+	return *dc.peerQUIC, true
 }
 
 // notePunching records that the peer is punching (it broadcast candidates),
@@ -1941,11 +1968,12 @@ func (e *engine) sendCandidates(peer derpclient.PublicKey, cands []candidate) er
 	return e.sendControl(peer, ctrlPunchCandidates, e.priv.SealTo(peer, encodeCandidates(cands)))
 }
 
-// sendCaps advertises our capability bits to the peer. Re-sent with every
+// sendCaps advertises our capabilities to the peer. Re-sent with every
 // candidate broadcast (idempotent) so a lost frame or a late-joining peer
-// cannot permanently degrade negotiation; the peer ORs the bits.
-func (e *engine) sendCaps(peer derpclient.PublicKey, caps uint8) error {
-	return e.sendControl(peer, ctrlCaps, e.priv.SealTo(peer, []byte{caps}))
+// cannot permanently degrade negotiation; the peer ORs the bits. The QUIC
+// identity rides along as a TLV when one is present.
+func (e *engine) sendCaps(peer derpclient.PublicKey, info capsInfo) error {
+	return e.sendControl(peer, ctrlCaps, e.priv.SealTo(peer, encodeCaps(info)))
 }
 
 // sendControl sends a control frame ([frameControl][kind][payload]) to peer.

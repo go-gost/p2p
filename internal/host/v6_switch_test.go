@@ -24,7 +24,7 @@ func TestIPv6OffAdvertisesNothing(t *testing.T) {
 	e := newTestEngine(t)
 	e.stunAddr = "127.0.0.1:1"
 	e.v6Addr = &net.UDPAddr{IP: net.IPv6loopback}
-	if got := e.caps(); got&capsIPv6 != 0 {
+	if got := e.caps().Bits; got&capsIPv6 != 0 {
 		t.Fatalf("caps = %#x, want no v6 bit with the switch off", got)
 	}
 	if !e.directEnabled() {
@@ -52,7 +52,7 @@ func TestIPv6OnProbesEveryRound(t *testing.T) {
 	if e.v6Available.Load() {
 		t.Fatal("v6Available = true after a round that found no egress")
 	}
-	if got := e.caps(); got&capsIPv6 != 0 {
+	if got := e.caps().Bits; got&capsIPv6 != 0 {
 		t.Fatalf("caps = %#x, want no v6 bit while no egress is usable", got)
 	}
 	if got := e.resolveV6(); got == nil || !got.IP.Equal(net.IPv6loopback) {
@@ -61,7 +61,7 @@ func TestIPv6OnProbesEveryRound(t *testing.T) {
 	if !e.v6Available.Load() {
 		t.Fatal("v6Available = false after a round that found an egress")
 	}
-	if got := e.caps(); got&capsIPv6 == 0 {
+	if got := e.caps().Bits; got&capsIPv6 == 0 {
 		t.Fatalf("caps = %#x, want the v6 bit once the egress is usable", got)
 	}
 	if n := calls.Load(); n != 2 {
