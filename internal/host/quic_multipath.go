@@ -48,6 +48,9 @@ func (a quicPathAddr) String() string {
 }
 
 // quicUnderlay is one packet path (relay or direct) feeding a multiPathConn.
+// pc should unblock a pending ReadFrom when closed so the reader goroutine can
+// exit, but removal never waits for that: a non-conforming Close only costs a
+// leaked reader, it cannot block the caller.
 type quicUnderlay struct {
 	name string
 	addr net.Addr
@@ -68,18 +71,10 @@ type quicReadResult struct {
 	addr net.Addr
 }
 
-// quicUnderlayReader is the per-instance state of one underlay. Installing a
-// replacement closes stop and done, so the old pump exits without publishing
-// its close error into the fan-in queue.
+// quicUnderlayReader is the per-instance state of one underlay. Its pointer
+// identity lets deliver reject packets from a replaced or removed reader.
 type quicUnderlayReader struct {
-	u    quicUnderlay
-	stop chan struct{}
-	done chan struct{}
-	once sync.Once
-}
-
-func (r *quicUnderlayReader) halt() {
-	r.once.Do(func() { close(r.stop) })
+	u quicUnderlay
 }
 
 // multiPathConn presents several packet underlays as a single net.PacketConn
@@ -128,14 +123,10 @@ func newMultiPathConn(role quicRole) *multiPathConn {
 }
 
 // addUnderlay installs u, replacing any underlay with the same name. The old
-// reader is stopped and its packet conn closed before the new reader starts;
-// its error is internal and never reaches ReadFrom.
+// reader is retired by the map swap and its packet conn closed, but it is not
+// waited for: deliver drops its packets even if Close does not unblock ReadFrom.
 func (c *multiPathConn) addUnderlay(u quicUnderlay) {
-	r := &quicUnderlayReader{
-		u:    u,
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
-	}
+	r := &quicUnderlayReader{u: u}
 
 	c.mu.Lock()
 	select {
@@ -150,17 +141,14 @@ func (c *multiPathConn) addUnderlay(u quicUnderlay) {
 	c.mu.Unlock()
 
 	if old != nil {
-		old.halt()
 		_ = old.u.pc.Close()
-		// net.PacketConn.Close unblocks a pending ReadFrom, so the old pump
-		// finishes promptly and cannot race the replacement reader.
-		<-old.done
 	}
 	go c.pump(r)
 }
 
-// removeUnderlay stops and closes the named underlay. Removing the preferred
-// path clears it; the client then falls back to relay on the next write.
+// removeUnderlay closes the named underlay without waiting for its reader.
+// Removing the preferred path clears it; the client then falls back to relay on
+// the next write.
 func (c *multiPathConn) removeUnderlay(name string) {
 	c.mu.Lock()
 	r := c.underlays[name]
@@ -174,9 +162,7 @@ func (c *multiPathConn) removeUnderlay(name string) {
 	}
 	c.mu.Unlock()
 
-	r.halt()
 	_ = r.u.pc.Close()
-	<-r.done
 }
 
 func (c *multiPathConn) setPreferred(name string) {
@@ -195,7 +181,6 @@ func (c *multiPathConn) preferredPath() string {
 // error only ends this pump: a dead path must not tear down the QUIC
 // connection, which can still migrate to another underlay.
 func (c *multiPathConn) pump(r *quicUnderlayReader) {
-	defer close(r.done)
 	buf := make([]byte, 64<<10)
 	for {
 		n, _, err := r.u.pc.ReadFrom(buf)
@@ -337,7 +322,6 @@ func (c *multiPathConn) Close() error {
 		c.mu.Unlock()
 
 		for _, r := range readers {
-			r.halt()
 			_ = r.u.pc.Close()
 		}
 	})

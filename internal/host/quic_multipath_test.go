@@ -100,6 +100,50 @@ func (c *pipePacketConn) noWrite(t *testing.T) {
 	}
 }
 
+// stuckReadPacketConn is a net.PacketConn whose ReadFrom blocks until the test
+// releases it, and whose Close deliberately does not unblock the read. It
+// models a custom underlay wrapper that violates the usual Close contract.
+type stuckReadPacketConn struct {
+	local   net.Addr
+	release chan struct{}
+	entered chan struct{}
+	exited  chan struct{}
+
+	enterOnce   sync.Once
+	releaseOnce sync.Once
+	exitOnce    sync.Once
+}
+
+func newStuckReadPacketConn(local net.Addr) *stuckReadPacketConn {
+	return &stuckReadPacketConn{
+		local:   local,
+		release: make(chan struct{}),
+		entered: make(chan struct{}),
+		exited:  make(chan struct{}),
+	}
+}
+
+func (c *stuckReadPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	c.enterOnce.Do(func() { close(c.entered) })
+	<-c.release
+	c.exitOnce.Do(func() { close(c.exited) })
+	return 0, nil, net.ErrClosed
+}
+
+func (c *stuckReadPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
+
+// Close is intentionally a no-op: a pending ReadFrom stays blocked.
+func (c *stuckReadPacketConn) Close() error { return nil }
+
+func (c *stuckReadPacketConn) LocalAddr() net.Addr              { return c.local }
+func (c *stuckReadPacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *stuckReadPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *stuckReadPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *stuckReadPacketConn) releaseRead() {
+	c.releaseOnce.Do(func() { close(c.release) })
+}
+
 func testRelayAddr() quicPathAddr {
 	return quicPathAddr{name: quicPathRelay}
 }
@@ -347,6 +391,45 @@ func TestMultiPathRemoveUnderlay(t *testing.T) {
 	// The removed underlay was closed by removeUnderlay.
 	if _, err := directPC.WriteTo([]byte("x"), testDirectAddr()); err == nil {
 		t.Fatal("removed underlay is still open")
+	}
+}
+
+func TestMultiPathRemoveUnderlayDoesNotWaitForRead(t *testing.T) {
+	c := newMultiPathConn(quicRoleClient)
+	pc := newStuckReadPacketConn(pipeAddr("stuck-local"))
+	t.Cleanup(func() {
+		pc.releaseRead()
+		_ = c.Close()
+	})
+
+	c.addUnderlay(quicUnderlay{name: quicPathDirect, addr: testDirectAddr(), pc: pc})
+	select {
+	case <-pc.entered:
+	case <-time.After(time.Second):
+		t.Fatal("underlay reader did not enter ReadFrom")
+	}
+
+	removed := make(chan struct{})
+	go func() {
+		c.removeUnderlay(quicPathDirect)
+		close(removed)
+	}()
+	select {
+	case <-removed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("removeUnderlay blocked on a ReadFrom that Close does not unblock")
+	}
+
+	if _, err := c.WriteTo([]byte("x"), testDirectAddr()); !errors.Is(err, errNoQUICUnderlay) {
+		t.Fatalf("WriteTo after removal = %v, want %v", err, errNoQUICUnderlay)
+	}
+
+	// Release the reader so the test does not leak its goroutine.
+	pc.releaseRead()
+	select {
+	case <-pc.exited:
+	case <-time.After(time.Second):
+		t.Fatal("underlay reader did not exit after release")
 	}
 }
 
