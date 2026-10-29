@@ -6,6 +6,7 @@ require (
 	github.com/coder/websocket v1.8.14
 	github.com/go-gost/plugin v0.10.0
 	github.com/goccy/go-yaml v1.19.2
+	github.com/quic-go/quic-go v0.63.0
 	github.com/xtaci/kcp-go/v5 v5.6.72
 	github.com/xtaci/smux v1.5.57
 	golang.org/x/crypto v0.55.0
