@@ -483,7 +483,7 @@ Expected: PASS（这是 KCP 行为的回归门）。
 
 - [ ] **Step 1: 写失败测试 `TestQUICModeOpensTunnelOverRelay`**
 
-用现有 fake DERP server 启动两个 engine（参考 `engine_test.go`/`direct_test.go` 的 `startEngines` 形状）；给两个 engine 设置 `transport=transportQUIC`、`quicCfg=default settings`、`quicID`；互相 `OpenStream`，断言 echo 成功；断言两侧 `PeerDiagnostic.Transport == "quic"`（Task 12 前可先断言 `engine.transport`）。同时断言没有 `relayKCPPair`（`len(e.relayKCPs)==0`）。
+用现有 fake DERP server 启动两个 engine（参考 `engine_test.go`/`direct_test.go` 的 `startEngines` 形状）；给两个 engine 设置 `transport=transportQUIC`、`quicCfg=default settings`、`quicID`；互相 `OpenStream`，断言 echo 成功；断言 `engine.transport==transportQUIC` 且两个 engine 都有 `quicPair`。同时断言没有 `relayKCPPair`（`len(e.relayKCPs)==0`）。`PeerDiagnostic.Transport=="quic"` 的断言留到 Task 12。
 
 - [ ] **Step 2: 跑测试确认失败**
 
