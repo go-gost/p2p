@@ -165,8 +165,8 @@ func (s *server) allocateTunnel(network, peer string, attached bool) (*tunnelRec
 			// link.mayPresent and engine.peerSessionEvents); it re-presents once
 			// the peer builds a new session, and ends if none arrives within the
 			// re-present grace so the consumer re-dials and re-registers.
-			// QUIC mode has no KCP direct underlay to punch for; its relay
-			// underlay is installed by ensureTransport.
+			// In QUIC mode the punch starts when the pair establishes (see
+			// ensureTransport), so no eager round is started here.
 			if s.engine.transport != transportQUIC {
 				s.engine.maybeStartDirect(key)
 			}
@@ -321,8 +321,8 @@ func (s *server) addForwardAddr(addr, key string) error {
 	}
 	// Eagerly warm the direct path so the first connection doesn't pay the
 	// punch latency. No-op when --stun is unset; a peer that isn't up yet just
-	// backoff-retries like any failed punch. QUIC mode has no KCP direct plane
-	// to punch for.
+	// backoff-retries like any failed punch. In QUIC mode the pair's
+	// establishment starts the punch, so this eager round is left to it.
 	if s.engine.transport != transportQUIC {
 		s.engine.maybeStartDirect(peer)
 	}

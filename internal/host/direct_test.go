@@ -653,6 +653,51 @@ func TestPeerDirectOffAfterPairDropIsNotDirect(t *testing.T) {
 	}
 }
 
+// TestMarkUpSameSocketNoOp: re-registering the socket the pair already holds
+// must not go through installDirect, whose KCP setDirectUnderlay would close it
+// as the retired "old" underlay (Task 3 contract). markUp is re-run on the
+// peer's announcements, so this guard keeps a live direct path alive.
+func TestMarkUpSameSocketNoOp(t *testing.T) {
+	e := newTestEngine(t)
+	peer := derpclient.PublicKey{9}
+	dc := &directConn{e: e, peer: peer}
+	e.directs[peer] = dc
+
+	sink := mustListenUDP(t)
+	t.Cleanup(func() { sink.Close() })
+	sock := mustListenUDP(t)
+	t.Cleanup(func() { sock.Close() })
+	addr := udpAddrPort(t, sink)
+
+	if err := dc.markUp(sock, addr, [seedTokenLen]byte{1}); err != nil {
+		t.Fatalf("first markUp: %v", err)
+	}
+	pair := e.relayKCPPairGet(peer)
+	pair.mu.Lock()
+	u := pair.direct
+	pair.mu.Unlock()
+	if u == nil || u.sock != sock {
+		t.Fatal("pair does not hold the punched socket after markUp")
+	}
+
+	if err := dc.markUp(sock, addr, [seedTokenLen]byte{2}); err != nil {
+		t.Fatalf("second markUp: %v", err)
+	}
+	if u.closed() {
+		t.Fatal("re-registering the same socket retired its underlay")
+	}
+	pair.mu.Lock()
+	held := pair.direct
+	pair.mu.Unlock()
+	if held != u {
+		t.Fatal("re-registering the same socket replaced its underlay")
+	}
+	// A closed socket rejects writes; the live one must still accept them.
+	if _, err := sock.WriteToUDP([]byte("x"), net.UDPAddrFromAddrPort(addr)); err != nil {
+		t.Fatalf("same-socket re-registration closed the socket: %v", err)
+	}
+}
+
 // TestRegisterDirectUnderlayRetiresOldSocket: registering a second punched
 // socket retires the first (its underlay is closed exactly once, by the
 // underlay's sync.Once) and the pair serves only the new one, never the old.

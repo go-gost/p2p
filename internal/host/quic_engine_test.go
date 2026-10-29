@@ -32,8 +32,8 @@ func newQUICTestEngine(t *testing.T, url, target string, priv derpclient.Private
 	e.transport = transportQUIC
 	e.quicCfg = cfg
 	e.quicID = id
-	// The relay path is the only one wired into QUIC by this change; keeping
-	// the punch off also keeps a stray candidate frame from building KCP.
+	// Most tests here exercise the relay path; keeping the punch off also
+	// keeps a stray candidate frame from starting a direct round.
 	e.direct = false
 	return e
 }

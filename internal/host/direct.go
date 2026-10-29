@@ -830,6 +830,7 @@ func (dc *directConn) teardown() {
 	if dc.e != nil {
 		dc.e.retireDirect(dc.peer, sock)
 	}
+	sock.Close()
 }
 
 // markUp stores the freshly punched socket and marks the state up, installing
@@ -842,8 +843,12 @@ func (dc *directConn) teardown() {
 // Installation comes first: a failed install closes the socket and does not
 // mark the path up (no dc.sock, no session age), so the punch's normal backoff
 // handles the retry instead of reporting a path the transport does not hold.
-// QUIC requires an established pair; the hook returns an error when the pair is
-// gone.
+// The state stays directAttempting on failure: punch() calls backoff() right
+// after markUp returns, and that single transition owns the next state. Clearing
+// it to directNone here would let onCandidates (or the QUIC ensureTransport fast
+// path) start a second round in the gap, which backoff() would then clobber —
+// the overlapping-round race retryFrom(..., fromNone) guards elsewhere. QUIC
+// requires an established pair; the hook returns an error when the pair is gone.
 //
 // A punch can succeed while an older underlay is still installed (it is re-run
 // on the peer's announcements): the new socket replaces it, and the old one is
@@ -862,23 +867,29 @@ func (dc *directConn) markUp(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 	// socket and starts local goroutines, so holding dc.mu here is bounded.
 	dc.mu.Lock()
 	prevSock := dc.sock
-	if err := dc.e.installDirect(dc.peer, sock, peerAddr, token); err != nil {
-		// Do not leave a failed install reported as a live path. The transport
-		// refused the new underlay, so the predecessor cannot be live either
-		// (in QUIC the pair that held it is gone).
-		if dc.sock == prevSock {
-			dc.sock = nil
-			dc.sessAt = time.Time{}
-			dc.state = directNone
+	// The pair already holds this socket: installing it again would make
+	// setDirectUnderlay close it as the "old" underlay (Task 3 contract). QUIC's
+	// addDirect has its own identity no-op, but the guard must hold for both.
+	if prevSock != sock {
+		if err := dc.e.installDirect(dc.peer, sock, peerAddr, token); err != nil {
+			// Do not leave a failed install reported as a live path. The
+			// transport refused the new underlay, so the predecessor cannot be
+			// live either (in QUIC the pair that held it is gone). The state is
+			// left for punch()'s backoff to transition exactly once.
+			if dc.sock == prevSock {
+				dc.sock = nil
+				dc.sessAt = time.Time{}
+				dc.peerAddr = netip.AddrPort{}
+			}
+			dc.mu.Unlock()
+			sock.Close()
+			if prevSock != nil && prevSock != sock {
+				prevSock.Close()
+			}
+			dc.noteErr(fmt.Sprintf("direct install failed: %v", err))
+			dc.noteRound("direct install failed: %v", err)
+			return err
 		}
-		dc.mu.Unlock()
-		sock.Close()
-		if prevSock != nil && prevSock != sock {
-			prevSock.Close()
-		}
-		dc.noteErr(fmt.Sprintf("direct install failed: %v", err))
-		dc.noteRound("direct install failed: %v", err)
-		return err
 	}
 
 	dc.sock = sock
