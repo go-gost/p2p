@@ -569,10 +569,12 @@ Expected: PASS。
 **Interfaces:**
 - Consumes: Task 9 `quicPair.addDirect/removeDirect`、现有 `directConn.markUp/teardown/underlayDead/punch`。
 - Produces:
-  - `func (e *engine) installDirect(peer derpclient.PublicKey, sock *net.UDPConn, addr netip.AddrPort, token [seedTokenLen]byte)`：KCP 模式走现有 `registerDirectUnderlay`；QUIC 模式走 `pair.addDirect`。
+  - `func (e *engine) installDirect(peer derpclient.PublicKey, sock *net.UDPConn, addr netip.AddrPort, token [seedTokenLen]byte) error`：KCP 模式走现有 `registerDirectUnderlay`；QUIC 模式走 `pair.addDirect`。失败时调用方关闭 socket 并走 punch backoff，不把 direct 标成 up。
   - `func (e *engine) retireDirect(peer derpclient.PublicKey, sock *net.UDPConn)`：KCP 模式走 `pair.clearDirectUnderlayIf`；QUIC 模式走 `pair.removeDirect`。
   - `directConn.markUp` 调 `e.installDirect`；`teardown`/`underlayDead` 调 `e.retireDirect`。
   - `punch()` 里 `relayKCPPairGet(...).noteSeed(...)` 改为 `e.noteSeed(peer, ...)`；QUIC 模式 no-op 或 QUIC 计数器。
+  - QUIC pair 建立成功后调用 `e.maybeStartDirect(peer)`（QUIC 模式没有 `ensureSession` 的既有触发点）；direct 安装只在 pair 已 establish 后进行，每次 punch 使用新 socket。
+  - `installDirect` 的 QUIC 分支若 pair 尚未建立/已关闭，返回错误并让现有 punch backoff 处理，不把 socket 留给错误的 pair。
 
 - [ ] **Step 1: 写失败测试 `TestQUICModeDirectPunch`**
 
@@ -589,6 +591,8 @@ Expected: PASS。
 - [ ] **Step 3: 实现 hook 与 directConn 改动**
 
 `markUp` 里原先 `registerDirectUnderlay` 的调用改为 `e.installDirect`；`teardown`/`underlayDead` 的 `pair.clearDirectUnderlay` 改为 `e.retireDirect`；保留 `dc.sock`/`sessAt`/state 语义。QUIC 模式下 `punch` 不调用 `relayKCPPairGet` 的 nil 解引用。
+
+在 QUIC pair 建立成功（`ensureTransport` 成功路径）后调用 `e.maybeStartDirect(peer)`；QUIC 模式的 direct 安装要求 pair 已 establish。每次 punch 用新 socket；`installDirect` 失败时不要留下 `dc.sock`/pair 状态，交给现有 backoff。
 
 - [ ] **Step 4: 跑 direct 回归与 race**
 
