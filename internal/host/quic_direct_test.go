@@ -31,7 +31,7 @@ func TestDirectPacketConnFiltersAndEchoes(t *testing.T) {
 	mine[0] = 1
 	peerAddr := udpAddrPort(t, b)
 	u := newDirectUnderlayToken(a, peerAddr, mine)
-	pc := &directPacketConn{u: u}
+	pc := newDirectPacketConn(u)
 	t.Cleanup(func() { _ = pc.Close() })
 
 	if got, want := pc.LocalAddr().String(), a.LocalAddr().String(); got != want {
@@ -374,5 +374,172 @@ func TestQUICPairMigratesRelayDirectRelay(t *testing.T) {
 	}
 	if clientRead.n < 500 || serverRead.n < 500 {
 		t.Fatalf("records client->server=%d server->client=%d, want >= 500 each", serverRead.n, clientRead.n)
+	}
+}
+
+// TestQUICPairDirectRetireDoesNotRemoveFreshUnderlay forces the stale-retire
+// interleaving: a retire that already passed its socket identity check is
+// parked just before the underlay swap while a fresh add installs a new socket.
+// Once the retire resumes it must not remove the fresh underlay.
+func TestQUICPairDirectRetireDoesNotRemoveFreshUnderlay(t *testing.T) {
+	p := &quicPair{role: quicRoleClient, mp: newMultiPathConn(quicRoleClient)}
+	t.Cleanup(func() { _ = p.mp.Close() })
+
+	oldSock := mustListenUDP(t)
+	newSock := mustListenUDP(t)
+	t.Cleanup(func() {
+		_ = oldSock.Close()
+		_ = newSock.Close()
+	})
+	var token [seedTokenLen]byte
+	token[0] = 1
+	oldPeer := udpAddrPort(t, newSock)
+	newPeer := udpAddrPort(t, oldSock)
+
+	if err := p.addDirect(oldSock, oldPeer, token); err != nil {
+		t.Fatalf("addDirect(old): %v", err)
+	}
+
+	// Park the retire inside its critical section by holding the multipath
+	// lock its next step needs.
+	p.mp.mu.Lock()
+	retireDone := make(chan struct{})
+	go func() {
+		p.removeDirect(oldSock)
+		close(retireDone)
+	}()
+
+	// The atomic implementation keeps p.mu while parked, so TryLock never
+	// succeeds. A non-atomic guard releases it, leaving a window in which the
+	// fresh add can run; detect that window so the bad interleaving is forced
+	// rather than hoped for.
+	guardOpen := false
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if p.mu.TryLock() {
+			guardOpen = p.directSock == nil
+			p.mu.Unlock()
+			if guardOpen {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	addDone := make(chan error, 1)
+	go func() { addDone <- p.addDirect(newSock, newPeer, token) }()
+
+	if guardOpen {
+		// Wait until the add has recorded the fresh socket, then release the
+		// parked retire so it acts on the already-installed new underlay.
+		installed := false
+		deadline = time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if p.mu.TryLock() {
+				installed = p.directSock == newSock
+				p.mu.Unlock()
+				if installed {
+					break
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if !installed {
+			p.mp.mu.Unlock()
+			t.Fatal("addDirect did not record the fresh socket")
+		}
+	}
+	p.mp.mu.Unlock()
+
+	select {
+	case <-retireDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("removeDirect did not finish")
+	}
+	select {
+	case err := <-addDone:
+		if err != nil {
+			t.Fatalf("addDirect(fresh): %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("addDirect did not finish")
+	}
+
+	p.mu.Lock()
+	gotSock := p.directSock
+	p.mu.Unlock()
+	if gotSock != newSock {
+		t.Fatalf("directSock = %p, want the fresh socket %p", gotSock, newSock)
+	}
+	if got := p.mp.preferredPath(); got != quicPathDirect {
+		t.Fatalf("preferred path = %q, want %q", got, quicPathDirect)
+	}
+
+	p.mp.mu.RLock()
+	r := p.mp.underlays[quicPathDirect]
+	p.mp.mu.RUnlock()
+	if r == nil {
+		t.Fatal("fresh direct underlay was removed by the stale retire")
+	}
+	pc, ok := r.u.pc.(*directPacketConn)
+	if !ok {
+		t.Fatalf("direct underlay packet conn is %T, want *directPacketConn", r.u.pc)
+	}
+	if pc.u.sock != newSock {
+		t.Fatalf("installed direct socket = %p, want the fresh socket %p", pc.u.sock, newSock)
+	}
+	if pc.u.closed() {
+		t.Fatal("fresh direct underlay was closed by the stale retire")
+	}
+}
+
+// TestQUICPairAddDirectSameSocketNoOp covers re-registering the socket that is
+// already installed: it must keep the live underlay instead of replacing it
+// and closing the socket the path depends on.
+func TestQUICPairAddDirectSameSocketNoOp(t *testing.T) {
+	p := &quicPair{role: quicRoleClient, mp: newMultiPathConn(quicRoleClient)}
+	t.Cleanup(func() { _ = p.mp.Close() })
+
+	sock := mustListenUDP(t)
+	t.Cleanup(func() { _ = sock.Close() })
+	var token [seedTokenLen]byte
+	token[0] = 2
+	peer := udpAddrPort(t, sock)
+
+	if err := p.addDirect(sock, peer, token); err != nil {
+		t.Fatalf("first addDirect: %v", err)
+	}
+	p.mp.mu.RLock()
+	first := p.mp.underlays[quicPathDirect]
+	p.mp.mu.RUnlock()
+	if first == nil {
+		t.Fatal("first addDirect did not install an underlay")
+	}
+
+	if err := p.addDirect(sock, peer, token); err != nil {
+		t.Fatalf("duplicate addDirect: %v", err)
+	}
+	p.mp.mu.RLock()
+	again := p.mp.underlays[quicPathDirect]
+	p.mp.mu.RUnlock()
+	if again != first {
+		t.Fatal("duplicate addDirect replaced the installed underlay")
+	}
+	pc, ok := first.u.pc.(*directPacketConn)
+	if !ok {
+		t.Fatalf("direct underlay packet conn is %T, want *directPacketConn", first.u.pc)
+	}
+	if pc.u.closed() {
+		t.Fatal("duplicate addDirect closed the installed socket")
+	}
+
+	p.mu.Lock()
+	gotSock := p.directSock
+	p.mu.Unlock()
+	if gotSock != sock {
+		t.Fatalf("directSock = %p, want %p", gotSock, sock)
+	}
+	if got := p.mp.preferredPath(); got != quicPathDirect {
+		t.Fatalf("preferred path = %q, want %q", got, quicPathDirect)
 	}
 }

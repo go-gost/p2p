@@ -65,8 +65,9 @@ type quicPair struct {
 	// handshake before conn exists.
 	relay *relayQUICConn
 	// directSock is the raw-UDP socket of the installed direct underlay, or
-	// nil. removeDirect compares against it so a delayed retire from an old
-	// punch cannot remove a newer underlay.
+	// nil. addDirect and removeDirect update it and swap the direct underlay
+	// under p.mu, so a delayed retire from an old punch cannot remove a newer
+	// underlay.
 	directSock *net.UDPConn
 	closed     bool
 
