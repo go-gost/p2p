@@ -50,6 +50,7 @@ colliding with a previous run). The last five runs are kept.
 | `stub` | The loopback bridge (`peer = host:port`) carries HTTP and a 1 MiB bulk transfer; `--token` is enforced (matching token works, missing token is rejected); `-C` config behaves like the equivalent flags. |
 | `derp-relay` | With a real derper and `--direct=false`, the relay path carries traffic, `Status` reports `derp_peers`, and a finished non-mux tunnel leaves no residue (`tunnels` returns to 0). |
 | `derp-direct` | STUN + UDP hole punch establishes a direct session (`status.direct_peers`); a 1 MiB transfer opened while relay-only migrates mid-stream under packet loss and stays byte-exact, the host log shows exactly one relay→direct migration, and killing the relay is logged as a loss suppressed by the live direct path with the pair kept on direct (H1); a fresh stream opened after the relay dies is still served over direct. |
+| `quic-direct` | The `--transport quic` data plane over a real derper: the first stream is relay-only, a 1 MiB transfer migrates relay→direct mid-stream (sha256 exact), and blocking the peers' UDP path makes the direct heartbeat watchdog retire the path and QUIC fall back to the relay, where a fresh stream and a 1 MiB read still complete. Neither host ever builds a KCP relay session. |
 | `forward` | `--forward listen=peerkey` exposes a raw TCP port bound to a peer key; a plain TCP client reaches a service on the peer. |
 | `inner-matrix` | The `tcp`, `tls`, `ws`, `mtcp`, `mtls`, and `mws` inner dialers each carry HTTP to peer gost listeners over one relay pair. |
 | `udp-tun` | The datagram link backs a point-to-point tun link (both ends tun clients, `udp` inner dialer): bidirectional ICMP across the link, and the link comes up on both sides. |
@@ -88,6 +89,12 @@ HTTP echo server (`/` and a 1 MiB `/bulk`), and a UDP echo server.
 - **IPv6 DAD delay.** Netns addresses are `tentative` for ~1 s; a tentative
   address is not a usable egress source, so `ipv6-direct` waits for duplicate
   address detection before starting the hosts.
+- **QUIC mode is strict.** `quic-direct` runs both hosts with `--transport quic`.
+  There is no KCP fallback: a peer that does not advertise QUIC caps fails the
+  open, and the scenario asserts neither host logs a KCP relay session. The
+  direct path is retired by the same heartbeat watchdog as KCP; the fallback
+  under test is QUIC's own migration back to the relay underlay, not a KCP
+  session.
 - **A relay loss tears the mux down; the pair survives and keeps serving.** A
   relay loss kills the per-build smux session on both ends, so a stream already
   open at that moment breaks. What survives is the pair (its KCP epoch and

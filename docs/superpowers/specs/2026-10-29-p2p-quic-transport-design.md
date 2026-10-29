@@ -811,6 +811,11 @@ relay down (preferred relay):
   只需重启。
 - 发布顺序建议：配置/caps/TLS + QUIC relay → direct 迁移 → 错误/观测 →
   batching 调优 → WAN/E2E → 文档/发布说明。默认始终 kcp。
+- **实现状态（2026-10-29）**：设计中的 QUIC transport 已落地为 opt-in
+  路径（relay + batching、direct 迁移/回落、失败重建、状态/日志、严格模式、
+  多 peer 隔离），E2E `quic-direct` 在本地 derper 上通过。默认仍为 kcp；
+  WAN/移动网络、UDP/TUN over QUIC、长跑压测和实现后的性能复测尚未完成，
+  发布说明不得引用未复测的吞吐数字。详见设计 §14.4 与 spike 报告 §10。
 
 ## 14. Decisions / open questions
 
@@ -860,3 +865,30 @@ relay down (preferred relay):
   - Q5 multi-DERP：按“简单处理”决定 QUIC v1 单 relay，不与 multi-DERP 组合。
     见 §3、§14.1 D11。
 - 其余为 builder 可自行决定的事项，不阻塞。
+
+### 14.4 实现状态（2026-10-29，Task 1–14）
+
+已完成并验证：
+
+- `transport: kcp|quic` 选择与全局互斥；默认 kcp，QUIC 无 KCP fallback。
+- caps 协商（QUIC bit/TLV/版本/batch 版本）+ TLS 证书 pinning。
+- 每 peer 一个 `quic.Transport`/零 CID/一条连接 + `multiPathConn`。
+- relay underlay + `[uint16 length][packet]` batching（默认 32 KiB /
+  200 µs，可配，帧预算含前缀与 frame type 字节）。
+- direct underlay 复用打洞/seed/heartbeat；迁移、direct→relay 回落、
+  relay 断线保活、连接死亡重建。
+- Status/PeerDiagnostics/QUICStats 与 `transport selected`、
+  `quic underlay`、`quic path-change` 日志。
+- 集成测试 `TestQUICRelayBatchingIntegration`：fake DERP data 队列 +
+  Task 8 sink，验证拆包、batching 合并、malformed 丢弃、64 KiB 帧界。
+- E2E `quic-direct`：relay-only 首流、1 MiB 迁移传输、direct 阻断后的
+  relay 回落、两端无 KCP session（2026-10-29 本地 derper，20/20 断言）。
+
+未完成 / 未验证：
+
+- WAN 50 ms RTT + 1% 丢包、移动网络、CPU 配额下的 E2E/性能复测；§11 的
+  吞吐数字仍是 spike 值。
+- UDP/TUN datagram 路径的 QUIC E2E（§12.2 该项）。
+- 运行时 KCP↔QUIC 切换（D6/O2 已定：重启生效，未单独测）。
+- 长跑迁移循环、内存/goroutine 长跑、二进制体积/启动成本。
+- 单 relay（D11/O7），无 0-RTT/datagram/多路径聚合（D9）。

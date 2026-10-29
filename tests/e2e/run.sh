@@ -43,7 +43,7 @@ DERPER_BIN="${DERPER_BIN:-}"
 # Scenario registry: --list, --scenario validation and the runner all read this
 # single list, so a new scenario just needs an entry here and a scenario_<name>
 # function below.
-SCENARIOS=(stub derp-relay relay-peer-restart derp-direct forward inner-matrix udp-tun udp-tun-loss udp-outlet ipv6-direct oneway-direct)
+SCENARIOS=(stub derp-relay relay-peer-restart derp-direct quic-direct forward inner-matrix udp-tun udp-tun-loss udp-outlet ipv6-direct oneway-direct)
 
 usage() {
 	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
@@ -354,9 +354,9 @@ YAML
 }
 
 # shared DERP topology: A=client side, B=service side (peer gost + target).
-# start_derp_pair <tag> <stun:on|off> <direct:true|false> <b-target>
+# start_derp_pair <tag> <stun:on|off> <direct:true|false> <b-target> [ipv6] [transport]
 start_derp_pair() {
-	local tag=$1 stun=$2 direct=$3 btarget=$4 ipv6=${5:-}
+	local tag=$1 stun=$2 direct=$3 btarget=$4 ipv6=${5:-} transport=${6:-}
 	local dir="$RUNDIR/$tag"
 	mkdir -p "$dir/keys"
 	start_derper "$tag" "$stun" || return 1
@@ -369,6 +369,7 @@ start_derp_pair() {
 	if [ "$ipv6" = true ]; then
 		bargs+=(--ipv6)
 	fi
+	[ -n "$transport" ] && bargs+=(--transport "$transport")
 	start_p2p B "p2p-$tag-b" "${bargs[@]}"
 	# A: client side control plane.
 	local aargs=(--addr 127.0.0.1:8003 --derp "wss://$DERP_IP:443/derp"
@@ -378,6 +379,7 @@ start_derp_pair() {
 	if [ "$ipv6" = true ]; then
 		aargs+=(--ipv6)
 	fi
+	[ -n "$transport" ] && aargs+=(--transport "$transport")
 	start_p2p A "p2p-$tag-a" "${aargs[@]}"
 	p2p_pubkey "p2p-$tag-a" >"$dir/a.pub" || { fail "no A pubkey"; return 1; }
 	p2p_pubkey "p2p-$tag-b" >"$dir/b.pub" || { fail "no B pubkey"; return 1; }
@@ -591,6 +593,142 @@ scenario_derp_direct() {
 	# side — no relay round trip is needed with the keys already settled.
 	body=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/")
 	check "a new stream is served over direct while the relay is down" test "$body" = "hello-p2p"
+}
+
+# scenario_quic_direct: the QUIC data plane (`--transport quic`) over a real
+# derper, with the same topology and punch as derp-direct.
+#
+# Three phases:
+#   1. relay-only: the first stream is what establishes the QUIC pair, and its
+#      "open stream: quic" log names derp; the relay underlay is installed
+#      before any direct underlay event exists.
+#   2. migration: a 1 MiB transfer opened before the punch rides the relay while
+#      the punch runs and migrates to the direct underlay mid-stream; the
+#      sha256 comparison proves the cutover carried the bytes.
+#   3. fallback: blocking the peers' UDP path (the relay is TCP to the derper)
+#      leaves the direct heartbeats unanswered, the underlay watchdog retires
+#      the direct path, and QUIC migrates back to the relay. A stream opened
+#      afterwards is still served, and the relay bulk transfer is byte-exact.
+#
+# QUIC is strict: there is no KCP session at any point, so a "peer relay
+# session up" line or a KCP transport label would be a regression.
+scenario_quic_direct() {
+	step "quic: relay-only, direct migration, direct->relay fallback"
+	local dir="$RUNDIR/quic"
+	mkdir -p "$dir"
+	start_echo - echo "$NET_GW:18081"
+	start_peer_gost B peer http 127.0.0.1:18080
+	start_derp_pair quic on true 127.0.0.1:18080 "" quic || return
+	local bkey
+	bkey=$(cat "$dir/b.pub")
+
+	gost_client_cfg "$dir/client.yaml" 127.0.0.1:8003 "$bkey" tcp "" 127.0.0.1:8080
+	start_gost A client -C "$dir/client.yaml"
+	wait_tcp A 127.0.0.1 8080 15 || fail "client proxy did not listen"
+	local alog="$LOGDIR/p2p-quic-a.log" blog="$LOGDIR/p2p-quic-b.log"
+
+	# Phase 1: the first stream establishes the pair, so it can only ride the
+	# relay. The relay underlay's install must precede any direct install.
+	local body
+	body=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/")
+	check "relay-only QUIC stream carries HTTP" test "$body" = "hello-p2p"
+	check_grep "the first QUIC stream opened over the relay" \
+		'"msg":"open stream: quic".*"transport":"derp"' "$alog"
+	check_grep "the relay underlay was installed" \
+		'"msg":"quic underlay".*"underlay":"relay","event":"installed"' "$alog"
+	local rln dln
+	rln=$(grep -n '"underlay":"relay","event":"installed"' "$alog" | head -1 | cut -d: -f1)
+	dln=$(grep -n '"underlay":"direct","event":"installed"' "$alog" | head -1 | cut -d: -f1)
+	if [ -n "$rln" ] && { [ -z "$dln" ] || [ "$rln" -lt "$dln" ]; }; then
+		ok "the relay was the first QUIC underlay"
+	else
+		fail "the relay underlay does not precede the direct underlay (relay=$rln direct=$dln)"
+	fi
+	check_not_grep "QUIC mode builds no KCP relay session on A" \
+		'"msg":"peer relay session up"' "$alog"
+	check_not_grep "QUIC mode builds no KCP relay session on B" \
+		'"msg":"peer relay session up"' "$blog"
+
+	# Phase 2: a transfer that outlives the punch. The throttled 1 MiB read
+	# (~16 s) is opened before any direct path exists, so the punch migrates it
+	# mid-stream; the source hash comes straight from the echo server.
+	local expect
+	expect=$(curl -s --max-time 10 "http://$NET_GW:18081/bulk" | sha256sum | awk '{print $1}')
+	local bulk="$dir/bulk.sha"
+	( ns_run A curl -s --max-time 60 --limit-rate 64k -x http://127.0.0.1:8080 \
+		"http://$NET_GW:18081/bulk" | sha256sum | awk '{print $1}' >"$bulk" ) &
+	local bulkpid=$!
+	PIDS+=("$bulkpid"); SCENARIO_PIDS+=("$bulkpid")
+
+	if wait_status_ge A 127.0.0.1:8003 direct_peers 1 40; then
+		ok "the punch installed a QUIC direct underlay"
+	else
+		fail "no QUIC direct session was established"
+	fi
+	# The relay->direct event is logged by whichever end is the QUIC client:
+	# the server only changes its path once a direct datagram arrives, and at
+	# install time it is still on relay, so its path-change pair can be
+	# relay->relay (silent). Either end's event proves the migration.
+	if wait_log_any '"msg":"quic path-change".*"to":"direct".*"reason":"direct-installed"' 15 \
+		"$alog" "$blog"; then
+		ok "the pair migrated relay->direct"
+	else
+		fail "no quic path-change to direct on either end"
+	fi
+	wait "$bulkpid" 2>/dev/null
+	check "the migrated 1 MiB transfer is byte-exact (sha256)" test "$(cat "$bulk")" = "$expect"
+
+	save_status A 127.0.0.1:8003 "$dir/status-direct.json"
+	check_grep "status shows a live direct peer" '"direct_peers":[1-9]' "$dir/status-direct.json"
+	body=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/")
+	check "the direct-capable QUIC tunnel carries HTTP" test "$body" = "hello-p2p"
+
+	# Phase 3: kill only the direct path. The relay is TCP to the derper, so
+	# the pair keeps its control plane while the direct heartbeat goes
+	# unanswered. Both directions are dropped, so neither side can keep the
+	# direct underlay alive by answering the other's heartbeat.
+	local err
+	if ! err=$(ns_run A iptables -I INPUT -s "$HOST_B_IP" -p udp -j DROP 2>&1); then
+		fail "could not block the direct path (input): $err"; return
+	fi
+	if ! err=$(ns_run A iptables -I OUTPUT -d "$HOST_B_IP" -p udp -j DROP 2>&1); then
+		# Undo the half-armed fault: the namespaces are shared by the later
+		# scenarios, and a leftover drop would silence their UDP paths.
+		ns_run A iptables -D INPUT -s "$HOST_B_IP" -p udp -j DROP 2>/dev/null || true
+		fail "could not block the direct path (output): $err"; return
+	fi
+	ok "direct UDP path blocked; relay TCP path untouched"
+
+	if wait_log_any '"msg":"quic path-change".*"to":"relay".*"reason":"heartbeat"' 30 \
+		"$alog" "$blog"; then
+		ok "the direct watchdog retired the silent path"
+	else
+		fail "no heartbeat-driven direct->relay fallback on either end"
+		save_status A 127.0.0.1:8003 "$dir/status-stuck.json"
+	fi
+	if wait_status_eq A 127.0.0.1:8003 direct_peers 0 15; then
+		ok "status shows relay-only after the fallback"
+	else
+		save_status A 127.0.0.1:8003 "$dir/status-fallback.json"
+		fail "a direct peer survived the fallback: $(cat "$dir/status-fallback.json")"
+	fi
+	wait_status_ge A 127.0.0.1:8003 derp_peers 1 15 || fail "no relay peer after the fallback"
+
+	# The QUIC connection (and its streams) survived the path loss: a fresh
+	# stream is served over the relay, and a full bulk read comes back intact.
+	body=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/")
+	check "a stream opened after the fallback is served over the relay" \
+		test "$body" = "hello-p2p"
+	local n
+	n=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/bulk" 20 | wc -c)
+	check "the relay bulk transfer after the fallback is 1 MiB" test "$n" -eq 1048576
+	check_not_grep "QUIC mode still built no KCP relay session on A" \
+		'"msg":"peer relay session up"' "$alog"
+	check_not_grep "QUIC mode still built no KCP relay session on B" \
+		'"msg":"peer relay session up"' "$blog"
+
+	ns_run A iptables -D INPUT -s "$HOST_B_IP" -p udp -j DROP 2>/dev/null || true
+	ns_run A iptables -D OUTPUT -d "$HOST_B_IP" -p udp -j DROP 2>/dev/null || true
 }
 
 scenario_forward() {

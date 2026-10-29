@@ -263,3 +263,67 @@ batching 的关键不是 DERP 协议改动，而是两端 PacketConn 都按长�
 - **直连**：QUIC 值得替换 KCP+smux；性能和丢包表现都更好。
 - **中继**：QUIC 可行，但必须先给 DERP 加 batching；单包一帧的 ~53 MB/s 是路径上限，不是 QUIC 上限。
 - **当前决策**：不立即替换；先做 DERP batching，再做 QUIC transport 原型和 WAN/TUN 验证。
+
+## 10. 实现状态（2026-10-29 design/plan）
+
+spike 结论已落成 opt-in 的 QUIC transport。本节是**状态记录**，不是性能
+复测：第 4 节的吞吐/丢包数字仍然只来自 spike，不能当成产品实现的数字。
+
+- 设计：`docs/superpowers/specs/2026-10-29-p2p-quic-transport-design.md`
+- 计划/任务记录：`.superpowers/sdd/2026-10-29-p2p-quic-transport/`（Task 1–14）
+
+### 10.1 已实现并验证
+
+- `transport: kcp|quic` 全局互斥，默认 `kcp`；QUIC 是严格模式，任何
+  caps/握手失败都直接报错，**不会回落 KCP**。
+- caps 协商（QUIC bit + TLV + 版本 + relay batch 版本）和 TLS 证书指纹
+  双向 pinning；QUIC 模式对旧/KCP-only peer 返回 `ErrTransportUnsupported`。
+- 每 peer 一个 `quic.Transport`、零长度 CID、一条 QUIC 连接，下面挂
+  `multiPathConn`（relay/direct underlay）。
+- relay underlay：DERP data 帧内 `[uint16 length][packet]...` batching，
+  默认 32 KiB / 200 µs，可配置；帧预算计入 2 字节长度前缀和 frame type
+  字节，任何一帧（含类型字节）都不超过 64 KiB。
+- direct underlay：复用现有 STUN/打洞/seed/heartbeat；支持 relay→direct
+  迁移、direct 心跳判死后的 direct→relay 回落、relay 断线保活、QUIC
+  连接死亡后的重建。
+- 观测：`transport selected`、`quic underlay`、`quic path-change` 日志；
+  进程内 Status 的 `Transport`/`PeerDiagnostics`/`QUICStats`。
+- 单元/集成：batching codec、帧预算、malformed、underlay 替换、Task 8
+  data sink、迁移、失败/重建、严格互斥、多 peer 隔离；`-race` 通过。
+- E2E `quic-direct`（2026-10-29，真实 `gogost/derper` + 两个 netns）：
+  relay-only 首流、1 MiB 传输中途 relay→direct 迁移且 sha256 一致、阻断
+  direct UDP 后心跳判死并 direct→relay 回落、回落后的 1 MiB 传输一致、
+  两端都没有 KCP session。修复“客户端角色才记录 path-change”的断言后连续
+  4 次通过（约 23 s/次）。
+
+### 10.2 未验证 / 已知限制
+
+- **E2E 只在本地 bridge + 单个 derper 上跑过**；没有 50 ms WAN RTT、1%
+  公网丢包、移动网络/doze、CPU 配额、生产 derper 队列/限速下的复测。
+- UDP/TUN datagram 路径在 QUIC 模式下没有 E2E 覆盖；现有 `udp-tun` 等场景
+  仍跑 KCP（设计 §12.2 的该项仍未验证）。
+- KCP↔QUIC 运行时切换未验证：只能改配置并重启。
+- 单 relay underlay；不与 multi-DERP 组合（设计 D11/O7）。
+- 无 0-RTT、无 QUIC datagram、无多路径聚合/带宽叠加。
+- 长时间迁移循环、内存/goroutine 长跑、二进制体积/启动成本未测。
+
+### 10.3 E2E 复现（2026-10-29 已执行）
+
+仓库内（p2p 作为 go-gost 子目录）：
+
+```sh
+cd p2p/tests/e2e
+P2P_E2E=1 go test ./tests/e2e -run TestQUICDirect -count=1 -v
+# 或：./run.sh --scenario quic-direct
+```
+
+本次 worktree 是独立 p2p 模块（没有同级 `gost/`），用预构建二进制运行：
+
+```sh
+P2P_E2E=1 P2P_E2E_WORK=/tmp/opencode/p2p-e2e-work \
+  HELPER_BIN=/tmp/opencode/p2p-e2e-bin/helper \
+  P2P_E2E_ARGS="--skip-build --p2p-bin /tmp/opencode/p2p-e2e-bin/p2p --gost-bin /tmp/opencode/p2p-e2e-bin/gost" \
+  go test ./tests/e2e -run TestQUICDirect -count=1 -v
+```
+
+结果：20/20 assertions PASS。

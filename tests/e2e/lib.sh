@@ -180,6 +180,19 @@ wait_log() {
 	return 1
 }
 
+# wait_log_any <ere> <timeout-seconds> <file...>: like wait_log, but matches
+# when any of the given logs has the pattern (grep over several files).
+wait_log_any() {
+	local pat=$1 t=$2
+	shift 2
+	local i
+	for i in $(seq 1 $((t * 10))); do
+		grep -qE "$pat" "$@" 2>/dev/null && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
 # wait_tcp <ns|-> <host> <port> [timeout-seconds]
 wait_tcp() {
 	local ns=$1 h=$2 p=$3 t=${4:-15}
