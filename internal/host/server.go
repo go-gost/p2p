@@ -348,6 +348,7 @@ func relayRTTMillis(d time.Duration) int64 {
 func (s *server) status() p2p.Status {
 	var st p2p.Status
 	if s.engine != nil {
+		st.Transport = s.engine.transportName()
 		st.RelayConnected, st.RelayError = s.engine.relayState()
 		// Rounded, not truncated: a fast relay must not read as "not measured".
 		st.RelayRTT = relayRTTMillis(s.engine.relayRTT())

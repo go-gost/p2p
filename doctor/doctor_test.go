@@ -229,6 +229,58 @@ func TestReport(t *testing.T) {
 	}
 }
 
+// TestDoctorPrintsQUICTransport: an in-process snapshot carries the QUIC
+// transport detail the gRPC proto does not, so the report names the host's
+// transport, the QUIC path and RTT, and the last transport error per peer.
+func TestDoctorPrintsQUICTransport(t *testing.T) {
+	st := p2p.Status{
+		Transport: "quic",
+		PeerDiagnostics: map[string]p2p.PeerDiagnostic{
+			"peerKey": {
+				Path:            "direct",
+				Transport:       "quic",
+				DirectTransport: "quic",
+				TransportError:  "quic-handshake",
+				QUIC: &p2p.QUICStats{
+					Live:      true,
+					Role:      "client",
+					Path:      "direct",
+					RTT:       12 * time.Millisecond,
+					Streams:   2,
+					BytesSent: 1000,
+					BytesRcvd: 2000,
+				},
+			},
+		},
+	}
+
+	out := Report(st, Options{InProcess: true})
+	for _, want := range []string{
+		"transport:",
+		"quic",
+		"quic path:",
+		"direct",
+		"quic rtt:",
+		"12ms",
+		"transport error:",
+		"quic-handshake",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the report is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestReportSaysTransportNotReportedOverWire: the frozen control-plane proto
+// does not carry the transport, so a wire-sourced report must name the missing
+// field rather than let an empty string read as "no transport".
+func TestReportSaysTransportNotReportedOverWire(t *testing.T) {
+	out := Report(p2p.Status{}, Options{})
+	if !strings.Contains(out, "transport:") || !strings.Contains(out, "not reported by the control plane") {
+		t.Fatalf("wire report does not name the missing transport:\n%s", out)
+	}
+}
+
 // TestReportRelayRTTNotMeasured: a connected relay that has not answered a
 // ping yet says so, rather than leaving a reader to wonder whether the line
 // was dropped. This is the in-process caller's zero: the relay really has not

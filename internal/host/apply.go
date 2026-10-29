@@ -33,6 +33,22 @@ const (
 	transportQUIC
 )
 
+// The public transport words used by p2p.Status and PeerDiagnostic. They are
+// deliberately separate from the internal enum so a diagnostic cannot leak an
+// implementation detail into the API.
+const (
+	transportNameKCP  = "kcp"
+	transportNameQUIC = "quic"
+)
+
+// transportName is the host-wide data-plane word Status.Transport reports.
+func (e *engine) transportName() string {
+	if e.transport == transportQUIC {
+		return transportNameQUIC
+	}
+	return transportNameKCP
+}
+
 // QUIC data-plane defaults. The values are host-wide and overridable through
 // p2p.QUICConfig; they mirror the design's stable, conservative choices.
 const (

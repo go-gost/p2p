@@ -59,11 +59,33 @@ type PeerDiagnostic struct {
 	// RelayKCPStats). In-process only: the gRPC proto is frozen and does not
 	// carry it, like RelayRebuilds.
 	RelayKCP RelayKCPStats
+	// Transport is the data plane that carries this peer: "kcp" or "quic". It
+	// names the host-wide choice, not the path word in Path (which says whether
+	// the pair currently rides the direct or relay underlay). In-process only:
+	// the gRPC proto is frozen and does not carry it, like RelayKCP.
+	Transport string
+	// QUIC is the peer's live QUIC connection detail, or nil in KCP mode. It
+	// is the QUIC counterpart of RelayKCP: the transport's own view of the
+	// pair (path, RTT, streams, bytes), which the relay-shaped fields cannot
+	// express. In-process only.
+	QUIC *QUICStats
+	// DirectTransport names the underlay the direct path uses: "kcp" or
+	// "quic". It follows the host's transport choice, so it answers "what
+	// would carry a direct path here" even while the pair is on the relay.
+	// In-process only.
+	DirectTransport string
+	// TransportError is the last transport-establishment failure for this
+	// peer, as a finite word ("peer-no-quic", "caps-timeout",
+	// "quic-handshake", ...), empty while the transport is healthy or has not
+	// errored since the last success. In-process only.
+	TransportError string
 	// SessionState is the relay mux session's own state — "up" or "down" — the
 	// layer the report had no field for at all. It is deliberately separate
 	// from State and Path: those are set from the punch state machine and from
 	// underlay recency, and neither reads the session object, so both can say
-	// "up" over a session that is gone. The measured field shape was
+	// "up" over a session that is gone. In QUIC mode it reports the QUIC
+	// connection's state instead ("up" while the pair's connection is live).
+	// The measured field shape was
 	// `path: direct`, `state: up`, `last traffic: 4m47s` with the smux session
 	// dead, which printed as healthy and stayed that way for 45 minutes.
 	//
@@ -196,6 +218,26 @@ type RelayKCPStats struct {
 	DirectAlive bool
 }
 
+// QUICStats is one peer's live QUIC connection health: the transport detail
+// the relay KCP session cannot express. Path names the underlay the connection
+// is currently using ("relay" or "direct"), Role is this host's QUIC role
+// ("client" or "server"), RTT is quic-go's smoothed round trip, Streams is the
+// number of streams currently open on the pair, and BytesSent/BytesRcvd are
+// quic-go's connection byte counters (including retransmissions, excluding UDP
+// framing). Live reports whether a QUIC connection actually exists, so a zero
+// RTT reads as "no RTT measured yet" rather than a healthy idle connection.
+//
+// In-process only: the gRPC proto is frozen, like RelayKCP.
+type QUICStats struct {
+	Live      bool          // whether the pair holds a live QUIC connection
+	Role      string        // "client" or "server"
+	Path      string        // "relay" or "direct"
+	RTT       time.Duration // smoothed round trip; 0 when none measured yet
+	Streams   int           // currently open streams on the pair
+	BytesSent uint64        // quic-go connection bytes sent (retransmissions included)
+	BytesRcvd uint64        // quic-go connection bytes received
+}
+
 // DirectConfig is the direct path a host is running with. It answers "why is
 // this host not punching?" without reading the engine: a caller hands p2p a
 // Config, and the engine narrows it (an embedder's STUN probe that fails leaves
@@ -232,6 +274,10 @@ type Status struct {
 	PunchSuccess  int64 // counter: attempts that reached direct
 	StreamsDirect int64 // counter
 	StreamsDerp   int64 // counter
+	// Transport is the host-wide data plane: "kcp" or "quic". Empty for a
+	// stub-mode endpoint (no relay engine), which has no transport to name.
+	// In-process only: the gRPC proto is frozen and does not carry it.
+	Transport string
 	// PairMigrations/PairFallbacks and the counters below are the pair-level
 	// migration history (O2), summed over every pair the engine holds; the
 	// per-peer split is on PeerDiagnostic. PairMigrations counts relay→direct

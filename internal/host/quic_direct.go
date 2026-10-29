@@ -153,16 +153,18 @@ func (p *quicPair) addDirect(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 		return errQUICUnderlayNil
 	}
 	u := newDirectUnderlayToken(sock, peerAddr, token)
+	from := p.pathName()
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		_ = u.close()
 		return errQUICPairClosed
 	}
 	if p.directSock == sock {
 		// Abandoning u is safe: it owns no goroutine until installed, and the
 		// socket belongs to the underlay that is already live.
+		p.mu.Unlock()
 		return nil
 	}
 	p.directSock = sock
@@ -177,6 +179,10 @@ func (p *quicPair) addDirect(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 	if p.role == quicRoleClient {
 		p.mp.setPreferred(quicPathDirect)
 	}
+	p.mu.Unlock()
+
+	p.logUnderlay(quicPathDirect, "installed", "punch")
+	p.logPathChange(from, p.pathName(), "direct-installed")
 	return nil
 }
 
@@ -191,9 +197,17 @@ func (p *quicPair) addDirect(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 // cannot clear directSock, switch to relay, and remove the new underlay
 // afterwards.
 func (p *quicPair) removeDirect(sock *net.UDPConn) {
+	p.removeDirectReason(sock, "retired")
+}
+
+// removeDirectReason is removeDirect with the reason named for the quic
+// underlay event: "retired" for an engine-driven retire, "heartbeat" for the
+// direct watchdog. It is the same identity-checked teardown either way.
+func (p *quicPair) removeDirectReason(sock *net.UDPConn, reason string) {
 	if sock == nil {
 		return
 	}
+	from := p.pathName()
 
 	p.mu.Lock()
 	if p.directSock != sock {
@@ -212,6 +226,8 @@ func (p *quicPair) removeDirect(sock *net.UDPConn) {
 	// this is the idempotent belt-and-braces close for a socket that had not
 	// been installed yet.
 	_ = sock.Close()
+	p.logUnderlay(quicPathDirect, "retired", reason)
+	p.logPathChange(from, p.pathName(), reason)
 }
 
 // hasDirect reports whether a direct underlay is installed on the pair. It is
@@ -232,7 +248,7 @@ func (p *quicPair) directHeartbeatDead(u *directUnderlay) {
 	if u == nil {
 		return
 	}
-	p.removeDirect(u.sock)
+	p.removeDirectReason(u.sock, "heartbeat")
 	if p.e != nil {
 		p.e.quicDirectDead(p.peer, u)
 	}

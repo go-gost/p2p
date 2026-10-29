@@ -7,6 +7,11 @@
 // `p2p doctor` CLI (over the gRPC control plane) and wisper (in-process, so it
 // also sees the relay's liveness). The package depends on nothing but the
 // contract package and the standard library.
+//
+// Transport detail added with the QUIC data plane (Status.Transport,
+// PeerDiagnostic.Transport/QUIC/DirectTransport/TransportError) is in-process
+// only: the control-plane proto is frozen, so a wire-sourced report says it was
+// not reported rather than showing zeros as measurements.
 package doctor
 
 import (
@@ -69,6 +74,15 @@ func Report(st p2p.Status, opts Options) string {
 	} else {
 		field(&b, "relay state", "not reported by the control plane")
 	}
+	// The host-wide data plane. In-process snapshots carry it; the frozen
+	// control-plane proto does not, so a wire-sourced report names the missing
+	// field instead of leaving the reader to infer it from the peers.
+	switch {
+	case st.Transport != "":
+		field(&b, "transport", st.Transport)
+	case !opts.InProcess:
+		field(&b, "transport", "not reported by the control plane")
+	}
 	// The relay's own round trip: the one latency here measured by this host
 	// instead of inferred from a peer's session, and the only thing that tells
 	// "the relay is slow" from "the relay is down" while a direct session keeps
@@ -129,7 +143,7 @@ func Report(st p2p.Status, opts Options) string {
 		}
 	}
 	for _, k := range keys {
-		peerBlock(&b, k, st.PeerDiagnostics[k])
+		peerBlock(&b, k, st.PeerDiagnostics[k], opts)
 	}
 
 	b.WriteString("\nverdicts:\n")
@@ -196,9 +210,26 @@ func recvWord(d time.Duration) string {
 }
 
 // peerBlock writes one peer's full diagnostic, its trace one round per line.
-func peerBlock(b *strings.Builder, key string, d p2p.PeerDiagnostic) {
+func peerBlock(b *strings.Builder, key string, d p2p.PeerDiagnostic, opts Options) {
 	fmt.Fprintf(b, "  %s\n", key)
 	field(b, "    path", orNone(d.Path))
+	if d.Transport != "" {
+		field(b, "    transport", d.Transport)
+	}
+	// The QUIC connection detail exists only in process: the frozen proto does
+	// not carry it, so a wire report has no QUIC block rather than a zero one.
+	if d.QUIC != nil {
+		field(b, "    quic path", orNone(d.QUIC.Path))
+		field(b, "    quic rtt", quicRTTWord(d.QUIC, opts))
+		if d.QUIC.Role != "" {
+			field(b, "    quic role", d.QUIC.Role)
+		}
+		field(b, "    quic streams", fmt.Sprintf("%d", d.QUIC.Streams))
+		field(b, "    quic bytes", fmt.Sprintf("%dB sent, %dB rcvd", d.QUIC.BytesSent, d.QUIC.BytesRcvd))
+	}
+	if d.TransportError != "" {
+		field(b, "    transport error", d.TransportError)
+	}
 	field(b, "    reason", orNone(d.Reason))
 	field(b, "    state", orNone(d.State))
 	field(b, "    failed", fmt.Sprintf("%t", d.Failed))
@@ -240,7 +271,11 @@ func peerBlock(b *strings.Builder, key string, d p2p.PeerDiagnostic) {
 	// stayed that way for 45 minutes. Neither path nor state reads the session
 	// object, which is why "session" now has a line of its own.
 	field(b, "    session", orNone(d.SessionState))
-	field(b, "    underlay", underlayWord(d))
+	// The relay KCP underlay rows are KCP-mode detail; a QUIC peer's underlay
+	// view is the quic block above.
+	if d.Transport != "quic" {
+		field(b, "    underlay", underlayWord(d))
+	}
 	// "last traffic", not "last frame": smux keepalive NOPs never reach the
 	// pump, so an idle peer ages here and "last recv" reads like a dead path.
 	// The window is stated next to the number for the same reason — but it is no
@@ -482,6 +517,23 @@ func peerVerdict(key string, d p2p.PeerDiagnostic) string {
 func relayRTT(st p2p.Status, opts Options) string {
 	if st.RelayRTT > 0 {
 		return fmt.Sprintf("%dms", st.RelayRTT)
+	}
+	if !opts.InProcess {
+		return "not reported by the control plane"
+	}
+	return "not measured yet"
+}
+
+// quicRTTWord formats the QUIC connection's smoothed round trip. Zero has two
+// causes — not measured yet (in-process, the usual case right after a
+// handshake) and not carried over the wire (the frozen proto) — and the
+// formatter names which applies, the same discipline the relay RTT follows.
+func quicRTTWord(st *p2p.QUICStats, opts Options) string {
+	if st == nil {
+		return "not reported"
+	}
+	if st.RTT > 0 {
+		return st.RTT.String()
 	}
 	if !opts.InProcess {
 		return "not reported by the control plane"

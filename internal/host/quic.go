@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/go-gost/p2p"
 	"github.com/go-gost/p2p/internal/derpclient"
 	"github.com/quic-go/quic-go"
 )
@@ -81,6 +83,12 @@ type quicPair struct {
 	directU    *directUnderlay
 	closed     bool
 
+	// streams counts the streams currently open on the pair: opened here or
+	// accepted here, decremented when their quicStreamConn is closed. quic-go
+	// does not expose a stream count, so the pair keeps its own; it is what the
+	// QUIC status and the connection-closed log report.
+	streams atomic.Int64
+
 	closeOnce sync.Once
 	// acceptDone is closed when the accept loop returns, so a test (or a
 	// future engine teardown) can prove a close did not leave AcceptStream
@@ -94,6 +102,10 @@ type quicStreamConn struct {
 	*quic.Stream
 	local  net.Addr
 	remote net.Addr
+	// pair is the stream's owner, so Close can release the pair's active-stream
+	// count exactly once. closeOnce absorbs a duplicate Close.
+	pair      *quicPair
+	closeOnce sync.Once
 }
 
 var _ net.Conn = (*quicStreamConn)(nil)
@@ -151,6 +163,7 @@ func (p *quicPair) relayUp(pc net.PacketConn) error {
 		addr: quicPathAddr{name: quicPathRelay},
 		pc:   pc,
 	})
+	p.logUnderlay(quicPathRelay, "installed", "relay")
 	return nil
 }
 
@@ -186,6 +199,7 @@ func (p *quicPair) relayDown(relay *relayQUICConn) {
 	// removeUnderlayIf already closed an installed underlay; this is the
 	// idempotent close for a sender that never made it into the map.
 	_ = relay.Close()
+	p.logUnderlay(quicPathRelay, "retired", "relay-down")
 }
 
 // directUnderlay returns the installed direct underlay, or nil. The pair keeps
@@ -380,10 +394,12 @@ func (p *quicPair) openStream(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("host: quic open stream: %w", err)
 	}
+	p.streams.Add(1)
 	return &quicStreamConn{
 		Stream: s,
 		local:  conn.LocalAddr(),
 		remote: conn.RemoteAddr(),
+		pair:   p,
 	}, nil
 }
 
@@ -405,10 +421,12 @@ func (p *quicPair) acceptStreams() {
 		if err != nil {
 			return
 		}
+		p.streams.Add(1)
 		c := &quicStreamConn{
 			Stream: s,
 			local:  conn.LocalAddr(),
 			remote: conn.RemoteAddr(),
+			pair:   p,
 		}
 		if p.onStream == nil {
 			_ = c.Close()
@@ -432,6 +450,7 @@ func (p *quicPair) close() {
 		p.mu.Lock()
 		p.closed = true
 		conn, ln, tr := p.conn, p.ln, p.tr
+		hadRelay, hadDirect := p.relay != nil, p.directSock != nil
 		p.mu.Unlock()
 
 		if conn != nil {
@@ -444,6 +463,13 @@ func (p *quicPair) close() {
 			_ = tr.Close()
 		}
 		_ = p.mp.Close()
+		p.streams.Store(0)
+		if hadRelay {
+			p.logUnderlay(quicPathRelay, "retired", "pair-closed")
+		}
+		if hadDirect {
+			p.logUnderlay(quicPathDirect, "retired", "pair-closed")
+		}
 	})
 }
 
@@ -467,6 +493,68 @@ func (p *quicPair) pathName() string {
 		}
 	}
 	return quicPathRelay
+}
+
+// stats snapshots the pair's QUIC connection for the status surface. Live says
+// the connection has completed its handshake and is still usable; the byte
+// counters and RTT are read from quic-go even while it is ending, so the last
+// sample is not lost. Path and Role describe the transport regardless of
+// liveness.
+func (p *quicPair) stats() p2p.QUICStats {
+	p.mu.Lock()
+	conn, closed := p.conn, p.closed
+	p.mu.Unlock()
+
+	st := p2p.QUICStats{
+		Role:    quicRoleName(p.role),
+		Path:    p.pathName(),
+		Streams: int(p.streams.Load()),
+	}
+	if conn == nil {
+		return st
+	}
+	cs := conn.ConnectionStats()
+	st.RTT = cs.SmoothedRTT
+	st.BytesSent = cs.BytesSent
+	st.BytesRcvd = cs.BytesReceived
+	st.Live = !closed && conn.Context().Err() == nil
+	return st
+}
+
+// releaseStream drops one active-stream count. It never goes below zero: a
+// pair close zeroes the count while stream Close calls may still be in flight.
+func (p *quicPair) releaseStream() {
+	for {
+		n := p.streams.Load()
+		if n <= 0 {
+			return
+		}
+		if p.streams.CompareAndSwap(n, n-1) {
+			return
+		}
+	}
+}
+
+// logUnderlay emits one quic underlay event (installed/retired) with the
+// underlay and reason, so a reader can reconstruct which path carried the pair
+// when without reading the packet code.
+func (p *quicPair) logUnderlay(underlay, event, reason string) {
+	if p.e == nil || p.e.log == nil {
+		return
+	}
+	p.e.log.Debug("quic underlay", "peer", keyName(p.peer),
+		"underlay", underlay, "event", event, "reason", reason)
+}
+
+// logPathChange emits one quic path-change event. It reads the pair's current
+// RTT for the record but never logs a non-change, so a caller may invoke it
+// after every install or retire without producing noise.
+func (p *quicPair) logPathChange(from, to, reason string) {
+	if p.e == nil || p.e.log == nil || from == to {
+		return
+	}
+	p.e.log.Debug("quic path-change", "peer", keyName(p.peer),
+		"from", from, "to", to, "reason", reason, "rtt", p.stats().RTT)
 }
 
 // quicConfigFromSettings maps the resolved host settings onto quic-go's
@@ -509,8 +597,13 @@ func (c *quicStreamConn) RemoteAddr() net.Addr { return c.remote }
 
 // Close shuts both directions. Stream.Close alone only sends FIN; without
 // CancelRead the peer's data would keep filling the receive window of a stream
-// nobody reads anymore.
+// nobody reads anymore. The pair's active-stream count is released once.
 func (c *quicStreamConn) Close() error {
+	c.closeOnce.Do(func() {
+		if c.pair != nil {
+			c.pair.releaseStream()
+		}
+	})
 	c.CancelRead(0)
 	return c.Stream.Close()
 }
