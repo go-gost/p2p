@@ -465,6 +465,7 @@ Expected: PASS（这是 KCP 行为的回归门）。
 - Modify: `p2p/internal/host/engine.go`
 - Modify: `p2p/internal/host/host.go`
 - Modify: `p2p/internal/host/server.go`
+- Modify: `p2p/internal/host/quic_relay.go`（constructor options + framing budget）
 - Test: `p2p/internal/host/quic_engine_test.go`（新建）
 - Test: 现有 `internal/host` 全包回归
 
@@ -482,6 +483,7 @@ Expected: PASS（这是 KCP 行为的回归门）。
   - `OpenStream`：`e.transport==transportQUIC` 时 `ensureTransport` + `pair.openStream`；否则现有 KCP 路径。
   - `pump`：QUIC 模式下 `frameData` 在 pair 已建立时交给 `pair.deliverRelay(pkt)`（`relayQUICConn` 的 `in` channel），不调用 `ensureSession`；pair 尚未建立时 `maybeStartQUIC(src)` 并丢弃该 data（控制帧会继续驱动握手）；KCP 模式不变。
   - `quicPair.deliverRelay(pkt []byte)`：非阻塞投递到 `relayQUICConn` 的 `in`。
+  - `type quicRelayOptions struct { BatchBytes int; Flush time.Duration }`；`newRelayQUICConn(in, send, closeFn, opts quicRelayOptions)`。`opts` 来自 `e.quicCfg.RelayBatchBytes/RelayFlush`；0 值用默认。batch 预算必须计入每包的 2 字节长度前缀（`2+len(pkt)`），并保证整帧 ≤ `derpclient.MaxPacketSize`（64 KiB）；单包超过预算则丢弃并计数。
   - `host.New` 设置 `engine.transport/quicCfg/quicID`；`server.status`/`peerTransports` 在 Task 12 扩展。
 
 - [ ] **Step 1: 写失败测试 `TestQUICModeOpensTunnelOverRelay`**
@@ -494,7 +496,9 @@ Expected: PASS（这是 KCP 行为的回归门）。
 
 - [ ] **Step 3: 实现 engine 集成**
 
-`ensureTransport` 的 caps 等待用一个 per-peer `capsWait` channel/`sync.Cond`；`handleControl` 收到 caps 时写入并唤醒。`OpenStream` 分支、`pump` 分支、`maybeStartQUIC`（server 入站 caps 时启动 `Listen`）。QUIC 模式下 `pump` 不调用 `pc.ensureSession`；`pc.setDataSink` 不需要，`pair.deliverRelay` 直接投递。`ctrlSecure`/`ctrlSecure` 的 secure 会话在 QUIC 模式下不创建。
+`ensureTransport` 的 caps 等待用一个 per-peer `capsWait` channel/`sync.Cond`；`handleControl` 收到 caps 时写入并唤醒。`OpenStream` 分支、`pump` 分支、`maybeStartQUIC`（server 入站 caps 时启动 `Listen`）。QUIC 模式下 `pump` 不调用 `pc.ensureSession`；`pc.setDataSink` 不需要，`pair.deliverRelay` 直接投递。`ctrlSecure` 的 secure 会话在 QUIC 模式下不创建。
+
+同时把 Task 5 的 `relayQUICConn` 接到 `quicRelayOptions`：`newRelayQUICConn(..., quicRelayOptions{BatchBytes: e.quicCfg.RelayBatchBytes, Flush: e.quicCfg.RelayFlush})`；修正 batch 预算为 `2+len(pkt)`，并测试“配置 64 KiB 时不产生 >64 KiB 的 DERP 帧”。Task 5 的旧测试按新签名更新。
 
 - [ ] **Step 4: 跑测试与 KCP 回归**
 
@@ -504,7 +508,7 @@ Expected: PASS。
 
 - [ ] **Step 5: Commit（仅用户要求时）**
 
-`git -C p2p add internal/host/engine.go internal/host/host.go internal/host/server.go internal/host/quic_engine_test.go && git -C p2p commit -m "feat: establish quic over relay"`
+`git -C p2p add internal/host/engine.go internal/host/host.go internal/host/server.go internal/host/quic_relay.go internal/host/quic_engine_test.go internal/host/quic_relay_test.go && git -C p2p commit -m "feat: establish quic over relay"`
 
 ---
 
