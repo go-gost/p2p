@@ -74,8 +74,11 @@ type quicPair struct {
 	// directSock is the raw-UDP socket of the installed direct underlay, or
 	// nil. addDirect and removeDirect update it and swap the direct underlay
 	// under p.mu, so a delayed retire from an old punch cannot remove a newer
-	// underlay.
+	// underlay. directU is the same underlay as an object, kept so a connection
+	// death can hand it to directConn.underlayLost after p.close forgets the
+	// multiPathConn; close deliberately leaves both set.
 	directSock *net.UDPConn
+	directU    *directUnderlay
 	closed     bool
 
 	closeOnce sync.Once
@@ -158,24 +161,41 @@ func (p *quicPair) addRelayUnderlay(pc net.PacketConn) error {
 	return p.relayUp(pc)
 }
 
-// relayDown detaches the relay path without touching the QUIC connection. A
-// client that currently prefers the direct underlay keeps its connection and
-// streams; a client that has no other path lets quic-go close the connection
-// once the idle timeout expires. The caller owns the replacement underlay: a
-// reconnect calls relayUp with a fresh relayQUICConn, whose send closure points
-// at the new peer adapter.
-func (p *quicPair) relayDown() {
+// relayDown detaches the relay underlay identified by relay without touching
+// the QUIC connection. A client that currently prefers the direct underlay
+// keeps its connection and streams; a client that has no other path lets
+// quic-go close the connection once the idle timeout expires. The caller owns
+// the replacement underlay: a reconnect calls relayUp with a fresh
+// relayQUICConn, whose send closure points at the new peer adapter.
+//
+// Both the pair's relay pointer and the multiPathConn slot are checked by
+// identity: a reconnect can install a fresh underlay between the caller's
+// snapshot and this call, and a delayed teardown must not detach the underlay
+// that is now carrying the traffic.
+func (p *quicPair) relayDown(relay *relayQUICConn) {
+	if relay == nil {
+		return
+	}
 	p.mu.Lock()
-	relay := p.relay
-	p.relay = nil
+	if p.relay == relay {
+		p.relay = nil
+	}
 	p.mu.Unlock()
 
-	p.mp.removeUnderlay(quicPathRelay)
-	if relay != nil {
-		// removeUnderlay already closed an installed underlay; this is the
-		// idempotent close for a sender that never made it into the map.
-		_ = relay.Close()
-	}
+	p.mp.removeUnderlayIf(quicPathRelay, relay)
+	// removeUnderlayIf already closed an installed underlay; this is the
+	// idempotent close for a sender that never made it into the map.
+	_ = relay.Close()
+}
+
+// directUnderlay returns the installed direct underlay, or nil. The pair keeps
+// it after close so a death-driven retirement can identify the underlay that
+// was closed with the multiPathConn; callers use it only as a retirement
+// snapshot, never to read through.
+func (p *quicPair) directUnderlay() *directUnderlay {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.directU
 }
 
 // deliverRelay hands one inbound DERP data payload to the relay underlay's

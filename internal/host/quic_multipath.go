@@ -165,6 +165,26 @@ func (c *multiPathConn) removeUnderlay(name string) {
 	_ = r.u.pc.Close()
 }
 
+// removeUnderlayIf removes the named underlay only while it is still pc. A
+// delayed teardown (a relay being retired after its reconnect) must not remove
+// the fresh underlay a newer install put in the same slot.
+func (c *multiPathConn) removeUnderlayIf(name string, pc net.PacketConn) bool {
+	c.mu.Lock()
+	r := c.underlays[name]
+	if r == nil || r.u.pc != pc {
+		c.mu.Unlock()
+		return false
+	}
+	delete(c.underlays, name)
+	if c.preferred == name {
+		c.preferred = ""
+	}
+	c.mu.Unlock()
+
+	_ = r.u.pc.Close()
+	return true
+}
+
 func (c *multiPathConn) setPreferred(name string) {
 	c.mu.Lock()
 	c.preferred = name

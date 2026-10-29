@@ -926,6 +926,25 @@ func (dc *directConn) markUp(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 // Non-blocking (H4): the socket was closed by clearDirectUnderlay, and the
 // re-punch runs on its own goroutine (start) or its own timer (retry).
 func (dc *directConn) underlayDead(u *directUnderlay) {
+	dc.retireUnderlay(u, true)
+}
+
+// underlayLost retires a direct underlay the transport lost together with the
+// QUIC connection that carried it (or when that pair is replaced). The path did
+// not die on its own, and there is no transport to install a replacement on
+// until the pair is rebuilt, so this does not schedule a punch: the rebuilt
+// pair's establishment kicks the next round. It still clears sock and the
+// directUp state, so status and the re-punch gate stop reporting a path the
+// transport no longer holds.
+func (dc *directConn) underlayLost(u *directUnderlay) {
+	dc.retireUnderlay(u, false)
+}
+
+// retireUnderlay is the shared body of underlayDead and underlayLost: it clears
+// the punch state for u, detaches the socket through the transport hook, and,
+// when schedule is true, re-punches with the H3 hysteresis. A false schedule
+// leaves the re-punch to the caller's transport rebuild.
+func (dc *directConn) retireUnderlay(u *directUnderlay, schedule bool) {
 	dc.mu.Lock()
 	if dc.sock == nil || (u != nil && dc.sock != u.sock) {
 		dc.mu.Unlock()
@@ -938,28 +957,34 @@ func (dc *directConn) underlayDead(u *directUnderlay) {
 	if dc.state != directAttempting {
 		dc.mine = nil // a round in flight owns its own candidate list
 	}
-	repunch := dc.state == directUp
+	wasUp := dc.state == directUp
 	// A muted direct path is never coming back while the fault is armed: the
 	// punch would just build another muted underlay that dies the same way.
 	// Count the death (so callers waiting on it still see it) but do not
 	// re-punch — the pair stays on the relay instead of flapping.
 	muted := u != nil && u.muted != nil && u.muted()
 	var backoff time.Duration
-	if repunch {
+	if wasUp {
 		dc.state = directNone
 		dc.drops.Add(1)
-		backoff = dc.repunchBackoffAfterLocked(lifetime)
+		if schedule {
+			backoff = dc.repunchBackoffAfterLocked(lifetime)
+		} else {
+			// The transport was replaced, not the direct path: the H3
+			// hysteresis does not apply, so the rebuild punches at once.
+			dc.repunchBackoff = 0
+		}
 	}
 	dc.mu.Unlock()
 	// Retire through the transport hook. The KCP idle path has already cleared
 	// its underlay, so this is an identity-checked no-op there; the reset path
-	// (markDirectUnderlayRetired) and QUIC's future health path rely on it to
-	// detach the dead socket from the transport.
+	// (markDirectUnderlayRetired) and QUIC's death path rely on it to detach the
+	// dead socket from the transport.
 	if sock != nil {
 		dc.e.retireDirect(dc.peer, sock)
 	}
-	if !repunch {
-		return // a round or a backoff is already rebuilding: it decides next
+	if !wasUp || !schedule {
+		return // no re-punch owed: a round/backoff is rebuilding, or the caller owns it
 	}
 	if muted {
 		return // do not re-punch a muted path; stay on the relay

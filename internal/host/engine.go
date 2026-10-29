@@ -114,6 +114,10 @@ type engine struct {
 	quicMu     sync.Mutex
 	quics      map[derpclient.PublicKey]*quicPeer
 	quicClosed bool
+	// relayMu serializes relay-underlay installation. An establishment and a
+	// reconnect restore can otherwise race to install the peer's relay path,
+	// and the loser would hand the pair an underlay the other just closed.
+	relayMu sync.Mutex
 	// sessionEvents holds one channel per peer that is closed when that peer's
 	// next relay session is built, so whoever registered state scoped to the
 	// old session can re-register. Guarded by its own leaf lock for the same
@@ -160,10 +164,10 @@ func (s *engineStats) countStream(transport string) {
 // a failed handshake, so establish can retry on it without rebuilding the
 // multiPathConn.
 type quicPeer struct {
-	pair    *quicPair
-	pairFP  [32]byte // fingerprint the pair's TLS config pins
-	relay   *relayQUICConn
-	relayUp bool
+	pair           *quicPair
+	pairFP         [32]byte // fingerprint the pair's TLS config pins
+	relay          *relayQUICConn
+	relayInstalled bool
 
 	caps     capsInfo
 	haveCaps bool
@@ -738,9 +742,12 @@ func (e *engine) ensureTransport(peer derpclient.PublicKey) (transportMode, erro
 	close(setup.done)
 	if err == nil {
 		// The pair just established (or another setup did while this one
-		// waited). Start the punch now: QUIC mode has no KCP session build to
-		// carry the trigger, and a later direct install requires this pair.
-		e.maybeStartDirect(peer)
+		// waited). Kick the punch: QUIC mode has no KCP session build to carry
+		// the trigger, a later direct install requires this pair, and a QUIC
+		// connection death retires the dead pair's direct path — which may
+		// leave a backoff armed from a round that could not install while the
+		// pair was down.
+		e.maybeKickDirect(peer)
 	}
 	return transportQUIC, err
 }
@@ -934,11 +941,15 @@ func (e *engine) quicPairFor(peer derpclient.PublicKey, role quicRole, fp [32]by
 	if old != nil {
 		qp.pair = nil
 		qp.relay = nil
-		qp.relayUp = false
+		qp.relayInstalled = false
 		qp.pairFP = [32]byte{}
 	}
 	e.quicMu.Unlock()
 	if old != nil {
+		// A dead or replaced pair closes its direct underlay with the
+		// multiPathConn. Clear the punch state before the replacement
+		// establishment kicks a new round.
+		e.retireQUICDirect(old)
 		old.close()
 	}
 
@@ -980,7 +991,17 @@ func quicTransportName(path string) string {
 // quicRelayUnderlay installs (once) the peer's relay packet path on pair. The
 // underlay outlives a failed handshake: establish retries reuse it rather than
 // rebuilding the multiPathConn or the relay batching goroutine.
+//
+// Installations are serialized engine-wide: an establishment and a reconnect
+// restore can otherwise both build (or both install) an underlay for the same
+// pair, and the second addUnderlay would close the one the first just handed
+// the pair. After installing, the engine state is checked again: a teardown
+// that detached the relay half while this call was installing must not leave a
+// pair marked "relay installed" with an underlay the teardown already owns.
 func (e *engine) quicRelayUnderlay(peer derpclient.PublicKey, pair *quicPair, pc *peerConn) error {
+	e.relayMu.Lock()
+	defer e.relayMu.Unlock()
+
 	e.quicMu.Lock()
 	qp, ok := e.quics[peer]
 	if !ok || qp.pair != pair {
@@ -998,7 +1019,7 @@ func (e *engine) quicRelayUnderlay(peer derpclient.PublicKey, pair *quicPair, pc
 		})
 	}
 	relay := qp.relay
-	installed := qp.relayUp
+	installed := qp.relayInstalled
 	e.quicMu.Unlock()
 	if installed {
 		return nil
@@ -1007,10 +1028,19 @@ func (e *engine) quicRelayUnderlay(peer derpclient.PublicKey, pair *quicPair, pc
 		return err
 	}
 	e.quicMu.Lock()
+	current := false
 	if qp, ok := e.quics[peer]; ok && qp.relay == relay && qp.pair == pair {
-		qp.relayUp = true
+		qp.relayInstalled = true
+		current = true
 	}
 	e.quicMu.Unlock()
+	if !current {
+		// The relay half was detached while this underlay was being installed
+		// (a reconnect raced the teardown). Detach only this instance; the
+		// teardown completion re-runs the restore.
+		pair.relayDown(relay)
+		return errors.New("relay underlay retired during setup")
+	}
 	return nil
 }
 
@@ -1116,13 +1146,13 @@ func (e *engine) quicDataSink(pc *peerConn) func([]byte) {
 }
 
 // quicPeerTeardown snapshots the resources a closing peer owns. They are
-// copied while quicMu is held: quicRelayUnderlay sets relayUp under that lock
+// copied while quicMu is held: quicRelayUnderlay sets relayInstalled under that lock
 // after installing the underlay, so reading the fields during teardown without
 // it would race.
 type quicPeerTeardown struct {
-	pair    *quicPair
-	relay   *relayQUICConn
-	relayUp bool
+	pair           *quicPair
+	relay          *relayQUICConn
+	relayInstalled bool
 }
 
 // closeQUIC tears down and forgets the peer's pair. It does not touch the
@@ -1133,7 +1163,7 @@ func (e *engine) closeQUIC(peer derpclient.PublicKey) {
 	delete(e.quics, peer)
 	var td quicPeerTeardown
 	if qp != nil {
-		td = quicPeerTeardown{pair: qp.pair, relay: qp.relay, relayUp: qp.relayUp}
+		td = quicPeerTeardown{pair: qp.pair, relay: qp.relay, relayInstalled: qp.relayInstalled}
 		if qp.setup != nil {
 			// Wake an in-flight establishment: its state is being discarded,
 			// and its waiters should not sit through the caps/handshake budget.
@@ -1144,7 +1174,7 @@ func (e *engine) closeQUIC(peer derpclient.PublicKey) {
 	if td.pair != nil {
 		td.pair.close()
 	}
-	if td.relay != nil && !td.relayUp {
+	if td.relay != nil && !td.relayInstalled {
 		// A relay underlay whose pair never got it installed still owns its
 		// sender goroutine.
 		_ = td.relay.Close()
@@ -1167,23 +1197,30 @@ func (e *engine) quicConnClosed(p *quicPair, err error) {
 	}
 	qp.pair = nil
 	qp.pairFP = [32]byte{}
-	relay, relayUp := qp.relay, qp.relayUp
+	relay, relayInstalled := qp.relay, qp.relayInstalled
 	qp.relay = nil
-	qp.relayUp = false
+	qp.relayInstalled = false
 	// Death-triggered restart is not subject to the inbound-trigger rate
 	// limit: both ends must start, and the accepting side may have just
 	// started a pair moments before the connection died.
 	qp.nextStart = time.Time{}
-	if qp.setup != nil {
-		qp.setup.cancel()
-	}
+	// Do not cancel an in-flight setup here: it can be the rebuild this death
+	// just triggered (the close watcher may run after an OpenStream started
+	// establishing against the already-dead pair), and canceling it would fail
+	// that open with no replacement attempt. The setup re-reads the relay
+	// underlay below and builds a fresh one when this reset cleared it.
 	e.quicMu.Unlock()
 
-	if relay != nil && !relayUp {
+	if relay != nil && !relayInstalled {
 		// The relay underlay never reached the pair's multiPathConn, so
 		// pair.close cannot end its sender goroutine.
 		_ = relay.Close()
 	}
+	// The dead connection takes its direct underlay with it. Retire the punch
+	// state now: otherwise directConn keeps reporting directUp and the rebuilt
+	// pair's punch trigger (maybeKickDirect) refuses to start, leaving the peer
+	// relay-only for good. The replacement pair starts the re-punch.
+	e.retireQUICDirect(p)
 	// Give the CONNECTION_CLOSE flight a moment to leave the transport:
 	// closing it synchronously discards the frame, leaving the peer on a
 	// half-open connection until its idle timeout. The engine state is already
@@ -1191,6 +1228,23 @@ func (e *engine) quicConnClosed(p *quicPair, err error) {
 	time.AfterFunc(quicDeathCloseDelay, p.close)
 	e.log.Debug("quic connection closed", "peer", keyName(p.peer), "error", err)
 	e.maybeStartQUIC(p.peer)
+}
+
+// retireQUICDirect marks the direct path down when the QUIC connection that
+// carried it died or its pair is being replaced. The pair's underlay closes
+// with that connection, so directConn must not keep sock/directUp: that would
+// both misreport the path and block the rebuilt pair's re-punch. It does not
+// schedule the punch itself — the replacement pair is not up yet, and an
+// install racing it would only fail and arm a backoff; ensureTransport kicks
+// the round once the new pair is established.
+func (e *engine) retireQUICDirect(p *quicPair) {
+	u := p.directUnderlay()
+	if u == nil {
+		return
+	}
+	if dc := e.getDirect(p.peer); dc != nil {
+		dc.underlayLost(u)
+	}
 }
 
 // quicDirectDead is the QUIC direct watchdog's engine side: the pair has
@@ -1210,10 +1264,10 @@ func (e *engine) quicDirectDead(peer derpclient.PublicKey, u *directUnderlay) {
 // (QUIC mode never builds one).
 func (e *engine) relayDownQUIC() {
 	type relayLoss struct {
-		pair    *quicPair
-		relay   *relayQUICConn
-		relayUp bool
-		keep    bool
+		pair           *quicPair
+		relay          *relayQUICConn
+		relayInstalled bool
+		keep           bool
 	}
 	e.quicMu.Lock()
 	states := make([]relayLoss, 0, len(e.quics))
@@ -1226,13 +1280,13 @@ func (e *engine) relayDownQUIC() {
 		}
 		keep := qp.pair != nil && qp.pair.hasDirect()
 		states = append(states, relayLoss{
-			pair:    qp.pair,
-			relay:   qp.relay,
-			relayUp: qp.relayUp,
-			keep:    keep,
+			pair:           qp.pair,
+			relay:          qp.relay,
+			relayInstalled: qp.relayInstalled,
+			keep:           keep,
 		})
 		qp.relay = nil
-		qp.relayUp = false
+		qp.relayInstalled = false
 		if keep {
 			// The connection survives on its direct path; keep its pair so the
 			// reconnect can attach the fresh relay underlay to the same QUIC
@@ -1251,14 +1305,23 @@ func (e *engine) relayDownQUIC() {
 	for _, st := range states {
 		if st.pair != nil {
 			if st.keep {
-				st.pair.relayDown()
+				st.pair.relayDown(st.relay)
 			} else {
 				st.pair.close()
 			}
 		}
-		if st.relay != nil && !st.relayUp {
+		if st.relay != nil && !st.relayInstalled {
 			_ = st.relay.Close()
 		}
+	}
+	// A reconnect can race this teardown. Its restore may have run while the
+	// stale underlay was still marked installed (and skipped), or it may have
+	// installed a fresh underlay that the identity-checked relayDown above
+	// deliberately left alone. Re-run the restore now that the teardown is
+	// complete, so a surviving pair cannot stay "relay installed" with no
+	// underlay until the next open.
+	if e.relayConnected() {
+		go e.relayRestoredQUIC()
 	}
 }
 
@@ -1287,7 +1350,7 @@ func (e *engine) relayRestoredQUIC() {
 	}
 	states := make([]restore, 0, len(e.quics))
 	for peer, qp := range e.quics {
-		if qp.pair == nil || qp.relayUp || !qp.pair.established() {
+		if qp.pair == nil || qp.relayInstalled || !qp.pair.established() {
 			continue
 		}
 		states = append(states, restore{peer: peer, pair: qp.pair})
@@ -1315,9 +1378,9 @@ func (e *engine) closeAllQUIC() {
 	states := make([]quicPeerTeardown, 0, len(e.quics))
 	for _, qp := range e.quics {
 		states = append(states, quicPeerTeardown{
-			pair:    qp.pair,
-			relay:   qp.relay,
-			relayUp: qp.relayUp,
+			pair:           qp.pair,
+			relay:          qp.relay,
+			relayInstalled: qp.relayInstalled,
 		})
 		if qp.setup != nil {
 			qp.setup.cancel()
@@ -1329,7 +1392,7 @@ func (e *engine) closeAllQUIC() {
 		if td.pair != nil {
 			td.pair.close()
 		}
-		if td.relay != nil && !td.relayUp {
+		if td.relay != nil && !td.relayInstalled {
 			_ = td.relay.Close()
 		}
 	}

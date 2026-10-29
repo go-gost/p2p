@@ -2,6 +2,7 @@ package host
 
 import (
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -62,6 +63,13 @@ func (c *directPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 				return 0, nil, net.ErrClosed
 			}
 			continue
+		}
+		if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			// A local read failure is a dead path, not a temporary one. Hand
+			// it to the same watchdog retirement so directConn stops reporting
+			// a direct path nobody can read; the QUIC connection migrates to
+			// the relay on its next write.
+			_ = c.fireIdle()
 		}
 		return 0, nil, err
 	}
@@ -158,6 +166,7 @@ func (p *quicPair) addDirect(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 		return nil
 	}
 	p.directSock = sock
+	p.directU = u
 	dpc := newDirectPacketConn(u)
 	dpc.onIdle = p.directHeartbeatDead
 	p.mp.addUnderlay(quicUnderlay{
@@ -192,6 +201,7 @@ func (p *quicPair) removeDirect(sock *net.UDPConn) {
 		return
 	}
 	p.directSock = nil
+	p.directU = nil
 	if p.role == quicRoleClient && p.mp.preferredPath() == quicPathDirect {
 		p.mp.setPreferred(quicPathRelay)
 	}
