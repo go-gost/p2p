@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"sync"
 
@@ -19,6 +18,12 @@ import (
 const (
 	quicMaxIncomingStreams    = 1024
 	quicMaxIncomingUniStreams = -1
+
+	// quicMaxInitialPacketSize is quic-go's maximum packet buffer size.
+	// validateConfig clamps InitialPacketSize to this value in place; applying
+	// the same clamp here keeps the resolved config equal to what the
+	// handshake actually uses.
+	quicMaxInitialPacketSize = 1452
 )
 
 var (
@@ -76,7 +81,14 @@ var _ net.Conn = (*quicStreamConn)(nil)
 
 // newQUICPair builds the per-peer transport state. No packets flow until the
 // caller installs an underlay and establish succeeds.
+//
+// The config is cloned: quic-go's validateConfig mutates the struct it is given
+// (clamping InitialPacketSize), so a caller-shared config would be written by
+// every pair concurrently.
 func newQUICPair(e *engine, peer derpclient.PublicKey, role quicRole, tlsCfg *tls.Config, qcfg *quic.Config, onStream func(net.Conn)) *quicPair {
+	if qcfg != nil {
+		qcfg = qcfg.Clone()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &quicPair{
 		e:          e,
@@ -122,9 +134,9 @@ func (p *quicPair) addRelayUnderlay(pc net.PacketConn) error {
 // connection out of 0-RTT: a replayed early-data flight would be accepted by
 // the relay path before the peer's identity was pinned.
 //
-// A failed establish closes the whole pair: a half-built transport owns
-// goroutines and a partially installed underlay, and the caller must retry
-// with a fresh pair rather than reuse this one.
+// A failed handshake tears down only the conn, listener and transport of that
+// attempt. The pair's multiPathConn and lifetime stay intact, so the caller may
+// retry establish on the same relay underlay (with a fresh transport).
 func (p *quicPair) establish(ctx context.Context) error {
 	p.mu.Lock()
 	if p.closed {
@@ -145,45 +157,74 @@ func (p *quicPair) establish(ctx context.Context) error {
 	ctx, cancel := quicPairContext(ctx, p.ctx)
 	defer cancel()
 
-	var (
-		conn *quic.Conn
-		ln   *quic.Listener
-		err  error
-	)
-	if p.role == quicRoleClient {
-		conn, err = tr.Dial(ctx, quicPathAddr{name: quicPathRelay}, p.tlsCfg, p.qcfg)
-	} else {
-		ln, err = tr.Listen(p.tlsCfg, p.qcfg)
-		if err == nil {
-			p.mu.Lock()
-			if p.closed {
-				err = errQUICPairClosed
-			} else {
-				p.ln = ln
-			}
-			p.mu.Unlock()
-			if err == nil {
-				conn, err = ln.Accept(ctx)
-			}
-		}
+	conn, ln, err := p.handshake(ctx, tr)
+
+	p.mu.Lock()
+	if err == nil && p.closed {
+		err = errQUICPairClosed
 	}
+	if err == nil {
+		p.conn = conn
+	}
+	p.mu.Unlock()
+
+	if err == nil {
+		go p.acceptStreams()
+		return nil
+	}
+
+	// Discard this attempt's resources, not the pair. A half-built transport
+	// owns goroutines and a listener, but the relay underlay must survive for a
+	// retry.
+	if conn != nil {
+		_ = conn.CloseWithError(quic.ApplicationErrorCode(0), "pair closed")
+	}
+	if ln != nil {
+		_ = ln.Close()
+	}
+	_ = tr.Close()
+
+	p.mu.Lock()
+	if p.tr == tr {
+		p.tr = nil
+	}
+	if p.ln == ln {
+		p.ln = nil
+	}
+	p.mu.Unlock()
+
+	return fmt.Errorf("host: quic pair establish: %w", err)
+}
+
+// handshake performs the role-specific exchange. The server closes its
+// listener as soon as the single connection is accepted: one Transport serves
+// exactly one connection, and a zero-length CID cannot tell a second connection
+// apart from the established one. Closing a listener does not affect
+// connections it already accepted.
+func (p *quicPair) handshake(ctx context.Context, tr *quic.Transport) (*quic.Conn, *quic.Listener, error) {
+	if p.role == quicRoleClient {
+		conn, err := tr.Dial(ctx, quicPathAddr{name: quicPathRelay}, p.tlsCfg, p.qcfg)
+		return conn, nil, err
+	}
+
+	ln, err := tr.Listen(p.tlsCfg, p.qcfg)
 	if err != nil {
-		p.close()
-		return fmt.Errorf("host: quic pair establish: %w", err)
+		return nil, nil, err
 	}
 
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		_ = conn.CloseWithError(quic.ApplicationErrorCode(0), "pair closed")
-		p.close()
-		return errQUICPairClosed
+		_ = ln.Close()
+		return nil, ln, errQUICPairClosed
 	}
-	p.conn = conn
+	p.ln = ln
 	p.mu.Unlock()
 
-	go p.acceptStreams()
-	return nil
+	conn, err := ln.Accept(ctx)
+	_ = ln.Close()
+
+	return conn, ln, err
 }
 
 // openStream opens one bidirectional stream, bounded by ctx. A stream and its
@@ -300,11 +341,12 @@ func (p *quicPair) pathName() string {
 // config. Path MTU discovery stays off because the relay path's datagram size
 // is not under this host's control.
 func quicConfigFromSettings(s quicSettings) *quic.Config {
-	// InitialPacketSize is a uint16; an absurd MTU must not wrap to a small
-	// packet size. quic-go clamps the result to its own maximum.
+	// quic-go clamps InitialPacketSize to its packet-buffer maximum in
+	// validateConfig. Clamp to the same bound up front so the resolved config
+	// reflects what the handshake uses (and can never overflow uint16).
 	mtu := s.MTU
-	if mtu > math.MaxUint16 {
-		mtu = math.MaxUint16
+	if mtu > quicMaxInitialPacketSize {
+		mtu = quicMaxInitialPacketSize
 	}
 	return &quic.Config{
 		HandshakeIdleTimeout:    s.HandshakeTimeout,
