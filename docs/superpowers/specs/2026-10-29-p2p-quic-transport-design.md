@@ -287,7 +287,8 @@ type 0x01 = QUIC:
   `addCaps` 对“无 QUIC bit”的 caps 会清掉已学到的 FP；一个 direct off 的 peer
   没有 punch caps 帧来恢复它。
 - TLS：
-  - 每个 engine 进程生成一个 Ed25519 自签证书（懒生成，仅 QUIC 模式）：
+  - 每个 engine 在 QUIC 模式下创建时生成一个 Ed25519 自签证书（只在 QUIC
+    模式生成；不在首次握手时懒初始化，避免并发首连的初始化竞态）：
     CN = base64 公钥，NotBefore -1h，NotAfter +365d，KeyUsage digitalSignature，
     ExtKeyUsage serverAuth+clientAuth。
   - 指纹 = SHA-256(DER)。
