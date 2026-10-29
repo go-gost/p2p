@@ -8,6 +8,13 @@ import "time"
 // the library (cmd/p2p), not by this package.
 type Config struct {
 	Derp string `yaml:"derp,omitempty"`
+	// Transport selects the data plane for every peer: "" or "kcp" keeps the
+	// existing secure+KCP+smux path, "quic" opts into the QUIC data plane. The
+	// mode is global (one data plane per endpoint) and read once at startup; a
+	// running endpoint never switches. QUIC is strict: a peer that cannot speak
+	// it is unreachable rather than served over KCP, and QUIC requires relay
+	// (DERP) mode.
+	Transport string `yaml:"transport,omitempty"`
 	// Key is the endpoint identity, in one of two forms: a 64-character
 	// hex-encoded curve25519 private key held in memory, or a path to an
 	// existing key file. p2p only reads the file and never creates or writes
@@ -27,6 +34,8 @@ type Config struct {
 	IPv6     bool            `yaml:"ipv6,omitempty"`
 	TLS      *TLSConfig      `yaml:"tls,omitempty"`
 	Timeouts *TimeoutsConfig `yaml:"timeouts,omitempty"`
+	// QUIC tunes the QUIC data plane. It is ignored when Transport is kcp.
+	QUIC     *QUICConfig     `yaml:"quic,omitempty"`
 	Forwards []ForwardConfig `yaml:"forwards,omitempty"`
 	// Faults injects deliberate transport failures (debug only — see
 	// FaultsConfig). Nil or zero means nothing is injected.
@@ -106,6 +115,30 @@ type TimeoutsConfig struct {
 type SmuxTimeouts struct {
 	Interval time.Duration `yaml:"interval,omitempty"`
 	Timeout  time.Duration `yaml:"timeout,omitempty"`
+}
+
+// QUICConfig tunes the QUIC data plane. The settings are host-wide (they apply
+// to every peer of the endpoint) and read at startup; the block is ignored when
+// Transport is kcp. Zero values keep the built-in defaults: 1200 bytes, 32 KiB,
+// 200µs, 5s, 15s and 10s respectively (see resolveQUICSettings).
+//
+// Validation: mtu >= 1200, relayBatchBytes <= 64 KiB, idle > keepAlive, and
+// handshakeTimeout > 0.
+type QUICConfig struct {
+	// MTU is the fixed QUIC packet size. 1200 is the conservative default so a
+	// relay packet and a direct-path UDP datagram fit the same path.
+	MTU int `yaml:"mtu,omitempty"`
+	// RelayBatchBytes is the most relay payload bytes one DERP frame carries.
+	RelayBatchBytes int `yaml:"relayBatchBytes,omitempty"`
+	// RelayFlush is the longest a relay batch waits before it is sent.
+	RelayFlush time.Duration `yaml:"relayFlush,omitempty"`
+	// KeepAlive is the QUIC keepalive period.
+	KeepAlive time.Duration `yaml:"keepAlive,omitempty"`
+	// Idle is the QUIC maximum idle timeout; it must exceed KeepAlive.
+	Idle time.Duration `yaml:"idle,omitempty"`
+	// HandshakeTimeout bounds QUIC connection establishment, including the
+	// relay handshake window.
+	HandshakeTimeout time.Duration `yaml:"handshakeTimeout,omitempty"`
 }
 
 // TLSConfig mirrors the --tls.* flags. Secure is a pointer so an omitted

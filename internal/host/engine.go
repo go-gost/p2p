@@ -46,6 +46,8 @@ var sessionGenSeq atomic.Uint64
 // regardless of who dials first. smux allows either side to open streams.
 type engine struct {
 	url         string
+	transport   transportMode                          // data plane for every peer; fixed at construction
+	quicCfg     quicSettings                           // resolved QUIC settings; used when transport == transportQUIC
 	targets     *targetPool                            // inbound bridge targets; an empty tcp pool refuses inbound tunnels
 	direct      bool                                   // master direct switch (--direct); false = relay-only
 	stunAddr    string                                 // STUN server (host:port); "" disables the IPv4 direct path

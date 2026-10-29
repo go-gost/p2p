@@ -50,6 +50,7 @@ func main() {
 	stunAddr := flag.String("stun", "", "STUN server address (host:port) for the IPv4 direct path; IPv6 is independent of STUN")
 	direct := flag.Bool("direct", true, "attempt a direct (hole-punched) path; false forces relay-only")
 	ipv6 := flag.Bool("ipv6", false, "enable the IPv6 direct-path family (needs a global IPv6 egress)")
+	transport := flag.String("transport", "kcp", "data plane: kcp or quic")
 	tlsSecure := flag.Bool("tls.secure", true, "verify the relay's TLS certificate (set false to trust any cert)")
 	tlsCAFile := flag.String("tls.caFile", "", "PEM CA file to trust the relay's self-signed certificate")
 	logLevel := flag.String("log.level", "info", "log level: trace, debug, info, warn, error, or fatal")
@@ -112,6 +113,9 @@ func main() {
 	}
 	if set["ipv6"] {
 		cfg.IPv6 = *ipv6
+	}
+	if set["transport"] {
+		cfg.Transport = *transport
 	}
 	if set["tls.secure"] {
 		cfg.TLS.Secure = tlsSecure

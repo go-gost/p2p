@@ -29,6 +29,10 @@ var (
 	// distinct from ErrPeerUnreachable — the peer is reachable, it just will not
 	// speak the cipher (an old or misbehaving peer). The cause is wrapped.
 	ErrEncryptionRequired = errors.New("p2p: peer encryption required")
+	// ErrTransportUnsupported reports that the peer cannot speak the transport
+	// the endpoint selected (transport=quic). QUIC is strict: such a peer is
+	// unreachable rather than served over KCP. The cause is wrapped.
+	ErrTransportUnsupported = errors.New("p2p: peer does not support the selected transport")
 	// ErrForward reports a failed static forward registration: a configuration
 	// error (bad listen address, no relay configured, port in use), not a
 	// transient one. A caller that serves through an unreachable relay must

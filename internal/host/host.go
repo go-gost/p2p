@@ -67,12 +67,29 @@ func New(cfg *p2p.Config, opts ...Option) (*Host, error) {
 		return nil, err
 	}
 
+	transport, err := resolveTransport(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var quicCfg quicSettings
+	if transport == transportQUIC {
+		// QUIC carries the relay path first, so it cannot run without one.
+		if cfg.Derp == "" {
+			return nil, fmt.Errorf("p2p: transport quic requires derp mode")
+		}
+		if quicCfg, err = resolveQUICSettings(cfg.QUIC); err != nil {
+			return nil, err
+		}
+	}
+
 	if cfg.Derp != "" {
 		priv, _, err := loadKey(cfg.Key)
 		if err != nil {
 			return nil, err
 		}
 		h.engine = newEngine(cfg.Derp, "", priv, h.log)
+		h.engine.transport = transport
+		h.engine.quicCfg = quicCfg
 		if err := h.engine.addTargets(cfg.TargetList()); err != nil {
 			return nil, err
 		}

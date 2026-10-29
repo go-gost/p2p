@@ -166,6 +166,23 @@ func TestConfigTargetsMerge(t *testing.T) {
 	}
 }
 
+// TestConfigTransportYAML: the transport selector and the quic block parse
+// through the inlined p2p.Config, so a config file can opt in.
+func TestConfigTransportYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p2p.yaml")
+	body := "transport: quic\nquic:\n  mtu: 1400\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Transport != "quic" || c.QUIC == nil || c.QUIC.MTU != 1400 {
+		t.Fatalf("transport = %q, quic = %+v", c.Transport, c.QUIC)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

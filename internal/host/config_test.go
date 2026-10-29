@@ -103,6 +103,72 @@ func TestApplyTimeouts(t *testing.T) {
 	}
 }
 
+// TestTransportConfigDefaults pins the transport selector: an omitted value and
+// "kcp" keep the existing data plane, "quic" opts in.
+func TestTransportConfigDefaults(t *testing.T) {
+	cases := []struct {
+		in   string
+		want transportMode
+	}{
+		{"", transportKCP}, {"kcp", transportKCP}, {"quic", transportQUIC},
+	}
+	for _, c := range cases {
+		cfg := &p2p.Config{Transport: c.in, Derp: "ws://example"}
+		got, err := resolveTransport(cfg)
+		if err != nil || got != c.want {
+			t.Fatalf("%q: got %v, %v", c.in, got, err)
+		}
+	}
+}
+
+// TestTransportConfigRejectsUnknown: a mode other than kcp/quic is a startup
+// error rather than a silent fall back to KCP.
+func TestTransportConfigRejectsUnknown(t *testing.T) {
+	if _, err := resolveTransport(&p2p.Config{Transport: "sctp", Derp: "ws://example"}); err == nil {
+		t.Fatal("want error")
+	}
+}
+
+// TestQUICConfigValidation pins the QUIC defaults and rejects every value the
+// spec limits: mtu >= 1200, batch <= 64 KiB, idle > keepalive, and a positive
+// handshake timeout. QUIC mode also requires a relay (DERP) mode.
+func TestQUICConfigValidation(t *testing.T) {
+	got, err := resolveQUICSettings(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := quicSettings{
+		MTU:              1200,
+		RelayBatchBytes:  32768,
+		RelayFlush:       200 * time.Microsecond,
+		KeepAlive:        5 * time.Second,
+		Idle:             15 * time.Second,
+		HandshakeTimeout: 10 * time.Second,
+	}
+	if got != want {
+		t.Fatalf("defaults = %+v, want %+v", got, want)
+	}
+
+	for _, c := range []struct {
+		name string
+		cfg  *p2p.QUICConfig
+	}{
+		{"mtu below 1200", &p2p.QUICConfig{MTU: 1199}},
+		{"batch above 64 KiB", &p2p.QUICConfig{RelayBatchBytes: 65537}},
+		{"idle not above keepalive", &p2p.QUICConfig{KeepAlive: 5 * time.Second, Idle: 5 * time.Second}},
+		{"negative handshake timeout", &p2p.QUICConfig{HandshakeTimeout: -time.Second}},
+	} {
+		if _, err := resolveQUICSettings(c.cfg); err == nil {
+			t.Fatalf("%s: want error", c.name)
+		}
+	}
+
+	// QUIC is strict: it needs the relay path, so stub mode cannot select it.
+	if _, err := New(&p2p.Config{Transport: "quic"}); err == nil {
+		t.Fatal("New accepted transport=quic without derp")
+	}
+}
+
 // TestApplyDefaults pins the library-side defaults: an omitted tls/direct block
 // means secure and direct-on, and an explicit false survives.
 func TestApplyDefaults(t *testing.T) {
