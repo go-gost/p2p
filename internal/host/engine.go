@@ -698,6 +698,9 @@ func (e *engine) ensureTransport(peer derpclient.PublicKey) (transportMode, erro
 			p2p.ErrTransportUnsupported, keyName(peer))
 	}
 	if pair := e.getQUIC(peer); pair != nil && pair.established() {
+		// QUIC has no ensureSession to start a punch: the established pair is
+		// the trigger, and maybeStartDirect is idempotent.
+		e.maybeStartDirect(peer)
 		return transportQUIC, nil
 	}
 
@@ -733,6 +736,12 @@ func (e *engine) ensureTransport(peer derpclient.PublicKey) (transportMode, erro
 	}
 	e.quicMu.Unlock()
 	close(setup.done)
+	if err == nil {
+		// The pair just established (or another setup did while this one
+		// waited). Start the punch now: QUIC mode has no KCP session build to
+		// carry the trigger, and a later direct install requires this pair.
+		e.maybeStartDirect(peer)
+	}
 	return transportQUIC, err
 }
 
@@ -2030,6 +2039,68 @@ func (e *engine) relayKCPFreshness(peer derpclient.PublicKey) (time.Time, bool) 
 	return pair.freshestRecv()
 }
 
+// installDirect installs a freshly punched socket on the selected transport's
+// direct plane. In KCP mode it is the existing registerDirectUnderlay. In QUIC
+// mode the socket becomes the pair's direct underlay, which is only valid once
+// the pair is established: a missing or closed pair returns an error so the
+// caller closes the socket and lets the punch back off instead of leaving it
+// attached to state that no longer exists.
+func (e *engine) installDirect(peer derpclient.PublicKey, sock *net.UDPConn, addr netip.AddrPort, token [seedTokenLen]byte) error {
+	if sock == nil {
+		return errQUICUnderlayNil
+	}
+	if e.transport == transportQUIC {
+		pair := e.getQUIC(peer)
+		if pair == nil || !pair.established() {
+			return fmt.Errorf("%w: peer %s: direct underlay", errQUICPairNoConn, keyName(peer))
+		}
+		return pair.addDirect(sock, addr, token)
+	}
+	e.registerDirectUnderlay(peer, sock, addr, token)
+	return nil
+}
+
+// retireDirect detaches a direct socket from the selected transport's direct
+// plane. The compare-and-clear is by socket identity, so a delayed retire from
+// an old punch can never remove a newer underlay. The socket is closed in every
+// case (Close is idempotent); the KCP hook also closes it when it owned it.
+func (e *engine) retireDirect(peer derpclient.PublicKey, sock *net.UDPConn) {
+	if sock == nil {
+		return
+	}
+	if e.transport == transportQUIC {
+		if pair := e.getQUIC(peer); pair != nil {
+			pair.removeDirect(sock)
+		}
+		_ = sock.Close()
+		return
+	}
+	if pair := e.relayKCPPairGet(peer); pair != nil {
+		pair.mu.Lock()
+		var u *directUnderlay
+		if pair.direct != nil && pair.direct.sock == sock {
+			u = pair.direct
+		}
+		pair.mu.Unlock()
+		if u != nil {
+			pair.clearDirectUnderlayIf(u, pathChangeClear)
+		}
+	}
+	_ = sock.Close()
+}
+
+// noteSeed records one seed-handshake outcome on the pair that owns the seed
+// diagnostics. QUIC has no relay KCP pair (its seed health is reported by the
+// QUIC counters in a later task), so the call is a no-op there.
+func (e *engine) noteSeed(peer derpclient.PublicKey, result, family, addr string) {
+	if e.transport == transportQUIC {
+		return
+	}
+	if pair := e.relayKCPPairGet(peer); pair != nil {
+		pair.noteSeed(result, family, addr)
+	}
+}
+
 // registerDirectUnderlay installs a freshly punched socket as the peer's pair
 // direct underlay (the P2 cutover). It builds the underlay with the raw-UDP seed
 // token threaded from the handshake (Task 6) so the underlay can echo the peer's
@@ -2852,13 +2923,6 @@ func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
 	}
 	switch body[0] {
 	case ctrlPunchCandidates:
-		if e.transport == transportQUIC {
-			// The direct plane is not wired into the QUIC pair by this
-			// change; running the punch state machine here would install a
-			// KCP direct underlay, which QUIC mode forbids. The candidate
-			// exchange resumes when the QUIC direct hook lands.
-			return
-		}
 		clear, ok := e.priv.OpenFrom(src, body[1:])
 		if !ok {
 			e.log.Debug("direct punch: bad candidate box", "peer", keyName(src))

@@ -424,11 +424,22 @@ func (e *engine) peerLive(peer derpclient.PublicKey) bool {
 // probe there is. peerLive would read that peer as disconnected (no relay
 // session, no live direct one) and stop the accepting side from re-punching a
 // peer whose direct session died, leaving the pair stuck until the other side
-// re-announces.
+// re-announces. In QUIC mode the established pair takes the place of the KCP
+// relay session as the live path; the KCP session never exists there, so it
+// must not be read as "gone".
 func (e *engine) peerGoneForPunch(peer derpclient.PublicKey) bool {
 	e.mu.Lock()
 	pc, dc := e.peers[peer], e.directs[peer]
 	e.mu.Unlock()
+	if e.transport == transportQUIC {
+		// QUIC has no KCP relay session, so pc.liveSession() is always false
+		// there. An established QUIC pair is the live data path: treating it
+		// as gone would make the retry timer skip every round, so a punch that
+		// lost one seed (a transient send failure) could never try again.
+		if pair := e.getQUIC(peer); pair != nil && pair.established() {
+			return false
+		}
+	}
 	return pc != nil && !pc.liveSession() && (dc == nil || !dc.live())
 }
 
@@ -817,31 +828,59 @@ func (dc *directConn) teardown() {
 		return
 	}
 	if dc.e != nil {
-		if pair := dc.e.relayKCPPairGet(dc.peer); pair != nil {
-			pair.mu.Lock()
-			held := pair.direct != nil && pair.direct.sock == sock
-			pair.mu.Unlock()
-			if held {
-				pair.clearDirectUnderlay() // closes the socket too
-			}
-		}
+		dc.e.retireDirect(dc.peer, sock)
 	}
-	sock.Close()
 }
 
-// markUp stores the freshly punched socket and marks the state up, registering
-// the socket as the pair's direct underlay. token is this side's raw-UDP seed
-// token (Task 6): the underlay echoes the peer's late seed probes with it and
-// drops its own returning echo, so two registered underlays cannot ping-pong.
+// markUp stores the freshly punched socket and marks the state up, installing
+// the socket as the pair's direct underlay through the transport-agnostic hook
+// (registerDirectUnderlay for KCP, quicPair.addDirect for QUIC). token is this
+// side's raw-UDP seed token (Task 6): the underlay echoes the peer's late seed
+// probes with it and drops its own returning echo, so two registered underlays
+// cannot ping-pong.
+//
+// Installation comes first: a failed install closes the socket and does not
+// mark the path up (no dc.sock, no session age), so the punch's normal backoff
+// handles the retry instead of reporting a path the transport does not hold.
+// QUIC requires an established pair; the hook returns an error when the pair is
+// gone.
 //
 // A punch can succeed while an older underlay is still installed (it is re-run
 // on the peer's announcements): the new socket replaces it, and the old one is
-// retired by setDirectUnderlay. Re-registering the same socket is skipped — the
-// pair already holds it, and setDirectUnderlay would close it as the "old"
-// underlay (Task 3 contract).
-func (dc *directConn) markUp(sock *net.UDPConn, peerAddr netip.AddrPort, token [seedTokenLen]byte) {
+// retired by the install (setDirectUnderlay or addDirect closes it).
+// Re-registering the same socket is skipped — the pair already holds it, and
+// the KCP setDirectUnderlay would close it as the "old" underlay (Task 3
+// contract).
+func (dc *directConn) markUp(sock *net.UDPConn, peerAddr netip.AddrPort, token [seedTokenLen]byte) error {
+	if sock == nil {
+		return nil
+	}
+	// Keep the direct state lock across the install: the KCP registration
+	// starts an asynchronous consumer that can retire the underlay at once (an
+	// unsettled cipher), and it must observe the new dc.sock rather than run
+	// before this function has recorded it. The install itself only swaps a
+	// socket and starts local goroutines, so holding dc.mu here is bounded.
 	dc.mu.Lock()
 	prevSock := dc.sock
+	if err := dc.e.installDirect(dc.peer, sock, peerAddr, token); err != nil {
+		// Do not leave a failed install reported as a live path. The transport
+		// refused the new underlay, so the predecessor cannot be live either
+		// (in QUIC the pair that held it is gone).
+		if dc.sock == prevSock {
+			dc.sock = nil
+			dc.sessAt = time.Time{}
+			dc.state = directNone
+		}
+		dc.mu.Unlock()
+		sock.Close()
+		if prevSock != nil && prevSock != sock {
+			prevSock.Close()
+		}
+		dc.noteErr(fmt.Sprintf("direct install failed: %v", err))
+		dc.noteRound("direct install failed: %v", err)
+		return err
+	}
+
 	dc.sock = sock
 	dc.peerAddr = peerAddr
 	dc.state = directUp
@@ -854,17 +893,14 @@ func (dc *directConn) markUp(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 	dc.controlLiveSeen = false
 	dc.mu.Unlock()
 
-	if sock == nil {
-		return
-	}
 	if prevSock != nil && prevSock != sock {
+		// The install already replaced and closed it; this covers a dc.sock
+		// whose pair underlay had gone away without the hook seeing it.
 		prevSock.Close()
-	}
-	if prevSock != sock {
-		dc.e.registerDirectUnderlay(dc.peer, sock, peerAddr, token)
 	}
 	dc.e.stats.punchSuccess.Add(1)
 	dc.ups.Add(1)
+	return nil
 }
 
 // underlayDead is the pair's idle-watchdog path (Task 4's onDirectIdle): the
@@ -885,6 +921,7 @@ func (dc *directConn) underlayDead(u *directUnderlay) {
 		return // a newer underlay already replaced this one
 	}
 	lifetime := time.Since(dc.sessAt)
+	sock := dc.sock
 	dc.sock = nil
 	dc.sessAt = time.Time{} // no live underlay: SessionAge must read 0
 	if dc.state != directAttempting {
@@ -903,6 +940,13 @@ func (dc *directConn) underlayDead(u *directUnderlay) {
 		backoff = dc.repunchBackoffAfterLocked(lifetime)
 	}
 	dc.mu.Unlock()
+	// Retire through the transport hook. The KCP idle path has already cleared
+	// its underlay, so this is an identity-checked no-op there; the reset path
+	// (markDirectUnderlayRetired) and QUIC's future health path rely on it to
+	// detach the dead socket from the transport.
+	if sock != nil {
+		dc.e.retireDirect(dc.peer, sock)
+	}
 	if !repunch {
 		return // a round or a backoff is already rebuilding: it decides next
 	}
@@ -1487,9 +1531,7 @@ func (dc *directConn) punch() {
 		if res.err != nil {
 			dc.noteSeedFailure(f.name, res.err, res.out.ProbeFrom)
 			e.log.Debug("direct punch: seed failed", "peer", pname, "family", f.name, "addr", res.dial.String(), "error", res.err, "probe_from", probeFromText(res.out.ProbeFrom))
-			if pair := e.relayKCPPairGet(dc.peer); pair != nil {
-				pair.noteSeed("timeout", f.name, res.dial.String())
-			}
+			e.noteSeed(dc.peer, "timeout", f.name, res.dial.String())
 			continue
 		}
 		winner = idx
@@ -1528,9 +1570,7 @@ func (dc *directConn) punch() {
 		}
 		dc.noteRound("%s %s (%s up)", fams[idx].name, word, fams[winner].name)
 		if res.err == nil {
-			if pair := e.relayKCPPairGet(dc.peer); pair != nil {
-				pair.noteSeed("ok", fams[idx].name, res.dial.String())
-			}
+			e.noteSeed(dc.peer, "ok", fams[idx].name, res.dial.String())
 		}
 	}
 
@@ -1538,9 +1578,7 @@ func (dc *directConn) punch() {
 	sock := win.sock
 	win.sock = nil // owned by the pair's direct underlay
 	closeFams()    // drop the cancelled families' sockets
-	if pair := e.relayKCPPairGet(dc.peer); pair != nil {
-		pair.noteSeed("ok", win.name, dials[winner].String())
-	}
+	e.noteSeed(dc.peer, "ok", win.name, dials[winner].String())
 	// The peer's NAT shape, as this round saw it: the endpoint it answered
 	// from, against the endpoints it announced (the freshest list, in this
 	// round's family). A peer that answers from somewhere else has a mapping
@@ -1557,7 +1595,14 @@ func (dc *directConn) punch() {
 	// Register the endpoint that actually answered the seed, not the stale
 	// candidate that was dialed: the steady-state underlay filters by source,
 	// so it must follow the completed path.
-	dc.markUp(sock, winOut.Answer, winOut.Token)
+	if err := dc.markUp(sock, winOut.Answer, winOut.Token); err != nil {
+		// The transport refused the underlay (a QUIC pair that closed while the
+		// round was in flight): markUp closed the socket and did not mark the
+		// path up, so the normal backoff owns the retry.
+		e.log.Debug("direct punch: install failed", "peer", pname, "family", win.name, "error", err)
+		dc.backoff()
+		return
+	}
 	dc.noteRound("%s up", win.name)
 	e.log.Debug("direct established", "peer", pname, "family", win.name,
 		"mine", candAddrs(win.mine), "peerAddr", winOut.Answer.String())
