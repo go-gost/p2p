@@ -481,8 +481,10 @@ Expected: PASS（这是 KCP 行为的回归门）。
   - `func (e *engine) quicPairFor(peer, role) *quicPair`。
   - `handleControl` 的 `ctrlCaps` 分支调用 `decodeCaps`、`addCaps`、`e.maybeStartQUIC(src)`；`ctrlSecure` 在 QUIC 模式直接忽略。
   - `OpenStream`：`e.transport==transportQUIC` 时 `ensureTransport` + `pair.openStream`；否则现有 KCP 路径。
-  - `pump`：QUIC 模式下 `frameData` 在 pair 已建立时交给 `pair.deliverRelay(pkt)`（`relayQUICConn` 的 `in` channel），不调用 `ensureSession`；pair 尚未建立时 `maybeStartQUIC(src)` 并丢弃该 data（控制帧会继续驱动握手）；KCP 模式不变。
+  - `pump` 保持 Task 6 的 `pc.deliverData(pkt)`；QUIC 模式下由 `peerConn` 的 data sink 接管，不再走 `ensureSession`/`deliverInbound`。KCP 模式 sink 为 nil，行为不变。
+  - `e.peerConn`（新建/替换 adapter 时）在 `transport==transportQUIC` 下安装 QUIC sink：sink 把 payload 非阻塞投递到当前 `quicPair` 的 `relayQUICConn.in`；pair 尚未建立时触发 `maybeStartQUIC` 并丢弃该 payload（控制帧继续驱动握手），**绝不能落回 KCP**。sink 需检查 `pc.closed`/pair 指针；adapter 替换后必须重新安装（Task 6 review carry-forward）。
   - `quicPair.deliverRelay(pkt []byte)`：非阻塞投递到 `relayQUICConn` 的 `in`。
+  - `ensureTransport` 在 QUIC 模式下为每个 peer 创建 `relayQUICConn`（`in` channel、`send=pc.Write`、`quicRelayOptions` 来自 `e.quicCfg`），`pair.addRelayUnderlay(relayConn)` 后 `establish`；`relayQUICConn.Close` 不关闭 `peerConn`。
   - `type quicRelayOptions struct { BatchBytes int; Flush time.Duration }`；`newRelayQUICConn(in, send, closeFn, opts quicRelayOptions)`。`opts` 来自 `e.quicCfg.RelayBatchBytes/RelayFlush`；0 值用默认。batch 预算必须计入每包的 2 字节长度前缀（`2+len(pkt)`），并保证整帧 ≤ `derpclient.MaxPacketSize`（64 KiB）；单包超过预算则丢弃并计数。
   - `host.New` 设置 `engine.transport/quicCfg/quicID`；`server.status`/`peerTransports` 在 Task 12 扩展。
 
@@ -496,7 +498,7 @@ Expected: PASS（这是 KCP 行为的回归门）。
 
 - [ ] **Step 3: 实现 engine 集成**
 
-`ensureTransport` 的 caps 等待用一个 per-peer `capsWait` channel/`sync.Cond`；`handleControl` 收到 caps 时写入并唤醒。`OpenStream` 分支、`pump` 分支、`maybeStartQUIC`（server 入站 caps 时启动 `Listen`）。QUIC 模式下 `pump` 不调用 `pc.ensureSession`；`pc.setDataSink` 不需要，`pair.deliverRelay` 直接投递。`ctrlSecure` 的 secure 会话在 QUIC 模式下不创建。
+`ensureTransport` 的 caps 等待用一个 per-peer `capsWait` channel/`sync.Cond`；`handleControl` 收到 caps 时写入并唤醒。`OpenStream` 分支、`maybeStartQUIC`（server 入站 caps 时启动 `Listen`）。QUIC 模式下 data sink 由 `e.peerConn` 安装/替换时重新安装：sink 投递到 `relayQUICConn.in`，pair 未就绪则 `maybeStartQUIC` + drop，绝不走 KCP。`ctrlSecure` 的 secure 会话在 QUIC 模式下不创建。
 
 同时把 Task 5 的 `relayQUICConn` 接到 `quicRelayOptions`：`newRelayQUICConn(..., quicRelayOptions{BatchBytes: e.quicCfg.RelayBatchBytes, Flush: e.quicCfg.RelayFlush})`；修正 batch 预算为 `2+len(pkt)`，并测试“配置 64 KiB 时不产生 >64 KiB 的 DERP 帧”。Task 5 的旧测试按新签名更新。
 
@@ -723,34 +725,32 @@ Expected: PASS；KCP 现有测试全部绿。
 
 ---
 
-### Task 14: relay batching 集成、E2E 场景、文档
+### Task 14: E2E 场景、batching 验证、文档
 
 **Files:**
-- Modify: `p2p/internal/host/engine.go`（QUIC relay sink 用 `relayQUICConn`；`frameData` 路由）
-- Modify: `p2p/internal/host/quic.go`（`deliverRelay`/`relayUp` 的 batch 连接）
 - Create: `p2p/tests/e2e/quic_test.go`（或扩展现有 e2e 场景）
 - Modify: `p2p/tests/e2e/e2e_test.go`（新 scenario `quic-direct`）
 - Modify: `p2p/docs/2026-10-29-quic-vs-kcp-smux-spike.md`（加实现状态）
 - Test: `p2p/internal/host/quic_relay_integration_test.go`（新建）
 
 **Interfaces:**
-- Consumes: Task 5 `relayQUICConn`/batching、Task 8 pump、Task 9/10 direct、Task 11 failure。
+- Consumes: Task 8 的 `relayQUICConn`/data-sink 接线、Task 9/10 direct、Task 11 failure。
 - Produces:
-  - `engine` 在 QUIC 模式下为每个 peer 创建 `relayQUICConn`，把 `in` 接到 `peerConn` 的 data sink，把 `send` 接到 `pc.Write`；`relayUp` 重建 batching conn。
+  - `TestQUICRelayBatchingIntegration`：在 fake DERP data 队列上验证 Task 8 的 relay sink + `relayQUICConn` 的 batching/framing；不需要再改 pump。
   - E2E `quic-direct`：两个容器 + derper，`transport: quic`，验证 relay-only、direct 迁移、direct→relay 回落、双向数据。
   - 文档：实现状态、已知限制（单 relay、无 fallback、零 CID/每 peer Transport、1200 MTU）。
 
 - [ ] **Step 1: 写失败测试 `TestQUICRelayBatchingIntegration`**
 
-用 fake DERP data payload 队列 + `relayQUICConn`；发送多个小 QUIC packet，断言对端 `ReadFrom` 能逐个拆出；malformed payload 被丢弃且后续 payload 正常。断言 batch 数 < packet 数（batching 生效）。
+用 fake DERP data payload 队列 + Task 8 的 sink/`relayQUICConn`；发送多个小 QUIC packet，断言对端 `ReadFrom` 能逐个拆出；malformed payload 被丢弃且后续 payload 正常。断言 batch 数 < packet 数（batching 生效），且帧大小 ≤ 64 KiB。
 
 - [ ] **Step 2: 跑测试确认失败**
 
 `bash -lc "cd p2p && GOWORK=off go test ./internal/host/ -run TestQUICRelayBatchingIntegration -count=1"`
 
-- [ ] **Step 3: 接入 pump 的 QUIC relay sink**
+- [ ] **Step 3: 验证 Task 8 的 sink/batching 配置**
 
-`peerConn` 的 QUIC data sink 是 `relayQUICConn` 的入队函数；`relayQUICConn.send` 调 `pc.Write`；`relayUp` 重建 `relayQUICConn`。控制帧仍走 `handleControl`。
+如果 Task 8 已正确接线，这一步只加/修测试；不重复改 pump。确认 `quicRelayOptions` 来自 `e.quicCfg`、batch 预算含 2 字节前缀、`relayUp` 重建 batching conn。
 
 - [ ] **Step 4: 加 E2E `quic-direct` 场景**
 
@@ -771,7 +771,7 @@ E2E（若 Docker 可用）：`bash -lc "cd p2p/tests/e2e && go test -run TestQUI
 
 - [ ] **Step 7: Commit（仅用户要求时）**
 
-`git -C p2p add internal/host/engine.go internal/host/quic.go internal/host/quic_relay_integration_test.go tests/e2e/... docs/... && git -C p2p commit -m "feat: integrate quic relay batching and e2e"`
+`git -C p2p add internal/host/quic_relay_integration_test.go tests/e2e/... docs/... && git -C p2p commit -m "test: add quic relay batching e2e and docs"`
 
 ---
 
