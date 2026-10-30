@@ -404,6 +404,35 @@ func TestRelayWatchdogZeroRelayStampClampsEvidence(t *testing.T) {
 	}
 }
 
+// TestRelayWatchdogVirginPairStandsDown: a pair that has never received a
+// datagram on either underlay has no silence to measure. time.Since(zero) is
+// uptime-shaped noise, not an observation, and treating it as one killed a
+// freshly built session on the watchdog's first tick — before the peer's
+// first smux NOP (3s) had a chance to arrive.
+func TestRelayWatchdogVirginPairStandsDown(t *testing.T) {
+	shortenRelayIdle(t)
+	capture := &logCapture{}
+	peer := derpclient.PublicKey{60}
+	e, _, pair := watchdogEngine(t, capture, peer)
+
+	if strike, silentFor := pair.reportRelayIdle(); strike != 0 || silentFor != 0 {
+		t.Fatalf("virgin report = (%d, %v), want (0, 0): nothing has been observed yet", strike, silentFor)
+	}
+
+	// Ride the real ticker for several windows: no evidence, no strike, and
+	// the pair stays live.
+	time.Sleep(10 * time.Duration(relayIdleWindow.Load()))
+	if got := capture.count("relay path silent"); got != 0 {
+		t.Fatalf("evidence lines = %d, want 0: a virgin pair has no verdict", got)
+	}
+	if got := capture.count("peer session killed"); got != 0 {
+		t.Fatalf("killed lines = %d, want 0: the watchdog must not kill a session it never measured", got)
+	}
+	if got := e.relayKCPPairGet(peer); got != pair {
+		t.Fatal("the virgin pair was dropped")
+	}
+}
+
 // TestRelayWatchdogExitsWithPair: the watchdog shares the pair's lifetime —
 // dropRelayKCP (the strike-2 end, or any pair reset) must end its goroutine,
 // not leak one ticker per dead pair.

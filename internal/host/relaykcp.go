@@ -772,8 +772,9 @@ func (p *relayKCPPair) pumpRelay() {
 // silence — either underlay carrying resets it — not relay silence: a
 // session living on direct sends nothing over the relay underlay, and
 // treating that quiet as an outage would kill every stable direct session's
-// mux once per window. (0, 0) means no action: either the pair is carrying,
-// or this episode already fired (the latch, same as pumpDirect's idleFired).
+// mux once per window. (0, 0) means no action: the pair is carrying, has
+// never carried on either underlay (nothing measured yet), or this episode
+// already fired (the latch, same as pumpDirect's idleFired).
 // A rebuild re-arms the latch for the new session (see rearmRelayIdle) while
 // the strikes carry, so a silence that survives a rebuild escalates; traffic
 // on either path clears both at its stamp site, ending the episode.
@@ -795,6 +796,16 @@ func (p *relayKCPPair) reportRelayIdle() (strike int, silentFor time.Duration) {
 	fresh := p.lastRelayRecv
 	if p.lastDirectRecv.After(fresh) {
 		fresh = p.lastDirectRecv
+	}
+	if fresh.IsZero() {
+		// Neither underlay has carried a datagram yet: there is no silence to
+		// measure, only the absence of an observation. time.Since(zero) is
+		// uptime-shaped noise — the same reason silentFor is reported as 0
+		// below — and firing on it killed a freshly built session on the
+		// watchdog's first tick, before the peer's first smux NOP (3s) could
+		// arrive. The connection-level probe and the smux keepalive own a pair
+		// that never carries anything.
+		return 0, 0
 	}
 	if time.Since(fresh) < time.Duration(relayIdleWindow.Load()) {
 		return 0, 0
