@@ -107,6 +107,12 @@ type engine struct {
 	// a fresh registration cures it. Guarded by mu.
 	relayHandshakeFails  int
 	relayHandshakeFailAt time.Time
+	// relayHealStage counts re-registrations since the last successful relay
+	// handshake: stage 1 is a fresh registration, stage 2 and beyond also drop
+	// every QUIC pair first (the automatic equivalent of the process restart
+	// that used to be needed). A handshake that succeeds resets it. Guarded by
+	// mu.
+	relayHealStage int
 	// relayKCPs holds one relay KCP holder per peer, on the same principle as
 	// secure: the pair's KCP session outlives any one adapter, so an adapter
 	// swap does not restart the pair's sequence epoch under a peer whose
@@ -4329,11 +4335,18 @@ func relayHandshakeBlackhole(fails int, relayUp, relayPeers bool, sinceHeal time
 }
 
 // resetRelayHandshakeFailures closes the handshake-failure run: a handshake
-// just completed, so the registration is demonstrably routable.
+// just completed, so the registration is demonstrably routable. If a heal was
+// in progress this is the verdict the next outage will want: the
+// re-registration worked, and at which stage.
 func (e *engine) resetRelayHandshakeFailures() {
 	e.mu.Lock()
 	e.relayHandshakeFails = 0
+	stage := e.relayHealStage
+	e.relayHealStage = 0
 	e.mu.Unlock()
+	if stage > 0 {
+		e.log.Info("relay registration restored", "after_stage", stage)
+	}
 }
 
 // hasRelayPeer reports whether any peer currently has a live session over the
@@ -4385,12 +4398,24 @@ func (e *engine) noteRelayHandshakeFailure(peer derpclient.PublicKey) {
 	}
 	e.lastControlHeal = time.Now()
 	e.relayHandshakeFails = 0
+	e.relayHealStage++
+	stage := e.relayHealStage
 	e.mu.Unlock()
 
-	e.log.Error("relay handshake blackhole: no peer connected, re-registering the relay",
-		"peer", keyName(peer), "fails", fails)
-	e.reconnectRelay(fmt.Errorf("peer %s: %d relay handshakes failed with no peer connected",
-		keyName(peer), fails))
+	if stage >= 2 {
+		// A fresh registration did not clear it: drop everything the previous
+		// stage left behind too, which is what restarting the process did
+		// before this tripwire existed. The relay is already unusable here, so
+		// nothing connected loses anything real.
+		e.log.Error("relay registration blackhole persists: dropping QUIC state and re-registering",
+			"peer", keyName(peer), "fails", fails, "stage", stage)
+		e.closeAllQUIC()
+	} else {
+		e.log.Error("relay handshake blackhole: no peer connected, re-registering the relay",
+			"peer", keyName(peer), "fails", fails, "stage", stage)
+	}
+	e.reconnectRelay(fmt.Errorf("peer %s: %d relay handshakes failed with no peer connected (stage %d)",
+		keyName(peer), fails, stage))
 }
 
 // healControlBlackhole reconnects the relay on the punch control plane's
