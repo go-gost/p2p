@@ -455,3 +455,39 @@ func TestRelayWatchdogExitsWithPair(t *testing.T) {
 		t.Fatalf("evidence lines grew %d -> %d after the pair died: the watchdog outlived it", before, got)
 	}
 }
+
+// TestRelayWatchdogGivesTheRelayAFreshWindowOnFallback: while direct carries a
+// session the relay underlay is idle by design, so when the direct path goes
+// silent and the pair falls back to relay, the silence accumulated behind
+// direct says nothing about the relay. The fallback itself must not be the
+// strike that kills the session: give the relay one full window to carry
+// before judging it. (2026-10-31: a 6s direct stall fell back to relay and the
+// watchdog killed the pair on the same tick, dropped the tun route, and turned
+// a blip into a rebuild.)
+func TestRelayWatchdogGivesTheRelayAFreshWindowOnFallback(t *testing.T) {
+	shortenRelayWindowOnly(t)
+	capture := &logCapture{}
+	peer := derpclient.PublicKey{59}
+	_, _, pair := watchdogEngine(t, capture, peer)
+
+	a := mustListenUDP(t)
+	b := mustListenUDP(t)
+	t.Cleanup(func() { b.Close() })
+	pair.setDirectUnderlay(newDirectUnderlay(a, udpAddrPort(t, b)))
+	// Direct carried the traffic and has now been silent past its idle window;
+	// the relay has been silent for minutes, which is normal behind direct.
+	setPairRecency(pair, time.Now().Add(-5*time.Minute), time.Now().Add(-10*time.Second))
+	if !pair.clearDirectUnderlayIf(nil, pathChangeDirectIdle) {
+		t.Fatal("the stale direct underlay was not retired")
+	}
+
+	if strike, silentFor := pair.reportRelayIdle(); strike != 0 {
+		t.Fatalf("strike = %d (silentFor=%s), want 0: the fallback must give the relay a fresh window", strike, silentFor)
+	}
+	// Once that window has passed without relay traffic, the relay silence is
+	// real evidence again and the watchdog fires.
+	time.Sleep(2 * time.Duration(relayIdleWindow.Load()))
+	if strike, _ := pair.reportRelayIdle(); strike != 1 {
+		t.Fatalf("strike after the grace = %d, want 1: a relay that stays silent is still an outage", strike)
+	}
+}

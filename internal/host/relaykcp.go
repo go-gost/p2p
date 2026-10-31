@@ -408,6 +408,14 @@ type relayKCPPair struct {
 	relayIdleFired bool
 	relayStrikes   int
 
+	// relayWarmAt starts the relay's first full window after a direct→relay
+	// fallback. While direct carries the session the relay underlay is idle by
+	// design, so its recency is old; judging that recency the instant the pair
+	// falls back would fire the watchdog on the fallback itself and kill a
+	// session that has a live relay to move to. Zero when no fallback is
+	// pending. Guarded by mu.
+	relayWarmAt time.Time
+
 	// lastPath is the last preferred path recorded for events/counters (O1/O2),
 	// distinct from appliedPath, which is only the KCP tuning state and stays ""
 	// until a session exists. It starts at "relay" (a fresh pair has no direct
@@ -790,6 +798,15 @@ func (p *relayKCPPair) reportRelayIdle() (strike int, silentFor time.Duration) {
 		p.relayStrikes = 0
 		return 0, 0
 	}
+	// A just-finished fallback owns a fresh window on the relay: the silence it
+	// accumulated behind a busy direct path is not evidence about the relay.
+	// Spend the grace once — past it, the ordinary pair-silence rule applies.
+	if warm := p.relayWarmAt; !warm.IsZero() {
+		if time.Since(warm) < time.Duration(relayIdleWindow.Load()) {
+			return 0, 0
+		}
+		p.relayWarmAt = time.Time{}
+	}
 	// Pair silence, not relay silence: the freshest of the two underlays is
 	// what says the link is carrying. silentFor below stays relay-measured
 	// — it is the evidence, not the decision.
@@ -951,6 +968,14 @@ func (p *relayKCPPair) clearDirectUnderlayIf(want *directUnderlay, reason string
 	}
 	p.direct = nil
 	p.directStop = nil
+	// The pair is falling back to the relay, so the relay starts a fresh
+	// watchdog window here: its own recency was accumulated behind direct and
+	// would otherwise be over the window on the very tick that the fallback
+	// needs it (2026-10-31: the fallback's own silence killed the session).
+	if u != nil {
+		p.relayWarmAt = time.Now()
+		p.relayIdleFired = false
+	}
 	// The path being retired ends any one-way episode it was in. The episode
 	// stays as a dated fact — the peer is about to fall back to the relay,
 	// which is when the reader needs to know the path was one-way.
