@@ -98,6 +98,15 @@ type engine struct {
 	// relay session down, so trips are rate limited engine-wide. Guarded by
 	// mu.
 	lastControlHeal time.Time
+	// relayHandshakeFails counts relay handshakes that failed in a row while
+	// the relay connection itself stayed healthy, and relayHandshakeFailAt is
+	// when the last one was counted (a long gap starts a new streak). With no
+	// peer connected, a run of these is the one signal that our own
+	// registration — not any peer — has gone stale at the relay: the derper
+	// keeps answering our pongs while nothing of ours is delivered, and only
+	// a fresh registration cures it. Guarded by mu.
+	relayHandshakeFails  int
+	relayHandshakeFailAt time.Time
 	// relayKCPs holds one relay KCP holder per peer, on the same principle as
 	// secure: the pair's KCP session outlives any one adapter, so an adapter
 	// swap does not restart the pair's sequence epoch under a peer whose
@@ -1158,9 +1167,11 @@ func (e *engine) establishQUIC(ctx context.Context, peer derpclient.PublicKey, q
 	e.log.Debug("quic handshake", "peer", keyName(peer),
 		"role", quicRoleName(role), "duration", time.Since(start).String(), "error", herr)
 	if herr != nil {
+		e.noteRelayHandshakeFailure(peer)
 		return fmt.Errorf("%w: peer %s: quic handshake: %v",
 			p2p.ErrPeerUnreachable, keyName(peer), herr)
 	}
+	e.resetRelayHandshakeFailures()
 	e.log.Debug("transport selected", "peer", keyName(peer), "transport", "quic",
 		"role", quicRoleName(role), "duration", time.Since(start).String())
 	return nil
@@ -4302,6 +4313,84 @@ func (e *engine) relaySessionEvidence(peer derpclient.PublicKey) (live, fresh bo
 		return false, false
 	}
 	return false, time.Since(at) < controlBlackholeGrace
+}
+
+// relayHandshakeBlackhole reports whether a run of failed relay handshakes has
+// earned a fresh relay registration. relayUp is the relay connection's own
+// health (pongs still answered), relayPeers whether any peer is currently
+// connected *over the relay* — a direct peer says nothing about our
+// registration — and sinceHeal the age of the last engine-wide reconnect. A
+// relay-connected peer proves the registration is being routed, so a silent
+// peer is that peer's problem; the cooldown is the control-blackhole cure's,
+// because both trips tear every relay session down.
+func relayHandshakeBlackhole(fails int, relayUp, relayPeers bool, sinceHeal time.Duration) bool {
+	return relayUp && !relayPeers && fails >= controlBlackholeThreshold &&
+		sinceHeal >= controlBlackholeCooldown
+}
+
+// resetRelayHandshakeFailures closes the handshake-failure run: a handshake
+// just completed, so the registration is demonstrably routable.
+func (e *engine) resetRelayHandshakeFailures() {
+	e.mu.Lock()
+	e.relayHandshakeFails = 0
+	e.mu.Unlock()
+}
+
+// hasRelayPeer reports whether any peer currently has a live session over the
+// relay. It is the tripwire's evidence that our registration is being routed.
+func (e *engine) hasRelayPeer() bool {
+	for _, tr := range e.peerTransports() {
+		if tr == transportRelay {
+			return true
+		}
+	}
+	return false
+}
+
+// noteRelayHandshakeFailure records one failed relay QUIC handshake and, when
+// the failure run is long enough, re-registers the relay. This is the case no
+// other tripwire covers: the relay connection is healthy (pongs answered,
+// frames flowing), yet every handshake through it times out because the
+// derper's routing for our key has gone stale — the peer restarts do not help
+// and only a fresh registration does. Requiring no relay-connected peer keeps
+// a lone offline phone from churning the relay: with such a peer, our
+// registration is evidently working.
+func (e *engine) noteRelayHandshakeFailure(peer derpclient.PublicKey) {
+	if !e.relayConnected() {
+		e.resetRelayHandshakeFailures()
+		return
+	}
+	now := time.Now()
+	e.mu.Lock()
+	// Handshake attempts are ~10s apart (the handshake deadline). A gap far
+	// beyond that means the run ended, not that it continued.
+	if now.Sub(e.relayHandshakeFailAt) > time.Minute {
+		e.relayHandshakeFails = 0
+	}
+	e.relayHandshakeFails++
+	e.relayHandshakeFailAt = now
+	fails := e.relayHandshakeFails
+	sinceHeal := now.Sub(e.lastControlHeal)
+	e.mu.Unlock()
+
+	if !relayHandshakeBlackhole(fails, true, e.hasRelayPeer(), sinceHeal) {
+		return
+	}
+	// Claim the shared cooldown: the reconnect and the control-blackhole cure
+	// are the same action, so they must not both fire.
+	e.mu.Lock()
+	if time.Since(e.lastControlHeal) < controlBlackholeCooldown {
+		e.mu.Unlock()
+		return
+	}
+	e.lastControlHeal = time.Now()
+	e.relayHandshakeFails = 0
+	e.mu.Unlock()
+
+	e.log.Error("relay handshake blackhole: no peer connected, re-registering the relay",
+		"peer", keyName(peer), "fails", fails)
+	e.reconnectRelay(fmt.Errorf("peer %s: %d relay handshakes failed with no peer connected",
+		keyName(peer), fails))
 }
 
 // healControlBlackhole reconnects the relay on the punch control plane's
