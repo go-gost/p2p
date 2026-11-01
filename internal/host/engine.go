@@ -4447,13 +4447,21 @@ func (e *engine) healControlBlackhole(peer derpclient.PublicKey, misses int) {
 // registers with it afresh. Nothing smaller cures a stale registration: the
 // relay's routing table is per connection, and it is the registration that has
 // gone stale.
-func (e *engine) reconnectRelay(cause error) {
+// reconnectRelay tears the shared relay connection down, so the redial loop
+// registers with it afresh. Nothing smaller cures a stale registration: the
+// relay's routing table is per connection, and it is the registration that has
+// gone stale. It reports whether a connection was up to tear down, which a
+// caller acting on a local network change uses to tell "re-registered" from
+// "there was nothing to re-register".
+func (e *engine) reconnectRelay(cause error) bool {
 	e.mu.Lock()
 	c := e.client
 	e.mu.Unlock()
-	if c != nil {
-		e.teardown(c, cause)
+	if c == nil {
+		return false
 	}
+	e.teardown(c, cause)
+	return true
 }
 
 // sessionLocked brings up the peer's relay mux session if it is not already

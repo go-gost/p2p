@@ -121,6 +121,16 @@ func (e *Endpoint) AddForward(listen, peerKey string) error {
 	return e.h.AddForward(listen, peerKey)
 }
 
+// ReconnectRelay forces a fresh relay registration, for a caller that knows the
+// local network changed (an existing socket stays bound to the network it was
+// created on). It reports whether a relay connection was up.
+func (e *Endpoint) ReconnectRelay(cause string) bool {
+	if e == nil || e.h == nil {
+		return false
+	}
+	return e.h.ReconnectRelay(cause)
+}
+
 // Dial opens a tunnel to peer and returns its local end. network selects the
 // tunnel's semantics: "udp" (any udp variant) asks for a datagram tunnel, and
 // anything else for a byte stream. peer is a base64 public key in relay mode, a

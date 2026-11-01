@@ -164,6 +164,18 @@ func (h *Host) Connect() error {
 	return h.prepareErr
 }
 
+// ReconnectRelay forces a fresh relay registration. A caller that knows the
+// local network changed needs it: existing sockets stay bound to the network
+// they were created on, so a Wi-Fi <-> cellular switch leaves the old relay
+// connection writing into a path that no longer routes, while the process
+// still believes it is connected. It reports whether a connection was up.
+func (h *Host) ReconnectRelay(cause string) bool {
+	if h.engine == nil {
+		return false
+	}
+	return h.engine.reconnectRelay(fmt.Errorf("local network changed: %s", cause))
+}
+
 // PublicKey returns the host's base64 DERP public key, or "" in stub mode.
 func (h *Host) PublicKey() string {
 	if h.engine == nil {

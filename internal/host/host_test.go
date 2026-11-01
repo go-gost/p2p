@@ -172,3 +172,18 @@ func TestTunnelStreamIntegrityUnderBackpressure(t *testing.T) {
 		t.Fatal("timed out waiting for the peer to drain the tunnel")
 	}
 }
+
+// TestHostReconnectRelayWithoutEngine: a stub-mode host (no relay configured)
+// has no registration to replace. It must say so rather than panic or pretend
+// a reconnect happened — the Android network callback calls this on every
+// default-network change, including before a relay was ever configured.
+func TestHostReconnectRelayWithoutEngine(t *testing.T) {
+	h, err := New(&p2p.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	if h.ReconnectRelay("wlan0") {
+		t.Fatal("stub-mode host reported a relay connection to reconnect")
+	}
+}
