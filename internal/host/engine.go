@@ -1523,6 +1523,59 @@ type quicPeerTeardown struct {
 	relayInstalled bool
 }
 
+// onSessionReset handles a peer's announcement that it has registered again.
+// It is the peer-gone cure the peer itself delivers, for the restarts the relay
+// never reports (see ctrlSessionReset).
+func (e *engine) onSessionReset(peer derpclient.PublicKey) {
+	e.log.Debug("session reset", "peer", keyName(peer))
+	// The same two effects the relay's own notice has for a live direct path:
+	// the relay half of the pair is retired (the registration under it is the
+	// stale one), and the QUIC session state is forgotten so the next handshake
+	// negotiates instead of short-circuiting.
+	if pair := e.relayKCPPairGet(peer); pair != nil {
+		pair.retireRelay()
+		pair.noteRelayLoss(true, string(reasonPeerGone))
+	}
+	e.invalidateQUICPeerSession(peer)
+	// Kick a rebuild now rather than at the next open: the registration this
+	// will handshake through has just become fresh, and an idle pair would
+	// otherwise sit on the stale one until traffic arrives.
+	e.closeQUICIfUnpaired(peer)
+	e.maybeKickDirect(peer)
+}
+
+// peersSnapshot returns the keys this engine currently holds state for, so a
+// caller can act on them without holding e.mu across the work.
+func (e *engine) peersSnapshot() []derpclient.PublicKey {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]derpclient.PublicKey, 0, len(e.peers))
+	for p := range e.peers {
+		out = append(out, p)
+	}
+	return out
+}
+
+// closeQUICIfUnpaired drops a QUIC state whose pair has no live direct path
+// left, so the next open builds a fresh one instead of riding the stale one.
+// A reset means the peer's session is gone, so a pair back on the relay (or one
+// that never reached direct) can only be rebuilt.
+func (e *engine) closeQUICIfUnpaired(peer derpclient.PublicKey) {
+	e.quicMu.Lock()
+	qp := e.quics[peer]
+	drop := qp != nil && (qp.pair == nil || !qp.pair.hasDirect())
+	e.quicMu.Unlock()
+	if drop {
+		e.closeQUIC(peer)
+	}
+}
+
+// sendSessionReset tells the peer this host has just registered again, so
+// whatever it knows about our session is stale (see ctrlSessionReset).
+func (e *engine) sendSessionReset(peer derpclient.PublicKey) error {
+	return e.sendControl(peer, ctrlSessionReset, e.priv.SealTo(peer, nil))
+}
+
 // invalidateQUICPeerSession forgets everything the peer's QUIC state says
 // about the session it had, while leaving the pair itself alone.
 //
@@ -2272,6 +2325,17 @@ func (e *engine) reconnect() {
 				e.log.Debug("relay reconnected, punching again", "peers", len(punch))
 				for _, dc := range punch {
 					go dc.kick()
+				}
+			}
+			// Tell the peers we have just registered again. The relay's own
+			// notice cannot be relied on here (see ctrlSessionReset), and a
+			// restart that only this side knows about is exactly the case that
+			// cost a full handshake deadline per attempt. Sent to the peers we
+			// have state for — a peer we have never spoken to has nothing stale
+			// to forget, and its own reconnect announcement covers that side.
+			if wasDown && e.client != nil {
+				for _, peer := range e.peersSnapshot() {
+					go func(p derpclient.PublicKey) { _ = e.sendSessionReset(p) }(peer)
 				}
 			}
 		}
@@ -3626,6 +3690,16 @@ func (e *engine) handleControl(src derpclient.PublicKey, body []byte) {
 			// wait for a local OpenStream. Non-blocking.
 			e.maybeStartQUIC(src)
 		}
+	case ctrlSessionReset:
+		// The peer restarted: forget what we knew about the session it had, so
+		// the next handshake is negotiated fresh instead of short-circuiting
+		// against state that belongs to a connection the peer no longer holds.
+		// Sealed, so only the peer it names can send it.
+		if _, ok := e.priv.OpenFrom(src, body[1:]); !ok {
+			e.log.Debug("session reset: bad box", "peer", keyName(src))
+			return
+		}
+		e.onSessionReset(src)
 	case ctrlSecure:
 		if e.transport == transportQUIC {
 			// QUIC has its own TLS 1.3 handshake; the secure record layer is

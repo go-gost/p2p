@@ -46,6 +46,22 @@ const (
 	// 0x03 was the udp dial notice: a datagram link now always presents its own
 	// edge, so no notice is sent and none is acted on. The kind stays unused.
 	ctrlSecure = 0x05 // sealed [transport][ephemeral X25519 public key]
+	// ctrlSessionReset is the peer saying "the session you know me by is gone;
+	// I have just registered again". The receiver forgets that peer's session
+	// state and rebuilds from the fresh registration.
+	//
+	// It exists because the relay's own notice cannot be relied on. A derper
+	// reports a peer gone only when it has a packet for it that it cannot
+	// deliver, so a peer that restarts while this host is idle produces no
+	// notice at all — and when one does arrive while a direct path is live, the
+	// H1 branch keeps the pair. Either way the next handshake rides a routing
+	// entry that now points nowhere, and each attempt costs its full deadline.
+	// Measured on a real hub and phone: a restart took 20-35s where a healthy
+	// handshake takes ~50ms, and the 3x10s was the whole of it.
+	//
+	// Sealed to the peer like every other control frame: only the key it names
+	// can send it, so a third party cannot tear down someone else's session.
+	ctrlSessionReset = 0x06
 )
 
 // Capability bits exchanged via ctrlCaps. Bit 0 marks IPv6 awareness. The frame

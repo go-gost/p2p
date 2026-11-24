@@ -575,3 +575,82 @@ func TestQUICPeerGoneClearsHandshakeUnderLiveDirect(t *testing.T) {
 			"will short-circuit on a session the peer no longer has")
 	}
 }
+
+// TestQUICSessionResetRebuildsFromFreshRouting is the second half of the restart
+// problem, and the half the derper cannot help with.
+//
+// The peer-gone notice is best-effort: it depends on the derper noticing an
+// undeliverable packet, and on this host having a live direct path at that
+// moment it takes the H1 branch. Measured on the deployed hub, restarts where
+// the notice never arrived still spent three 10s handshake deadlines —
+// TestQUICPeerGoneClearsHandshakeUnderLiveDirect does not cover those, because
+// nothing told the hub anything.
+//
+// So the peer says it itself: on reconnect it sends ctrlSessionReset, and the
+// receiver forgets what it knew about that peer's session and rebuilds. The
+// message is sealed to the peer's key like every other control frame, so only
+// the peer it names can send it.
+func TestQUICSessionResetRebuildsFromFreshRouting(t *testing.T) {
+	a, b := newQUICFailurePair(t, true)
+	establishQUICRelayAndDirect(t, a, b)
+
+	if a.getQUIC(b.pub) == nil {
+		t.Fatal("no QUIC pair before the reset")
+	}
+
+	// b restarts and announces it. From a's side this must look exactly like a
+	// peer-gone: the session state goes, the direct path stays.
+	b.sendSessionReset(a.pub)
+
+	waitFor(t, 5*time.Second, func() bool {
+		a.quicMu.Lock()
+		qp := a.quics[b.pub]
+		cached := qp != nil && qp.haveCaps
+		a.quicMu.Unlock()
+		return !cached
+	})
+	if !hasDirect(a, b.pub) {
+		t.Fatal("the reset retired the direct path, which it must not")
+	}
+
+	// And the peer can be reached again immediately: this is the whole point.
+	s, err := a.OpenStream(b.PublicKey())
+	if err != nil {
+		t.Fatalf("OpenStream after a session reset: %v", err)
+	}
+	defer s.Close()
+	roundTrip(t, s, "after-session-reset")
+}
+
+// TestQUICSessionResetRequiresThePeersSeal: only the named peer can reset its
+// own session. A frame sealed by a third party must be dropped, or anyone who
+// learns a key could tear down another host's connections.
+func TestQUICSessionResetRejectsForeignSeal(t *testing.T) {
+	a, b := newQUICFailurePair(t, true)
+	establishQUICRelayAndDirect(t, a, b)
+
+	// A third identity that a has never dealt with.
+	privC, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sealed by C, claiming to be B: the open must fail, because a looks for a
+	// box from B's key.
+	a.quicMu.Lock()
+	before := a.quics[b.pub]
+	a.quicMu.Unlock()
+	if before == nil {
+		t.Fatal("no QUIC state before the forged frame")
+	}
+
+	a.handleControl(b.pub, append([]byte{ctrlSessionReset}, privC.SealTo(b.pub, nil)...))
+
+	// Nothing changed: the peer's own state is untouched.
+	a.quicMu.Lock()
+	after := a.quics[b.pub]
+	a.quicMu.Unlock()
+	if after != before {
+		t.Fatal("a foreign-sealed reset frame replaced the peer's state")
+	}
+}
