@@ -134,6 +134,12 @@ type engine struct {
 	// must not resurrect the state: the peer (or the engine) already decided it
 	// is gone. An explicit quicPeerLocked creation clears the mark.
 	quicDead map[derpclient.PublicKey]struct{}
+	// announcedPeers are the peers this engine was asked to serve (Warm/Punch),
+	// whichever transport. They are the peers to tell "my session is new" when
+	// the relay connection comes up: the ones we have never been asked about
+	// have nothing stale on the other side, and peers with live state are
+	// covered by peersSnapshot. Guarded by e.mu.
+	announcedPeers map[derpclient.PublicKey]struct{}
 	// relayMu serializes relay-underlay installation. An establishment and a
 	// reconnect restore can otherwise race to install the peer's relay path,
 	// and the loser would hand the pair an underlay the other just closed.
@@ -1544,6 +1550,35 @@ func (e *engine) onSessionReset(peer derpclient.PublicKey) {
 	e.maybeKickDirect(peer)
 }
 
+// noteAnnouncedPeer records a peer this engine was asked to serve, so the next
+// relay registration can tell it the session is new even when no peerConn
+// exists yet (a cold start reaches ensureTransport before any peer state does).
+func (e *engine) noteAnnouncedPeer(peer derpclient.PublicKey) {
+	e.mu.Lock()
+	if e.announcedPeers == nil {
+		e.announcedPeers = make(map[derpclient.PublicKey]struct{})
+	}
+	e.announcedPeers[peer] = struct{}{}
+	e.mu.Unlock()
+}
+
+// resetAnnounceTargets returns the peers to tell "my relay session is new": the
+// ones we were asked to serve plus any that have live state, deduplicated.
+func (e *engine) resetAnnounceTargets() []derpclient.PublicKey {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]derpclient.PublicKey, 0, len(e.announcedPeers)+len(e.peers))
+	for p := range e.announcedPeers {
+		out = append(out, p)
+	}
+	for p := range e.peers {
+		if _, dup := e.announcedPeers[p]; !dup {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // peersSnapshot returns the keys this engine currently holds state for, so a
 // caller can act on them without holding e.mu across the work.
 func (e *engine) peersSnapshot() []derpclient.PublicKey {
@@ -2246,21 +2281,22 @@ var (
 
 func newEngine(url, target string, priv derpclient.PrivateKey, log *slog.Logger) *engine {
 	e := &engine{
-		url:       url,
-		targets:   newTargetPool(),
-		direct:    true,
-		priv:      priv,
-		pub:       priv.Public(),
-		peers:     make(map[derpclient.PublicKey]*peerConn),
-		directs:   make(map[derpclient.PublicKey]*directConn),
-		links:     make(map[derpclient.PublicKey][]*link),
-		gone:      make(map[derpclient.PublicKey]bool),
-		secure:    make(map[secureKey]*secureSession),
-		relayKCPs: make(map[derpclient.PublicKey]*relayKCPPair),
-		quics:     make(map[derpclient.PublicKey]*quicPeer),
-		v6Probe:   v6Egress,
-		log:       log,
-		stop:      make(chan struct{}),
+		url:            url,
+		targets:        newTargetPool(),
+		direct:         true,
+		priv:           priv,
+		pub:            priv.Public(),
+		peers:          make(map[derpclient.PublicKey]*peerConn),
+		directs:        make(map[derpclient.PublicKey]*directConn),
+		links:          make(map[derpclient.PublicKey][]*link),
+		gone:           make(map[derpclient.PublicKey]bool),
+		secure:         make(map[secureKey]*secureSession),
+		relayKCPs:      make(map[derpclient.PublicKey]*relayKCPPair),
+		quics:          make(map[derpclient.PublicKey]*quicPeer),
+		announcedPeers: make(map[derpclient.PublicKey]struct{}),
+		v6Probe:        v6Egress,
+		log:            log,
+		stop:           make(chan struct{}),
 	}
 	if target != "" {
 		if err := e.addTargets([]string{target}); err != nil {
@@ -2334,7 +2370,9 @@ func (e *engine) reconnect() {
 			// have state for — a peer we have never spoken to has nothing stale
 			// to forget, and its own reconnect announcement covers that side.
 			if wasDown && e.client != nil {
-				for _, peer := range e.peersSnapshot() {
+				targets := e.resetAnnounceTargets()
+				e.log.Debug("relay registered, announcing a new session", "peers", len(targets))
+				for _, peer := range targets {
 					go func(p derpclient.PublicKey) { _ = e.sendSessionReset(p) }(peer)
 				}
 			}

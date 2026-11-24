@@ -654,3 +654,32 @@ func TestQUICSessionResetRejectsForeignSeal(t *testing.T) {
 		t.Fatal("a foreign-sealed reset frame replaced the peer's state")
 	}
 }
+
+// TestResetAnnounceTargetsIncludesWarmedPeers: a cold start announces itself
+// before any peer state exists.
+//
+// The first call on a fresh host is Warm/Punch, which reaches ensureTransport
+// without ever building a peerConn — so a target list drawn from e.peers is
+// empty exactly when the announcement matters most. Measured on a real phone:
+// the first start after the fix still took 35s because nothing was sent, even
+// though the frame and its handler were in place.
+func TestResetAnnounceTargetsIncludesWarmedPeers(t *testing.T) {
+	a, _ := newQUICFailurePair(t, false)
+	peer := derpclient.PublicKey{7}
+
+	if got := a.resetAnnounceTargets(); len(got) != 0 {
+		t.Fatalf("a fresh engine has %d announce targets, want none", len(got))
+	}
+
+	a.noteAnnouncedPeer(peer)
+	got := a.resetAnnounceTargets()
+	if len(got) != 1 || got[0] != peer {
+		t.Fatalf("announce targets = %v, want the warmed peer", got)
+	}
+
+	// Deduplicated: a peer that also has live state is announced once.
+	a.peerConn(peer)
+	if got := a.resetAnnounceTargets(); len(got) != 1 {
+		t.Fatalf("announce targets = %v, want the peer once", got)
+	}
+}

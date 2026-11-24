@@ -236,6 +236,10 @@ func (h *Host) warm(peerB64 string, punch bool) error {
 	if err != nil {
 		return err
 	}
+	// Remember the peer: a cold start reaches here before any peer state
+	// exists, and this is what lets the relay registration announce itself to
+	// the peers it was asked to serve (see ctrlSessionReset).
+	h.engine.noteAnnouncedPeer(peer)
 	if h.engine.transport == transportQUIC {
 		// Warm means "have a data path to this peer ready". In QUIC mode that
 		// is the QUIC pair; the KCP warm path would build exactly the session
