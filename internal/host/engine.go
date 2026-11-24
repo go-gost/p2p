@@ -1523,6 +1523,44 @@ type quicPeerTeardown struct {
 	relayInstalled bool
 }
 
+// invalidateQUICPeerSession forgets everything the peer's QUIC state says
+// about the session it had, while leaving the pair itself alone.
+//
+// The distinction matters because peerGone arrives in two very different
+// situations. Our own relay link dropping is not one of them (that is teardown,
+// and there the pair must survive on its direct path — see
+// TestQUICRelayLossKeepsDirect). This one is the peer going away: it restarted,
+// so the caps it advertised describe a connection that no longer exists, and
+// the registration our next handshake would ride is the one the derper has just
+// marked undeliverable for it.
+//
+// Keeping either of those is what made a phone's restart cost 20-35s: the cached
+// caps short-circuit the caps exchange, and the surviving pair means every open
+// rides it into three 10s handshake deadlines. Clearing them costs one caps
+// round trip on a peer that comes back, and nothing on a peer that does not.
+//
+// The pair is deliberately left in place: its direct underlay is what carries a
+// live session through the notice (H1), and the relay half is re-attached by
+// relayRestoredQUIC once the registration is fresh.
+func (e *engine) invalidateQUICPeerSession(peer derpclient.PublicKey) {
+	e.quicMu.Lock()
+	qp := e.quics[peer]
+	if qp == nil {
+		e.quicMu.Unlock()
+		return
+	}
+	qp.caps = capsInfo{}
+	qp.haveCaps = false
+	qp.capsSent = false
+	if qp.setup != nil {
+		// A handshake in flight was negotiated against the session that just
+		// died; let it fail now instead of waiting out its deadline, and let
+		// its waiters see the outcome.
+		qp.setup.cancel()
+	}
+	e.quicMu.Unlock()
+}
+
 // closeQUIC tears down and forgets the peer's pair. It does not touch the
 // peer adapter, which the engine owns.
 func (e *engine) closeQUIC(peer derpclient.PublicKey) {
@@ -3874,6 +3912,7 @@ func (e *engine) peerGone(peer derpclient.PublicKey) {
 			pair.retireRelay()
 			pair.noteRelayLoss(true, string(reasonPeerGone))
 		}
+		e.invalidateQUICPeerSession(peer)
 		e.log.Debug("derp peer gone", "peer", keyName(peer), "suppressed", true)
 		return
 	}

@@ -532,3 +532,46 @@ func TestQUICRelayTeardownRestoreOrder(t *testing.T) {
 		t.Fatal("stale relayDown disturbed the QUIC pair")
 	}
 }
+
+// TestQUICPeerGoneClearsHandshakeUnderLiveDirect is the phone-restart bug in one
+// test, and it is deliberately narrower than "drop everything".
+//
+// H1 protects the direct path across a *relay* blip: the pair must survive our
+// own relay loss, keep its streams, and re-attach an underlay when the relay
+// returns (TestQUICRelayLossKeepsDirect). This case is a different event —
+// peerGone, the peer itself going away — and there the pair's control plane is
+// exactly what went stale: the relay registration it would re-handshake through
+// still points at the peer's old connection, so every open rode the surviving
+// pair and timed out three times at 10s. The phone's restart then cost 20-35s
+// instead of the ~50ms a healthy handshake takes.
+//
+// So: the direct path and the pair object stay (H1), but the handshake state
+// that says "this peer is already established with us" must be invalidated, or
+// the next establish() short-circuits against a session that no longer exists
+// on the other side.
+func TestQUICPeerGoneClearsHandshakeUnderLiveDirect(t *testing.T) {
+	a, b := newQUICFailurePair(t, true)
+	establishQUICRelayAndDirect(t, a, b)
+
+	if a.getQUIC(b.pub) == nil {
+		t.Fatal("no QUIC pair before the peer-gone notice")
+	}
+
+	a.peerGone(b.pub)
+
+	// H1's promise: the direct path survives.
+	if !hasDirect(a, b.pub) {
+		t.Fatal("peer-gone retired the direct path, which it must not")
+	}
+	// The stale half: caps belong to the session that just died, so a peer
+	// coming back must re-exchange them rather than be answered from a cache
+	// describing the connection it no longer has.
+	a.quicMu.Lock()
+	qp := a.quics[b.pub]
+	cached := qp != nil && qp.haveCaps
+	a.quicMu.Unlock()
+	if cached {
+		t.Fatal("peer-gone kept the peer's cached caps; the next establish " +
+			"will short-circuit on a session the peer no longer has")
+	}
+}
