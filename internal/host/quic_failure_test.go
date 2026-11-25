@@ -716,3 +716,64 @@ func TestWarmAnnouncesWhenRelayIsAlreadyUp(t *testing.T) {
 		return !cached
 	})
 }
+
+// TestWarmBeforeRelayAnnouncesWhenItConnects: the cold-start race the
+// transition-gated announcement cannot see.
+//
+// A restarting host warms its peer while its own relay dial is still in flight.
+// The announcement was wired to the down->up transition the reconnect ticker
+// observes, and to an immediately-up relay at warm time — neither applies here:
+// warm saw no client, so it sent nothing but still recorded the peer as already
+// told, and by the first tick the eager Connect had made the client non-nil, so
+// there was no transition to observe. The peer was then never told and kept its
+// stale registration state.
+func TestWarmBeforeRelayAnnouncesWhenItConnects(t *testing.T) {
+	rs := &relayServer{}
+	url := rs.start(t)
+	echo := startEcho(t)
+
+	privA, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privB, _, err := derpclient.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newQUICTestEngine(t, url, echo, privA)
+	b := newQUICTestEngine(t, url, echo, privB)
+
+	// b is up so it can hear; a's relay is still down.
+	if err := b.Connect(); err != nil {
+		t.Fatalf("b connect: %v", err)
+	}
+
+	// b holds a cached session for a — the state the announcement must clear.
+	b.quicMu.Lock()
+	qp := b.quicPeerLocked(a.pub)
+	qp.caps = capsInfo{Bits: capsQUIC}
+	qp.haveCaps = true
+	qp.capsSent = true
+	b.quicMu.Unlock()
+
+	// a warms b while a has no relay at all, so nothing can be sent yet.
+	a.noteAnnouncedPeer(b.pub)
+	b.quicMu.Lock()
+	stillCached := b.quics[a.pub].haveCaps
+	b.quicMu.Unlock()
+	if !stillCached {
+		t.Fatal("a sent a session reset with no relay: want nothing sent")
+	}
+
+	// a's relay comes up; the owed announcement must follow immediately.
+	if err := a.Connect(); err != nil {
+		t.Fatalf("a connect: %v", err)
+	}
+
+	waitFor(t, 5*time.Second, func() bool {
+		b.quicMu.Lock()
+		defer b.quicMu.Unlock()
+		qp := b.quics[a.pub]
+		return qp == nil || !qp.haveCaps
+	})
+}

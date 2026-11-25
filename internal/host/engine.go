@@ -140,6 +140,17 @@ type engine struct {
 	// have nothing stale on the other side, and peers with live state are
 	// covered by peersSnapshot. Guarded by e.mu.
 	announcedPeers map[derpclient.PublicKey]struct{}
+	// announcedTo records the peers already told that the current relay
+	// registration is new, so each registration announces once per peer. It is
+	// cleared when the registration goes away (teardown) and when a peer is
+	// reported gone, because that peer comes back having forgotten us. Guarded
+	// by e.mu.
+	announcedTo map[derpclient.PublicKey]struct{}
+	// announcePending holds peers warmed while no relay was up. Their
+	// announcement is owed as soon as one is, and nothing else would send it:
+	// the reconnect path only fires on a down->up transition, and a warm that
+	// raced the eager dial leaves no transition behind. Guarded by e.mu.
+	announcePending map[derpclient.PublicKey]struct{}
 	// relayMu serializes relay-underlay installation. An establishment and a
 	// reconnect restore can otherwise race to install the peer's relay path,
 	// and the loser would hand the pair an underlay the other just closed.
@@ -1589,13 +1600,67 @@ func (e *engine) noteAnnouncedPeer(peer derpclient.PublicKey) {
 	if e.announcedPeers == nil {
 		e.announcedPeers = make(map[derpclient.PublicKey]struct{})
 	}
-	_, known := e.announcedPeers[peer]
 	e.announcedPeers[peer] = struct{}{}
 	up := e.client != nil
-	e.mu.Unlock()
-	if up && !known {
-		go func() { _ = e.sendSessionReset(peer) }()
+	if !up {
+		// No relay yet is not "nothing to announce": the answer is owed once
+		// the dial lands. Dropping it here was the bug — the peer that warmed a
+		// moment too early was never told, because the eager Connect leaves no
+		// down->up transition for the reconnect ticker to observe.
+		if e.announcePending == nil {
+			e.announcePending = make(map[derpclient.PublicKey]struct{})
+		}
+		e.announcePending[peer] = struct{}{}
 	}
+	e.mu.Unlock()
+	if up {
+		e.announceSession(peer)
+	}
+}
+
+// announceSession tells peer that this host's relay registration is new,
+// unless it has already been told for the current one. It reports whether a
+// frame was sent. A missing relay leaves the peer unmarked, so a later call
+// (see announcePendingSessions) completes the announcement.
+func (e *engine) announceSession(peer derpclient.PublicKey) bool {
+	e.mu.Lock()
+	if e.client == nil {
+		e.mu.Unlock()
+		return false
+	}
+	if e.announcedTo == nil {
+		e.announcedTo = make(map[derpclient.PublicKey]struct{})
+	}
+	if _, done := e.announcedTo[peer]; done {
+		e.mu.Unlock()
+		return false
+	}
+	e.announcedTo[peer] = struct{}{}
+	e.mu.Unlock()
+	go func() { _ = e.sendSessionReset(peer) }()
+	return true
+}
+
+// announcePendingSessions delivers the announcements owed to peers that were
+// warmed while this host had no relay. It reports how many were sent. Called
+// after a relay connect (eager and ticked), because no transition will ever
+// follow a warm that raced the dial.
+func (e *engine) announcePendingSessions() int {
+	e.mu.Lock()
+	if e.client == nil || len(e.announcePending) == 0 {
+		e.mu.Unlock()
+		return 0
+	}
+	peers := make([]derpclient.PublicKey, 0, len(e.announcePending))
+	for p := range e.announcePending {
+		peers = append(peers, p)
+	}
+	e.announcePending = nil
+	e.mu.Unlock()
+	for _, p := range peers {
+		e.announceSession(p)
+	}
+	return len(peers)
 }
 
 // resetAnnounceTargets returns the peers to tell "my relay session is new": the
@@ -2415,8 +2480,13 @@ func (e *engine) reconnect() {
 				targets := e.resetAnnounceTargets()
 				e.log.Debug("relay registered, announcing a new session", "peers", len(targets))
 				for _, peer := range targets {
-					go func(p derpclient.PublicKey) { _ = e.sendSessionReset(p) }(peer)
+					e.announceSession(peer)
 				}
+			}
+			// A warm that raced the eager dial is owed its announcement too,
+			// and no transition will ever deliver it: nothing else flushes this.
+			if n := e.announcePendingSessions(); n > 0 {
+				e.log.Debug("relay up, announcing the sessions that were owed", "peers", n)
 			}
 		}
 	}
@@ -2426,16 +2496,21 @@ func (e *engine) reconnect() {
 // immediately instead of waiting for the reconnect ticker).
 func (e *engine) Connect() error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.ensureClientLocked()
-	if e.client == nil {
-		if e.dialErr != nil {
+	up, dialErr := e.client != nil, e.dialErr
+	e.mu.Unlock()
+	if !up {
+		if dialErr != nil {
 			// The caller gets the cause, not just "failed": a TLS or DNS
 			// failure is actionable, a bare "connect failed" is not.
-			return fmt.Errorf("derp engine: connect: %w", e.dialErr)
+			return fmt.Errorf("derp engine: connect: %w", dialErr)
 		}
 		return errors.New("derp engine: connect failed")
 	}
+	// A warm that preceded this dial is still owed its announcement; the
+	// reconnect ticker would deliver it up to a full interval later, and the
+	// peer is waiting on exactly this news to drop its stale state.
+	e.announcePendingSessions()
 	return nil
 }
 
@@ -4073,6 +4148,10 @@ func (e *engine) peerGone(peer derpclient.PublicKey) {
 
 	e.mu.Lock()
 	delete(e.peers, peer)
+	// The peer that dropped its relay connection comes back having forgotten
+	// this host's session, so the announcement is owed again. Only a live
+	// direct path keeps it (handled above), because that peer never left.
+	delete(e.announcedTo, peer)
 	// The peer's relay connection dropped: forget its security session too.
 	// The peer may have restarted (a new ephemeral will arrive), and holding
 	// a stale key would leave the next rebuild mismatched. A peer that merely
@@ -4139,6 +4218,10 @@ func (e *engine) teardown(c *derpclient.Client, cause error) {
 		return
 	}
 	e.client = nil
+	// A new registration is a new session for every peer, so the record of who
+	// has been told starts empty. Without this a reconnect would leave every
+	// peer holding the state of the registration that just died.
+	e.announcedTo = nil
 	peers := make([]*peerConn, 0, len(e.peers))
 	directs := make(map[derpclient.PublicKey]*directConn, len(e.directs))
 	for _, pc := range e.peers {
@@ -4219,6 +4302,7 @@ func (e *engine) Close() {
 	}
 	c := e.client
 	e.client = nil
+	e.announcedTo = nil
 	peers := make([]*peerConn, 0, len(e.peers))
 	for _, pc := range e.peers {
 		peers = append(peers, pc)
