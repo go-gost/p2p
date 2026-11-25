@@ -125,6 +125,10 @@ var (
 	// asked, so there is nothing to back off from: a lookup that failed once
 	// usually works on the next try.
 	directUnreadyRetry = newAtomicDuration(2 * time.Second)
+	// directUnreadyMaxTries bounds the short-retry loop: eight tries is ~16s,
+	// which covers a QUIC pair that is still handshaking on a fresh start, and
+	// anything longer is not "not yet" but a transport that is not coming up.
+	directUnreadyMaxTries = 8
 	// directRepunchBackoffCap caps the H3 hysteresis: the re-punch wait for a
 	// direct that keeps dying shortly after registration grows from
 	// backoffPeriod and stops here, so a flapping path settles into a slow
@@ -218,9 +222,12 @@ type directConn struct {
 
 	cand chan []candidate // peer candidates (buffered)
 
-	mu     sync.Mutex
-	state  directState
-	failed bool // a punch round has failed at least once (sticky)
+	mu sync.Mutex
+	// unreadyTries counts consecutive short retries taken because this side's
+	// transport was not ready (see retryUnready). Reset when a round installs.
+	unreadyTries int
+	state        directState
+	failed       bool // a punch round has failed at least once (sticky)
 	// failGen counts punch rounds that have failed. failed alone cannot tell a
 	// failure that happened while a caller was waiting for a punch from one that
 	// happened long before it: failed is sticky for the life of the peer, so a
@@ -1241,7 +1248,7 @@ func (dc *directConn) silentPeerWait(d time.Duration) time.Duration {
 // routinely succeeds on the next try.
 func (dc *directConn) retryDirectUnready(reason string) {
 	dc.noteErr(reason)
-	dc.retry(time.Duration(directUnreadyRetry.Load()), false)
+	dc.retryUnready(time.Duration(directUnreadyRetry.Load()))
 }
 
 func (dc *directConn) backoff() {
@@ -1324,6 +1331,33 @@ func (dc *directConn) retry(d time.Duration, failed bool) {
 	dc.retryFrom(d, failed, false)
 }
 
+// retryFromSkipGone is retryFrom without the gone gate in the timer: see
+// retryUnready.
+func (dc *directConn) retryFromSkipGone(d time.Duration) {
+	dc.retryFromFull(d, false, false, true)
+}
+
+// retryUnready re-arms a round that failed on this side's transport not being
+// ready (no local candidates, a QUIC pair not established yet). skipProof is
+// what makes it different from a path failure: the round may just have
+// completed a seed handshake, which is the peer answering, so the "peer is
+// gone" gate must not escalate the wait on evidence a live exchange has already
+// contradicted.
+func (dc *directConn) retryUnready(d time.Duration) {
+	dc.mu.Lock()
+	dc.unreadyTries++
+	n := dc.unreadyTries
+	dc.mu.Unlock()
+	if n > directUnreadyMaxTries {
+		// The transport has not come up across repeated short retries. Fall back
+		// to the normal wait: a host whose pair never establishes must not punch
+		// on a two-second loop for as long as it runs.
+		dc.backoff()
+		return
+	}
+	dc.retryFromSkipGone(d)
+}
+
 // retryFrom is retry with an optional state guard. fromNone makes it refuse to
 // run unless the state is still directNone, so a re-punch scheduled off the idle
 // watchdog (underlayDead) cannot clobber a round a peer's candidate announcement
@@ -1332,6 +1366,10 @@ func (dc *directConn) retry(d time.Duration, failed bool) {
 // candidates (I6). A guarded refusal is safe: a round is running, so it decides
 // what happens next.
 func (dc *directConn) retryFrom(d time.Duration, failed bool, fromNone bool) {
+	dc.retryFromFull(d, failed, fromNone, false)
+}
+
+func (dc *directConn) retryFromFull(d time.Duration, failed, fromNone, skipGone bool) {
 	dc.mu.Lock()
 	if fromNone && dc.state != directNone {
 		dc.mu.Unlock()
@@ -1384,7 +1422,7 @@ func (dc *directConn) retryFrom(d time.Duration, failed bool, fromNone bool) {
 		// a round armed before that advertisement does not run behind its back —
 		// the first symptom being that an endless "punch failed" keeps coming
 		// from a peer that said it was never going to answer.
-		gone := dc.e.peerGoneForPunch(dc.peer)
+		gone := !skipGone && dc.e.peerGoneForPunch(dc.peer)
 		if gone || dc.peerDirectOff() {
 			// A skip is a control attempt abandoned: the round never ran, so
 			// nothing was exchanged. Counted like a failed round when the
@@ -1698,6 +1736,9 @@ func (dc *directConn) punch() {
 		dc.backoff()
 		return
 	}
+	dc.mu.Lock()
+	dc.unreadyTries = 0
+	dc.mu.Unlock()
 	dc.noteRound("%s up", win.name)
 	e.log.Debug("direct established", "peer", pname, "family", win.name,
 		"mine", candAddrs(win.mine), "peerAddr", winOut.Answer.String())
