@@ -198,7 +198,14 @@ type quicPeer struct {
 	caps     capsInfo
 	haveCaps bool
 	capsSent bool
-	capsCh   chan struct{}
+	// capsCh carries the caps frame to whoever is waiting for it. It is a
+	// buffered channel of one rather than a bare signal because the value must
+	// travel with the wake-up: a waiter that re-reads qp.caps after waking races
+	// every writer that clears it, and one such writer is a session reset
+	// arriving in the same millisecond as the caps. Measured on a hub: caps
+	// arrived 28ms after a timeout, the state was cleared 0ms later, and the
+	// waiter reported "caps missing" and then waited 32s for the next event.
+	capsCh chan capsInfo
 	// lastErr is the last transport-establishment failure reason, a finite
 	// word for PeerDiagnostic.TransportError (e.g. "caps-timeout",
 	// "quic-handshake"). It is cleared by a successful establishment. Guarded
@@ -880,7 +887,12 @@ func (e *engine) setPeerCaps(peer derpclient.PublicKey, info capsInfo) {
 	qp.caps = info
 	qp.haveCaps = true
 	if qp.capsCh != nil {
-		close(qp.capsCh)
+		// The waiter takes the frame from the channel, so a later clear of
+		// qp.caps cannot make it lose what it was woken for.
+		select {
+		case qp.capsCh <- info:
+		default:
+		}
 		qp.capsCh = nil
 	}
 	e.quicMu.Unlock()
@@ -1124,6 +1136,7 @@ func (e *engine) establishQUIC(ctx context.Context, peer derpclient.PublicKey, q
 		qp.capsSent = true
 	}
 	haveCaps := qp.haveCaps
+	info := qp.caps
 	e.quicMu.Unlock()
 
 	if sendCaps {
@@ -1136,7 +1149,15 @@ func (e *engine) establishQUIC(ctx context.Context, peer derpclient.PublicKey, q
 		}
 	}
 	if !haveCaps {
-		if _, ok := e.awaitPeerCaps(ctx, peer, qp); !ok {
+		// The wait's own result is the answer: re-reading the shared field after
+		// it returns is a race against anything that clears it in between, and
+		// one such writer is a session reset arriving alongside the caps. The
+		// caps this wait received are the peer's current advertisement whether
+		// or not the field still holds them a moment later — measured on a hub
+		// as `caps timeout` immediately followed by the caps arriving, then
+		// `caps missing`, and 32s before anything retried.
+		got, ok := e.awaitPeerCaps(ctx, peer, qp)
+		if !ok {
 			if ctx.Err() != nil {
 				return fmt.Errorf("%w: peer %s: quic setup canceled: %v",
 					p2p.ErrPeerUnreachable, keyName(peer), ctx.Err())
@@ -1144,16 +1165,9 @@ func (e *engine) establishQUIC(ctx context.Context, peer derpclient.PublicKey, q
 			return fmt.Errorf("%w: peer %s: caps timeout",
 				p2p.ErrPeerUnreachable, keyName(peer))
 		}
+		info = got
 	}
 
-	e.quicMu.Lock()
-	info := qp.caps
-	haveCaps = qp.haveCaps
-	e.quicMu.Unlock()
-	if !haveCaps {
-		return fmt.Errorf("%w: peer %s: caps missing",
-			p2p.ErrPeerUnreachable, keyName(peer))
-	}
 	qc, err := usableQUICCaps(info)
 	if err != nil {
 		return fmt.Errorf("%w: peer %s: %v",
@@ -1201,7 +1215,7 @@ func (e *engine) awaitPeerCaps(ctx context.Context, peer derpclient.PublicKey, q
 		return info, true
 	}
 	if qp.capsCh == nil {
-		qp.capsCh = make(chan struct{})
+		qp.capsCh = make(chan capsInfo, 1)
 	}
 	ch := qp.capsCh
 	e.quicMu.Unlock()
@@ -1209,7 +1223,13 @@ func (e *engine) awaitPeerCaps(ctx context.Context, peer derpclient.PublicKey, q
 	timer := time.NewTimer(capsReplyTimeout)
 	defer timer.Stop()
 	select {
-	case <-ch:
+	case got := <-ch:
+		e.quicMu.Lock()
+		if qp.capsCh == ch {
+			qp.capsCh = nil
+		}
+		e.quicMu.Unlock()
+		return got, true
 	case <-timer.C:
 		e.quicMu.Lock()
 		if qp.haveCaps {
@@ -1221,16 +1241,20 @@ func (e *engine) awaitPeerCaps(ctx context.Context, peer derpclient.PublicKey, q
 		e.quicMu.Unlock()
 		return capsInfo{}, false
 	case <-ctx.Done():
+		e.quicMu.Lock()
+		if qp.capsCh == ch {
+			qp.capsCh = nil
+		}
+		e.quicMu.Unlock()
 		return capsInfo{}, false
 	case <-e.stop:
+		e.quicMu.Lock()
+		if qp.capsCh == ch {
+			qp.capsCh = nil
+		}
+		e.quicMu.Unlock()
 		return capsInfo{}, false
 	}
-
-	e.quicMu.Lock()
-	info := qp.caps
-	ok := qp.haveCaps
-	e.quicMu.Unlock()
-	return info, ok
 }
 
 // usableQUICCaps validates the QUIC parameters in a peer's caps frame. Both
@@ -1610,7 +1634,12 @@ func (e *engine) peersSnapshot() []derpclient.PublicKey {
 func (e *engine) closeQUICIfUnpaired(peer derpclient.PublicKey) {
 	e.quicMu.Lock()
 	qp := e.quics[peer]
-	drop := qp != nil && (qp.pair == nil || !qp.pair.hasDirect())
+	// A setup in flight is not "unpaired": the pair it owns is being
+	// established right now, and it has no direct underlay yet by definition.
+	// Closing it there kills the handshake one millisecond in — measured as
+	// `underlay=relay event=retired reason=pair-closed` followed by
+	// `quic pair closed` after 176µs, on every cold start.
+	drop := qp != nil && qp.setup == nil && (qp.pair == nil || !qp.pair.hasDirect())
 	e.quicMu.Unlock()
 	if drop {
 		e.closeQUIC(peer)
@@ -1652,12 +1681,13 @@ func (e *engine) invalidateQUICPeerSession(peer derpclient.PublicKey) {
 	qp.caps = capsInfo{}
 	qp.haveCaps = false
 	qp.capsSent = false
-	if qp.setup != nil {
-		// A handshake in flight was negotiated against the session that just
-		// died; let it fail now instead of waiting out its deadline, and let
-		// its waiters see the outcome.
-		qp.setup.cancel()
-	}
+	// A setup in flight is left alone. It was started by the very caps this
+	// reset arrived alongside — a peer that registers and warms together sends
+	// both frames in one millisecond — so cancelling it destroys the handshake
+	// that is already carrying the answer. Measured on a hub: `quic handshake
+	// duration=767µs error=context canceled` on every cold start, followed by
+	// the caps timeout loop. The next establish rebuilds from whatever state
+	// this leaves, so nothing needs to interrupt the current attempt.
 	e.quicMu.Unlock()
 }
 
