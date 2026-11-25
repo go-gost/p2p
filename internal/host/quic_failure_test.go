@@ -831,3 +831,32 @@ func TestQUICRebuildsWhenThePeerAdvertisesANewIdentity(t *testing.T) {
 		t.Fatal("the rebuild discarded the caps that proved the new identity")
 	}
 }
+
+// TestPeerLiveSeesAnEstablishedQUICPair: an established QUIC pair is a live
+// data path, and peerLive has to say so.
+//
+// peerLive is what decides whether a failed punch round grows its wait
+// (silentPeerWait): a peer with a path gets the wait it asked for, one without
+// doubles it. In QUIC mode none of the three things peerLive used to consult
+// exist — there is no KCP session on the peer adapter, the directConn only goes
+// live once a punch installs an underlay, and QUIC builds no KCP pair — so a
+// peer we were actively connected to read as absent. Measured on a phone after
+// an app restart: one failed punch round armed a 60s wait instead of 30s, and
+// the direct path took 66s to come up while the relay carried traffic.
+func TestPeerLiveSeesAnEstablishedQUICPair(t *testing.T) {
+	a, b := newQUICFailurePair(t, false)
+
+	s, err := a.OpenStream(b.PublicKey())
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	defer s.Close()
+	roundTrip(t, s, "before-live-check")
+
+	if got := a.getQUIC(b.pub); got == nil || !got.established() {
+		t.Fatal("no established pair to test against")
+	}
+	if !a.peerLive(b.pub) {
+		t.Fatal("an established quic pair is a live data path")
+	}
+}

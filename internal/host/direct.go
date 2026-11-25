@@ -120,6 +120,11 @@ var (
 	// schedules a retry, and a test that overrides it (or restores it) while
 	// an engine is still live would race that read.
 	backoffPeriod = newAtomicDuration(30 * time.Second)
+	// directUnreadyRetry is the wait after a round that could not be attempted
+	// at all (no local STUN answer and no IPv6 egress). The peer was never
+	// asked, so there is nothing to back off from: a lookup that failed once
+	// usually works on the next try.
+	directUnreadyRetry = newAtomicDuration(2 * time.Second)
 	// directRepunchBackoffCap caps the H3 hysteresis: the re-punch wait for a
 	// direct that keeps dying shortly after registration grows from
 	// backoffPeriod and stops here, so a flapping path settles into a slow
@@ -426,6 +431,15 @@ func (e *engine) peerLive(peer derpclient.PublicKey) bool {
 	// carries traffic. relayKCPPairGet takes kcpMu, so it is called after e.mu
 	// is released.
 	if pair := e.relayKCPPairGet(peer); pair != nil && pair.preferredDirect() {
+		return true
+	}
+	// QUIC keeps its own pair, and none of the state above exists in that mode:
+	// no KCP session on the adapter, no KCP pair, and the directConn only goes
+	// live once a punch installs an underlay. Without this a peer we are
+	// actively connected to reads as absent, which is what decides whether a
+	// failed punch round grows its wait — measured as a 60s wait instead of 30s
+	// and 66s to a direct path after an app restart.
+	if pair := e.getQUIC(peer); pair != nil && pair.established() {
 		return true
 	}
 	return false
@@ -1221,6 +1235,15 @@ func (dc *directConn) silentPeerWait(d time.Duration) time.Duration {
 }
 
 // backoff marks a failed punch and schedules a retry.
+// retryDirectUnready re-arms a round that could not even be attempted, with a
+// short fixed wait rather than the peer-silence backoff: nothing was sent, so
+// there is no evidence about the peer, and a local lookup that failed once
+// routinely succeeds on the next try.
+func (dc *directConn) retryDirectUnready(reason string) {
+	dc.noteErr(reason)
+	dc.retry(time.Duration(directUnreadyRetry.Load()), false)
+}
+
 func (dc *directConn) backoff() {
 	dc.retry(dc.silentPeerWait(time.Duration(backoffPeriod.Load())), true)
 }
@@ -1443,7 +1466,15 @@ func (dc *directConn) punch() {
 		}
 	}
 	if len(fams) == 0 {
-		dc.backoff()
+		// Nothing local could be collected (no STUN answer, no IPv6 egress), so
+		// the peer was never asked and its silence says nothing about the path.
+		// Charging that to the peer meant a transient STUN miss armed the
+		// silent-peer wait — 60s when the pair looked absent, 30s otherwise —
+		// while a lookup a second later works. Measured on a phone after an app
+		// restart: the first round collected nothing, and the direct path took
+		// 66s to come up.
+		dc.noteRound("no local candidates (stun/ipv6)")
+		dc.retryDirectUnready("no local candidates")
 		return
 	}
 	e.log.Debug("direct punch: start", "peer", pname)

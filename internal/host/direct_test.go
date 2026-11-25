@@ -2596,3 +2596,46 @@ func TestPunchTraceTimes(t *testing.T) {
 		t.Fatal("traceTimes aliases the ring")
 	}
 }
+
+// TestPunchWithNoLocalCandidatesRetriesQuickly: a round that could not collect
+// anything local never asked the peer, so its silence must not be charged to
+// the peer-silence backoff.
+//
+// The branch that collects STUN/IPv6 candidates can come up empty when the STUN
+// server does not answer — a transient condition that routinely succeeds a
+// second later. It used to call backoff(), which reads as "the peer is absent"
+// and produced a 30s wait (60s before peerLive could see a QUIC pair). Measured
+// on a phone after an app restart: the first round collected nothing and the
+// direct path took 66s.
+func TestPunchWithNoLocalCandidatesRetriesQuickly(t *testing.T) {
+	dc := newSlotConn(t)
+	// A STUN server that answers nothing: the round cannot collect a family.
+	dc.e.stunAddr = "127.0.0.1:9"
+	dc.e.v6Enabled = false
+	// A relay that exists: without one the round waits for the connection
+	// (relayWaitRetry) and never reaches candidate collection.
+	dc.e.client = &derpclient.Client{}
+	// TestMain shrinks backoffPeriod to 500ms, which makes the peer-silence wait
+	// (1s after one doubling) SHORTER than the production unready retry, so the
+	// threshold has to be set here: what matters is that the wait does not come
+	// from the silent-peer path at all.
+	old := directUnreadyRetry.Load()
+	directUnreadyRetry.Store(int64(50 * time.Millisecond))
+	t.Cleanup(func() { directUnreadyRetry.Store(old) })
+
+	if !dc.start() {
+		t.Fatal("start() refused a round with the direct path on")
+	}
+
+	waitFor(t, 5*time.Second, func() bool {
+		dc.mu.Lock()
+		defer dc.mu.Unlock()
+		return dc.state == directBackoff
+	})
+	dc.mu.Lock()
+	wait := time.Until(dc.backoffUntil)
+	dc.mu.Unlock()
+	if wait > 300*time.Millisecond {
+		t.Fatalf("retry armed %v out, want about the unready retry: the peer was never asked", wait)
+	}
+}
