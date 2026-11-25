@@ -1679,10 +1679,22 @@ func (dc *directConn) punch() {
 	// candidate that was dialed: the steady-state underlay filters by source,
 	// so it must follow the completed path.
 	if err := dc.markUp(sock, winOut.Answer, winOut.Token); err != nil {
-		// The transport refused the underlay (a QUIC pair that closed while the
-		// round was in flight): markUp closed the socket and did not mark the
-		// path up, so the normal backoff owns the retry.
 		e.log.Debug("direct punch: install failed", "peer", pname, "family", win.name, "error", err)
+		// A QUIC pair that is not established yet is this side's transport not
+		// being ready, not the peer being absent: the seed handshake just
+		// completed, so the path exists and the peer answered. Charging that to
+		// the silent-peer wait armed a minute of backoff on every app start —
+		// measured on a phone as `direct install failed: quic pair is not
+		// established`, `backoff 1m0s`, and the direct path only arriving when
+		// the peer's own announcement cut the wait short (15-18s).
+		if errors.Is(err, errQUICPairNoConn) {
+			dc.noteRound("direct install deferred: quic pair not ready")
+			dc.retryDirectUnready("quic pair not established")
+			return
+		}
+		// Any other refusal (a pair that closed while the round was in flight)
+		// is the transport saying no; markUp closed the socket and the normal
+		// backoff owns the retry.
 		dc.backoff()
 		return
 	}
