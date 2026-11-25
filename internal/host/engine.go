@@ -1550,16 +1550,28 @@ func (e *engine) onSessionReset(peer derpclient.PublicKey) {
 	e.maybeKickDirect(peer)
 }
 
-// noteAnnouncedPeer records a peer this engine was asked to serve, so the next
+// noteAnnouncedPeer records a peer this engine was asked to serve, so a later
 // relay registration can tell it the session is new even when no peerConn
 // exists yet (a cold start reaches ensureTransport before any peer state does).
+//
+// It also announces immediately when the relay is already up. The reconnect
+// loop only fires on a transition it observes, and a cold start's ordering does
+// not guarantee one: the host is built, the relay dials, and only then does the
+// caller warm the first peer — by which point there is no wasDown transition
+// left to notice, so relying on it alone announced nothing on exactly the
+// startup this exists for.
 func (e *engine) noteAnnouncedPeer(peer derpclient.PublicKey) {
 	e.mu.Lock()
 	if e.announcedPeers == nil {
 		e.announcedPeers = make(map[derpclient.PublicKey]struct{})
 	}
+	_, known := e.announcedPeers[peer]
 	e.announcedPeers[peer] = struct{}{}
+	up := e.client != nil
 	e.mu.Unlock()
+	if up && !known {
+		go func() { _ = e.sendSessionReset(peer) }()
+	}
 }
 
 // resetAnnounceTargets returns the peers to tell "my relay session is new": the

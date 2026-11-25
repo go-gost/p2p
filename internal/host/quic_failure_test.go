@@ -683,3 +683,36 @@ func TestResetAnnounceTargetsIncludesWarmedPeers(t *testing.T) {
 		t.Fatalf("announce targets = %v, want the peer once", got)
 	}
 }
+
+// TestWarmAnnouncesWhenRelayIsAlreadyUp: the cold-start ordering that made the
+// announcement silent.
+//
+// A fresh host is built, its relay dials, and only then does the caller warm its
+// first peer. The reconnect loop announces on the wasDown transition it observes
+// on its own tick — which has already happened by then, so nothing is sent, and
+// the start this exists for got no help at all. Measured on a real phone: six
+// cold starts after the frame shipped, one announcement.
+//
+// The announcement is what a peer sees as its session state being dropped, so
+// that is what is asserted here: b has a pair to a, a warms b while its relay is
+// already up, and b must forget the session without waiting for a transition.
+func TestWarmAnnouncesWhenRelayIsAlreadyUp(t *testing.T) {
+	a, b := newQUICFailurePair(t, true)
+	establishQUICRelayAndDirect(t, a, b)
+
+	if b.getQUIC(a.pub) == nil {
+		t.Fatal("no QUIC pair on b before the announcement")
+	}
+
+	// a's relay is already up (newQUICFailurePair connected it), so this must
+	// send immediately rather than schedule for a later transition.
+	a.noteAnnouncedPeer(b.pub)
+
+	waitFor(t, 5*time.Second, func() bool {
+		b.quicMu.Lock()
+		qp := b.quics[a.pub]
+		cached := qp != nil && qp.haveCaps
+		b.quicMu.Unlock()
+		return !cached
+	})
+}
