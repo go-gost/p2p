@@ -925,6 +925,24 @@ func (e *engine) maybeStartQUIC(peer derpclient.PublicKey) {
 	}
 	qp := e.quicPeerLocked(peer)
 	if qp.pair != nil && qp.pair.established() {
+		// A peer that restarted brings a rebuilt engine and therefore a new
+		// QUIC identity, and its caps are where that shows. The connection we
+		// hold still looks established — nothing has told it otherwise yet — so
+		// answering with it swallows every handshake packet the peer sends into
+		// a connection it no longer owns, and each attempt costs a full
+		// handshake deadline. Acting on the fingerprint needs no cooperation
+		// from the peer and no idle timeout: a mismatch is proof the pair is
+		// dead whatever its connection object believes.
+		if e.peerIdentityChangedLocked(qp) {
+			e.quicMu.Unlock()
+			e.log.Debug("quic: peer advertised a new identity, dropping the stale pair",
+				"peer", keyName(peer))
+			e.dropQUICPairForRebuild(peer)
+			// The pair is gone now, so this call cannot see an established one
+			// and cannot recurse further.
+			e.maybeStartQUIC(peer)
+			return
+		}
 		e.quicMu.Unlock()
 		return
 	}
@@ -953,6 +971,21 @@ func (e *engine) maybeStartQUIC(peer derpclient.PublicKey) {
 	e.quicMu.Unlock()
 
 	go func() { _, _ = e.ensureTransport(peer) }()
+}
+
+// peerIdentityChangedLocked reports whether the peer's latest caps announce a
+// QUIC identity other than the one the pair pins. qp.pairFP is the fingerprint
+// the live pair's TLS config trusts, so a mismatch means that pair can never
+// carry this peer. Caller holds e.quicMu.
+func (e *engine) peerIdentityChangedLocked(qp *quicPeer) bool {
+	if qp == nil || qp.pair == nil || !qp.haveCaps {
+		return false
+	}
+	qc, err := usableQUICCaps(qp.caps)
+	if err != nil {
+		return false
+	}
+	return qc.Fingerprint != qp.pairFP
 }
 
 // ensureTransport selects and brings up the data plane for peer. In KCP mode
@@ -1787,6 +1820,45 @@ func (e *engine) closeQUIC(peer derpclient.PublicKey) {
 		// A relay underlay whose pair never got it installed still owns its
 		// sender goroutine.
 		_ = td.relay.Close()
+	}
+}
+
+// dropQUICPairForRebuild forgets the peer's pair while keeping the negotiation
+// input that proves what replaced it: the caps and their fingerprint.
+//
+// closeQUIC is the wrong tool here. It deletes the whole peer state, and the
+// caps that arrived with the news are exactly what the rebuild must handshake
+// against — clearing them sends the establishment back to awaitPeerCaps, where
+// it waits for a frame the peer has already sent and, with its own capsSent
+// set, will not send again. That wait is a caps deadline per attempt.
+//
+// The pair's transport is closed the same way a natural connection death does
+// it: after the CONNECTION_CLOSE flight has had a moment to leave, so the peer
+// is not left holding a half-open connection.
+func (e *engine) dropQUICPairForRebuild(peer derpclient.PublicKey) {
+	e.quicMu.Lock()
+	qp := e.quics[peer]
+	if qp == nil {
+		e.quicMu.Unlock()
+		return
+	}
+	p := qp.pair
+	qp.pair = nil
+	qp.pairFP = [32]byte{}
+	relay, relayInstalled := qp.relay, qp.relayInstalled
+	qp.relay = nil
+	qp.relayInstalled = false
+	// The rebuild this drop exists for must not wait out the inbound-trigger
+	// rate limit.
+	qp.nextStart = time.Time{}
+	e.quicMu.Unlock()
+
+	if relay != nil && !relayInstalled {
+		_ = relay.Close()
+	}
+	if p != nil {
+		e.retireQUICDirect(p)
+		time.AfterFunc(quicDeathCloseDelay, p.close)
 	}
 }
 

@@ -777,3 +777,57 @@ func TestWarmBeforeRelayAnnouncesWhenItConnects(t *testing.T) {
 		return qp == nil || !qp.haveCaps
 	})
 }
+
+// TestQUICRebuildsWhenThePeerAdvertisesANewIdentity: the hub's side of a peer
+// restart, decided from evidence instead of from a timeout.
+//
+// A restarted peer has a rebuilt engine and so a new QUIC identity. The hub's
+// connection still looks established — the peer's death has not been noticed
+// yet — so it answered every handshake packet with that dead connection, each
+// attempt costing a full handshake deadline before the blackhole cure. The
+// peer's caps carry the new fingerprint, and a mismatch with the one the pair
+// pins is proof the pair can never carry it.
+func TestQUICRebuildsWhenThePeerAdvertisesANewIdentity(t *testing.T) {
+	a, b := newQUICFailurePair(t, false)
+
+	s, err := a.OpenStream(b.PublicKey())
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	defer s.Close()
+	oldPair := a.getQUIC(b.pub)
+	if oldPair == nil {
+		t.Fatal("no pair after OpenStream")
+	}
+
+	// The peer comes back with a new identity: same relay key, different
+	// fingerprint in its caps, exactly as a rebuilt engine advertises.
+	a.quicMu.Lock()
+	qp := a.quicPeerLocked(b.pub)
+	if qp.caps.QUIC == nil {
+		a.quicMu.Unlock()
+		t.Fatal("peer caps carried no quic identity to change")
+	}
+	info := qp.caps
+	q := *info.QUIC
+	q.Fingerprint[0] ^= 0xff
+	info.QUIC = &q
+	qp.caps = info
+	qp.haveCaps = true
+	a.quicMu.Unlock()
+
+	a.maybeStartQUIC(b.pub)
+
+	if got := a.getQUIC(b.pub); got == oldPair {
+		t.Fatal("the stale pair survived a peer that advertised a new identity")
+	}
+	// The caps that carried the news are what the rebuild handshakes against:
+	// losing them sends it back to waiting for a frame the peer will not resend.
+	a.quicMu.Lock()
+	qp = a.quicPeerLocked(b.pub)
+	kept := qp.haveCaps && qp.caps.QUIC != nil
+	a.quicMu.Unlock()
+	if !kept {
+		t.Fatal("the rebuild discarded the caps that proved the new identity")
+	}
+}
