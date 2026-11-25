@@ -897,6 +897,7 @@ func (e *engine) setPeerCaps(peer derpclient.PublicKey, info capsInfo) {
 	qp := e.quicPeerLocked(peer)
 	qp.caps = info
 	qp.haveCaps = true
+	e.log.Debug("quic: peer caps received", "peer", keyName(peer))
 	if qp.capsCh != nil {
 		// The waiter takes the frame from the channel, so a later clear of
 		// qp.caps cannot make it lose what it was woken for.
@@ -1601,7 +1602,7 @@ type quicPeerTeardown struct {
 // It is the peer-gone cure the peer itself delivers, for the restarts the relay
 // never reports (see ctrlSessionReset).
 func (e *engine) onSessionReset(peer derpclient.PublicKey) {
-	e.log.Debug("session reset", "peer", keyName(peer))
+	e.log.Debug("quic: session reset received", "peer", keyName(peer))
 	// The same two effects the relay's own notice has for a live direct path:
 	// the relay half of the pair is retired (the registration under it is the
 	// stale one), and the QUIC session state is forgotten so the next handshake
@@ -1670,7 +1671,15 @@ func (e *engine) announceSession(peer derpclient.PublicKey) bool {
 	}
 	e.announcedTo[peer] = struct{}{}
 	e.mu.Unlock()
-	go func() { _ = e.sendSessionReset(peer) }()
+	// Sent on the caller's goroutine on purpose. warm() announces and then
+	// establishes, and the establishment's caps are a frame the peer answers;
+	// the announcement's whole job is to be seen BEFORE that, so the peer
+	// discards the session it had rather than racing the caps it is answering.
+	// Measured with the send in a goroutine: the hub received the caps and the
+	// reset on the same timestamp, in that order, discarded the caps it needed,
+	// and the peer — its capsSent already set — never sent them again. That was
+	// the 24s first restart, in about two runs in three.
+	_ = e.sendSessionReset(peer)
 	return true
 }
 
@@ -1775,6 +1784,9 @@ func (e *engine) invalidateQUICPeerSession(peer derpclient.PublicKey) {
 	if qp == nil {
 		e.quicMu.Unlock()
 		return
+	}
+	if qp.haveCaps {
+		e.log.Debug("quic: dropping cached caps on session reset", "peer", keyName(peer))
 	}
 	qp.caps = capsInfo{}
 	qp.haveCaps = false
