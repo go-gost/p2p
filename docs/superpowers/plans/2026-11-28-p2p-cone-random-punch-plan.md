@@ -21,7 +21,7 @@
 - No new module dependency.
 - Tests run from `p2p/` with `GOWORK=off`:
   `GOWORK=off go test ./internal/host -run <Test> -count=1`
-- Commit after every task. After the code commit, fill the task's Implementation record in this file (use `git rev-parse HEAD` for the code commit), `git add` the plan, and commit `docs(p2p): record task N`. Only commit; never push.
+- Commit after every task in **one task commit**: the task's code/tests, any plan updates, and the filled Implementation record together. In the record's Repo/commit field write "this commit (the task commit; exact SHA in the SDD ledger)" — do not chase a SHA that the commit itself is about to change. Only commit; never push.
 - The wisper wiring (settings/API/host config) is a separate follow-up plan after the p2p tag; this plan ends with a manual field verification.
 
 ## Review Focus
