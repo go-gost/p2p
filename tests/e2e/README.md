@@ -60,6 +60,7 @@ colliding with a previous run). The last five runs are kept.
 | `udp-tun` | The datagram link backs a point-to-point tun link (both ends tun clients, `udp` inner dialer): bidirectional ICMP across the link, and the link comes up on both sides. |
 | `udp-outlet` | A `udp://` target outlet: a tun **server** behind the tunnel with a shared passphrase; a remote spoke registers a keepalive route and reaches both the server address and a LAN address behind it. |
 | `ipv6-direct` | With no STUN server, a global IPv6 egress is enough to select a direct path (`direct_peers`); the peer's announced candidate is an `fd00::` address, proving the dial was IPv6 and not a v4 fallback. |
+| `nat-cone-random` | Two hosts behind separate router namespaces — cone `MASQUERADE` vs `MASQUERADE --random-fully` — exercise `punch.mode: spray` against `punch.mode: sockets`. A `punch.mode: off` incarnation in the same run is the relay control. The direct assertion is expected to pass where the native NAT's random mappings can meet a random spray; nested-netns conntrack currently keeps those port sets disjoint, so the assertion fails in that lab (see the plan's Task 8 record). |
 
 ## Topology
 

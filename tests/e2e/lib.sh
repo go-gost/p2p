@@ -238,12 +238,37 @@ DERP_IP=10.99.0.254
 HOST_A_IP=10.99.0.2
 HOST_B_IP=10.99.0.3
 
+# NAT scenario: each host sits on its own private LAN behind a router namespace
+# whose external veth is on the shared bridge. The cone router preserves the
+# source port; the random router uses MASQUERADE --random-fully, so its mapping
+# changes per destination -- the shape the spray/sockets fallback is for.
+# 198.18.0.0/24 is a benchmark range: not RFC1918, so the host treats the
+# router's external address as a public IPv4 candidate, but isolated to this
+# netns bridge. The relay/helper stay on the 10.99.0.0/24 bridge segment.
+NAT_PUBLIC_GW=198.18.0.1
+NAT_A_EXT_IP=198.18.0.4
+NAT_B_EXT_IP=198.18.0.5
+NAT_A_INTERNAL_IP=10.99.1.1
+NAT_B_INTERNAL_IP=10.99.2.1
+NAT_A_HOST_IP=10.99.1.2
+NAT_B_HOST_IP=10.99.2.2
+
 # net_teardown: remove everything setup_net created. Safe to call when nothing
 # exists, and called first so a crashed previous run cannot poison this one.
 net_teardown() {
 	local n v
-	for n in A B; do ip netns del "$n" 2>/dev/null || true; done
-	for v in v-A vp-A v-B vp-B; do ip link del "$v" 2>/dev/null || true; done
+	for n in "${NS_NAMES[@]}"; do
+		if [ "$NS_MODE" = ip ]; then
+			ip netns del "$n" 2>/dev/null || true
+		else
+			kill_pid "${NS_PID[$n]:-}"
+		fi
+	done
+	NS_NAMES=()
+	NS_PID=()
+	for v in v-A vp-A v-B vp-B v-RA vp-RA v-RB vp-RB nro-RA nri-RA nro-RB nri-RB; do
+		ip link del "$v" 2>/dev/null || true
+	done
 	ip link del "$BRIDGE" 2>/dev/null || true
 }
 
@@ -275,6 +300,74 @@ net_host_up() {
 		ns_run "$n" ip addr add "$ip/24" dev eth0
 		ns_run "$n" ip link set eth0 up
 		ns_run "$n" ip route add default via "$NET_GW"
+	fi
+}
+
+# net_nat_host_up <host-ns> <router-ns> <host-ip> <router-internal-ip> <router-external-ip>:
+# the host reaches the bridge only through the router namespace. Two veth pairs
+# keep the private LAN separate from the bridge, so every peer/STUN destination
+# is reached through the router's NAT rather than by a directly routable address.
+net_nat_host_up() {
+	local host=$1 router=$2 hip=$3 rip=$4 eip=$5
+	local eveth="v-$router" epeer="vp-$router"
+	local iveth="nro-$router" ipeer="nri-$router"
+
+	ip link add "$eveth" type veth peer name "$epeer"
+	ip link set "$eveth" master "$BRIDGE"
+	ip link set "$eveth" up
+	ip link add "$iveth" type veth peer name "$ipeer"
+
+	if [ "$NS_MODE" = ip ]; then
+		ip link set "$epeer" netns "$router"
+		ip -n "$router" link set "$epeer" name eth0
+		ip -n "$router" addr add "$eip/24" dev eth0
+		ip -n "$router" link set eth0 up
+		ip -n "$router" route add "$NET_CIDR" dev eth0
+		ip -n "$router" route add default via "$NET_GW"
+
+		ip link set "$iveth" netns "$router"
+		ip -n "$router" link set "$iveth" name eth1
+		ip -n "$router" addr add "$rip/24" dev eth1
+		ip -n "$router" link set eth1 up
+
+		ip link set "$ipeer" netns "$host"
+		ip -n "$host" link set "$ipeer" name eth0
+		ip -n "$host" addr add "$hip/24" dev eth0
+		ip -n "$host" link set eth0 up
+		ip -n "$host" route add default via "$rip"
+	else
+		ip link set "$epeer" netns "${NS_PID[$router]}"
+		ns_run "$router" ip link set "$epeer" name eth0
+		ns_run "$router" ip addr add "$eip/24" dev eth0
+		ns_run "$router" ip link set eth0 up
+		ns_run "$router" ip route add "$NET_CIDR" dev eth0
+		ns_run "$router" ip route add default via "$NET_GW"
+
+		ip link set "$iveth" netns "${NS_PID[$router]}"
+		ns_run "$router" ip link set "$iveth" name eth1
+		ns_run "$router" ip addr add "$rip/24" dev eth1
+		ns_run "$router" ip link set eth1 up
+
+		ip link set "$ipeer" netns "${NS_PID[$host]}"
+		ns_run "$host" ip link set "$ipeer" name eth0
+		ns_run "$host" ip addr add "$hip/24" dev eth0
+		ns_run "$host" ip link set eth0 up
+		ns_run "$host" ip route add default via "$rip"
+	fi
+	ns_run "$router" sh -c 'echo 1 >/proc/sys/net/ipv4/ip_forward'
+}
+
+# nat_masquerade <router-ns> [random]: translate the private LAN onto the
+# bridge. "random" adds --random-fully, which allocates a new source port per
+# destination (a random-symmetric NAT); the default keeps the port when free.
+nat_masquerade() {
+	local router=$1 mode=${2:-cone}
+	if [ "$mode" = random ]; then
+		ns_run "$router" iptables -t nat -A POSTROUTING -o eth0 \
+			-j MASQUERADE --random-fully
+	else
+		ns_run "$router" iptables -t nat -A POSTROUTING -o eth0 \
+			-j MASQUERADE
 	fi
 }
 

@@ -43,7 +43,7 @@ DERPER_BIN="${DERPER_BIN:-}"
 # Scenario registry: --list, --scenario validation and the runner all read this
 # single list, so a new scenario just needs an entry here and a scenario_<name>
 # function below.
-SCENARIOS=(stub derp-relay relay-peer-restart derp-direct quic-direct forward inner-matrix udp-tun udp-tun-loss udp-outlet ipv6-direct oneway-direct)
+SCENARIOS=(stub derp-relay relay-peer-restart derp-direct quic-direct forward inner-matrix udp-tun udp-tun-loss udp-outlet ipv6-direct oneway-direct nat-cone-random)
 
 usage() {
 	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
@@ -163,6 +163,26 @@ setup_net() {
 	net_host_up A "$HOST_A_IP"
 	net_host_up B "$HOST_B_IP"
 	say "namespaces A=$HOST_A_IP B=$HOST_B_IP (mode=$NS_MODE), bridge $BRIDGE"
+}
+
+# setup_nat_net: the cone-random topology. The derper and helper stay on the
+# shared bridge in the root namespace; only the hosts move behind routers.
+setup_nat_net() {
+	ns_probe_mode
+	net_teardown
+	net_bridge_up
+	# The routers' external segment needs an address in the root namespace so
+	# replies to masqueraded peers can be routed back onto the bridge.
+	ip addr add "$NAT_PUBLIC_GW/24" dev "$BRIDGE" 2>/dev/null || true
+	ns_add A
+	ns_add B
+	ns_add RA
+	ns_add RB
+	net_nat_host_up A RA "$NAT_A_HOST_IP" "$NAT_A_INTERNAL_IP" "$NAT_A_EXT_IP"
+	net_nat_host_up B RB "$NAT_B_HOST_IP" "$NAT_B_INTERNAL_IP" "$NAT_B_EXT_IP"
+	nat_masquerade RA cone
+	nat_masquerade RB random
+	say "NAT namespaces: A=$NAT_A_HOST_IP via RA=$NAT_A_EXT_IP (cone) B=$NAT_B_HOST_IP via RB=$NAT_B_EXT_IP (random-fully)"
 }
 
 # start_derper <logname> <on|off>
@@ -354,14 +374,19 @@ YAML
 }
 
 # shared DERP topology: A=client side, B=service side (peer gost + target).
-# start_derp_pair <tag> <stun:on|off> <direct:true|false> <b-target> [ipv6] [transport]
-start_derp_pair() {
+# start_p2p_pair <tag> <stun:on|off> <direct:true|false> <b-target> [ipv6]
+#                [transport] [cfg-a] [cfg-b]
+# Starts both hosts against an already running relay. The optional config files
+# carry per-host settings (punch.mode) that flags cannot express per side.
+start_p2p_pair() {
 	local tag=$1 stun=$2 direct=$3 btarget=$4 ipv6=${5:-} transport=${6:-}
+	local cfg_a=${7:-} cfg_b=${8:-}
 	local dir="$RUNDIR/$tag"
 	mkdir -p "$dir/keys"
-	start_derper "$tag" "$stun" || return 1
 	# B: bridges inbound tunnels to the peer gost (or holds a udp target).
-	local bargs=(--addr 127.0.0.1:8003 --derp "wss://$DERP_IP:443/derp"
+	local bargs=()
+	[ -n "$cfg_b" ] && bargs+=(-C "$cfg_b")
+	bargs+=(--addr 127.0.0.1:8003 --derp "wss://$DERP_IP:443/derp"
 		--key "$dir/keys/b" --tls.secure=false)
 	[ -n "$btarget" ] && bargs+=(--target "$btarget")
 	[ "$direct" = false ] && bargs+=(--direct=false)
@@ -372,7 +397,9 @@ start_derp_pair() {
 	[ -n "$transport" ] && bargs+=(--transport "$transport")
 	start_p2p B "p2p-$tag-b" "${bargs[@]}"
 	# A: client side control plane.
-	local aargs=(--addr 127.0.0.1:8003 --derp "wss://$DERP_IP:443/derp"
+	local aargs=()
+	[ -n "$cfg_a" ] && aargs+=(-C "$cfg_a")
+	aargs+=(--addr 127.0.0.1:8003 --derp "wss://$DERP_IP:443/derp"
 		--key "$dir/keys/a" --tls.secure=false)
 	[ "$direct" = false ] && aargs+=(--direct=false)
 	[ "$stun" = on ] && aargs+=(--stun "$DERP_IP:3478")
@@ -384,6 +411,13 @@ start_derp_pair() {
 	p2p_pubkey "p2p-$tag-a" >"$dir/a.pub" || { fail "no A pubkey"; return 1; }
 	p2p_pubkey "p2p-$tag-b" >"$dir/b.pub" || { fail "no B pubkey"; return 1; }
 	ok "derp pair up ($tag): A=$(cat "$dir/a.pub") B=$(cat "$dir/b.pub")"
+}
+
+# start_derp_pair <tag> <stun:on|off> <direct:true|false> <b-target> [ipv6] [transport] [cfg-a] [cfg-b]
+start_derp_pair() {
+	local tag=$1 stun=$2
+	start_derper "$tag" "$stun" || return 1
+	start_p2p_pair "$@"
 }
 
 scenario_derp_relay() {
@@ -593,6 +627,102 @@ scenario_derp_direct() {
 	# side — no relay round trip is needed with the keys already settled.
 	body=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/")
 	check "a new stream is served over direct while the relay is down" test "$body" = "hello-p2p"
+}
+
+# punch_cfg <file> <mode>: a host config carrying the per-side punch role. Both
+# sides use the largest bounded budgets, and the cone side retries with a short
+# backoff so several independent spray sets get a chance inside the budget.
+punch_cfg() {
+	local file=$1 mode=$2
+	{
+		echo "punch:"
+		echo "  mode: $mode"
+		case "$mode" in
+		spray)
+			echo "  sprayPorts: 2048"
+			echo "  sprayEvery: 1s"
+			echo "  socketWindow: 8s"
+			echo "timeouts: {backoff: 1s}"
+			;;
+		sockets)
+			echo "  sockets: 512"
+			echo "  socketWindow: 60s"
+			;;
+		esac
+	} >"$file"
+}
+
+# scenario_nat_cone_random: the same NAT topology runs twice. With punch off
+# the pair stays on the relay; with spray on the cone side and sockets on the
+# random side the fallback must install a direct underlay. Both incarnations
+# share the derper, STUN server, bridge and NAT routers -- only the hosts are
+# restarted, so the control is an assertion in this run, not a second topology.
+scenario_nat_cone_random() {
+	step "NAT cone <-> random: the spray/sockets fallback crosses a random NAT"
+	local dir="$RUNDIR/nat-cone-random"
+	mkdir -p "$dir"
+	setup_nat_net
+
+	start_echo - echo "$NET_GW:18081"
+	start_peer_gost B peer http 127.0.0.1:18080
+
+	# Control: same asymmetric NAT, same relay, both fallback modes off.
+	punch_cfg "$dir/a-off.yaml" off
+	punch_cfg "$dir/b-off.yaml" off
+	start_derp_pair nat-ctrl on true 127.0.0.1:18080 "" "" \
+		"$dir/a-off.yaml" "$dir/b-off.yaml" || return
+	local bkey
+	bkey=$(cat "$RUNDIR/nat-ctrl/b.pub")
+	gost_client_cfg "$dir/client-ctrl.yaml" 127.0.0.1:8003 "$bkey" tcp "" 127.0.0.1:8080
+	start_gost A client-ctrl -C "$dir/client-ctrl.yaml"
+	wait_tcp A 127.0.0.1 8080 15 || fail "control client proxy did not listen"
+	local body
+	body=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/")
+	check "control: the relay carries HTTP" test "$body" = "hello-p2p"
+	sleep 6 # enough for ordinary seed rounds to fail against the random NAT
+	save_status A 127.0.0.1:8003 "$dir/status-ctrl.json"
+	check_grep "control: the peer is on the relay" '"derp_peers":1' "$dir/status-ctrl.json"
+	check_grep "control: no direct peer with punch off" '"direct_peers":0' "$dir/status-ctrl.json"
+	check_not_grep "control: no direct established with punch off" \
+		'direct established' "$LOGDIR/p2p-nat-ctrl-a.log"
+
+	# Restart the hosts with the fallback roles; the relay and NAT routers stay.
+	kill_pid "$(cat "$RUNDIR/pids/p2p-nat-ctrl-b")"
+	kill_pid "$(cat "$RUNDIR/pids/p2p-nat-ctrl-a")"
+	kill_pid "$(cat "$RUNDIR/pids/client-ctrl")"
+	punch_cfg "$dir/a-spray.yaml" spray
+	punch_cfg "$dir/b-sockets.yaml" sockets
+	start_p2p_pair nat on true 127.0.0.1:18080 "" "" \
+		"$dir/a-spray.yaml" "$dir/b-sockets.yaml" || return
+	bkey=$(cat "$RUNDIR/nat/b.pub")
+	gost_client_cfg "$dir/client.yaml" 127.0.0.1:8003 "$bkey" tcp "" 127.0.0.1:8080
+	start_gost A client -C "$dir/client.yaml"
+	wait_tcp A 127.0.0.1 8080 15 || fail "client proxy did not listen"
+
+	# Keep opening streams while the fallback rounds run; the first relay-only
+	# stream is what arms the fallback after its seed fails.
+	local probe_pid
+	(
+		local i
+		for i in $(seq 1 95); do
+			curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/" >/dev/null 2>&1
+			sleep 1
+		done
+	) &
+	probe_pid=$!
+	PIDS+=("$probe_pid"); SCENARIO_PIDS+=("$probe_pid")
+
+	if wait_log "$LOGDIR/p2p-nat-a.log" '"msg":"direct established by spray"' 70; then
+		ok "the cone side established a direct path through the random NAT"
+	else
+		fail "no direct established by spray within 70s"
+	fi
+	check_grep "the random side established the matching direct path" \
+		'"msg":"direct established by sockets"' "$LOGDIR/p2p-nat-b.log"
+	save_status A 127.0.0.1:8003 "$dir/status.json"
+	check_grep "status shows a live direct peer" '"direct_peers":[1-9]' "$dir/status.json"
+	body=$(curl_proxy A http://127.0.0.1:8080 "http://$NET_GW:18081/")
+	check "the punched tunnel carries HTTP" test "$body" = "hello-p2p"
 }
 
 # scenario_quic_direct: the QUIC data plane (`--transport quic`) over a real
@@ -1323,6 +1453,9 @@ run_scenario() {
 	local before=$FAILURES
 	"scenario_${name//-/_}" || rc=$?
 	scenario_cleanup
+	# The cone-random scenario replaces the shared L2 topology with NAT routers;
+	# restore the default one so later scenarios in the same run still work.
+	[ "$name" = nat-cone-random ] && setup_net
 	# A non-zero return is a failure even if the scenario never called fail()
 	# (e.g. a missing function), so a typo in a scenario name cannot report PASS.
 	[ "$rc" = 0 ] || fail "scenario $name exited with status $rc"
