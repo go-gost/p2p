@@ -42,3 +42,33 @@ func TestResolvePunchClampsAndValidates(t *testing.T) {
 		}
 	}
 }
+
+func TestResolvePunchOffSkipsValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode string
+	}{
+		{name: "off", mode: "off"},
+		{name: "empty", mode: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolvePunch(&p2p.PunchConfig{
+				Mode:         tc.mode,
+				AfterRounds:  -1,
+				SprayPorts:   -1,
+				SprayEvery:   500 * time.Millisecond,
+				Sockets:      -1,
+				SocketWindow: 61 * time.Second,
+				SeedGrace:    -time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.mode != "" || got.afterRounds != 1 || got.sprayPorts != 1000 ||
+				got.sprayEvery != 2*time.Second || got.sockets != 150 ||
+				got.socketWindow != 20*time.Second || got.seedGrace != 500*time.Millisecond {
+				t.Fatalf("off settings = %+v", got)
+			}
+		})
+	}
+}

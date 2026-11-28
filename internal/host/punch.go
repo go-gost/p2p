@@ -54,6 +54,9 @@ func resolvePunch(c *p2p.PunchConfig) (punchSettings, error) {
 	default:
 		return punchSettings{}, fmt.Errorf("punch.mode: unknown mode %q (want spray or sockets)", c.Mode)
 	}
+	if s.mode == "" {
+		return s, nil
+	}
 
 	if c.AfterRounds < 0 {
 		return punchSettings{}, fmt.Errorf("punch.afterRounds must not be negative")
