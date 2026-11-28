@@ -120,6 +120,44 @@ func TestCapsQUICLatestFingerprintWins(t *testing.T) {
 	}
 }
 
+func TestCapsSprayBit(t *testing.T) {
+	if capsSpray == capsQUIC {
+		t.Fatal("capsSpray collides with capsQUIC")
+	}
+	e := &engine{punch: punchSettings{mode: "spray"}}
+	if e.caps().Bits&capsSpray == 0 {
+		t.Fatal("spray mode did not advertise capsSpray")
+	}
+	e.punch = punchSettings{}
+	if e.caps().Bits&capsSpray != 0 {
+		t.Fatal("empty punch mode advertised capsSpray")
+	}
+}
+
+func TestCapNamesIncludesSpray(t *testing.T) {
+	if got := capNames(capsSpray); len(got) != 1 || got[0] != "spray" {
+		t.Fatalf("capNames = %v", got)
+	}
+}
+
+func TestCapsDecodeSprayBit(t *testing.T) {
+	info, err := decodeCaps([]byte{capsSpray})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Bits != capsSpray {
+		t.Fatalf("bits = %#x, want %#x", info.Bits, capsSpray)
+	}
+}
+
+func TestCapsSprayPeerSupport(t *testing.T) {
+	dc := &directConn{}
+	dc.addCaps(capsInfo{Bits: capsSpray})
+	if !dc.supports(capsSpray) {
+		t.Fatalf("peerCaps = %#x, want capsSpray support", dc.peerCaps)
+	}
+}
+
 func TestCapsQUICBitWithoutTLVClearsInfo(t *testing.T) {
 	dc := &directConn{e: newTestEngine(t)}
 	dc.addCaps(capsInfo{Bits: capsQUIC | capsIPv6, QUIC: &quicCaps{Version: 1, Fingerprint: [32]byte{1}}})

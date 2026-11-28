@@ -13,6 +13,12 @@ import (
 // QUIC TLV must be present and valid as well.
 const capsQUIC uint8 = 1 << 3
 
+// capsSpray marks a host that opted into the multi-target seed punch fallback:
+// spray mode sends one seed to many peer ports, sockets mode sends one seed per
+// local socket. It is advertised only while that fallback is enabled, so hosts
+// with punch off (and older peers) keep advertising the same bits as before.
+const capsSpray uint8 = 1 << 4
+
 // capsTLVVersion1 is the version of the TLV container that follows the caps
 // byte. It versions the framing, not QUIC itself. A payload with only the caps
 // byte is the legacy KCP form and has no TLV container.

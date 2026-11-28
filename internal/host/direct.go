@@ -687,11 +687,8 @@ func (dc *directConn) candidateCount() int {
 	return len(dc.lastPeer)
 }
 
-// capNames names the capability bits the peer advertised.
-func (dc *directConn) capNames() []string {
-	dc.mu.Lock()
-	bits := dc.peerCaps
-	dc.mu.Unlock()
+// capNames names the capability bits set in bits.
+func capNames(bits uint8) []string {
 	var out []string
 	if bits&capsIPv6 != 0 {
 		out = append(out, "ipv6")
@@ -702,7 +699,18 @@ func (dc *directConn) capNames() []string {
 	if bits&capsQUIC != 0 {
 		out = append(out, "quic")
 	}
+	if bits&capsSpray != 0 {
+		out = append(out, "spray")
+	}
 	return out
+}
+
+// capNames names the capability bits the peer advertised.
+func (dc *directConn) capNames() []string {
+	dc.mu.Lock()
+	bits := dc.peerCaps
+	dc.mu.Unlock()
+	return capNames(bits)
 }
 
 // punchCounters snapshots this peer's punch history. The counters are atomics,

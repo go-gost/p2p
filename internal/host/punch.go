@@ -32,6 +32,12 @@ type punchSettings struct {
 	seedGrace    time.Duration
 }
 
+// sprayEnabled reports whether this host opted into the spray/sockets punch
+// fallback and therefore advertises capsSpray.
+func (e *engine) sprayEnabled() bool {
+	return e.punch.mode == "spray" || e.punch.mode == "sockets"
+}
+
 // resolvePunch merges the punch block over the built-in defaults and validates
 // the result. Zero fields keep their defaults; "off" normalizes to "".
 func resolvePunch(c *p2p.PunchConfig) (punchSettings, error) {

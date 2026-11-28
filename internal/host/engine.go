@@ -843,9 +843,10 @@ func (e *engine) resolveV6() *net.UDPAddr {
 
 // caps returns the capabilities this host advertises. The IPv6 bit is a
 // statement about what this host can use right now: a host that has the family
-// off, or has it on without an egress, must not claim it. In QUIC mode the
-// caps frame also carries the TLS identity (version, certificate fingerprint
-// and relay batch version); a KCP host advertises only the legacy bits.
+// off, or has it on without an egress, must not claim it. The spray bit is set
+// only while the opt-in punch fallback is enabled. In QUIC mode the caps frame
+// also carries the TLS identity (version, certificate fingerprint and relay
+// batch version); a KCP host advertises only the legacy bits.
 func (e *engine) caps() capsInfo {
 	info := capsInfo{}
 	if e.v6Enabled && e.v6Usable() {
@@ -858,6 +859,9 @@ func (e *engine) caps() capsInfo {
 			Fingerprint:  e.quicID.fingerprint(),
 			BatchVersion: quicCapsBatchVersion,
 		}
+	}
+	if e.sprayEnabled() {
+		info.Bits |= capsSpray
 	}
 	return info
 }

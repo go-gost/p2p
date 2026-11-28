@@ -43,6 +43,47 @@ func TestResolvePunchClampsAndValidates(t *testing.T) {
 	}
 }
 
+func TestSprayEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode string
+		want bool
+	}{
+		{name: "spray", mode: "spray", want: true},
+		{name: "sockets", mode: "sockets", want: true},
+		{name: "empty", mode: "", want: false},
+		{name: "off", mode: "off", want: false},
+		{name: "unknown", mode: "bogus", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &engine{punch: punchSettings{mode: tc.mode}}
+			if got := e.sprayEnabled(); got != tc.want {
+				t.Fatalf("sprayEnabled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEngineCapsSprayModes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode string
+		want bool
+	}{
+		{name: "spray", mode: "spray", want: true},
+		{name: "sockets", mode: "sockets", want: true},
+		{name: "empty", mode: "", want: false},
+		{name: "off", mode: "off", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &engine{punch: punchSettings{mode: tc.mode}}
+			if got := e.caps().Bits&capsSpray != 0; got != tc.want {
+				t.Fatalf("capsSpray advertised = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolvePunchOffSkipsValidation(t *testing.T) {
 	for _, tc := range []struct {
 		name string
