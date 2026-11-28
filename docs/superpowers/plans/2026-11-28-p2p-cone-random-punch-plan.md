@@ -450,12 +450,20 @@ git commit -m "feat(p2p): spray random ports from the cone side"
 
 **Implementation record**
 
-- Date/status:
-- Repo/commit:
-- Files changed:
+- Date/status: 2026-11-28 — complete.
+- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; this commit (the task commit; exact SHA in the SDD ledger).
+- Files changed: `internal/host/punchspray.go` (new: `randomPortTargets`, the `randomPortTargetsFn` seam, and `punchSpray`), `internal/host/direct.go` (the `punch()` spray branch after family selection: same-v4-socket spray, `markUp` on success, `noteFallbackFailure` + `backoff` on failure, no concurrent normal seed, no spray without a v4 socket, `mode == "spray"` gate, candidate handoff on success), `internal/host/punchspray_test.go` (new: seven tests for port range/uniqueness/clamp, a real spray handshake through a controlled target set, branch success and failure, missing-v4 skip, and the `sockets` mode gate), this plan's Task 5 record. No dependency changes.
 - Tests/commands and results:
-- Review findings and fixes:
-- Deferred items/limitations:
+  - RED before implementation: `GOWORK=off go test ./internal/host -run 'TestRandomPortTargets|TestPunchSpray' -count=1` → FAIL (build failed: `undefined: randomPortTargets`, `undefined: randomPortTargetsFn`, `dc.punchSpray undefined`).
+  - Partial GREEN after `punchspray.go`: `GOWORK=off go test ./internal/host -run 'TestRandomPortTargets|TestPunchSprayHitsOneTarget' -count=1 -v` → `ok github.com/go-gost/p2p/internal/host 0.110s`; the three generator/handshake tests PASS.
+  - Branch RED before wiring `punch()`: `GOWORK=off go test ./internal/host -run 'TestPunchSprayRound|TestPunchSkipsSprayWithoutV4Family|TestPunchOtherModesDoNotSpray' -count=1 -v` → FAIL (`TestPunchSprayRoundInstallsAnswer` and `TestPunchSprayRoundFailureBacksOff` timed out waiting for the spray outcome); the two skip tests already PASS.
+  - GREEN after wiring: the brief's `GOWORK=off go test ./internal/host -run 'TestRandomPortTargets|TestPunchSpray' -count=1 -v` → `ok github.com/go-gost/p2p/internal/host 0.777s`, all five matching tests PASS.
+  - Full task-focused run: `GOWORK=off go test ./internal/host -run 'TestRandomPortTargets|TestPunchSpray|TestPunchSkipsSprayWithoutV4Family|TestPunchOtherModesDoNotSpray|TestSeedPlan|TestFallback' -count=1 -v` → `ok github.com/go-gost/p2p/internal/host 4.873s`; all 17 new, Task 4 fallback, and `TestSeedPlan*` tests PASS.
+  - Regression: `GOWORK=off go test ./internal/host -run 'TestDirect' -count=1` → `ok github.com/go-gost/p2p/internal/host 53.700s`; no regression. (The brief's 100x command was not run: one iteration takes ~54–58s, so 100x would take ~1.5 hours and exceed `go test`'s default timeout.)
+  - `CGO_ENABLED=1 GOWORK=off go test -race ./internal/host -run 'TestRandomPortTargets|TestPunchSpray|TestPunchSkipsSprayWithoutV4Family|TestPunchOtherModesDoNotSpray' -count=1` → `ok github.com/go-gost/p2p/internal/host 3.111s`; no races.
+  - `GOWORK=off go build ./...`, `GOWORK=off go vet ./internal/host`, `gofmt -l internal/host/direct.go internal/host/punchspray.go internal/host/punchspray_test.go`, `git diff --check` → all clean (no output).
+- Review findings and fixes: self-review only (no subagent reviewer, per task rules). The first test draft imported `net` without using it; removed before the RED run. The spray branch was placed after family selection but before the concurrent normal seed, and returns on every spray outcome, so the normal seed cannot consume the peer's late probes. On success it hands only the sprayed family's candidates to `dc.mine` (a sibling family's socket is closed by `closeFams`), matching the normal winner path. The announced endpoint is `peerV4[len(peerV4)-1]` and its address is passed to the generator; the tests capture that argument. `markUp` already calls `noteFallbackSuccess`, so the spray success path adds no separate counter reset. Failure paths count one `noteFallbackFailure` and leave the failure run armed, as in Task 4. Logging reports only target counts and the answering endpoint, never the port list. No post-GREEN behavior fixes were needed.
+- Deferred items/limitations: Task 6 (sockets/random side) is not implemented; the `sockets` mode keeps the normal punch path and its mode gate is covered by a test. Status/doctor reporting (Task 7) and e2e verification (Task 8) remain separate. `punchSpray`'s `SprayEvery`, `Grace`, and timeout forwarding are asserted only indirectly through the tested outcomes — `seedHandshakePlan`'s own behavior has dedicated `TestSeedPlan*` tests. The full `internal/host` suite is not run (known flake/hang); verification is scoped to the new tests, the Task 4 fallback tests, the seed-plan tests, and the `TestDirect` names.
 
 ---
 

@@ -1712,6 +1712,47 @@ func (dc *directConn) punch() {
 		return
 	}
 
+	// The cone side of the fallback sprays from the very socket whose local
+	// candidate was advertised as p3. It replaces this round's seed attempts:
+	// running both would consume the peer's late probes after the winner's grace
+	// window has closed. Without a v4 family there is no socket to spray from,
+	// so the ordinary path below owns the round.
+	if e.punch.mode == "spray" && has4 && dc.fallbackReady(peerV4) {
+		sock := fams[i4].sock
+		if sock != nil {
+			fams[i4].sock = nil // the spray owns it until markUp
+			announced := peerV4[len(peerV4)-1]
+			dc.noteRound("spray %d targets %s", e.punch.sprayPorts, announced.String())
+			out, err := dc.punchSpray(sock, announced, announced.Addr())
+			closeFams()
+			if err != nil {
+				e.log.Debug("direct punch: spray failed", "peer", pname, "error", err)
+				dc.noteErr(fmt.Sprintf("spray failed: %v", err))
+				dc.noteRound("spray failed: %v", err)
+				dc.noteFallbackFailure()
+				dc.backoff()
+				return
+			}
+			if err := dc.markUp(sock, out.Answer, out.Token); err != nil {
+				e.log.Debug("direct punch: spray install failed", "peer", pname, "error", err)
+				dc.noteRound("spray install failed: %v", err)
+				dc.noteFallbackFailure()
+				dc.backoff()
+				return
+			}
+			// Only the sprayed socket is still bound; answer future announcements
+			// with its candidates, not with a sibling family's closed socket.
+			dc.mu.Lock()
+			dc.mine = fams[i4].mine
+			dc.unreadyTries = 0
+			dc.mu.Unlock()
+			dc.noteRound("spray up")
+			e.log.Debug("direct established by spray", "peer", pname,
+				"answer", out.Answer.String(), "candidates", len(fams[i4].mine))
+			return
+		}
+	}
+
 	// 4. Attempt every family at once, then adjudicate: a family outranks the
 	// ones after it, so v6 wins whenever it completes and a completed v4
 	// handshake is held until v6 has reported a failure.
