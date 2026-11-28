@@ -600,7 +600,7 @@ git commit -m "feat(p2p): report punch fallback diagnostics"
 **Implementation record**
 
 - Date/status: 2026-11-28, complete.
-- Repo/commit: `p2p` @ `feat/p2p-cone-random`; task commit subject `feat(p2p): report punch fallback diagnostics` (SHA inlined by the required follow-up docs commit; no push).
+- Repo/commit: `p2p` @ `feat/p2p-cone-random`, task commit `5e7e98b feat(p2p): report punch fallback diagnostics` (SHA inlined by the required follow-up docs commit; no push).
 - Files changed: `status.go` (six in-process `PeerDiagnostic` fields), `internal/host/direct.go` (fallback outcome fields, `noteFallbackResult`, `fillFallbackDiag`, three trace lines and outcome recording in both fallback branches), `internal/host/engine.go` (call `fillFallbackDiag` in the status snapshot), `doctor/doctor.go` (peer `punch mode` line), `internal/host/punch_test.go` (`TestPeerDiagnosticFallback`, `TestPunchFallbackTraceAndWinner`), `doctor/doctor_test.go` (`TestPunchMode`), and this plan.
 - Tests/commands and results:
   - RED: `GOWORK=off go test ./internal/host -run 'TestPeerDiagnosticFallback' -count=1` → FAIL (build: `noteFallbackResult` and the six diagnostic fields undefined); `GOWORK=off go test ./doctor -run 'TestPunchMode' -count=1` → FAIL (build: unknown field `PunchFallback`).
