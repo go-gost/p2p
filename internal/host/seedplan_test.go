@@ -349,3 +349,30 @@ func TestSeedPlanLearnsUnexpectedSource(t *testing.T) {
 		t.Fatal("unexpected-source peer never finished")
 	}
 }
+
+// TestSeedPlanRejectsInvalidPeer catches a plan that reaches WriteToUDP with an
+// invalid destination: it must fail immediately rather than spray to a nil
+// address or spin until the timeout.
+func TestSeedPlanRejectsInvalidPeer(t *testing.T) {
+	ours := mustListenUDP(t)
+	defer ours.Close()
+	out, err := seedHandshakePlan(ours, seedPlan{
+		Peer:       netip.AddrPort{},
+		Retransmit: 20 * time.Millisecond,
+	}, 100*time.Millisecond)
+	if err == nil {
+		t.Fatalf("seedHandshakePlan = %+v, want an invalid-peer error", out)
+	}
+	if out.Token != [seedTokenLen]byte{} || out.Answer.IsValid() || out.ProbeFrom.IsValid() {
+		t.Fatalf("outcome = %+v, want the zero outcome on an invalid peer", out)
+	}
+
+	start := time.Now()
+	if _, err := seedHandshakePlan(ours, seedPlan{Peer: netip.MustParseAddrPort("127.0.0.1:9")},
+		50*time.Millisecond); !errors.Is(err, errSeedTimeout) {
+		t.Fatalf("valid-peer plan = %v, want a timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("valid-peer plan took %s, want the 50ms window", elapsed)
+	}
+}

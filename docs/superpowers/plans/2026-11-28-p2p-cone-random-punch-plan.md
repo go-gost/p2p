@@ -376,7 +376,7 @@ git commit -m "feat(p2p): arm punch fallback after seed failures"
   - `GOWORK=off go test ./internal/host -run 'TestDirect' -count=1` → `ok github.com/go-gost/p2p/internal/host 57.893s`.
   - `GOWORK=off go build ./...`, `GOWORK=off go vet ./internal/host`, `git diff --check`, `gofmt -l internal/host/direct.go internal/host/punch_test.go` → all clean (no output).
   - Final repeat after moving `fallbackRetry` to `const`: `GOWORK=off go test ./internal/host -run 'TestFallback' -count=1 -v` → `ok github.com/go-gost/p2p/internal/host 2.018s`, all eight PASS (no-peer-candidates round 2.01s).
-  - `GOWORK=off go test ./internal/host -run 'TestDirect' -count=5` → `ok github.com/go-gost/p2p/internal/host 265.119s`; no known flakes and no new failures. The brief's `-count=100` was started but not completed: one iteration takes ~58s, so 100 would take ~97 minutes and exceed `go test`'s default 10-minute timeout; it was stopped and replaced with the bounded 5x stress above. Accepted substitute: the 1x+5x runs, compared against the known-flake baseline; a long-timeout CI job can run the 100x later.
+  - `GOWORK=off go test ./internal/host -run 'TestDirect' -count=5` → `ok github.com/go-gost/p2p/internal/host 265.119s`; no known flakes and no new failures. The brief's `-count=100` was started but not completed: one iteration takes ~58s, so 100 would take ~97 minutes and exceed `go test`'s default 10-minute timeout; it was stopped and replaced with the bounded 5x stress above. Accepted substitute: the 1x+5x runs, compared against the known-flake baseline. **CI recommendation:** add a dedicated long-timeout job running `GOWORK=off go test ./internal/host -run '^TestDirect$' -count=100 -timeout 3h` (≈97 min); the default 10m timeout cannot host it.
   - Final `GOWORK=off go build ./...`, `GOWORK=off go vet ./internal/host`, `git diff --check`, `gofmt -l internal/host/direct.go internal/host/punch_test.go` → all clean after the `const` change.
 - Review findings and fixes: self-review only during implementation (no subagent reviewer, per task rules). Task review (subagent): Approved with one Minor — the 100x stress was not completed; accepted the bounded 1x+5x substitute (runtime ~97 min) with baseline-flake comparison; no code change. Moved `fallbackRetry` into a `const` declaration after spotting it in the timing `var` block, matching the brief's interface. `fallbackReady` uses `sprayEnabled()` rather than a bare non-empty string, so `mode: "off"` (and an unknown mode) stays inert as required. The public-address check excludes RFC1918, loopback, link-local, unspecified, multicast and the CGNAT block that `Addr.IsPrivate` misses; documentation ranges are deliberately left alone because existing tests use them as unreachable public candidates. The retry-selection helper was named `seedFailureRetry` so `punch()` calls one small, testable function; the control-plane exits continue to call `backoff`/`retryDirectUnready` without counting a seed failure. No post-GREEN behavior fixes were needed.
 - Deferred items/limitations: no spray/sockets traffic is implemented here — `noteFallbackFailure` only records state and is consumed by the execution path in Tasks 5–6. `fallbackReady` is checked at the end of a failed normal round, so the first armed round schedules a 500ms retry rather than running a fallback inside the same round; Task 5 replaces that seam with the real spray call. Status/doctor reporting of the new counters and e2e verification remain Tasks 7–8. The full `internal/host` suite is not run (known whole-suite hang in `TestPeerGoneKeepsLiveDirectSession`); verification is scoped to the new tests and the `TestDirect` names.
@@ -393,7 +393,7 @@ git commit -m "feat(p2p): arm punch fallback after seed failures"
 **Interfaces:**
 - `func randomPortTargets(ip netip.Addr, n int) []netip.AddrPort` — 1024–65535, unique, `n` clamped to 2048. Add `var randomPortTargetsFn = randomPortTargets` as the test seam.
 - `func (dc *directConn) punchSpray(sock *net.UDPConn, peer netip.AddrPort, peerIP netip.Addr) (seedOutcome, error)`
-- The `punch()` fallback branch: when `e.punch.mode == "spray"` and `fallbackReady`, call `punchSpray` with the v4 family socket and `peerV4[len(peerV4)-1]`; on success `markUp(sock, out.Answer, out.Token)`; on failure `dc.backoff()`.
+- The `punch()` fallback branch: when `e.punch.mode == "spray"` and the fallback is armed, call `punchSpray` with the v4 family socket and the public endpoint returned by `fallbackTarget(peerV4)` (final review; never the list's tail); on success `markUp(sock, out.Answer, out.Token)`; on failure `dc.backoff()`.
 
 Behavior:
 - `punchSpray` builds `randomPortTargets(peerIP, e.punch.sprayPorts)` and runs `seedHandshakePlan` with `Peer = peer` (the announced endpoint, for retransmit/learn), `Targets = targets`, `SprayEvery = e.punch.sprayEvery`, `Grace = e.punch.seedGrace`; timeout = `e.punch.socketWindow`.
@@ -464,7 +464,7 @@ git commit -m "feat(p2p): spray random ports from the cone side"
   - Regression: `GOWORK=off go test ./internal/host -run 'TestDirect' -count=1` → `ok github.com/go-gost/p2p/internal/host 53.700s`; no regression. (The brief's 100x command was not run: one iteration takes ~54–58s, so 100x would take ~1.5 hours and exceed `go test`'s default timeout.)
   - `CGO_ENABLED=1 GOWORK=off go test -race ./internal/host -run 'TestRandomPortTargets|TestPunchSpray|TestPunchSkipsSprayWithoutV4Family|TestPunchOtherModesDoNotSpray' -count=1` → `ok github.com/go-gost/p2p/internal/host 3.111s`; no races.
   - `GOWORK=off go build ./...`, `GOWORK=off go vet ./internal/host`, `gofmt -l internal/host/direct.go internal/host/punchspray.go internal/host/punchspray_test.go`, `git diff --check` → all clean (no output).
-- Review findings and fixes: Task review (subagent) found one Important: `punch()` detached the spray socket from `fams` before `closeFams()`, and neither `punchSpray` nor `seedHandshakePlan` closed it, so a timed-out or errored spray round left a bound socket and file descriptor behind and retries accumulated them. Fixed by calling `sock.Close()` in the handshake-error branch before returning; the success path leaves ownership with `markUp`, which already closes the socket on install failure. `TestPunchSprayFailureReleasesSocket` captures the spray socket's local address from a real probe and asserts a fresh UDP bind to it succeeds after the failed round. Original implementation self-review notes: the first test draft imported `net` without using it; removed before the RED run. The spray branch was placed after family selection but before the concurrent normal seed, and returns on every spray outcome, so the normal seed cannot consume the peer's late probes. On success it hands only the sprayed family's candidates to `dc.mine` (a sibling family's socket is closed by `closeFams`), matching the normal winner path. The announced endpoint is `peerV4[len(peerV4)-1]` and its address is passed to the generator; the tests capture that argument. `markUp` already calls `noteFallbackSuccess`, so the spray success path adds no separate counter reset. Failure paths count one `noteFallbackFailure` and leave the failure run armed, as in Task 4. Logging reports only target counts and the answering endpoint, never the port list. The reviewer's Minor findings are deferred to the final review and were not changed here.
+- Review findings and fixes: Task review (subagent) found one Important: `punch()` detached the spray socket from `fams` before `closeFams()`, and neither `punchSpray` nor `seedHandshakePlan` closed it, so a timed-out or errored spray round left a bound socket and file descriptor behind and retries accumulated them. Fixed by calling `sock.Close()` in the handshake-error branch before returning; the success path leaves ownership with `markUp`, which already closes the socket on install failure. `TestPunchSprayFailureReleasesSocket` captures the spray socket's local address from a real probe and asserts a fresh UDP bind to it succeeds after the failed round. Original implementation self-review notes: the first test draft imported `net` without using it; removed before the RED run. The spray branch was placed after family selection but before the concurrent normal seed, and returns on every spray outcome, so the normal seed cannot consume the peer's late probes. On success it hands only the sprayed family's candidates to `dc.mine` (a sibling family's socket is closed by `closeFams`), matching the normal winner path. The announced endpoint was initially read as `peerV4[len(peerV4)-1]`; the final review now selects the first public entry via `fallbackTarget` (the list may end in a loopback candidate), and passes that address to the generator; the tests capture that argument. `markUp` already calls `noteFallbackSuccess`, so the spray success path adds no separate counter reset. Failure paths count one `noteFallbackFailure` and leave the failure run armed, as in Task 4. Logging reports only target counts and the answering endpoint, never the port list. The reviewer's Minor findings are deferred to the final review and were not changed here.
 - Deferred items/limitations: Task 6 (sockets/random side) is not implemented; the `sockets` mode keeps the normal punch path and its mode gate is covered by a test. Status/doctor reporting (Task 7) and e2e verification (Task 8) remain separate. `punchSpray`'s `SprayEvery`, `Grace`, and timeout forwarding are asserted only indirectly through the tested outcomes — `seedHandshakePlan`'s own behavior has dedicated `TestSeedPlan*` tests. The full `internal/host` suite is not run (known flake/hang); verification is scoped to the new tests, the Task 4 fallback tests, the seed-plan tests, and the `TestDirect` names.
 
 ---
@@ -508,7 +508,7 @@ Expected: FAIL — undefined.
 
 - [ ] **Step 3: Implement**
 
-Add `punchSockets`; wire the `punch()` branch for `mode == "sockets"`: use the v4 family socket as `first` and `peerV4[len(peerV4)-1]` as the peer p3; on success `markUp(win, out.Answer, out.Token)`; on failure `dc.backoff()`. Close losers with the existing ownership rules (the winner is handed to `markUp`, not closed by the function).
+Add `punchSockets`; wire the `punch()` branch for `mode == "sockets"`: use the v4 family socket as `first` and the public endpoint from `fallbackTarget(peerV4)` as the peer p3 (final review; never the list's tail); on success `markUp(win, out.Answer, out.Token)`; on failure `dc.backoff()`. Close losers with the existing ownership rules (the winner is handed to `markUp`, not closed by the function).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -540,7 +540,7 @@ git commit -m "feat(p2p): open multiple sockets on the random side"
   - Regression: `GOWORK=off go test ./internal/host -run 'TestDirect' -count=1` → `ok github.com/go-gost/p2p/internal/host 56.097s`; no regression.
   - `CGO_ENABLED=1 GOWORK=off go test -race ./internal/host -run 'TestPunchSockets|TestPunchSpray|TestSeedPlan' -count=1` → `ok github.com/go-gost/p2p/internal/host 4.306s`; no races.
   - `GOWORK=off go build ./...`, `GOWORK=off go vet ./internal/host`, `gofmt -l internal/host/punchsockets.go internal/host/punchsockets_test.go internal/host/direct.go internal/host/punchspray_test.go`, `git diff --check` → all clean (no output).
-- Review findings and fixes: self-review confirmed the Task 5 socket-leak failure mode is not repeated: `punchSockets` binds all sockets, closes every non-winner (including `first` on a failed round) before returning, and drains the loser goroutines' buffered results so none writes to a closed socket after the caller starts `markUp`; the winner is never closed by `punchSockets`. A bind error closes all sockets opened so far. All hands off the winner to `markUp`, whose install-failure path closes it. The sockets branch detaches the family socket before `closeFams()`, so a sibling family cannot close the winner, and it returns on every sockets outcome so the normal seed cannot consume late probes. One test needed an intentional update: `TestPunchOtherModesDoNotSpray` assumed `sockets` mode still ran the normal seed; its wait condition now observes the sockets fallback failure while still asserting no spray generator call and no spray trace. When a non-first socket wins, `dc.mine` is updated with that socket's local endpoint ahead of the preserved public mapping so later rounds announce the socket that is actually installed. The nil-`first` guard returns a skip (no sockets, no error) and the `punch()` branch never calls it without a v4 socket. Comments are English-only; no new dependencies or caps changes.
+- Review findings and fixes: self-review confirmed the Task 5 socket-leak failure mode is not repeated: `punchSockets` binds all sockets, closes every non-winner (including `first` on a failed round) before returning, and drains the loser goroutines' buffered results so none writes to a closed socket after the caller starts `markUp`; the winner is never closed by `punchSockets`. A bind error closes all sockets opened so far. All hands off the winner to `markUp`, whose install-failure path closes it. The sockets branch detaches the family socket before `closeFams()`, so a sibling family cannot close the winner, and it returns on every sockets outcome so the normal seed cannot consume late probes. One test needed an intentional update: `TestPunchOtherModesDoNotSpray` assumed `sockets` mode still ran the normal seed; its wait condition now observes the sockets fallback failure while still asserting no spray generator call and no spray trace. When a non-first socket wins, `dc.mine` is updated with that socket's local endpoint ahead of the preserved public mapping so later rounds announce the socket that is actually installed. The nil-`first` guard originally returned a success-shaped zero outcome (the caller happened to treat a nil winner as failure); the final review makes it return `errNoSockets` explicitly, and bounds the loser-result drain with `socketResultsDrain`. The `punch()` branch never calls it without a v4 socket. Comments are English-only; no new dependencies or caps changes.
 - Deferred items/limitations: Task 7 (status/doctor) and Task 8 (e2e) remain separate; no report of the sockets winner is added here. The full `internal/host` suite is not run (known flake/hang); verification is scoped to the new tests, the seed-plan and spray/fallback tests, and `TestDirect`. `socketStartDelay` is a plain package variable overwritten by tests in this package; no test runs in parallel here, and the focused `-race` run is clean. Code treats a zero `punch.sockets` as one socket (the resolved config always supplies a positive count); that clamp is not separately tested.
 
 ---
@@ -601,7 +601,7 @@ git commit -m "feat(p2p): report punch fallback diagnostics"
 
 - Date/status: 2026-11-28, complete.
 - Repo/commit: `p2p` @ `feat/p2p-cone-random`, task commit `5e7e98b feat(p2p): report punch fallback diagnostics` (SHA inlined by the required follow-up docs commit; no push).
-- Files changed: `status.go` (six in-process `PeerDiagnostic` fields), `internal/host/direct.go` (fallback outcome fields, `noteFallbackResult`, `fillFallbackDiag`, three trace lines and outcome recording in both fallback branches), `internal/host/engine.go` (call `fillFallbackDiag` in the status snapshot), `doctor/doctor.go` (peer `punch mode` line), `internal/host/punch_test.go` (`TestPeerDiagnosticFallback`, `TestPunchFallbackTraceAndWinner`), `doctor/doctor_test.go` (`TestPunchMode`), and this plan.
+- Files changed: `status.go` (six in-process `PeerDiagnostic` fields; the final review adds a seventh, `FallbackFailures`), `internal/host/direct.go` (fallback outcome fields, `noteFallbackResult`, `fillFallbackDiag`, three trace lines and outcome recording in both fallback branches), `internal/host/engine.go` (call `fillFallbackDiag` in the status snapshot), `doctor/doctor.go` (peer `punch mode` line), `internal/host/punch_test.go` (`TestPeerDiagnosticFallback`, `TestPunchFallbackTraceAndWinner`), `doctor/doctor_test.go` (`TestPunchMode`), and this plan.
 - Tests/commands and results:
   - RED: `GOWORK=off go test ./internal/host -run 'TestPeerDiagnosticFallback' -count=1` → FAIL (build: `noteFallbackResult` and the six diagnostic fields undefined); `GOWORK=off go test ./doctor -run 'TestPunchMode' -count=1` → FAIL (build: unknown field `PunchFallback`).
   - GREEN: the same two commands → PASS (`internal/host` 0.004s, `doctor` 0.003s).
@@ -658,14 +658,14 @@ git commit -m "test(p2p): gate cone-random direct assertion on the NAT lab"
 
 **Implementation record**
 
-- Date/status: 2026-11-28, REVISED — environment-gated. The scenario has zero failures and reports `SKIPPED (3 skipped assertion(s))`; no direct path is claimed as passing in this lab. Opt-in, not a CI gate.
+- Date/status: 2026-11-28, REVISED — smoke test, environment-gated. The scenario asserts branch entry **and completion** (a recorded `spray failed`/`sockets failed`/`fallback up via` outcome), reports `SKIPPED (3 skipped assertion(s))`, and claims no direct path in this lab. CI does not run this e2e suite, so the scenario cannot fail CI.
 - Repo/commit: `p2p` @ `feat/p2p-cone-random`, revision commit `07b9804 test(p2p): gate cone-random direct assertion on the NAT lab`; earlier task commits `46f7cfa test(p2p): cover cone-random punch in netns` and `a423725 docs(p2p): record task 8 commit`; no push.
-- Files changed: `tests/e2e/run.sh` (skip-aware scenario/global summary, `wait_status_grep`, branch-activity assertions and the three environment-gated skips in `nat-cone-random`), `tests/e2e/lib.sh` (`skip` primitive and counter), `tests/e2e/README.md` (opt-in/skip semantics and the scenario row), and this plan.
+- Files changed: `tests/e2e/run.sh` (skip-aware scenario/global summary, `wait_status_grep`, branch-activity and completion assertions, control-log guard, quiet topology restore, three environment-gated skips), `tests/e2e/lib.sh` (`skip` primitive and counter), `tests/e2e/README.md` (smoke-test/skip semantics and the scenario row), and this plan.
 - Tests/commands and results:
   - Controller ruling: the nested-netns `MASQUERADE --random-fully` mappings do not meet the random spray (eight runs, tcpdump showing disjoint port sets, both fallback branches running). Task 8 Step 4's expected green `direct established` is wrong for this container. The direct path was already proven by the earlier real-network pi/phone spike; the definitive field check is Task 9. Therefore the direct assertions are explicit skips, not passes and not failures.
   - Harness interface is `./run.sh --scenario nat-cone-random`, not the brief's positional form; the worktree sits under `p2p/.worktrees`, so `run.sh`'s derived `$GOST_DIR` does not exist. Binaries were prebuilt (`GOWORK=off` for p2p/helper, workspace build for gost) and the suite was run with `--skip-build` inside `unshare -n` with `lo` up (the host's 10.99.0.1:18081 is occupied by an unrelated process).
   - Earlier RED evidence (retained from the first implementation): with both modes `off`, the same command gave `scenario nat-cone-random: FAIL (3 assertion(s))` / `3 FAILED / 11 assertions`; all control assertions passed. With `spray`/`sockets`, eight runs reached both fallback branches but never established direct; packet captures showed zero overlap between sprayed ports and random mappings within a run. That evidence is why the gate exists; it is not a pass.
-  - Final gated command (from `tests/e2e`), run id `20261128-111746-3622363-19109`, log dir `/tmp/p2p-e2e/runs/20261128-111746-3622363-19109/logs`:
+  - Earlier gated command (retained for history), run id `20261128-111746-3622363-19109`, log dir `/tmp/p2p-e2e/runs/20261128-111746-3622363-19109/logs`:
 
     ```sh
     set -o pipefail; unshare -n bash -c 'ip link set lo up; exec ./run.sh --scenario nat-cone-random --skip-build --keep' 2>&1 | tee /tmp/opencode/task8-gated-run-final.log; echo "run.sh exit=${PIPESTATUS[0]}"
@@ -703,22 +703,64 @@ git commit -m "test(p2p): gate cone-random direct assertion on the NAT lab"
     logs: /tmp/p2p-e2e/runs/20261128-111746-3622363-19109/logs
     run.sh exit=0
     ```
-  - Regression check, same netns, run id `20261128-111735-3621647-21721`:
+  - Final fix-wave smoke command (from `tests/e2e`, after rebuilding `p2p` and `helper` from this branch with `GOWORK=off`), run id `20261128-114443-3632585-24917`, logs `/tmp/p2p-e2e/runs/20261128-114443-3632585-24917/logs`:
 
     ```sh
-    unshare -n bash -c 'ip link set lo up; exec ./run.sh --scenario derp-relay --skip-build --keep'
+    set -o pipefail; unshare -n bash -c 'ip link set lo up; exec ./run.sh --scenario nat-cone-random --skip-build --keep' 2>&1 | tee /tmp/opencode/final-fix-e2e.log; echo "run.sh exit=${PIPESTATUS[0]}"
     ```
 
     Exact output:
 
     ```text
-    p2p e2e  run=20261128-111735-3621647-21721  work=/tmp/p2p-e2e
+    p2p e2e  run=20261128-114443-3632585-24917  work=/tmp/p2p-e2e
+    binaries: p2p=/tmp/p2p-e2e/bin/p2p gost=/tmp/p2p-e2e/bin/gost helper=/tmp/p2p-e2e/bin/helper derper=/tmp/p2p-e2e/derper-root/usr/local/bin/derper
+    namespaces A=10.99.0.2 B=10.99.0.3 (mode=ip), bridge p2p-e2e-br
+
+    == NAT cone <-> random: fallback smoke test (branch entry and completion)
+    NAT namespaces: A=10.99.1.2 via RA=198.18.0.4 (cone) B=10.99.2.2 via RB=198.18.0.5 (random-fully)
+      PASS derper nat-ctrl up (stun=on)
+      PASS derp pair up (nat-ctrl): A=SzPfhCOAjt3xlEMy-P4yLovIrxeW3IQVHAWezD1GtSg B=TjpME8x2EsRhWpJQxxqNvr2XLfQ55LcLQJPAcJ3d5S4
+      PASS control: the relay carries HTTP
+      PASS control: the peer is on the relay
+      PASS control: no direct peer with punch off
+      PASS control log exists before the negative direct grep
+      PASS control: no direct established with punch off
+      PASS derp pair up (nat): A=XJB6JuTb0B7lb2NBjxXr88QiVHLbyH4zsS6GGZsvKlA B=4-rCgxQnICAqYkrnBp5YP0V0wfbUwonpSU9tehAntFk
+      PASS the cone side ran the spray fallback
+      PASS the random side ran the sockets fallback
+      PASS the cone side's punch trace records the spray fallback
+      PASS the spray round completed with a recorded outcome
+      PASS the sockets round completed with a recorded outcome
+      SKIP direct established by spray on the cone side (nested-netns MASQUERADE --random-fully mappings do not meet the random spray; direct path is verified on the real network — Task 9)
+      SKIP the random side established the matching direct path (nested-netns MASQUERADE --random-fully mappings do not meet the random spray; direct path is verified on the real network — Task 9)
+      SKIP status shows a live direct peer (nested-netns MASQUERADE --random-fully mappings do not meet the random spray; direct path is verified on the real network — Task 9)
+      PASS the fallback pair still carries HTTP
+      PASS the fallback pair still has its relay peer
+      PASS the fallback pair's HTTP rode the relay
+    scenario nat-cone-random: SKIPPED (3 skipped assertion(s))
+
+    NO FAILURES (16 passed, 3 skipped)
+    logs: /tmp/p2p-e2e/runs/20261128-114443-3632585-24917/logs
+    run.sh exit=0
+    ```
+
+    The two completion snapshots prove the rounds finished, not merely that their entry logs appeared: A's trace ends `spray failed: host: seed handshake timeout`, B's ends `sockets failed: host: seed handshake timeout`; both snapshots report `derp_peers=1`, `direct_peers=0`. This is the expected smoke-test result in this lab, not a fallback success.
+  - Final fix-wave regression check, same netns, run id `20261128-114618-3634964-8104` (an earlier run `20261128-111735-3621647-21721` also passed):
+
+    ```sh
+    set -o pipefail; unshare -n bash -c 'ip link set lo up; exec ./run.sh --scenario derp-relay --skip-build --keep' 2>&1 | tee /tmp/opencode/final-fix-derp-relay.log; echo "run.sh exit=${PIPESTATUS[0]}"
+    ```
+
+    Exact output:
+
+    ```text
+    p2p e2e  run=20261128-114618-3634964-8104  work=/tmp/p2p-e2e
     binaries: p2p=/tmp/p2p-e2e/bin/p2p gost=/tmp/p2p-e2e/bin/gost helper=/tmp/p2p-e2e/bin/helper derper=/tmp/p2p-e2e/derper-root/usr/local/bin/derper
     namespaces A=10.99.0.2 B=10.99.0.3 (mode=ip), bridge p2p-e2e-br
 
     == derp relay-only: two hosts, real derper, no direct path
       PASS derper relay up (stun=off)
-      PASS derp pair up (relay): A=dKzAi_u7Tcv3yBzr96d6wJI27lsEljcteOnh1ck1AkY B=4_KQ3mENgCKSGwHj-xVpaNHXDMusDR6s9d6aKYD6JgY
+      PASS derp pair up (relay): A=6qXLzeyZ3yuk7TDRoGEHmcv_D5r1Ti23YPqQadKC9CI B=Tm_LxDFJU2Pvzz1-2EED-L5v4qisK-8UEtG_bQNQiXY
       PASS relay tunnel carries HTTP
       PASS relay bulk transfer is 1 MiB
       PASS relay path is used
@@ -730,11 +772,12 @@ git commit -m "test(p2p): gate cone-random direct assertion on the NAT lab"
     scenario derp-relay: PASS
 
     ALL PASS (10 assertions)
-    logs: /tmp/p2p-e2e/runs/20261128-111735-3621647-21721/logs
+    logs: /tmp/p2p-e2e/runs/20261128-114618-3634964-8104/logs
+    run.sh exit=0
     ```
   - `GOWORK=off go build ./...` from the worktree → PASS; `git diff --check` → clean. `bash -n tests/e2e/run.sh tests/e2e/lib.sh` → PASS.
-- Review findings and fixes: controller revised the blocked Task 8: keep the topology, the `punch.mode: off` control and both fallback branches, but replace the three direct-established assertions with explicit skips carrying the lab reason. Added a `skip` primitive that never increments `PASSED`, and made the scenario summary print `SKIPPED` (never `PASS`) when skips exist; the global summary prints `NO FAILURES (... passed, ... skipped)` instead of `ALL PASS`. Branch activity is now asserted from the wire: A's log (`direct punch: spray`) and Status trace (`fallback spray ports=`), B's log (`direct punch: sockets`), plus relay peer and HTTP over the relay. Earlier findings retained: RFC1918 external addresses were replaced with the isolated 198.18.0.0/24 benchmark range so `isPublicIPv4` can arm the fallback; `net_teardown` iterates tracked namespaces; temporary tcpdump/NOTRACK experiments were removed.
-- Deferred items/limitations: the direct path remains **field-only** here: Task 9 (pi hub + Pixel 9 cellular, `spray` vs `sockets`, with an `off` control) is the definitive verification. This scenario is opt-in and not a CI gate; its `SKIPPED` result must never be read as a direct-path pass. The nested-netns NAT keeps sprayed ports disjoint from `--random-fully` mappings, so a green direct assertion in this container is not expected. The full `internal/host` suite was not run (known flake).
+- Review findings and fixes: controller revised the blocked Task 8: keep the topology, the `punch.mode: off` control and both fallback branches, but replace the three direct-established assertions with explicit skips carrying the lab reason. Added a `skip` primitive that never increments `PASSED`, and made the scenario summary print `SKIPPED` (never `PASS`) when skips exist; the global summary prints `NO FAILURES (... passed, ... skipped)` instead of `ALL PASS`. Branch activity is now asserted from the wire: A's log (`direct punch: spray`) and Status trace (`fallback spray ports=`), B's log (`direct punch: sockets`), plus relay peer and HTTP over the relay. Earlier findings retained: RFC1918 external addresses were replaced with the isolated 198.18.0.0/24 benchmark range so `isPublicIPv4` can arm the fallback; `net_teardown` iterates tracked namespaces; temporary tcpdump/NOTRACK experiments were removed. Final whole-branch review: entry logs alone could not prove a round completed, so both sides now poll their Status trace for `spray failed`/`sockets failed`/`fallback up via`; a missing/empty control log can no longer make the negative `direct established` grep pass vacuously; the topology-restore banner is quiet; and the README calls this a smoke test. No direct assertion was promoted to PASS, and the direct path stays field-only.
+- Deferred items/limitations: the direct path remains **field-only** here: Task 9 (pi hub + Pixel 9 cellular, `spray` vs `sockets`, with an `off` control) is the definitive verification. This scenario is a **smoke test only**: it is in the `SCENARIOS` run list, but the e2e suite is gated by `P2P_E2E` and no CI job sets it, so the scenario cannot fail CI; its `SKIPPED` result must never be read as a direct-path pass, and a completed round here usually completes with a failure. The nested-netns NAT keeps sprayed ports disjoint from `--random-fully` mappings, so a green direct assertion in this container is not expected. The full `internal/host` suite was not run (known flake); the 100x `TestDirect` stress belongs in a dedicated long-timeout CI job (see Task 4).
 
 ---
 
@@ -753,12 +796,21 @@ git commit -m "test(p2p): gate cone-random direct assertion on the NAT lab"
 
 **Implementation record**
 
-- Date/status:
-- Repo/commit:
-- Files changed:
-- Tests/commands and results:
-- Review findings and fixes:
-- Deferred items/limitations:
+- Date/status: 2026-11-28 — NOT STARTED. **Field-unverified until Task 9:** every item below is pending; no p2p repository test, netns smoke run, or in-process diagnostic can substitute for the pi + Pixel 9 cellular check.
+- Repo/commit: pending. Build and deploy one SHA from `feat/p2p-cone-random` to both ends; record that SHA, the wisper/APK revision (if used), and the phone/carrier here.
+- Files changed: none in the p2p repo; evidence is recorded in this plan only.
+- Field-verification checklist (uncheck nothing without the matching log/command evidence):
+  - [ ] Deployed hub binary SHA and phone binary/APK revision recorded; hub config has `stun`, `punch.mode: spray`; phone config has `punch.mode: sockets`.
+  - [ ] Phone on cellular only (Wi-Fi off) or forced to `rmnet1`; run window and observed carrier/region recorded.
+  - [ ] Hub log shows `fallback spray ports=` / `spray ... targets` **and** a terminal outcome (`fallback up via`, `spray failed`, or `spray install failed`).
+  - [ ] Hub log shows `direct established ... peerAddr=<39.144.43.x:<q_i>>` from the spray, with the answer matching a phone-side socket endpoint; `direct_peers` is 1 in `p2p doctor`/Status.
+  - [ ] Doctor peer block shows `punch mode: spray` and `caps` includes `spray`; spray ports/sockets budgets match the deployed config (in-process fields, not on the frozen gRPC wire).
+  - [ ] Recorded in-process `PeerDiagnostic.FallbackRounds >= 1`, `FallbackWinner`/`FallbackError`, and `FallbackFailures` from the hub's Status, with the timestamped lines that produced them.
+  - [ ] Control run with `punch.mode: off`: no `direct established`, no spray/sockets trace, relay carries HTTP; record the control SHAs/configs.
+  - [ ] Date, trimmed logs, commands, result, and carrier/region/time limitations recorded below this checklist.
+- Tests/commands and results: pending field run; the netns `nat-cone-random` scenario is a branch/completion smoke test only and is explicitly not evidence for any checked item above.
+- Review findings and fixes: final whole-branch review added this checklist and the field-unverified note; no behavior code in Task 9.
+- Deferred items/limitations: wisper settings/API/host wiring is a separate follow-up plan after the p2p tag; UI has no punch toggle. NAT auto-classification and the rest of the 3×3 matrix remain out of scope.
 
 ---
 

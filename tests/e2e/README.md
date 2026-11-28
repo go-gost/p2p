@@ -60,7 +60,7 @@ colliding with a previous run). The last five runs are kept.
 | `udp-tun` | The datagram link backs a point-to-point tun link (both ends tun clients, `udp` inner dialer): bidirectional ICMP across the link, and the link comes up on both sides. |
 | `udp-outlet` | A `udp://` target outlet: a tun **server** behind the tunnel with a shared passphrase; a remote spoke registers a keepalive route and reaches both the server address and a LAN address behind it. |
 | `ipv6-direct` | With no STUN server, a global IPv6 egress is enough to select a direct path (`direct_peers`); the peer's announced candidate is an `fd00::` address, proving the dial was IPv6 and not a v4 fallback. |
-| `nat-cone-random` | **Opt-in, not a CI gate.** Two hosts behind separate router namespaces — cone `MASQUERADE` vs `MASQUERADE --random-fully` — exercise `punch.mode: spray` against `punch.mode: sockets`. A `punch.mode: off` incarnation in the same run is the relay control. The scenario asserts that both fallback code paths ran (`direct punch: spray` in A's log plus `fallback spray` in its punch trace, `direct punch: sockets` in B's log) and that the relay still carries HTTP. The three `direct established`/live-direct-peer assertions are explicitly **skipped** in this nested-netns lab, because `MASQUERADE --random-fully` mappings do not meet the random spray; verify them on the real network (plan Task 9). |
+| `nat-cone-random` | **Smoke test only — not a fallback-success or direct-path test.** It is registered in `run.sh`'s scenario list, but CI does not run this suite (`P2P_E2E` must be set), so it cannot fail CI; run it manually. Two hosts behind separate router namespaces — cone `MASQUERADE` vs `MASQUERADE --random-fully` — exercise `punch.mode: spray` against `punch.mode: sockets`. A `punch.mode: off` incarnation in the same run is the relay control. The scenario asserts that both branches were entered (`direct punch: spray`/`direct punch: sockets` logs, spray trace) **and completed** (a `spray failed`/`sockets failed`/`fallback up via` trace outcome), and that the relay still carries HTTP. The three `direct established`/live-direct-peer assertions are explicitly **skipped** in this nested-netns lab, because `MASQUERADE --random-fully` mappings do not meet the random spray; the direct path is field-only (plan Task 9). A completed round here usually completes with a failure — that is expected in this lab. |
 
 ## Topology
 
@@ -89,7 +89,9 @@ HTTP echo server (`/` and a 1 MiB `/bulk`), and a UDP echo server.
   counts neither pass nor failure. A scenario with skips reports `SKIPPED (...)`
   instead of `PASS`, and the suite reports `NO FAILURES (<n> passed, <m>
   skipped)` instead of `ALL PASS`. Only `nat-cone-random` uses this today, for
-  the three direct-establishment assertions that this NAT lab cannot exercise.
+  the three direct-establishment assertions that this NAT lab cannot exercise;
+  its remaining assertions only smoke-test branch entry, completion and the
+  relay path, never a successful fallback or direct connection.
 - **PID tracking, not `pkill`.** All namespaces share one PID namespace, so
   `pkill -f <binary>` would kill both sides. `run.sh` records every PID it
   starts and kills them individually; teardown also removes the bridge,

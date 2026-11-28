@@ -39,8 +39,18 @@ type socketsProbe struct {
 // wantSources distinct sockets have sent, so all sockets are known to the test.
 func socketsProbePeer(t *testing.T, echoFrom netip.AddrPort, wantSources int) (netip.AddrPort, <-chan socketsProbe) {
 	t.Helper()
+	addr, probes, _ := socketsProbePeerWith(t, echoFrom, 0, wantSources)
+	return addr, probes
+}
+
+// socketsProbePeerWith also supports echoing the echoIndex-th distinct socket
+// (1-based) without knowing its local port in advance, and reports which source
+// it answered on. A zero echoIndex disables that selector.
+func socketsProbePeerWith(t *testing.T, echoFrom netip.AddrPort, echoIndex, wantSources int) (netip.AddrPort, <-chan socketsProbe, <-chan netip.AddrPort) {
+	t.Helper()
 	peer := mustListenUDP(t)
 	probes := make(chan socketsProbe, 64)
+	answered := make(chan netip.AddrPort, 1)
 	done := make(chan struct{})
 	t.Cleanup(func() {
 		close(done)
@@ -48,6 +58,7 @@ func socketsProbePeer(t *testing.T, echoFrom netip.AddrPort, wantSources int) (n
 	})
 	go func() {
 		seen := map[netip.AddrPort]bool{}
+		order := []netip.AddrPort{}
 		echoed := false
 		buf := make([]byte, 128)
 		for {
@@ -68,18 +79,26 @@ func socketsProbePeer(t *testing.T, echoFrom netip.AddrPort, wantSources int) (n
 				continue
 			}
 			ap := src.AddrPort()
-			seen[ap] = true
+			if !seen[ap] {
+				seen[ap] = true
+				order = append(order, ap)
+			}
 			select {
 			case probes <- socketsProbe{src: ap, at: time.Now()}:
 			default:
 			}
-			if echoFrom.IsValid() && !echoed && ap == echoFrom && len(seen) >= wantSources {
+			if echoed || len(order) < wantSources {
+				continue
+			}
+			answerByIndex := echoIndex > 0 && len(order) >= echoIndex && order[echoIndex-1] == ap
+			if (echoFrom.IsValid() && ap == echoFrom) || answerByIndex {
 				_, _ = peer.WriteToUDP(planSeedPacket(tok), src)
+				answered <- ap
 				echoed = true
 			}
 		}
 	}()
-	return udpAddrPort(t, peer), probes
+	return udpAddrPort(t, peer), probes, answered
 }
 
 func socketsCollectProbes(t *testing.T, probes <-chan socketsProbe, want int) []netip.AddrPort {
@@ -194,6 +213,102 @@ func TestPunchSocketsWindow(t *testing.T) {
 	}
 }
 
+// TestPunchSocketsNilFirstReturnsSentinel makes the skip self-describing: a
+// missing first socket is an explicit failure, not a success-shaped zero outcome.
+func TestPunchSocketsNilFirstReturnsSentinel(t *testing.T) {
+	dc := socketsTestConn(t, 1, 50*time.Millisecond)
+	win, _, err := dc.punchSockets(nil, netip.MustParseAddrPort("203.0.113.7:41000"))
+	if win != nil || !errors.Is(err, errNoSockets) {
+		t.Fatalf("punchSockets(nil) = (%v, %v), want (nil, errNoSockets)", win, err)
+	}
+}
+
+// TestPunchSocketsRoundTargetsPublicCandidateNotLast pins the branch's peer
+// target: a public entry before a loopback one must win, not the list's tail.
+func TestPunchSocketsRoundTargetsPublicCandidateNotLast(t *testing.T) {
+	socketsSetStartDelay(t, 10*time.Millisecond)
+	const public = "203.0.113.7:41000"
+	dc, _ := sprayTestRound(t, "sockets", public)
+	dc.e.punch.sockets = 2
+	dc.e.punch.socketWindow = 100 * time.Millisecond
+	dc.cand <- []candidate{
+		{addr: netip.MustParseAddrPort(public)},
+		{addr: netip.MustParseAddrPort("127.0.0.1:9")},
+	}
+
+	if !dc.start() {
+		t.Fatal("punch did not start")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return fallbackDiagnostics(dc).FallbackError != ""
+	})
+	if !sprayTraceHas(dc, "sockets 2 "+public) {
+		t.Fatalf("sockets did not target the public candidate: %v", dc.traceLines())
+	}
+	if sprayTraceHas(dc, "sockets 2 127.0.0.1:9") {
+		t.Fatalf("sockets targeted the loopback tail: %v", dc.traceLines())
+	}
+	if d := fallbackDiagnostics(dc); d.FallbackRounds != 1 || d.FallbackWinner != "" {
+		t.Fatalf("fallback outcome = (%q, %d rounds), want (empty, 1)", d.FallbackWinner, d.FallbackRounds)
+	}
+}
+
+// TestPunchSocketsNonFirstWinnerUpdatesMine is the regression for a non-first
+// socket winning: the winner must be installed and announced in dc.mine ahead of
+// the preserved public mapping, while the other sockets are closed.
+func TestPunchSocketsNonFirstWinnerUpdatesMine(t *testing.T) {
+	socketsSetStartDelay(t, 10*time.Millisecond)
+	const count = 3
+	const public = "203.0.113.7:41000"
+	dc, _ := sprayTestRound(t, "sockets", public)
+	dc.e.punch.sockets = count
+	dc.e.punch.socketWindow = 2 * time.Second
+	peerAddr, probes, answered := socketsProbePeerWith(t, netip.AddrPort{}, 2, count)
+	fallbackTreatAsPublic(t, peerAddr) // a loopback fake peer in the public slot
+	dc.cand <- []candidate{{addr: peerAddr}}
+
+	if !dc.start() {
+		t.Fatal("punch did not start")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return fallbackDiagnostics(dc).FallbackWinner != ""
+	})
+	var echoed netip.AddrPort
+	select {
+	case echoed = <-answered:
+	default:
+		t.Fatal("the fake peer never answered a socket")
+	}
+	if !echoed.IsValid() {
+		t.Fatal("answered by an invalid local socket")
+	}
+	for _, ap := range socketsCollectProbes(t, probes, count) {
+		if ap != echoed {
+			socketsAssertClosed(t, ap)
+		}
+	}
+
+	dc.mu.Lock()
+	sock, mine, installed := dc.sock, append([]candidate(nil), dc.mine...), dc.peerAddr
+	dc.mu.Unlock()
+	if sock == nil {
+		t.Fatal("no socket installed")
+	}
+	la, ok := sock.LocalAddr().(*net.UDPAddr)
+	if !ok || la.AddrPort() != echoed {
+		t.Fatalf("installed socket = %v, want the non-first winner %v", sock.LocalAddr(), echoed)
+	}
+	if installed != peerAddr {
+		t.Fatalf("installed peer = %v, want %v", installed, peerAddr)
+	}
+	if len(mine) < 2 || mine[0].addr != echoed {
+		t.Fatalf("mine = %v, want the winner %v first", mine, echoed)
+	}
+	if want := netip.MustParseAddrPort(public); mine[len(mine)-1].addr != want {
+		t.Fatalf("mine = %v, want the public mapping %v last", mine, want)
+	}
+}
+
 // TestPunchSocketsRoundInstallsAnswer proves the punch() sockets branch runs
 // the multi-socket handshake instead of the normal seed and installs its answer.
 func TestPunchSocketsRoundInstallsAnswer(t *testing.T) {
@@ -202,10 +317,8 @@ func TestPunchSocketsRoundInstallsAnswer(t *testing.T) {
 	dc.e.punch.sockets = 3
 	dc.e.punch.socketWindow = 2 * time.Second
 	peerAddr := sprayTestEchoPeer(t)
-	dc.cand <- []candidate{
-		{addr: netip.MustParseAddrPort("203.0.113.7:41000")},
-		{addr: peerAddr},
-	}
+	fallbackTreatAsPublic(t, peerAddr) // the fake peer occupies the public slot
+	dc.cand <- []candidate{{addr: peerAddr}}
 
 	if !dc.start() {
 		t.Fatal("punch did not start")

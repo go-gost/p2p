@@ -98,7 +98,7 @@ type PunchConfig struct {
 ### 4.4 spray 侧（Cone）
 
 - 复用 `collectV4` 的 socket（必须是做 STUN 的同一个 socket，保证 p3 一致）。
-- 目标：对端 **公网 IPv4**（`peerV4` 的最后一个；若只有本地候选则跳过 fallback）的 `SprayPorts` 个随机端口（1024–65535，去重，`math/rand` 每轮新集合）。
+- 目标：对端 **公网 IPv4**（从 `peerV4` 中选出的第一个公网地址，而不是列表末尾——末尾可能是 loopback/私网；若只有本地候选则跳过 fallback）的 `SprayPorts` 个随机端口（1024–65535，去重，`math/rand` 每轮新集合）。
 - 本端自己的 p3 来自 `collectV4` 的同一个 socket；spray 必须在这个 socket 上发，否则对端 filter 里的 p3 与源端口不一致，包会被丢。
 - 每 `SprayEvery` 把 `seedProbeMagic+token` 发到整个目标集合一次；总窗口 `SocketWindow`（默认 20s）或直到成功。1000 个包/2s ≈ 500pps，有上限。
 - 同一 token 由现有 `seedHandshakeUDPToken` 生成；目标集合作为新的 `targets []netip.AddrPort` 参数；对端 probe 仍回显到 source，learn-and-retarget 保留。

@@ -3,6 +3,7 @@ package host
 import (
 	"bytes"
 	"crypto/rand"
+	"fmt"
 	"net"
 	"net/netip"
 	"time"
@@ -45,6 +46,9 @@ type seedPlan struct {
 // before the socket is handed back.
 func seedHandshakePlan(sock *net.UDPConn, plan seedPlan, timeout time.Duration) (seedOutcome, error) {
 	var out seedOutcome
+	if !plan.Peer.IsValid() {
+		return out, fmt.Errorf("seedHandshakePlan: invalid peer address")
+	}
 	if _, err := rand.Read(out.Token[:]); err != nil {
 		return out, err
 	}

@@ -154,7 +154,7 @@ gen_cert() {
 		-subj "/CN=$host" -addext "subjectAltName=$san" >/dev/null 2>&1 || return 1
 }
 
-setup_net() {
+setup_net() { # [quiet]: the post-scenario topology restore needs no banner
 	ns_probe_mode
 	net_teardown
 	net_bridge_up
@@ -162,7 +162,7 @@ setup_net() {
 	ns_add B
 	net_host_up A "$HOST_A_IP"
 	net_host_up B "$HOST_B_IP"
-	say "namespaces A=$HOST_A_IP B=$HOST_B_IP (mode=$NS_MODE), bridge $BRIDGE"
+	[ "${1:-}" = quiet ] || say "namespaces A=$HOST_A_IP B=$HOST_B_IP (mode=$NS_MODE), bridge $BRIDGE"
 }
 
 # setup_nat_net: the cone-random topology. The derper and helper stay on the
@@ -665,16 +665,18 @@ punch_cfg() {
 	} >"$file"
 }
 
-# scenario_nat_cone_random: the same NAT topology runs twice. With punch off
-# the pair stays on the relay; with spray on the cone side and sockets on the
-# random side both fallback branches run and the relay keeps carrying traffic.
-# Both incarnations share the derper, STUN server, bridge and NAT routers -- only
-# the hosts are restarted, so the control is an assertion in this run, not a
-# second topology. The direct-established assertions are explicitly skipped in
-# this nested-netns lab: MASQUERADE --random-fully's mappings never meet the
-# spray here (see the plan's Task 8 record and Task 9 for the real-network check).
+# scenario_nat_cone_random: a smoke test, not a direct-path test. The same NAT
+# topology runs twice. With punch off the pair stays on the relay; with spray on
+# the cone side and sockets on the random side both fallback branches start AND
+# complete (the trace records spray/sockets failed or fallback up via), while the
+# relay keeps carrying traffic. Both incarnations share the derper, STUN server,
+# bridge and NAT routers -- only the hosts are restarted, so the control is an
+# assertion in this run, not a second topology. The direct-established assertions
+# are explicitly skipped in this nested-netns lab: MASQUERADE --random-fully's
+# mappings never meet the spray here (see the plan's Task 8 record and Task 9
+# for the real-network check).
 scenario_nat_cone_random() {
-	step "NAT cone <-> random: the spray/sockets fallback crosses a random NAT"
+	step "NAT cone <-> random: fallback smoke test (branch entry and completion)"
 	local dir="$RUNDIR/nat-cone-random"
 	mkdir -p "$dir"
 	setup_nat_net
@@ -699,8 +701,14 @@ scenario_nat_cone_random() {
 	save_status A 127.0.0.1:8003 "$dir/status-ctrl.json"
 	check_grep "control: the peer is on the relay" '"derp_peers":1' "$dir/status-ctrl.json"
 	check_grep "control: no direct peer with punch off" '"direct_peers":0' "$dir/status-ctrl.json"
-	check_not_grep "control: no direct established with punch off" \
-		'direct established' "$LOGDIR/p2p-nat-ctrl-a.log"
+	# A negative grep over a missing or empty log would pass vacuously.
+	if [ -s "$LOGDIR/p2p-nat-ctrl-a.log" ]; then
+		ok "control log exists before the negative direct grep"
+		check_not_grep "control: no direct established with punch off" \
+			'direct established' "$LOGDIR/p2p-nat-ctrl-a.log"
+	else
+		fail "control log $LOGDIR/p2p-nat-ctrl-a.log is missing or empty"
+	fi
 
 	# Restart the hosts with the fallback roles; the relay and NAT routers stay.
 	kill_pid "$(cat "$RUNDIR/pids/p2p-nat-ctrl-b")"
@@ -746,6 +754,22 @@ scenario_nat_cone_random() {
 		ok "the cone side's punch trace records the spray fallback"
 	else
 		fail "no spray fallback in the cone side's punch trace within 30s"
+	fi
+
+	# Completion, not just entry: an entry log alone would still pass if the
+	# handshake hung forever. The trace records the round's terminal outcome —
+	# spray/sockets failed in this lab, or fallback up via on a real NAT.
+	if wait_status_grep A 127.0.0.1:8003 'spray failed|fallback up via' \
+		"$dir/status-a-completed.json" 25; then
+		ok "the spray round completed with a recorded outcome"
+	else
+		fail "the spray round never completed within 25s"
+	fi
+	if wait_status_grep B 127.0.0.1:8003 'sockets failed|fallback up via' \
+		"$dir/status-b-completed.json" 75; then
+		ok "the sockets round completed with a recorded outcome"
+	else
+		fail "the sockets round never completed within 75s"
 	fi
 
 	# Environment gate. The direct path is proven on the real network in Task 9;
@@ -1493,7 +1517,7 @@ run_scenario() {
 	scenario_cleanup
 	# The cone-random scenario replaces the shared L2 topology with NAT routers;
 	# restore the default one so later scenarios in the same run still work.
-	[ "$name" = nat-cone-random ] && setup_net
+	[ "$name" = nat-cone-random ] && setup_net quiet
 	# A non-zero return is a failure even if the scenario never called fail()
 	# (e.g. a missing function), so a typo in a scenario name cannot report PASS.
 	[ "$rc" = 0 ] || fail "scenario $name exited with status $rc"

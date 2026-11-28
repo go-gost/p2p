@@ -1,6 +1,7 @@
 package host
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"time"
@@ -9,6 +10,13 @@ import (
 // socketStartDelay caps the wait before the sockets side starts sending, so a
 // spraying peer gets a head start. Tests shorten it.
 var socketStartDelay = 2 * time.Second
+
+// socketResultsDrain bounds the wait for the losing goroutines' final reports.
+// Closing their sockets should interrupt them immediately; a stuck report must
+// not hold the punch goroutine after a winner (or a failed round) is known.
+const socketResultsDrain = 5 * time.Second
+
+var errNoSockets = errors.New("no socket available for the sockets fallback")
 
 type socketAttempt struct {
 	sock *net.UDPConn
@@ -24,7 +32,7 @@ type socketAttempt struct {
 // On a failed round every socket, including first, is closed.
 func (dc *directConn) punchSockets(first *net.UDPConn, peer netip.AddrPort) (*net.UDPConn, seedOutcome, error) {
 	if first == nil {
-		return nil, seedOutcome{}, nil
+		return nil, seedOutcome{}, errNoSockets
 	}
 	e := dc.e
 	n := e.punch.sockets
@@ -88,8 +96,17 @@ func (dc *directConn) punchSockets(first *net.UDPConn, peer netip.AddrPort) (*ne
 			sock.Close()
 		}
 	}
+	drain := time.NewTimer(socketResultsDrain)
+	defer drain.Stop()
+drainResults:
 	for ; received < n; received++ {
-		<-results
+		select {
+		case <-results:
+		case <-drain.C:
+			e.log.Debug("direct punch: sockets result drain timed out", "peer", keyName(dc.peer),
+				"missing", n-received)
+			break drainResults
+		}
 	}
 	if win == nil {
 		e.log.Debug("direct punch: sockets failed", "peer", keyName(dc.peer), "error", firstErr)

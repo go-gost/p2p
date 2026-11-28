@@ -39,6 +39,11 @@ type PeerDiagnostic struct {
 	// whether they ended in an answer or a failure. It is deliberately not the
 	// consecutive-failure counter, which resets on success.
 	FallbackRounds int
+	// FallbackFailures is the consecutive failed-attempt count for this peer;
+	// unlike FallbackRounds it resets when a direct path comes up. It is the
+	// in-process mirror of the punch's fallbackFailures counter and is not on
+	// the frozen gRPC wire.
+	FallbackFailures int
 	// FallbackWinner is the peer endpoint whose seed answer won the latest
 	// fallback round; empty after a failure or when none ran. FallbackError is
 	// why the latest round failed; empty on success or when none ran. Both are

@@ -117,5 +117,8 @@ func resolvePunch(c *p2p.PunchConfig) (punchSettings, error) {
 	if c.SeedGrace > 0 {
 		s.seedGrace = c.SeedGrace
 	}
+	if s.seedGrace > maxPunchSocketWindow {
+		return punchSettings{}, fmt.Errorf("punch.seedGrace (%s) must be at most %s", s.seedGrace, maxPunchSocketWindow)
+	}
 	return s, nil
 }

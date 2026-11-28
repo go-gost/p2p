@@ -223,6 +223,44 @@ func TestPunchSprayRoundInstallsAnswer(t *testing.T) {
 	}
 }
 
+// TestPunchSprayRoundUsesPublicCandidateNotLast pins the spray target when a
+// public candidate is followed by a loopback one: the spray must aim at the
+// public IP even though the old code took the list's last entry.
+func TestPunchSprayRoundUsesPublicCandidateNotLast(t *testing.T) {
+	const public = "203.0.113.7:41000"
+	dc, _ := sprayTestRound(t, "spray", public)
+	peerAddr := sprayTestEchoPeer(t)
+	var gotIP netip.Addr
+	var gotN int
+	spraySetTargets(t, &gotIP, &gotN, []netip.AddrPort{peerAddr})
+	dc.cand <- []candidate{
+		{addr: netip.MustParseAddrPort(public)},
+		{addr: netip.MustParseAddrPort("127.0.0.1:9")},
+	}
+
+	if !dc.start() {
+		t.Fatal("punch did not start")
+	}
+	waitFor(t, 4*time.Second, func() bool {
+		return dc.isUp() || sprayTraceHas(dc, "spray failed")
+	})
+	if !dc.isUp() {
+		t.Fatalf("spray did not install a direct path; trace = %v", dc.traceLines())
+	}
+	if want := netip.MustParseAddr("203.0.113.7"); gotIP != want {
+		t.Fatalf("sprayed IP = %v, want the public candidate's %v", gotIP, want)
+	}
+	if !sprayTraceHas(dc, "spray 2 targets "+public) {
+		t.Fatalf("spray did not announce the public target: %v", dc.traceLines())
+	}
+	dc.mu.Lock()
+	installed := dc.peerAddr
+	dc.mu.Unlock()
+	if installed != peerAddr {
+		t.Fatalf("installed peer = %v, want the spray answer %v", installed, peerAddr)
+	}
+}
+
 // TestPunchSprayRoundFailureBacksOff proves a failed spray counts as a fallback
 // failure and does not run the normal seed in the same round.
 func TestPunchSprayRoundFailureBacksOff(t *testing.T) {

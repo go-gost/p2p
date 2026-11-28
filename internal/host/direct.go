@@ -1339,34 +1339,48 @@ func (dc *directConn) fillFallbackDiag(d *p2p.PeerDiagnostic) {
 	}
 	dc.mu.Lock()
 	d.FallbackRounds = dc.fallbackRounds
+	d.FallbackFailures = dc.fallbackFailures
 	d.FallbackWinner = dc.fallbackWinner
 	d.FallbackError = dc.fallbackError
 	dc.mu.Unlock()
 }
 
-// fallbackReady reports whether the next round should use the spray/sockets
-// fallback. It needs an opted-in mode, enough failed normal rounds, a peer that
-// advertised capsSpray, and a public IPv4 candidate to aim at: spraying a
-// private address says nothing about a NAT on the far side, and only IPv4 is
-// supported by the fallback.
-func (dc *directConn) fallbackReady(peerV4 []netip.AddrPort) bool {
+// fallbackTarget selects the single public IPv4 endpoint both fallback branches
+// must aim at. It needs an opted-in mode, enough failed normal rounds, a peer
+// that advertised capsSpray, and a public candidate: spraying a private address
+// says nothing about a NAT on the far side. The first public entry wins — the
+// list can carry private or loopback candidates after it, and taking its tail
+// would aim the fallback at an endpoint it can never reach.
+func (dc *directConn) fallbackTarget(peerV4 []netip.AddrPort) (netip.AddrPort, bool) {
 	if dc.e == nil || !dc.e.sprayEnabled() || len(peerV4) == 0 {
-		return false
+		return netip.AddrPort{}, false
 	}
 	dc.mu.Lock()
 	armed := dc.normalFailures >= dc.e.punch.afterRounds
 	spray := dc.peerCaps&capsSpray != 0
 	dc.mu.Unlock()
 	if !armed || !spray {
-		return false
+		return netip.AddrPort{}, false
 	}
 	for _, ap := range peerV4 {
-		if isPublicIPv4(ap) {
-			return true
+		if isPublicIPv4Fn(ap) {
+			return ap, true
 		}
 	}
-	return false
+	return netip.AddrPort{}, false
 }
+
+// fallbackReady reports whether an armed fallback has a usable public target.
+// Callers that actually spray or open sockets use fallbackTarget so they cannot
+// select a different endpoint from the one that armed the round.
+func (dc *directConn) fallbackReady(peerV4 []netip.AddrPort) bool {
+	_, ok := dc.fallbackTarget(peerV4)
+	return ok
+}
+
+// isPublicIPv4Fn is the classifier fallbackTarget uses; tests replace it when
+// an in-process fake peer must occupy the public slot.
+var isPublicIPv4Fn = isPublicIPv4
 
 // isPublicIPv4 reports whether ap is a usable public IPv4 endpoint. IsPrivate
 // does not cover the CGNAT range (100.64.0.0/10), which a phone carrier uses
@@ -1756,11 +1770,10 @@ func (dc *directConn) punch() {
 	// running both would consume the peer's late probes after the winner's grace
 	// window has closed. Without a v4 family there is no socket to spray from,
 	// so the ordinary path below owns the round.
-	if e.punch.mode == "spray" && has4 && dc.fallbackReady(peerV4) {
+	if announced, ready := dc.fallbackTarget(peerV4); e.punch.mode == "spray" && has4 && ready {
 		sock := fams[i4].sock
 		if sock != nil {
 			fams[i4].sock = nil // the spray owns it until markUp
-			announced := peerV4[len(peerV4)-1]
 			dc.noteRound("fallback spray ports=%d", e.punch.sprayPorts)
 			dc.noteRound("spray %d targets %s", e.punch.sprayPorts, announced.String())
 			out, err := dc.punchSpray(sock, announced, announced.Addr())
@@ -1780,8 +1793,7 @@ func (dc *directConn) punch() {
 			}
 			if err := dc.markUp(sock, out.Answer, out.Token); err != nil {
 				reason := fmt.Sprintf("spray install failed: %v", err)
-				e.log.Debug("direct punch: spray install failed", "peer", pname, "error", err)
-				dc.noteRound("spray install failed: %v", err)
+				dc.noteRound("%s", reason)
 				dc.noteFallbackFailure()
 				dc.noteFallbackResult("", reason)
 				dc.backoff()
@@ -1808,11 +1820,10 @@ func (dc *directConn) punch() {
 	// round's normal seed: a late probe would otherwise be consumed after the
 	// winner's grace window closed. Without a v4 family there is no socket to
 	// start from, so the ordinary path below owns the round.
-	if e.punch.mode == "sockets" && has4 && dc.fallbackReady(peerV4) {
+	if announced, ready := dc.fallbackTarget(peerV4); e.punch.mode == "sockets" && has4 && ready {
 		sock := fams[i4].sock
 		if sock != nil {
 			fams[i4].sock = nil // the sockets round owns it until markUp
-			announced := peerV4[len(peerV4)-1]
 			dc.noteRound("fallback sockets=%d", e.punch.sockets)
 			dc.noteRound("sockets %d %s", e.punch.sockets, announced.String())
 			win, out, err := dc.punchSockets(sock, announced)

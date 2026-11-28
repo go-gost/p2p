@@ -41,6 +41,7 @@ func TestResolvePunchClampsAndValidates(t *testing.T) {
 	for _, bad := range []*p2p.PunchConfig{
 		{Mode: "spray", SprayEvery: 100 * time.Millisecond},
 		{Mode: "sockets", SocketWindow: 61 * time.Second},
+		{Mode: "spray", SeedGrace: 61 * time.Second},
 	} {
 		if _, err := resolvePunch(bad); err == nil {
 			t.Fatalf("want error for %+v", bad)
@@ -93,6 +94,18 @@ func TestEngineCapsSprayModes(t *testing.T) {
 // can be sprayed. It is distinct from the TEST-NET addresses used elsewhere.
 func fallbackPublicV4() []netip.AddrPort {
 	return []netip.AddrPort{netip.MustParseAddrPort("8.8.8.8:443")}
+}
+
+// fallbackTreatAsPublic lets an in-process loopback fake peer stand in for a
+// public endpoint: the real predicate rejects loopback by design. It restores
+// the seam on cleanup so other tests keep the production classification.
+func fallbackTreatAsPublic(t *testing.T, ap netip.AddrPort) {
+	t.Helper()
+	old := isPublicIPv4Fn
+	isPublicIPv4Fn = func(candidate netip.AddrPort) bool {
+		return candidate == ap || old(candidate)
+	}
+	t.Cleanup(func() { isPublicIPv4Fn = old })
 }
 
 // newFallbackTestConn builds a directConn with the given punch settings. Its
@@ -191,6 +204,36 @@ func TestFallbackNotArmedWithoutPublicV4(t *testing.T) {
 	}
 	if !dc.fallbackReady(mixed) {
 		t.Fatal("not armed with a public candidate among local ones")
+	}
+}
+
+// TestFallbackTargetSelectsPublicNotLast pins the target both fallback branches
+// use: a public entry earlier in the list wins even when a private or loopback
+// entry comes after it. fallbackReady alone only proves some entry armed.
+func TestFallbackTargetSelectsPublicNotLast(t *testing.T) {
+	dc := newFallbackTestConn(t, "spray", 1, capsSpray)
+	dc.noteNormalSeedFailure()
+	want := netip.MustParseAddrPort("8.8.8.8:443")
+	mixed := []netip.AddrPort{
+		want,
+		netip.MustParseAddrPort("10.0.0.1:443"),
+		netip.MustParseAddrPort("127.0.0.1:9"),
+	}
+	if !dc.fallbackReady(mixed) {
+		t.Fatal("fallback not armed with a public candidate before private ones")
+	}
+	got, ok := dc.fallbackTarget(mixed)
+	if !ok {
+		t.Fatal("fallbackTarget did not select an armed public endpoint")
+	}
+	if got != want {
+		t.Fatalf("fallbackTarget = %v, want the public endpoint %v", got, want)
+	}
+	if got, ok := dc.fallbackTarget([]netip.AddrPort{
+		netip.MustParseAddrPort("10.0.0.1:443"),
+		netip.MustParseAddrPort("127.0.0.1:9"),
+	}); ok || got.IsValid() {
+		t.Fatalf("fallbackTarget = (%v, %v), want (invalid, false) with no public endpoint", got, ok)
 	}
 }
 
@@ -385,6 +428,19 @@ func TestPeerDiagnosticFallback(t *testing.T) {
 				t.Fatalf("outcome = (%q, %q), want (empty, spray failed: timeout)",
 					d.FallbackWinner, d.FallbackError)
 			}
+
+			// FallbackFailures is the consecutive-failure counter, distinct from
+			// the cumulative FallbackRounds, and a success clears it.
+			dc.noteFallbackFailure()
+			d = fallbackDiagnostics(dc)
+			if d.FallbackFailures != 1 || d.FallbackRounds != 2 {
+				t.Fatalf("failures/rounds = (%d, %d), want (1, 2)", d.FallbackFailures, d.FallbackRounds)
+			}
+			dc.noteFallbackSuccess()
+			d = fallbackDiagnostics(dc)
+			if d.FallbackFailures != 0 || d.FallbackRounds != 2 {
+				t.Fatalf("failures/rounds after success = (%d, %d), want (0, 2)", d.FallbackFailures, d.FallbackRounds)
+			}
 		})
 	}
 
@@ -460,10 +516,8 @@ func TestPunchFallbackTraceAndWinner(t *testing.T) {
 		dc.e.punch.sockets = 3
 		dc.e.punch.socketWindow = 2 * time.Second
 		peerAddr := sprayTestEchoPeer(t)
-		dc.cand <- []candidate{
-			{addr: netip.MustParseAddrPort("203.0.113.7:41000")},
-			{addr: peerAddr},
-		}
+		fallbackTreatAsPublic(t, peerAddr) // the fake peer occupies the public slot
+		dc.cand <- []candidate{{addr: peerAddr}}
 		if !dc.start() {
 			t.Fatal("punch did not start")
 		}
