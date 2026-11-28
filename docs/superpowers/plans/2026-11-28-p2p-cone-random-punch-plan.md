@@ -659,7 +659,7 @@ git commit -m "test(p2p): gate cone-random direct assertion on the NAT lab"
 **Implementation record**
 
 - Date/status: 2026-11-28, REVISED — environment-gated. The scenario has zero failures and reports `SKIPPED (3 skipped assertion(s))`; no direct path is claimed as passing in this lab. Opt-in, not a CI gate.
-- Repo/commit: `p2p` @ `feat/p2p-cone-random`, revision commit subject `test(p2p): gate cone-random direct assertion on the NAT lab` (SHA inlined by the required follow-up docs commit); earlier task commits `46f7cfa test(p2p): cover cone-random punch in netns` and `a423725 docs(p2p): record task 8 commit`; no push.
+- Repo/commit: `p2p` @ `feat/p2p-cone-random`, revision commit `07b9804 test(p2p): gate cone-random direct assertion on the NAT lab`; earlier task commits `46f7cfa test(p2p): cover cone-random punch in netns` and `a423725 docs(p2p): record task 8 commit`; no push.
 - Files changed: `tests/e2e/run.sh` (skip-aware scenario/global summary, `wait_status_grep`, branch-activity assertions and the three environment-gated skips in `nat-cone-random`), `tests/e2e/lib.sh` (`skip` primitive and counter), `tests/e2e/README.md` (opt-in/skip semantics and the scenario row), and this plan.
 - Tests/commands and results:
   - Controller ruling: the nested-netns `MASQUERADE --random-fully` mappings do not meet the random spray (eight runs, tcpdump showing disjoint port sets, both fallback branches running). Task 8 Step 4's expected green `direct established` is wrong for this container. The direct path was already proven by the earlier real-network pi/phone spike; the definitive field check is Task 9. Therefore the direct assertions are explicit skips, not passes and not failures.
