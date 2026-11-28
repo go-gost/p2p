@@ -1756,6 +1756,60 @@ func (dc *directConn) punch() {
 		}
 	}
 
+	// The random side opens several sockets from the v4 family's advertised p3:
+	// a per-destination NAT gives each socket its own public mapping, so a peer
+	// spraying a range of ports only has to hit one of them. This replaces this
+	// round's normal seed: a late probe would otherwise be consumed after the
+	// winner's grace window closed. Without a v4 family there is no socket to
+	// start from, so the ordinary path below owns the round.
+	if e.punch.mode == "sockets" && has4 && dc.fallbackReady(peerV4) {
+		sock := fams[i4].sock
+		if sock != nil {
+			fams[i4].sock = nil // the sockets round owns it until markUp
+			announced := peerV4[len(peerV4)-1]
+			dc.noteRound("sockets %d %s", e.punch.sockets, announced.String())
+			win, out, err := dc.punchSockets(sock, announced)
+			closeFams()
+			if err != nil || win == nil {
+				reason := "sockets failed: no winner"
+				if err != nil {
+					reason = fmt.Sprintf("sockets failed: %v", err)
+				}
+				e.log.Debug("direct punch: sockets failed", "peer", pname, "error", reason)
+				dc.noteErr(reason)
+				dc.noteRound("%s", reason)
+				dc.noteFallbackFailure()
+				dc.backoff()
+				return
+			}
+			if err := dc.markUp(win, out.Answer, out.Token); err != nil {
+				e.log.Debug("direct punch: sockets install failed", "peer", pname, "error", err)
+				dc.noteRound("sockets install failed: %v", err)
+				dc.noteFallbackFailure()
+				dc.backoff()
+				return
+			}
+			// Announce the winner's local endpoint: it may not be the family
+			// socket whose candidate was sent at the start of this round. Keep
+			// the public mapping last, as dialFor expects.
+			mine := fams[i4].mine
+			if la, ok := win.LocalAddr().(*net.UDPAddr); ok && len(mine) > 0 && la.AddrPort() != mine[0].addr {
+				next := make([]candidate, 0, len(mine))
+				next = append(next, candidate{addr: la.AddrPort()})
+				next = append(next, mine[1:]...)
+				mine = next
+			}
+			dc.mu.Lock()
+			dc.mine = mine
+			dc.unreadyTries = 0
+			dc.mu.Unlock()
+			dc.noteRound("sockets up")
+			e.log.Debug("direct established by sockets", "peer", pname,
+				"answer", out.Answer.String(), "candidates", len(mine))
+			return
+		}
+	}
+
 	// 4. Attempt every family at once, then adjudicate: a family outranks the
 	// ones after it, so v6 wins whenever it completes and a completed v4
 	// handshake is held until v6 has reported a failure.

@@ -334,8 +334,8 @@ func TestPunchSkipsSprayWithoutV4Family(t *testing.T) {
 	}
 }
 
-// TestPunchOtherModesDoNotSpray proves mode "sockets" keeps the normal path
-// until its own fallback is implemented in a later task.
+// TestPunchOtherModesDoNotSpray proves mode "sockets" uses its own fallback and
+// never the cone side's port spray.
 func TestPunchOtherModesDoNotSpray(t *testing.T) {
 	dc, _ := sprayTestRound(t, "sockets", "203.0.113.7:44000")
 	var sprayed bool
@@ -351,7 +351,7 @@ func TestPunchOtherModesDoNotSpray(t *testing.T) {
 		t.Fatal("punch did not start")
 	}
 	waitFor(t, 4*time.Second, func() bool {
-		return normalFailuresOf(dc) == 2 || sprayTraceHas(dc, "spray")
+		return fallbackFailuresOf(dc) == 1 || sprayTraceHas(dc, "spray")
 	})
 
 	if sprayed || sprayTraceHas(dc, "spray") {
