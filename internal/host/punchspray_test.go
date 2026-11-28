@@ -3,6 +3,7 @@ package host
 import (
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"strings"
 	"sync"
@@ -256,6 +257,51 @@ func TestPunchSprayRoundFailureBacksOff(t *testing.T) {
 	if dc.isUp() {
 		t.Fatal("a failed spray installed a direct path")
 	}
+}
+
+// TestPunchSprayFailureReleasesSocket proves a failed spray closes the socket
+// detached from the round's families: its local port must be bindable again.
+func TestPunchSprayFailureReleasesSocket(t *testing.T) {
+	dc, _ := sprayTestRound(t, "spray", "203.0.113.7:45000")
+	dc.e.punch.socketWindow = 400 * time.Millisecond
+	sink := mustListenUDP(t)
+	defer sink.Close()
+	source := make(chan netip.AddrPort, 1)
+	go func() {
+		buf := make([]byte, 128)
+		for {
+			_, src, err := sink.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			select {
+			case source <- src.AddrPort():
+			default:
+			}
+		}
+	}()
+	var gotIP netip.Addr
+	var gotN int
+	spraySetTargets(t, &gotIP, &gotN, []netip.AddrPort{udpAddrPort(t, sink)})
+	dc.cand <- sprayPublicV4(45000)
+
+	if !dc.start() {
+		t.Fatal("punch did not start")
+	}
+	waitFor(t, 4*time.Second, func() bool {
+		return fallbackFailuresOf(dc) == 1
+	})
+	var addr netip.AddrPort
+	select {
+	case addr = <-source:
+	case <-time.After(time.Second):
+		t.Fatal("no spray probe reached the sink")
+	}
+	rebound, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(addr))
+	if err != nil {
+		t.Fatalf("spray socket %s is still bound after a failed spray: %v", addr, err)
+	}
+	rebound.Close()
 }
 
 // TestPunchSkipsSprayWithoutV4Family proves the fallback is skipped when the

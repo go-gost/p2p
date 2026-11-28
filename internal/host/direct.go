@@ -1726,6 +1726,9 @@ func (dc *directConn) punch() {
 			out, err := dc.punchSpray(sock, announced, announced.Addr())
 			closeFams()
 			if err != nil {
+				// closeFams cannot reclaim the socket we detached; markUp owns
+				// it only after a successful handshake.
+				sock.Close()
 				e.log.Debug("direct punch: spray failed", "peer", pname, "error", err)
 				dc.noteErr(fmt.Sprintf("spray failed: %v", err))
 				dc.noteRound("spray failed: %v", err)
