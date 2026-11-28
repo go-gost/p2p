@@ -168,6 +168,11 @@ var (
 	seedTimeout = 5 * time.Second
 )
 
+// fallbackRetry is the next round's wait once the spray/sockets fallback is
+// armed. It replaces the normal backoff (30s in production) so the fallback
+// gets a fresh seed round promptly after a failed one.
+const fallbackRetry = 500 * time.Millisecond
+
 // seedRetransmit is how often seedHandshakeUDP resends its probe while it waits
 // for its own token to come back. The read deadline between sends is the same
 // interval, so a retransmit and the wait for a reply interleave.
@@ -297,6 +302,15 @@ type directConn struct {
 	// the evidence goes stale. Guarded by mu.
 	controlMisses   int
 	controlLiveSeen bool
+
+	// normalFailures counts consecutive rounds whose seed attempts all failed.
+	// Only that outcome is evidence that the ordinary punch path is blocked;
+	// a control-plane round that ended before any seed was sent says nothing
+	// about it and must not arm the fallback. fallbackFailures counts attempts
+	// of the fallback itself and is separate so one does not masquerade as the
+	// other. Both are guarded by mu.
+	normalFailures   int
+	fallbackFailures int
 
 	// This peer's punch history, reported through Status.PeerDiagnostics. Atomics
 	// so a status query reads them without taking dc.mu and queueing behind a
@@ -946,6 +960,9 @@ func (dc *directConn) markUp(sock *net.UDPConn, peerAddr netip.AddrPort, token [
 	dc.controlMisses = 0
 	dc.controlLiveSeen = false
 	dc.mu.Unlock()
+	// A direct path is up, so the run of failed rounds is over. This covers
+	// both a normal win and a fallback win (the latter calls markUp too).
+	dc.noteFallbackSuccess()
 
 	if prevSock != nil && prevSock != sock {
 		// The install already replaced and closed it; this covers a dc.sock
@@ -1259,6 +1276,92 @@ func (dc *directConn) retryDirectUnready(reason string) {
 
 func (dc *directConn) backoff() {
 	dc.retry(dc.silentPeerWait(time.Duration(backoffPeriod.Load())), true)
+}
+
+// noteNormalSeedFailure counts one round in which every seed attempt failed.
+// Control-plane endings call backoff (or retryDirectUnready) without this, so
+// they cannot arm the fallback by accident.
+func (dc *directConn) noteNormalSeedFailure() {
+	dc.mu.Lock()
+	dc.normalFailures++
+	dc.mu.Unlock()
+}
+
+// noteFallbackSuccess ends the run of failed normal rounds: a direct path came
+// up, so the next round has no reason to use the fallback. markUp calls this
+// for both normal and fallback successes.
+func (dc *directConn) noteFallbackSuccess() {
+	dc.mu.Lock()
+	dc.normalFailures = 0
+	dc.fallbackFailures = 0
+	dc.mu.Unlock()
+}
+
+// noteFallbackFailure records a failed fallback attempt without disarming it:
+// the next round must still see a ready fallback and try again.
+func (dc *directConn) noteFallbackFailure() {
+	dc.mu.Lock()
+	dc.fallbackFailures++
+	dc.mu.Unlock()
+}
+
+// fallbackReady reports whether the next round should use the spray/sockets
+// fallback. It needs an opted-in mode, enough failed normal rounds, a peer that
+// advertised capsSpray, and a public IPv4 candidate to aim at: spraying a
+// private address says nothing about a NAT on the far side, and only IPv4 is
+// supported by the fallback.
+func (dc *directConn) fallbackReady(peerV4 []netip.AddrPort) bool {
+	if dc.e == nil || !dc.e.sprayEnabled() || len(peerV4) == 0 {
+		return false
+	}
+	dc.mu.Lock()
+	armed := dc.normalFailures >= dc.e.punch.afterRounds
+	spray := dc.peerCaps&capsSpray != 0
+	dc.mu.Unlock()
+	if !armed || !spray {
+		return false
+	}
+	for _, ap := range peerV4 {
+		if isPublicIPv4(ap) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPublicIPv4 reports whether ap is a usable public IPv4 endpoint. IsPrivate
+// does not cover the CGNAT range (100.64.0.0/10), which a phone carrier uses
+// and which cannot be sprayed from outside like a public address.
+func isPublicIPv4(ap netip.AddrPort) bool {
+	if !ap.IsValid() {
+		return false
+	}
+	addr := ap.Addr()
+	if !addr.Is4() || addr.IsPrivate() || addr.IsLoopback() ||
+		addr.IsLinkLocalUnicast() || addr.IsUnspecified() || addr.IsMulticast() {
+		return false
+	}
+	b := addr.As4()
+	if b[0] == 0 { // the whole "this network" block is not a public host
+		return false
+	}
+	if b[0] == 100 && b[1]&0xc0 == 64 { // 100.64.0.0/10
+		return false
+	}
+	return true
+}
+
+// seedFailureRetry is the winner < 0 path of punch: count one failed normal
+// round, then schedule a short retry when the fallback is ready. Before the
+// fallback is armed this is exactly the normal backoff.
+func (dc *directConn) seedFailureRetry(peerV4 []netip.AddrPort) {
+	dc.noteNormalSeedFailure()
+	if !dc.fallbackReady(peerV4) {
+		dc.backoff()
+		return
+	}
+	dc.noteRound("fallback ready, retry in %s", fallbackRetry)
+	dc.retry(fallbackRetry, true)
 }
 
 // resetControlMisses forgets the counted control failures: control demonstrably
@@ -1666,9 +1769,10 @@ func (dc *directConn) punch() {
 		break
 	}
 	if winner < 0 {
-		// Every available family failed this round.
+		// Every available family failed this round. Only this outcome counts
+		// toward arming the fallback; the control-plane exits above do not.
 		closeFams()
-		dc.backoff()
+		dc.seedFailureRetry(peerV4)
 		return
 	}
 

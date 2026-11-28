@@ -367,12 +367,19 @@ git commit -m "feat(p2p): arm punch fallback after seed failures"
 
 **Implementation record**
 
-- Date/status:
-- Repo/commit:
-- Files changed:
+- Date/status: 2026-11-28 — complete.
+- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; this commit (the task commit; exact SHA in the SDD ledger).
+- Files changed: `internal/host/direct.go` (`fallbackRetry`, `normalFailures`/`fallbackFailures`, `fallbackReady`, `isPublicIPv4`, `noteNormalSeedFailure`, `noteFallbackSuccess`, `noteFallbackFailure`, `seedFailureRetry`, the `winner < 0` branch, and the success reset in `markUp`), `internal/host/punch_test.go` (eight new `TestFallback*` tests covering arming thresholds, caps, public-v4 filtering including CGNAT, off/unknown modes, success resets, fallback failure staying armed, short vs long retry, and a real "no peer candidates" round), this plan's Task 4 record. No dependency changes.
 - Tests/commands and results:
-- Review findings and fixes:
-- Deferred items/limitations:
+  - RED before implementation: `GOWORK=off go test ./internal/host -run 'TestFallback' -count=1` → FAIL (build failed: `dc.normalFailures undefined`, `dc.fallbackReady undefined`, `dc.noteNormalSeedFailure undefined`, `dc.fallbackFailures undefined`, plus the other missing helpers).
+  - GREEN after implementation: the same command with `-v` → `ok github.com/go-gost/p2p/internal/host 2.023s`; all eight new tests PASS (the no-peer-candidates round takes 2.02s, the rest are instantaneous).
+  - `GOWORK=off go test ./internal/host -run 'TestDirect' -count=1` → `ok github.com/go-gost/p2p/internal/host 57.893s`.
+  - `GOWORK=off go build ./...`, `GOWORK=off go vet ./internal/host`, `git diff --check`, `gofmt -l internal/host/direct.go internal/host/punch_test.go` → all clean (no output).
+  - Final repeat after moving `fallbackRetry` to `const`: `GOWORK=off go test ./internal/host -run 'TestFallback' -count=1 -v` → `ok github.com/go-gost/p2p/internal/host 2.018s`, all eight PASS (no-peer-candidates round 2.01s).
+  - `GOWORK=off go test ./internal/host -run 'TestDirect' -count=5` → `ok github.com/go-gost/p2p/internal/host 265.119s`; no known flakes and no new failures. The brief's `-count=100` was started but not completed: one iteration takes ~58s, so 100 would take ~97 minutes and exceed `go test`'s default 10-minute timeout; it was stopped and replaced with the bounded 5x stress above.
+  - Final `GOWORK=off go build ./...`, `GOWORK=off go vet ./internal/host`, `git diff --check`, `gofmt -l internal/host/direct.go internal/host/punch_test.go` → all clean after the `const` change.
+- Review findings and fixes: self-review only (no subagent reviewer, per task rules). Moved `fallbackRetry` into a `const` declaration after spotting it in the timing `var` block, matching the brief's interface. `fallbackReady` uses `sprayEnabled()` rather than a bare non-empty string, so `mode: "off"` (and an unknown mode) stays inert as required. The public-address check excludes RFC1918, loopback, link-local, unspecified, multicast and the CGNAT block that `Addr.IsPrivate` misses; documentation ranges are deliberately left alone because existing tests use them as unreachable public candidates. The retry-selection helper was named `seedFailureRetry` so `punch()` calls one small, testable function; the control-plane exits continue to call `backoff`/`retryDirectUnready` without counting a seed failure. No post-GREEN behavior fixes were needed.
+- Deferred items/limitations: no spray/sockets traffic is implemented here — `noteFallbackFailure` only records state and is consumed by the execution path in Tasks 5–6. `fallbackReady` is checked at the end of a failed normal round, so the first armed round schedules a 500ms retry rather than running a fallback inside the same round; Task 5 replaces that seam with the real spray call. Status/doctor reporting of the new counters and e2e verification remain Tasks 7–8. The full `internal/host` suite is not run (known whole-suite hang in `TestPeerGoneKeepsLiveDirectSession`); verification is scoped to the new tests and the `TestDirect` names.
 
 ---
 
