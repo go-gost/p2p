@@ -21,7 +21,7 @@
 - No new module dependency.
 - Tests run from `p2p/` with `GOWORK=off`:
   `GOWORK=off go test ./internal/host -run <Test> -count=1`
-- Commit after every task in **one task commit**: the task's code/tests, any plan updates, and the filled Implementation record together. In the record's Repo/commit field write "this commit (the task commit; exact SHA in the SDD ledger)" — do not chase a SHA that the commit itself is about to change. Only commit; never push.
+- Commit after every task in **one task commit**: the task's code/tests, any plan updates, and the filled Implementation record together. The record's Repo/commit field must name the task commit's SHA; because the record lives in that commit, an immediately following docs commit may inline the SHA the commit just got (the SDD ledger holds it too). Only commit; never push.
 - The wisper wiring (settings/API/host config) is a separate follow-up plan after the p2p tag; this plan ends with a manual field verification.
 
 ## Review Focus
@@ -284,7 +284,7 @@ git commit -m "feat(p2p): seed handshake with target sets and echo grace"
 **Implementation record**
 
 - Date/status: 2026-11-28 — complete.
-- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; this commit (the task commit; exact SHA in the SDD ledger).
+- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; task commit `fd23db7` (this record is in that commit).
 - Files changed: `internal/host/seedplan.go` (`seedPlan`, `seedHandshakePlan`: primary retransmit schedule, immediate/periodic whole-set spray, no source filter, probe learning/echo, post-success echo grace), `internal/host/direct.go` (`seedHandshakeUDPToken` is now a one-line wrapper supplying `Peer` and `seedRetransmit`; unused `bytes`/`crypto/rand` imports removed), `internal/host/seedplan_test.go` (three new tests: mutual spray completion + dead-target spray check, responder grace echo, unexpected-source learning), this plan's Task 3 record. No dependency changes.
 - Tests/commands and results:
   - RED before implementation: `GOWORK=off go test ./internal/host -run 'TestSeedPlan' -count=1` → FAIL (build failed: `undefined: seedHandshakePlan`, `undefined: seedPlan` at four call sites).
@@ -368,7 +368,7 @@ git commit -m "feat(p2p): arm punch fallback after seed failures"
 **Implementation record**
 
 - Date/status: 2026-11-28 — complete.
-- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; this commit (the task commit; exact SHA in the SDD ledger).
+- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; task commit `0445f5f` (this record is in that commit).
 - Files changed: `internal/host/direct.go` (`fallbackRetry`, `normalFailures`/`fallbackFailures`, `fallbackReady`, `isPublicIPv4`, `noteNormalSeedFailure`, `noteFallbackSuccess`, `noteFallbackFailure`, `seedFailureRetry`, the `winner < 0` branch, and the success reset in `markUp`), `internal/host/punch_test.go` (eight new `TestFallback*` tests covering arming thresholds, caps, public-v4 filtering including CGNAT, off/unknown modes, success resets, fallback failure staying armed, short vs long retry, and a real "no peer candidates" round), this plan's Task 4 record. No dependency changes.
 - Tests/commands and results:
   - RED before implementation: `GOWORK=off go test ./internal/host -run 'TestFallback' -count=1` → FAIL (build failed: `dc.normalFailures undefined`, `dc.fallbackReady undefined`, `dc.noteNormalSeedFailure undefined`, `dc.fallbackFailures undefined`, plus the other missing helpers).
@@ -451,7 +451,7 @@ git commit -m "feat(p2p): spray random ports from the cone side"
 **Implementation record**
 
 - Date/status: 2026-11-28 — complete.
-- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; this commit (the task commit; exact SHA in the SDD ledger).
+- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; task commit `045c2c6`; the review fix `80ebde9` also updates this record.
 - Files changed: `internal/host/punchspray.go` (new: `randomPortTargets`, the `randomPortTargetsFn` seam, and `punchSpray`), `internal/host/direct.go` (the `punch()` spray branch after family selection: same-v4-socket spray, `markUp` on success, `noteFallbackFailure` + `backoff` on failure, no concurrent normal seed, no spray without a v4 socket, `mode == "spray"` gate, candidate handoff on success), `internal/host/punchspray_test.go` (new: eight tests for port range/uniqueness/clamp, a real spray handshake through a controlled target set, branch success and failure, failed-spray socket release, missing-v4 skip, and the `sockets` mode gate), this plan's Task 5 record. No dependency changes.
 - Tests/commands and results:
   - RED before implementation: `GOWORK=off go test ./internal/host -run 'TestRandomPortTargets|TestPunchSpray' -count=1` → FAIL (build failed: `undefined: randomPortTargets`, `undefined: randomPortTargetsFn`, `dc.punchSpray undefined`).
@@ -528,7 +528,7 @@ git commit -m "feat(p2p): open multiple sockets on the random side"
 **Implementation record**
 
 - Date/status: 2026-11-28 — complete.
-- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; this commit (the task commit; exact SHA in the SDD ledger).
+- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; task commit `ad577e1` (this record is in that commit).
 - Files changed: `internal/host/punchsockets.go` (new: `socketStartDelay`, `punchSockets` with concurrent per-socket `seedHandshakePlan`, capped head start, first-success wins, loser cleanup), `internal/host/direct.go` (the `punch()` sockets branch after family selection: detach the v4 family socket, close siblings, run `punchSockets`, `markUp` the winner, `noteFallbackFailure` + `backoff` on failure, no concurrent normal seed, no fallback without a v4 socket, `mode == "sockets"` gate, winner's local candidate handoff), `internal/host/punchsockets_test.go` (new: seven tests for start delay, winner identity and loser cleanup, timeout cleanup, branch success/failure, missing-v4 skip), `internal/host/punchspray_test.go` (updated the `sockets`-mode gate test to wait for the sockets fallback instead of a second normal seed), this plan's Task 6 record. No dependency changes.
 - Tests/commands and results:
   - RED before implementation: `GOWORK=off go test ./internal/host -run 'TestPunchSockets' -count=1` → FAIL (build failed: `undefined: socketStartDelay`, `dc.punchSockets undefined`).
