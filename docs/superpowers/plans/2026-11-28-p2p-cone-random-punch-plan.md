@@ -283,12 +283,17 @@ git commit -m "feat(p2p): seed handshake with target sets and echo grace"
 
 **Implementation record**
 
-- Date/status:
-- Repo/commit:
-- Files changed:
+- Date/status: 2026-11-28 — complete.
+- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; this commit (the task commit; exact SHA in the SDD ledger).
+- Files changed: `internal/host/seedplan.go` (`seedPlan`, `seedHandshakePlan`: primary retransmit schedule, immediate/periodic whole-set spray, no source filter, probe learning/echo, post-success echo grace), `internal/host/direct.go` (`seedHandshakeUDPToken` is now a one-line wrapper supplying `Peer` and `seedRetransmit`; unused `bytes`/`crypto/rand` imports removed), `internal/host/seedplan_test.go` (three new tests: mutual spray completion + dead-target spray check, responder grace echo, unexpected-source learning), this plan's Task 3 record. No dependency changes.
 - Tests/commands and results:
-- Review findings and fixes:
-- Deferred items/limitations:
+  - RED before implementation: `GOWORK=off go test ./internal/host -run 'TestSeedPlan' -count=1` → FAIL (build failed: `undefined: seedHandshakePlan`, `undefined: seedPlan` at four call sites).
+  - GREEN after implementation: the same command → `ok github.com/go-gost/p2p/internal/host 0.849s` (all three new tests PASS with `-v`: 0.30s / 0.30s / 0.24s).
+  - Brief's final command: `GOWORK=off go test ./internal/host -run 'TestSeedPlan|TestSeedHandshake|TestSeedAddress' -count=1` → `ok github.com/go-gost/p2p/internal/host 5.109s`; all 12 matched tests PASS, including the nine pre-existing seed tests via the wrapper.
+  - Repeat/stability: `GOWORK=off go test ./internal/host -run 'TestSeedPlan' -count=5` → `ok ... 4.222s`; `GOWORK=off go build ./...` → PASS (no output); `GOWORK=off go vet ./internal/host` → PASS (no output); `gofmt -l` on all three Go files and `git diff --check` → clean.
+  - The full `internal/host` suite was deliberately not run (known hang in `TestPeerGoneKeepsLiveDirectSession` when run whole); the brief scopes verification to the focused seed/plan tests.
+- Review findings and fixes: self-review only (no subagent reviewer, per task rules). Verified the wrapper is behaviorally identical to the old body for `SeedPlan{Peer, Retransmit: seedRetransmit}` — same immediate send, same `readBy` deadline, same timeout/malformed/own-token/learn-and-echo path, same cleared read deadline on return. Grace echoes peer probes to their source but never re-echoes a late duplicate of our own token, so two installed underlays cannot ping-pong; retargeting is confined to the pre-success loop, and a zero/invalid `SprayEvery` disables spraying. Test helpers were adjusted before the RED run to compute addresses on the test goroutine only (no `t.Fatal` from a peer goroutine). No post-GREEN fixes were needed.
+- Deferred items/limitations: no caller of `seedHandshakePlan` is added yet — fallback arming, spray/sockets execution, status/doctor fields and e2e remain Tasks 4–8. `Grace` makes the handshake function hold the socket longer, but the production grace value comes from `punchSettings.seedGrace` only when a later task passes it in; this task does not wire that. The new tests use loopback IPv4 sockets and short intervals; real asymmetric-NAT behavior is covered only by the later e2e task.
 
 ---
 

@@ -1,9 +1,7 @@
 package host
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -1840,119 +1838,12 @@ type seedOutcome struct {
 	ProbeFrom netip.AddrPort
 }
 
-// seedHandshakeUDPToken runs the symmetric token echo over a raw UDP socket and
-// returns what the round learned: the local token it used, the source address
-// the successful echo came from, and the source the peer's own probe came
-// from. The answer is the path that actually completed — a peer behind a
-// per-destination NAT answers from an endpoint that is rarely the one dialed,
-// so callers registering a data underlay must use the source, not the dialed
-// candidate, or the steady-state source filter drops every data datagram.
-//
-// It writes its own token to peer every seedRetransmit until it reads that
-// same token back, and it echoes each of the peer's probes so the peer's own
-// handshake can complete. A raw UDP socket has no retransmit, so the resend
-// loop stands in for KCP's send window; the read deadline between sends is
-// short so a retransmit interleaves with waiting for a reply.
-//
-// Only a datagram carrying seedProbeMagic with a full token is considered,
-// from any source address: the token authenticates the peer, the source
-// address cannot. A per-destination NAT maps a different public endpoint than
-// the one advertised, and the endpoint that can answer is rarely the one that
-// was dialed, so a source filter is what made such a path untraversable. A
-// probe from an unexpected source is echoed back to that source and the resend
-// loop retargets to it, so both sides complete on the path that actually works.
-// Success requires a full own->peer->own round trip, so a half-open path (we
-// receive but our bytes never arrive) times out instead of producing a false
-// direct session. A packet carrying our own token is the success case; a peer's token
-// is echoed back on every probe, with no dedupe, because our own token is
-// never echoed (an echo of our echo can only carry the peer's token, which
-// this side re-echoes to the peer, never back to itself). Termination is the
-// handshake deadline, not a per-token count.
+// seedHandshakeUDPToken is the ordinary single-target seed: one peer, one
+// retransmit interval, no spray set and no responder grace. It keeps the
+// pre-fallback semantics and every existing caller unchanged; seedPlan holds
+// the doc comment for the shared handshake.
 func seedHandshakeUDPToken(sock *net.UDPConn, peer netip.AddrPort, timeout time.Duration) (seedOutcome, error) {
-	var out seedOutcome
-	if _, err := rand.Read(out.Token[:]); err != nil {
-		return out, err
-	}
-	probe := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
-	probe = append(probe, seedProbeMagic[:]...)
-	probe = append(probe, out.Token[:]...)
-	dst := net.UDPAddrFromAddrPort(peer)
-	// The underlay that later owns this socket sets its own read deadline per
-	// read, so this is only hygiene; clear it so no stale short deadline
-	// survives the handshake.
-	defer sock.SetReadDeadline(time.Time{})
-
-	deadline := time.Now().Add(timeout)
-	next := time.Now() // send immediately
-	buf := make([]byte, 2048)
-	for {
-		now := time.Now()
-		if !now.Before(deadline) {
-			return out, errSeedTimeout
-		}
-		if !now.Before(next) {
-			if _, err := sock.WriteToUDP(probe, dst); err != nil {
-				return out, err
-			}
-			next = now.Add(seedRetransmit)
-		}
-		readBy := next
-		if readBy.After(deadline) {
-			readBy = deadline
-		}
-		if err := sock.SetReadDeadline(readBy); err != nil {
-			return out, err
-		}
-		n, src, err := sock.ReadFromUDP(buf)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue // time to retransmit or to give up
-			}
-			return out, err
-		}
-		// No source filter: the token authenticates the peer, the source
-		// address cannot — a per-destination NAT maps a different public
-		// endpoint than the one it advertised, and the endpoint that can
-		// answer is rarely the one that was dialed. Only the magic and a
-		// full token shape are required, and only an echo of this side's
-		// own token completes the handshake.
-		if n < len(seedProbeMagic)+seedTokenLen || !bytes.Equal(buf[:len(seedProbeMagic)], seedProbeMagic[:]) {
-			continue
-		}
-		var got [seedTokenLen]byte
-		copy(got[:], buf[len(seedProbeMagic):len(seedProbeMagic)+seedTokenLen])
-		if got == out.Token {
-			out.Answer = src.AddrPort()
-			return out, nil // the peer echoed our probe
-		}
-		// A probe from the peer. Remember where it came from: a round that
-		// does not complete still has to say whether the peer's packet
-		// reached us at all, which is the difference between a path blocked
-		// before us and a path that broke after the arrival.
-		out.ProbeFrom = src.AddrPort()
-		// The endpoint the peer answers from is rarely the one it advertised:
-		// a per-destination NAT maps a different public endpoint per
-		// destination. Learn that endpoint so the resend loop carries our
-		// token to it, letting the peer echo our probe and complete this
-		// side's round trip; the echo below answers the peer's own handshake
-		// on the same path.
-		if !sameAddrPort(src.AddrPort(), peer) {
-			learned := *src
-			dst = &learned
-		}
-		// The peer's probe: echo it. Every retransmit is echoed again — raw UDP
-		// has no reliability, so an echo lost in flight must be recovered by
-		// the peer's next probe rather than dropped as a duplicate. An echo of
-		// our own token is never produced here (that is the success case), so
-		// two handshakes cannot loop.
-		echo := make([]byte, 0, len(seedProbeMagic)+seedTokenLen)
-		echo = append(echo, seedProbeMagic[:]...)
-		echo = append(echo, got[:]...)
-		// Echo to the probe's source, not the dialed address: for the
-		// expected peer they are the same, but for a peer answering from an
-		// unexpected endpoint this is what lets its own handshake complete.
-		_, _ = sock.WriteToUDP(echo, src)
-	}
+	return seedHandshakePlan(sock, seedPlan{Peer: peer, Retransmit: seedRetransmit}, timeout)
 }
 
 // fresherCandidates returns the newest candidate list to arrive within grace,
