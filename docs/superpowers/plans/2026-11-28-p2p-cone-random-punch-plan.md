@@ -656,7 +656,7 @@ git commit -m "test(p2p): cover cone-random punch in netns"
 **Implementation record**
 
 - Date/status: 2026-11-28, BLOCKED — the scenario runs end to end and the control passes, but the fallback direct-path assertion does not pass in this container's netns/iptables NAT lab.
-- Repo/commit: `p2p` @ `feat/p2p-cone-random`, task commit subject `test(p2p): cover cone-random punch in netns` (SHA inlined by the required follow-up docs commit; no push).
+- Repo/commit: `p2p` @ `feat/p2p-cone-random`, task commit `46f7cfa test(p2p): cover cone-random punch in netns`; no push.
 - Files changed: `tests/e2e/run.sh` (`nat-cone-random` in the registry, `setup_nat_net`, a config-aware `start_p2p_pair` extracted from `start_derp_pair`, the scenario with its in-run relay control, and topology restore after the scenario), `tests/e2e/lib.sh` (router-namespace NAT helpers, `net_teardown` generalized to tracked namespaces/veths), `tests/e2e/README.md` (scenario row), and this plan.
 - Tests/commands and results:
   - Harness interface is `./run.sh --scenario nat-cone-random`, not the brief's positional form; the worktree sits under `p2p/.worktrees`, so `run.sh`'s derived `$GOST_DIR` does not exist. Binaries were prebuilt (`GOWORK=off` for p2p/helper, workspace build for gost) and the suite was run with `--skip-build` inside `unshare -n` with `lo` up (the host's 10.99.0.1:18081 is occupied by an unrelated process).
