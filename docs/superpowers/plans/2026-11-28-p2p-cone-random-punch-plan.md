@@ -207,12 +207,16 @@ git commit -m "feat(p2p): advertise spray capability"
 
 **Implementation record**
 
-- Date/status:
-- Repo/commit:
-- Files changed:
+- Date/status: 2026-11-28 — complete.
+- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; code commit `0dd133566b8bc870fb0bd9a36d1824cb03e2c0d6` (`0dd1335`, `feat(p2p): advertise spray capability`). This record is added in the follow-up `docs(p2p): record task 2` commit.
+- Files changed: `internal/host/caps.go` (`capsSpray uint8 = 1 << 4` with role comment), `internal/host/punch.go` (`engine.sprayEnabled()` for `spray`/`sockets`), `internal/host/engine.go` (`caps()` sets the bit only when `sprayEnabled()`, doc comment updated), `internal/host/direct.go` (package-level `capNames(bits uint8) []string` adds `"spray"`; `directConn.capNames()` delegates to it), `internal/host/caps_test.go` (brief's `TestCapsSprayBit` and `TestCapNamesIncludesSpray` verbatim, plus decode and `addCaps`/`supports` checks), `internal/host/punch_test.go` (`TestSprayEnabled`, `TestEngineCapsSprayModes` covering both enabled modes and empty/`off`).
 - Tests/commands and results:
-- Review findings and fixes:
-- Deferred items/limitations:
+  - RED before implementation: `GOWORK=off go test ./internal/host -run 'TestCapsSpray|TestCapNamesIncludesSpray' -count=1` → FAIL (build failed: `undefined: capsSpray`, `undefined: capNames`); the punch-wiring run (`-run 'TestSprayEnabled|TestEngineCapsSprayModes'`) hit the same build failure because the package test binary could not compile.
+  - GREEN after implementation: the same first command → `ok github.com/go-gost/p2p/internal/host 0.007s`; brief's final command `GOWORK=off go test ./internal/host -run 'TestCapsSpray|TestCapNamesIncludesSpray|TestCaps' -count=1` → `ok ... 0.012s`.
+  - Additional checks: `GOWORK=off go test ./internal/host -run 'TestSprayEnabled|TestEngineCapsSprayModes|TestResolvePunch' -count=1` → `ok ... 0.010s`; `GOWORK=off go test ./internal/host -run 'TestCaps|TestV6|TestQuicCaps|TestCapNames' -count=1` → `ok ... 0.037s`; `GOWORK=off go build ./...` → PASS (no output); `git diff --check` and `gofmt -l` on all six files → clean.
+  - Full-suite caveat: `GOWORK=off go test ./internal/host -count=1` did not finish in 300s; with `-timeout 90s` it panicked while `TestPeerGoneKeepsLiveDirectSession` was running (`direct_test.go:1358` long sleep), with no other `--- FAIL` lines. That test passes in isolation (`GOWORK=off go test ./internal/host -run '^TestPeerGoneKeepsLiveDirectSession$' -count=1 -timeout 60s` → `ok ... 20.033s`). Known flaky suite; the brief scopes verification to focused tests.
+- Review findings and fixes: No reviewer findings (self-review only, per task rules). Self-review confirmed bit 4 does not collide with `capsQUIC` (bit 3) or the older bits, empty/`off` modes advertise no bit, old peers keep the same decode/support semantics, and `capNames` output is unchanged for peers without the new bit. The brief's `capNames(bits uint8)` free function was added while keeping the existing `directConn.capNames()` call site intact.
+- Deferred items/limitations: This task only advertises and identifies the capability — no spray/sockets execution, seed changes, fallback arming, status/doctor fields, or e2e (Tasks 3–8). `directConn.addCaps` debug logging does not yet include the spray bit; the peer-facing name list does. Enabled-mode behavior is only unit-tested at the caps boundary; no live peer negotiation was exercised.
 
 ---
 
