@@ -659,7 +659,7 @@ git commit -m "test(p2p): gate cone-random direct assertion on the NAT lab"
 **Implementation record**
 
 - Date/status: 2026-11-28, REVISED — smoke test, environment-gated. The scenario asserts branch entry **and completion** (a recorded `spray failed`/`sockets failed`/`fallback up via` outcome), reports `SKIPPED (3 skipped assertion(s))`, and claims no direct path in this lab. CI does not run this e2e suite, so the scenario cannot fail CI.
-- Repo/commit: `p2p` @ `feat/p2p-cone-random`, revision commit `07b9804 test(p2p): gate cone-random direct assertion on the NAT lab`; earlier task commits `46f7cfa test(p2p): cover cone-random punch in netns` and `a423725 docs(p2p): record task 8 commit`; no push.
+- Repo/commit: `p2p` @ `feat/p2p-cone-random`, revision commit `07b9804 test(p2p): gate cone-random direct assertion on the NAT lab`; earlier task commits `46f7cfa test(p2p): cover cone-random punch in netns` and `a423725 docs(p2p): record task 8 commit`; the final smoke/completion fix is `18000f0994609d877ec746e33d94828a07e23842` (`fix(p2p): harden fallback targeting and e2e smoke`, inlined here by the follow-up docs commit); no push.
 - Files changed: `tests/e2e/run.sh` (skip-aware scenario/global summary, `wait_status_grep`, branch-activity and completion assertions, control-log guard, quiet topology restore, three environment-gated skips), `tests/e2e/lib.sh` (`skip` primitive and counter), `tests/e2e/README.md` (smoke-test/skip semantics and the scenario row), and this plan.
 - Tests/commands and results:
   - Controller ruling: the nested-netns `MASQUERADE --random-fully` mappings do not meet the random spray (eight runs, tcpdump showing disjoint port sets, both fallback branches running). Task 8 Step 4's expected green `direct established` is wrong for this container. The direct path was already proven by the earlier real-network pi/phone spike; the definitive field check is Task 9. Therefore the direct assertions are explicit skips, not passes and not failures.
@@ -811,6 +811,19 @@ git commit -m "test(p2p): gate cone-random direct assertion on the NAT lab"
 - Tests/commands and results: pending field run; the netns `nat-cone-random` scenario is a branch/completion smoke test only and is explicitly not evidence for any checked item above.
 - Review findings and fixes: final whole-branch review added this checklist and the field-unverified note; no behavior code in Task 9.
 - Deferred items/limitations: wisper settings/API/host wiring is a separate follow-up plan after the p2p tag; UI has no punch toggle. NAT auto-classification and the rest of the 3×3 matrix remain out of scope.
+
+---
+
+### Final whole-branch review fix wave
+
+**Implementation record**
+
+- Date/status: 2026-11-28 — complete; one fix commit plus this SHA-inlining docs commit; no push.
+- Repo/commit: `p2p` @ `feat/p2p-cone-random`, fix commit `18000f0994609d877ec746e33d94828a07e23842` (`fix(p2p): harden fallback targeting and e2e smoke`), inlined here by the follow-up `docs(p2p): record final fix wave` commit. Full evidence: `.superpowers/sdd/2026-11-28-p2p-cone-random-punch-plan/final-fix-report.md`.
+- Files changed: `internal/host/direct.go` (`fallbackTarget`, both branches use its selected public endpoint, duplicate spray log dropped, `FallbackFailures` filled), `internal/host/punch.go` (`SeedGrace` bound), `internal/host/seedplan.go` (invalid-peer guard), `internal/host/punchsockets.go` (bounded drain, `errNoSockets`), `status.go` (`FallbackFailures`), four host test files, `tests/e2e/run.sh` (completion assertions, control-log guard, quiet restore), `tests/e2e/README.md` (smoke wording), this plan and the spec's target wording.
+- Tests/commands and results: TDD RED (missing APIs, then the two branch-target tests failed on the loopback target) → GREEN (8/8 focused tests); focused host suite `ok ... 6.636s`; `doctor` `ok ... 0.004s`; `go build ./...` clean; `CGO_ENABLED=1` focused `-race` `ok ... 2.264s`; `TestDirect` `ok ... 57.524s`; `gofmt -l`, `git diff --check`, `bash -n` clean. Real harness: `nat-cone-random` run `20261128-114443-3632585-24917` → `NO FAILURES (16 passed, 3 skipped)` with both completion assertions PASS (`spray failed`/`sockets failed` in the saved traces); `derp-relay` run `20261128-114618-3634964-8104` → `ALL PASS (10 assertions)`.
+- Review findings and fixes: Important — arming any public candidate while aiming at `peerV4[len-1]` could target loopback/private; fixed by selecting once via `fallbackTarget`. Important — entry logs could pass with a hung round; fixed by polling terminal outcomes on both sides and labelling the scenario a smoke test. Minors — `SeedGrace` bound, invalid seed peer, non-first sockets winner + `dc.mine`, bounded drain, explicit nil-first sentinel, duplicate log, control-log guard, README/topology wording, `FallbackFailures` field, Task 9 checklist, 100x CI recommendation.
+- Deferred items/limitations: Task 9 field verification is still pending and is the only direct-path evidence; `FallbackFailures` stays in-process because the gRPC proto is frozen; the full host suite and the 100x `TestDirect` stress were not run (known hang, ~97 min runtime).
 
 ---
 
