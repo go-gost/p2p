@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -337,4 +338,171 @@ func TestResolvePunchOffSkipsValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fallbackDiagnostics reads the peer's diagnostic the way a status caller does.
+func fallbackDiagnostics(dc *directConn) p2p.PeerDiagnostic {
+	name := keyName(dc.peer)
+	st := dc.e.peerDiagnostics(map[string]string{name: "derp"})
+	return st[name]
+}
+
+// TestPeerDiagnosticFallback pins the in-process diagnostic fields: the opted-in
+// mode and resolved budgets, plus one completed fallback attempt's outcome. The
+// counters are per attempt, not consecutive failures, so a later failure must
+// add to the same round count and replace the winner with its reason.
+func TestPeerDiagnosticFallback(t *testing.T) {
+	const winner = "203.0.113.9:51000"
+	for _, mode := range []string{"spray", "sockets"} {
+		t.Run(mode, func(t *testing.T) {
+			dc := newFallbackTestConn(t, mode, 1, capsSpray)
+			dc.e.punch.sprayPorts = 64
+			dc.e.punch.sockets = 7
+			dc.e.directs[dc.peer] = dc
+			dc.noteFallbackResult(winner, "")
+
+			d := fallbackDiagnostics(dc)
+			if d.PunchFallback != mode {
+				t.Fatalf("PunchFallback = %q, want %q", d.PunchFallback, mode)
+			}
+			if d.FallbackRounds != 1 {
+				t.Fatalf("FallbackRounds = %d, want 1", d.FallbackRounds)
+			}
+			if d.SprayPorts != 64 || d.Sockets != 7 {
+				t.Fatalf("budgets = (%d ports, %d sockets), want (64, 7)", d.SprayPorts, d.Sockets)
+			}
+			if d.FallbackWinner != winner || d.FallbackError != "" {
+				t.Fatalf("outcome = (%q, %q), want (%q, empty)",
+					d.FallbackWinner, d.FallbackError, winner)
+			}
+
+			dc.noteFallbackResult("", "spray failed: timeout")
+			d = fallbackDiagnostics(dc)
+			if d.FallbackRounds != 2 {
+				t.Fatalf("FallbackRounds = %d after a second attempt, want 2", d.FallbackRounds)
+			}
+			if d.FallbackWinner != "" || d.FallbackError != "spray failed: timeout" {
+				t.Fatalf("outcome = (%q, %q), want (empty, spray failed: timeout)",
+					d.FallbackWinner, d.FallbackError)
+			}
+		})
+	}
+
+	t.Run("off", func(t *testing.T) {
+		dc := newFallbackTestConn(t, "off", 1, capsSpray)
+		dc.e.punch.sprayPorts = 64
+		dc.e.punch.sockets = 7
+		dc.e.directs[dc.peer] = dc
+
+		d := fallbackDiagnostics(dc)
+		if d.PunchFallback != "" || d.FallbackRounds != 0 || d.SprayPorts != 0 || d.Sockets != 0 {
+			t.Fatalf("off diagnostic = %+v, want all-empty fallback fields", d)
+		}
+	})
+}
+
+// TestPunchFallbackTraceAndWinner drives both fallback branches so the trace
+// lines and the recorded outcome come from punch(), not from a test helper.
+func TestPunchFallbackTraceAndWinner(t *testing.T) {
+	t.Run("spray success", func(t *testing.T) {
+		dc, _ := sprayTestRound(t, "spray", "203.0.113.7:41000")
+		peerAddr := sprayTestEchoPeer(t)
+		var gotIP netip.Addr
+		var gotN int
+		spraySetTargets(t, &gotIP, &gotN, []netip.AddrPort{peerAddr})
+		dc.cand <- sprayPublicV4(41000)
+		if !dc.start() {
+			t.Fatal("punch did not start")
+		}
+		waitFor(t, 4*time.Second, func() bool {
+			return sprayTraceHas(dc, "fallback up via") || sprayTraceHas(dc, "spray failed")
+		})
+		if !dc.isUp() {
+			t.Fatalf("spray did not install a direct path; trace = %v", dc.traceLines())
+		}
+		winner := peerAddr.String()
+		for _, want := range []string{"fallback spray ports=2", "fallback up via " + winner} {
+			if !sprayTraceHas(dc, want) {
+				t.Fatalf("no trace line %q: %v", want, dc.traceLines())
+			}
+		}
+		d := fallbackDiagnostics(dc)
+		if d.FallbackWinner != winner || d.FallbackRounds != 1 || d.FallbackError != "" {
+			t.Fatalf("fallback outcome = (%q, %d rounds, %q), want (%q, 1, empty)",
+				d.FallbackWinner, d.FallbackRounds, d.FallbackError, winner)
+		}
+	})
+
+	t.Run("spray failure", func(t *testing.T) {
+		dc, _ := sprayTestRound(t, "spray", "203.0.113.7:42000")
+		dc.e.punch.socketWindow = 150 * time.Millisecond
+		var gotIP netip.Addr
+		var gotN int
+		spraySetTargets(t, &gotIP, &gotN, nil)
+		dc.cand <- sprayPublicV4(42000)
+		if !dc.start() {
+			t.Fatal("punch did not start")
+		}
+		waitFor(t, 4*time.Second, func() bool {
+			return fallbackDiagnostics(dc).FallbackError != ""
+		})
+		d := fallbackDiagnostics(dc)
+		if d.FallbackRounds != 1 || d.FallbackWinner != "" ||
+			!strings.Contains(d.FallbackError, "spray failed") {
+			t.Fatalf("fallback outcome = (%q, %d rounds, %q), want an empty winner and a spray failure",
+				d.FallbackWinner, d.FallbackRounds, d.FallbackError)
+		}
+	})
+
+	t.Run("sockets success", func(t *testing.T) {
+		socketsSetStartDelay(t, 10*time.Millisecond)
+		dc, _ := sprayTestRound(t, "sockets", "203.0.113.7:41000")
+		dc.e.punch.sockets = 3
+		dc.e.punch.socketWindow = 2 * time.Second
+		peerAddr := sprayTestEchoPeer(t)
+		dc.cand <- []candidate{
+			{addr: netip.MustParseAddrPort("203.0.113.7:41000")},
+			{addr: peerAddr},
+		}
+		if !dc.start() {
+			t.Fatal("punch did not start")
+		}
+		waitFor(t, 5*time.Second, func() bool {
+			return sprayTraceHas(dc, "fallback up via") || sprayTraceHas(dc, "sockets failed")
+		})
+		if !dc.isUp() {
+			t.Fatalf("sockets did not install a direct path; trace = %v", dc.traceLines())
+		}
+		winner := peerAddr.String()
+		for _, want := range []string{"fallback sockets=3", "fallback up via " + winner} {
+			if !sprayTraceHas(dc, want) {
+				t.Fatalf("no trace line %q: %v", want, dc.traceLines())
+			}
+		}
+		d := fallbackDiagnostics(dc)
+		if d.FallbackWinner != winner || d.FallbackRounds != 1 || d.FallbackError != "" {
+			t.Fatalf("fallback outcome = (%q, %d rounds, %q), want (%q, 1, empty)",
+				d.FallbackWinner, d.FallbackRounds, d.FallbackError, winner)
+		}
+	})
+
+	t.Run("sockets failure", func(t *testing.T) {
+		socketsSetStartDelay(t, 10*time.Millisecond)
+		dc, _ := sprayTestRound(t, "sockets", "203.0.113.7:42000")
+		dc.e.punch.sockets = 2
+		dc.e.punch.socketWindow = 100 * time.Millisecond
+		dc.cand <- sprayPublicV4(42000)
+		if !dc.start() {
+			t.Fatal("punch did not start")
+		}
+		waitFor(t, 5*time.Second, func() bool {
+			return fallbackDiagnostics(dc).FallbackError != ""
+		})
+		d := fallbackDiagnostics(dc)
+		if d.FallbackRounds != 1 || d.FallbackWinner != "" ||
+			!strings.Contains(d.FallbackError, "sockets failed") {
+			t.Fatalf("fallback outcome = (%q, %d rounds, %q), want an empty winner and a sockets failure",
+				d.FallbackWinner, d.FallbackRounds, d.FallbackError)
+		}
+	})
 }

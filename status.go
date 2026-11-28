@@ -26,8 +26,25 @@ type PeerDiagnostic struct {
 	// round dials. Candidates is how many the peer announced.
 	PeerAddr   string
 	Candidates int
-	// Caps is the peer's advertised capabilities ("ipv6", "no-direct").
+	// Caps is the peer's advertised capabilities ("ipv6", "no-direct", "spray").
 	Caps []string
+	// PunchFallback is this host's resolved, opted-in fallback mode ("spray" or
+	// "sockets"), empty when the fallback is off. SprayPorts and Sockets are the
+	// resolved budgets for that mode. All three are in-process only: the gRPC
+	// proto is frozen and does not carry them.
+	PunchFallback string
+	SprayPorts    int
+	Sockets       int
+	// FallbackRounds counts completed spray/sockets attempts for this peer,
+	// whether they ended in an answer or a failure. It is deliberately not the
+	// consecutive-failure counter, which resets on success.
+	FallbackRounds int
+	// FallbackWinner is the peer endpoint whose seed answer won the latest
+	// fallback round; empty after a failure or when none ran. FallbackError is
+	// why the latest round failed; empty on success or when none ran. Both are
+	// in-process only, like the mode and budgets above.
+	FallbackWinner string
+	FallbackError  string
 	// SessionAge is how long the live direct session has been up (0 when none);
 	// LastRecvAge is how long since this host last saw *traffic* from the peer,
 	// on either path: an inbound relay packet, or bytes off a stream (relay or

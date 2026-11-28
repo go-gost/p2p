@@ -312,6 +312,16 @@ type directConn struct {
 	normalFailures   int
 	fallbackFailures int
 
+	// fallbackRounds counts completed spray/sockets attempts (a different thing
+	// from fallbackFailures, which is the consecutive run that arms the short
+	// retry). fallbackWinner is the answering endpoint of the latest successful
+	// attempt, fallbackError the reason of the latest failed one; each outcome
+	// replaces the other. All are guarded by mu and copied into the status
+	// snapshot under it.
+	fallbackRounds int
+	fallbackWinner string
+	fallbackError  string
+
 	// This peer's punch history, reported through Status.PeerDiagnostics. Atomics
 	// so a status query reads them without taking dc.mu and queueing behind a
 	// punch round; drops is also incremented while dc.mu is held, where a second
@@ -1305,6 +1315,35 @@ func (dc *directConn) noteFallbackFailure() {
 	dc.mu.Unlock()
 }
 
+// noteFallbackResult records the outcome of one completed spray/sockets
+// attempt for the in-process diagnostic: winner is the seed answer on success,
+// reason the failure word otherwise. Each outcome replaces the previous one,
+// while the round count keeps growing.
+func (dc *directConn) noteFallbackResult(winner, reason string) {
+	dc.mu.Lock()
+	dc.fallbackRounds++
+	dc.fallbackWinner = winner
+	dc.fallbackError = reason
+	dc.mu.Unlock()
+}
+
+// fillFallbackDiag copies this host's fallback configuration and this peer's
+// recorded outcome onto d. The configuration is resolved once at startup and
+// the outcome is shared with the punch goroutine, so the latter is read under
+// dc.mu like the rest of the round's state.
+func (dc *directConn) fillFallbackDiag(d *p2p.PeerDiagnostic) {
+	if dc.e != nil && dc.e.sprayEnabled() {
+		d.PunchFallback = dc.e.punch.mode
+		d.SprayPorts = dc.e.punch.sprayPorts
+		d.Sockets = dc.e.punch.sockets
+	}
+	dc.mu.Lock()
+	d.FallbackRounds = dc.fallbackRounds
+	d.FallbackWinner = dc.fallbackWinner
+	d.FallbackError = dc.fallbackError
+	dc.mu.Unlock()
+}
+
 // fallbackReady reports whether the next round should use the spray/sockets
 // fallback. It needs an opted-in mode, enough failed normal rounds, a peer that
 // advertised capsSpray, and a public IPv4 candidate to aim at: spraying a
@@ -1722,6 +1761,7 @@ func (dc *directConn) punch() {
 		if sock != nil {
 			fams[i4].sock = nil // the spray owns it until markUp
 			announced := peerV4[len(peerV4)-1]
+			dc.noteRound("fallback spray ports=%d", e.punch.sprayPorts)
 			dc.noteRound("spray %d targets %s", e.punch.sprayPorts, announced.String())
 			out, err := dc.punchSpray(sock, announced, announced.Addr())
 			closeFams()
@@ -1729,17 +1769,21 @@ func (dc *directConn) punch() {
 				// closeFams cannot reclaim the socket we detached; markUp owns
 				// it only after a successful handshake.
 				sock.Close()
+				reason := fmt.Sprintf("spray failed: %v", err)
 				e.log.Debug("direct punch: spray failed", "peer", pname, "error", err)
-				dc.noteErr(fmt.Sprintf("spray failed: %v", err))
+				dc.noteErr(reason)
 				dc.noteRound("spray failed: %v", err)
 				dc.noteFallbackFailure()
+				dc.noteFallbackResult("", reason)
 				dc.backoff()
 				return
 			}
 			if err := dc.markUp(sock, out.Answer, out.Token); err != nil {
+				reason := fmt.Sprintf("spray install failed: %v", err)
 				e.log.Debug("direct punch: spray install failed", "peer", pname, "error", err)
 				dc.noteRound("spray install failed: %v", err)
 				dc.noteFallbackFailure()
+				dc.noteFallbackResult("", reason)
 				dc.backoff()
 				return
 			}
@@ -1749,6 +1793,8 @@ func (dc *directConn) punch() {
 			dc.mine = fams[i4].mine
 			dc.unreadyTries = 0
 			dc.mu.Unlock()
+			dc.noteFallbackResult(out.Answer.String(), "")
+			dc.noteRound("fallback up via %s", out.Answer.String())
 			dc.noteRound("spray up")
 			e.log.Debug("direct established by spray", "peer", pname,
 				"answer", out.Answer.String(), "candidates", len(fams[i4].mine))
@@ -1767,6 +1813,7 @@ func (dc *directConn) punch() {
 		if sock != nil {
 			fams[i4].sock = nil // the sockets round owns it until markUp
 			announced := peerV4[len(peerV4)-1]
+			dc.noteRound("fallback sockets=%d", e.punch.sockets)
 			dc.noteRound("sockets %d %s", e.punch.sockets, announced.String())
 			win, out, err := dc.punchSockets(sock, announced)
 			closeFams()
@@ -1779,13 +1826,16 @@ func (dc *directConn) punch() {
 				dc.noteErr(reason)
 				dc.noteRound("%s", reason)
 				dc.noteFallbackFailure()
+				dc.noteFallbackResult("", reason)
 				dc.backoff()
 				return
 			}
 			if err := dc.markUp(win, out.Answer, out.Token); err != nil {
+				reason := fmt.Sprintf("sockets install failed: %v", err)
 				e.log.Debug("direct punch: sockets install failed", "peer", pname, "error", err)
 				dc.noteRound("sockets install failed: %v", err)
 				dc.noteFallbackFailure()
+				dc.noteFallbackResult("", reason)
 				dc.backoff()
 				return
 			}
@@ -1803,6 +1853,8 @@ func (dc *directConn) punch() {
 			dc.mine = mine
 			dc.unreadyTries = 0
 			dc.mu.Unlock()
+			dc.noteFallbackResult(out.Answer.String(), "")
+			dc.noteRound("fallback up via %s", out.Answer.String())
 			dc.noteRound("sockets up")
 			e.log.Debug("direct established by sockets", "peer", pname,
 				"answer", out.Answer.String(), "candidates", len(mine))

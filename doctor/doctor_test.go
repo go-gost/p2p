@@ -36,6 +36,62 @@ func verdictLine(t *testing.T, out string) string {
 	return ""
 }
 
+// peerFieldValue returns a peer block's value for label, searching the report
+// by line so a value on another line cannot satisfy the assertion.
+func peerFieldValue(t *testing.T, out, label string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, label+":") {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, label+":"))
+		}
+	}
+	t.Fatalf("no %q line in the report:\n%s", label, out)
+	return ""
+}
+
+// TestPunchMode: the peer block names the locally resolved punch fallback mode
+// (off when not opted in), and a peer that advertised bit 4 shows the spray
+// capability the capNames list already carries.
+func TestPunchMode(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		want string
+	}{
+		{mode: "spray", want: "spray"},
+		{mode: "sockets", want: "sockets"},
+		{mode: "", want: "off"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			st := p2p.Status{
+				PeerDiagnostics: map[string]p2p.PeerDiagnostic{
+					"peerKey": {
+						Path:          "derp",
+						PunchFallback: tc.mode,
+						Caps:          []string{"ipv6", "spray"},
+					},
+				},
+			}
+			out := Report(st, Options{InProcess: true})
+			if got := peerFieldValue(t, out, "punch mode"); got != tc.want {
+				t.Fatalf("punch mode = %q, want %q:\n%s", got, tc.want, out)
+			}
+			if got := peerFieldValue(t, out, "caps"); got != "ipv6, spray" {
+				t.Fatalf("caps = %q, want spray in the caps line:\n%s", got, out)
+			}
+		})
+	}
+
+	// The proto is frozen: a wire-sourced report with no mode must say so rather
+	// than present an absent field as a host that opted out.
+	wire := Report(p2p.Status{
+		PeerDiagnostics: map[string]p2p.PeerDiagnostic{"peerKey": {Path: "derp"}},
+	}, Options{})
+	if got := peerFieldValue(t, wire, "punch mode"); got != "not reported by the control plane" {
+		t.Fatalf("wire punch mode = %q, want the unreported wording:\n%s", got, wire)
+	}
+}
+
 // TestPeerBlockShowsNATShape: the shape reaches the per-peer block, with the
 // endpoint the peer answered from and how long ago that was seen — the
 // evidence behind the word, not the word alone.

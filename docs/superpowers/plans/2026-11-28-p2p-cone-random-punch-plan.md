@@ -559,7 +559,7 @@ git commit -m "feat(p2p): open multiple sockets on the random side"
 - `punch` trace lines: `fallback spray ports=%d`, `fallback sockets=%d`, `fallback up via %s`.
 - Doctor peer block: `punch mode: <spray|sockets|off>` and the existing `caps` line includes `spray`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```go
 func TestPeerDiagnosticFallback(t *testing.T) {
@@ -570,25 +570,25 @@ func TestPeerDiagnosticFallback(t *testing.T) {
 ```
 And a doctor test asserting the `punch mode` line appears and `spray` is in the caps line.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 `GOWORK=off go test ./internal/host -run 'TestPeerDiagnosticFallback' -count=1`
 `GOWORK=off go test ./doctor -run 'TestPunchMode' -count=1`
 Expected: FAIL — fields/lines missing.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add fields and fill them in the status path; add the trace lines and doctor lines. Do not add UI or gRPC fields.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run:
 `GOWORK=off go test ./internal/host -run 'TestPeerDiagnosticFallback' -count=1`
 `GOWORK=off go test ./doctor -run 'TestPunchMode' -count=1`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd p2p
@@ -599,12 +599,15 @@ git commit -m "feat(p2p): report punch fallback diagnostics"
 
 **Implementation record**
 
-- Date/status:
-- Repo/commit:
-- Files changed:
+- Date/status: 2026-11-28, complete.
+- Repo/commit: `p2p` @ `feat/p2p-cone-random`; task commit subject `feat(p2p): report punch fallback diagnostics` (SHA inlined by the required follow-up docs commit; no push).
+- Files changed: `status.go` (six in-process `PeerDiagnostic` fields), `internal/host/direct.go` (fallback outcome fields, `noteFallbackResult`, `fillFallbackDiag`, three trace lines and outcome recording in both fallback branches), `internal/host/engine.go` (call `fillFallbackDiag` in the status snapshot), `doctor/doctor.go` (peer `punch mode` line), `internal/host/punch_test.go` (`TestPeerDiagnosticFallback`, `TestPunchFallbackTraceAndWinner`), `doctor/doctor_test.go` (`TestPunchMode`), and this plan.
 - Tests/commands and results:
-- Review findings and fixes:
-- Deferred items/limitations:
+  - RED: `GOWORK=off go test ./internal/host -run 'TestPeerDiagnosticFallback' -count=1` → FAIL (build: `noteFallbackResult` and the six diagnostic fields undefined); `GOWORK=off go test ./doctor -run 'TestPunchMode' -count=1` → FAIL (build: unknown field `PunchFallback`).
+  - GREEN: the same two commands → PASS (`internal/host` 0.004s, `doctor` 0.003s).
+  - Branch coverage: `GOWORK=off go test ./internal/host -run 'TestPunchFallbackTraceAndWinner' -count=1 -v` → PASS (4 subtests: spray success/failure, sockets success/failure, 1.36s); `GOWORK=off go test ./internal/host -run 'Test(PunchSpray|PunchSockets|Fallback|SprayEnabled|EngineCapsSprayModes|ResolvePunch|PeerDiagnosticFallback|PunchFallbackTraceAndWinner|CapsSpray)' -count=1` → PASS (5.9s); `GOWORK=off go test ./doctor -count=1` → PASS; `GOWORK=off go build ./...` → PASS; `CGO_ENABLED=1 GOWORK=off go test -race ./internal/host -run 'Test(PeerDiagnosticFallback|PunchFallbackTraceAndWinner)' -count=1` → PASS; `gofmt -l` and `git diff --check` → clean.
+- Review findings and fixes: a wire-sourced doctor snapshot must not read an empty mode as `off` because the frozen proto omits it, so the line says `not reported by the control plane` unless the caller is in-process (or supplied a mode explicitly); the failure-path tests originally waited on `fallbackFailures`, which is set just before the result is recorded, so they now wait on the diagnostic itself to remove that race. `FallbackRounds` counts completed attempts, unlike `fallbackFailures` (consecutive failures, reset on success). No punch behavior, caps bit, or wire format changed.
+- Deferred items/limitations: Task 8 (netns e2e) remains separate; no UI or gRPC/proto fields were added. SprayPorts/Sockets are reported only for an opted-in mode (zero when off) to avoid reading the unused defaults as an active fallback. The full `internal/host` suite is not run (known flake/hang); verification is scoped to the named tests, the doctor package, build, and focused race run.
 
 ---
 

@@ -499,6 +499,7 @@ func (e *engine) peerDiagnostics(transports map[string]string) map[string]p2p.Pe
 			d.SessionAge = now.Sub(at)
 		}
 		d.Attempts, d.Ups, d.Drops = dc.punchCounters()
+		dc.fillFallbackDiag(&d)
 		d.Trace, d.TraceTimes = dc.traceSnapshot()
 		// The pair's NAT shape: what the punch observed about the two ends'
 		// address translation. The peer's own observation is on the

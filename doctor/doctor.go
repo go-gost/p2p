@@ -264,6 +264,18 @@ func peerBlock(b *strings.Builder, key string, d p2p.PeerDiagnostic, opts Option
 	}
 	field(b, "    candidates", fmt.Sprintf("%d", d.Candidates))
 	field(b, "    caps", orNone(strings.Join(d.Caps, ", ")))
+	// The fallback mode is host configuration read in process. An empty mode
+	// from a wire-sourced caller means the frozen proto does not carry it, not
+	// that the host opted out, so only an in-process snapshot may call it off.
+	mode := d.PunchFallback
+	switch {
+	case mode != "":
+	case !opts.InProcess:
+		mode = "not reported by the control plane"
+	default:
+		mode = "off"
+	}
+	field(b, "    punch mode", mode)
 	// The three layers, each attributed separately. They used to be one word:
 	// "path" and "state" come from the punch machine and from underlay recency,
 	// and "last traffic" carried a note telling the reader to discount it, so a
