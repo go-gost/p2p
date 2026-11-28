@@ -131,12 +131,15 @@ git commit -m "feat(p2p): add punch fallback configuration"
 
 **Implementation record**
 
-- Date/status:
-- Repo/commit:
-- Files changed:
+- Date/status: 2026-11-28 — complete.
+- Repo/commit: `p2p` (worktree `/root/code/go-gost/p2p/.worktrees/p2p-cone-random`), branch `feat/p2p-cone-random`; code commit `b8d93725e20414f022ca69f3803373b7c32a2e4c` (`b8d9372`). This record is added in the follow-up `docs(p2p): record task 1` commit.
+- Files changed: `config.go` (`Config.Punch`, `PunchConfig`), `internal/host/punch.go` (`punchSettings`, `resolvePunch`, defaults/limits), `internal/host/punch_test.go` (3 resolver tests), `internal/host/engine.go` (`engine.punch`), `internal/host/host.go` (`host.New` resolves and assigns it), `cmd/p2p/main.go` (7 `--punch-*` flags with per-flag overrides), `cmd/p2p/config_test.go` (`TestPunchConfigRoundTrip`). No dependency changes.
 - Tests/commands and results:
-- Review findings and fixes:
-- Deferred items/limitations:
+  - RED before implementation: `GOWORK=off go test ./internal/host -run 'TestResolvePunch' -count=1` → FAIL (build failed: `undefined: resolvePunch`, `undefined: p2p.PunchConfig`); `GOWORK=off go test ./cmd/p2p -run 'TestPunchConfigRoundTrip' -count=1` → FAIL (build failed: `c.Punch undefined (type *config has no field or method Punch)`).
+  - GREEN after implementation: the same two commands → `ok github.com/go-gost/p2p/internal/host 0.004s` and `ok github.com/go-gost/p2p/cmd/p2p 0.005s` (final rerun).
+  - Additional checks: `GOWORK=off go test ./cmd/p2p -count=1` → `ok github.com/go-gost/p2p/cmd/p2p 0.009s`; `GOWORK=off go build ./...` → PASS (no output); `git diff --check` → clean. The full `internal/host` suite was deliberately not run (known flaky; brief scopes verification to the focused tests).
+- Review findings and fixes: none from a reviewer yet. Self-review: reordered `punchSettings` fields to match the plan's interface; corrected the seven flag help strings from "keeps the config/default" to "uses the built-in default" because an explicit `0` overrides the file value. Re-ran both focused tests and the build after these edits; no unrelated files changed.
+- Deferred items/limitations: this task only stores and normalizes config — no caps bit, spray/socket engines, socket lifecycle, status/doctor fields or e2e (Tasks 2–8). The verbatim brief tests cover defaults, unknown mode, clamp and two invalid durations; negative-value rejection and `off` normalization are implemented per plan but get no direct assertion until later test work. `engine.punch` is not yet read by any code path.
 
 ---
 
