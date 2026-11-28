@@ -183,6 +183,35 @@ func TestConfigTransportYAML(t *testing.T) {
 	}
 }
 
+func TestPunchConfigRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p2p.yaml")
+	body := `punch:
+  mode: spray
+  afterRounds: 2
+  sprayPorts: 512
+  sprayEvery: 3s
+  sockets: 64
+  socketWindow: 15s
+  seedGrace: 750ms
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := c.Punch
+	if p == nil {
+		t.Fatal("punch = nil")
+	}
+	if p.Mode != "spray" || p.AfterRounds != 2 || p.SprayPorts != 512 ||
+		p.SprayEvery != 3*time.Second || p.Sockets != 64 ||
+		p.SocketWindow != 15*time.Second || p.SeedGrace != 750*time.Millisecond {
+		t.Fatalf("punch = %+v", p)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

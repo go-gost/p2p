@@ -40,6 +40,38 @@ type Config struct {
 	// Faults injects deliberate transport failures (debug only — see
 	// FaultsConfig). Nil or zero means nothing is injected.
 	Faults *FaultsConfig `yaml:"faults,omitempty"`
+	// Punch selects the optional fallback for NAT pairs the regular hole punch
+	// cannot cross. It has two complementary roles: the cone side sprays
+	// random ports toward the random side, while the random side opens several
+	// sockets to seed the cone side. Nil or Mode ""/"off" keeps the existing
+	// direct path unchanged.
+	Punch *PunchConfig `yaml:"punch,omitempty"`
+}
+
+// PunchConfig tunes the optional cone-random punch fallback. Mode picks the
+// local role: "spray" is the cone side, which sprays random ports toward the
+// random side's public IP; "sockets" is the random side, which opens several
+// sockets to seed the cone side. "" or "off" disables the fallback entirely.
+type PunchConfig struct {
+	Mode string `yaml:"mode,omitempty"`
+	// AfterRounds is the number of failed ordinary punch rounds before the
+	// fallback starts. Zero keeps the default of one.
+	AfterRounds int `yaml:"afterRounds,omitempty"`
+	// SprayPorts is the random-port budget per fallback round. Zero keeps the
+	// default of 1000; values above 2048 are clamped.
+	SprayPorts int `yaml:"sprayPorts,omitempty"`
+	// SprayEvery is the interval between fallback spray rounds. Zero keeps the
+	// default of 2s; a positive value below 1s is rejected.
+	SprayEvery time.Duration `yaml:"sprayEvery,omitempty"`
+	// Sockets is the number of sockets the random side opens. Zero keeps the
+	// default of 150; values above 512 are clamped.
+	Sockets int `yaml:"sockets,omitempty"`
+	// SocketWindow is the total fallback socket window. Zero keeps the default
+	// of 20s; values above 60s are rejected.
+	SocketWindow time.Duration `yaml:"socketWindow,omitempty"`
+	// SeedGrace is how long the side that finished first keeps echoing the
+	// peer's tokens. Zero keeps the default of 500ms.
+	SeedGrace time.Duration `yaml:"seedGrace,omitempty"`
 }
 
 // FaultsConfig deliberately breaks the transport to reproduce a field failure

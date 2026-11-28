@@ -51,6 +51,7 @@ type engine struct {
 	quicID      *quicIdentity                          // QUIC TLS identity; non-nil only when transport == transportQUIC
 	targets     *targetPool                            // inbound bridge targets; an empty tcp pool refuses inbound tunnels
 	direct      bool                                   // master direct switch (--direct); false = relay-only
+	punch       punchSettings                          // resolved cone-random fallback; zero mode keeps the old path
 	stunAddr    string                                 // STUN server (host:port); "" disables the IPv4 direct path
 	v6Addr      *net.UDPAddr                           // explicit IPv6 egress override (tests); nil = probe each round
 	v6Enabled   bool                                   // Config.IPv6: the IPv6 family is opt-in (off by default)

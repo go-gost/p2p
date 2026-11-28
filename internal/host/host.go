@@ -104,6 +104,11 @@ func New(cfg *p2p.Config, opts ...Option) (*Host, error) {
 			return nil, err
 		}
 		h.engine.direct = *cfg.Direct
+		punch, err := resolvePunch(cfg.Punch)
+		if err != nil {
+			return nil, err
+		}
+		h.engine.punch = punch
 		h.engine.stunAddr = cfg.Stun
 		h.engine.v6Enabled = cfg.IPv6
 		h.engine.tlsCfg = buildTLSConfig(*cfg.TLS.Secure, cfg.TLS.CAFile, h.log)

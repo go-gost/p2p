@@ -51,6 +51,13 @@ func main() {
 	direct := flag.Bool("direct", true, "attempt a direct (hole-punched) path; false forces relay-only")
 	ipv6 := flag.Bool("ipv6", false, "enable the IPv6 direct-path family (needs a global IPv6 egress)")
 	transport := flag.String("transport", "kcp", "data plane: kcp or quic")
+	punchMode := flag.String("punch-mode", "", "cone-random punch fallback role: off, spray (cone side), or sockets (random side)")
+	punchAfterRounds := flag.Int("punch-after-rounds", 0, "failed ordinary punch rounds before the fallback (0 uses the built-in default)")
+	punchSprayPorts := flag.Int("punch-spray-ports", 0, "random-port budget per fallback round (0 uses the built-in default; max 2048)")
+	punchSprayEvery := flag.Duration("punch-spray-every", 0, "interval between fallback spray rounds (0 uses the built-in default)")
+	punchSockets := flag.Int("punch-sockets", 0, "sockets opened by the random side (0 uses the built-in default; max 512)")
+	punchSocketWindow := flag.Duration("punch-socket-window", 0, "total fallback socket window (0 uses the built-in default; max 60s)")
+	punchSeedGrace := flag.Duration("punch-seed-grace", 0, "echo grace after one side finishes (0 uses the built-in default)")
 	tlsSecure := flag.Bool("tls.secure", true, "verify the relay's TLS certificate (set false to trust any cert)")
 	tlsCAFile := flag.String("tls.caFile", "", "PEM CA file to trust the relay's self-signed certificate")
 	logLevel := flag.String("log.level", "info", "log level: trace, debug, info, warn, error, or fatal")
@@ -116,6 +123,45 @@ func main() {
 	}
 	if set["transport"] {
 		cfg.Transport = *transport
+	}
+	// A single --punch-* flag creates the block; unset flags keep whatever the
+	// config file supplied, so a partial override does not reset other knobs.
+	punchFlags := []string{
+		"punch-mode", "punch-after-rounds", "punch-spray-ports", "punch-spray-every",
+		"punch-sockets", "punch-socket-window", "punch-seed-grace",
+	}
+	punchOverridden := false
+	for _, name := range punchFlags {
+		if set[name] {
+			punchOverridden = true
+			break
+		}
+	}
+	if punchOverridden {
+		if cfg.Punch == nil {
+			cfg.Punch = &p2p.PunchConfig{}
+		}
+		if set["punch-mode"] {
+			cfg.Punch.Mode = *punchMode
+		}
+		if set["punch-after-rounds"] {
+			cfg.Punch.AfterRounds = *punchAfterRounds
+		}
+		if set["punch-spray-ports"] {
+			cfg.Punch.SprayPorts = *punchSprayPorts
+		}
+		if set["punch-spray-every"] {
+			cfg.Punch.SprayEvery = *punchSprayEvery
+		}
+		if set["punch-sockets"] {
+			cfg.Punch.Sockets = *punchSockets
+		}
+		if set["punch-socket-window"] {
+			cfg.Punch.SocketWindow = *punchSocketWindow
+		}
+		if set["punch-seed-grace"] {
+			cfg.Punch.SeedGrace = *punchSeedGrace
+		}
 	}
 	if set["tls.secure"] {
 		cfg.TLS.Secure = tlsSecure
