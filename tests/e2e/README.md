@@ -60,7 +60,7 @@ colliding with a previous run). The last five runs are kept.
 | `udp-tun` | The datagram link backs a point-to-point tun link (both ends tun clients, `udp` inner dialer): bidirectional ICMP across the link, and the link comes up on both sides. |
 | `udp-outlet` | A `udp://` target outlet: a tun **server** behind the tunnel with a shared passphrase; a remote spoke registers a keepalive route and reaches both the server address and a LAN address behind it. |
 | `ipv6-direct` | With no STUN server, a global IPv6 egress is enough to select a direct path (`direct_peers`); the peer's announced candidate is an `fd00::` address, proving the dial was IPv6 and not a v4 fallback. |
-| `nat-cone-random` | Two hosts behind separate router namespaces — cone `MASQUERADE` vs `MASQUERADE --random-fully` — exercise `punch.mode: spray` against `punch.mode: sockets`. A `punch.mode: off` incarnation in the same run is the relay control. The direct assertion is expected to pass where the native NAT's random mappings can meet a random spray; nested-netns conntrack currently keeps those port sets disjoint, so the assertion fails in that lab (see the plan's Task 8 record). |
+| `nat-cone-random` | **Opt-in, not a CI gate.** Two hosts behind separate router namespaces — cone `MASQUERADE` vs `MASQUERADE --random-fully` — exercise `punch.mode: spray` against `punch.mode: sockets`. A `punch.mode: off` incarnation in the same run is the relay control. The scenario asserts that both fallback code paths ran (`direct punch: spray` in A's log plus `fallback spray` in its punch trace, `direct punch: sockets` in B's log) and that the relay still carries HTTP. The three `direct established`/live-direct-peer assertions are explicitly **skipped** in this nested-netns lab, because `MASQUERADE --random-fully` mappings do not meet the random spray; verify them on the real network (plan Task 9). |
 
 ## Topology
 
@@ -85,6 +85,11 @@ HTTP echo server (`/` and a 1 MiB `/bulk`), and a UDP echo server.
 
 ## Notes
 
+- **Explicit skips are not passes.** `skip <desc> <reason>` prints `SKIP` and
+  counts neither pass nor failure. A scenario with skips reports `SKIPPED (...)`
+  instead of `PASS`, and the suite reports `NO FAILURES (<n> passed, <m>
+  skipped)` instead of `ALL PASS`. Only `nat-cone-random` uses this today, for
+  the three direct-establishment assertions that this NAT lab cannot exercise.
 - **PID tracking, not `pkill`.** All namespaces share one PID namespace, so
   `pkill -f <binary>` would kill both sides. `run.sh` records every PID it
   starts and kills them individually; teardown also removes the bridge,

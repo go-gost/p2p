@@ -639,33 +639,102 @@ Same command; capture the failure.
 
 Add the NAT setup and the two configs; reuse the existing `scenario_derp_direct` helpers; do not duplicate the STUN/relay setup. If the existing harness cannot add `--random-fully`, add a small `lib.sh` helper. Ensure the control run (`mode: off`) is a separate assertion, not a second full topology if that doubles runtime.
 
-- [ ] **Step 4: Run to verify it passes**
+- [ ] **Step 4: Run to verify the environment-gated result**
 
 Run:
-`cd p2p/tests/e2e && ./run.sh nat-cone-random`
-Expected: PASS — `direct established` on the cone/random pair; control shows relay.
+`cd p2p/tests/e2e && ./run.sh --scenario nat-cone-random --skip-build --keep`
+Expected: the control stays on the relay, both fallback branches run, and the
+three direct-established assertions are reported as `SKIP`, never as PASS. The
+scenario summary says `SKIPPED`, and the suite reports `NO FAILURES (... passed,
+... skipped)`. The direct path is verified on the real network in Task 9.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cd p2p
-git add tests/e2e/run.sh tests/e2e/lib.sh docs/superpowers/plans/2026-11-28-p2p-cone-random-punch-plan.md
-git commit -m "test(p2p): cover cone-random punch in netns"
+git add tests/e2e/run.sh tests/e2e/lib.sh tests/e2e/README.md docs/superpowers/plans/2026-11-28-p2p-cone-random-punch-plan.md
+git commit -m "test(p2p): gate cone-random direct assertion on the NAT lab"
 ```
 
 **Implementation record**
 
-- Date/status: 2026-11-28, BLOCKED — the scenario runs end to end and the control passes, but the fallback direct-path assertion does not pass in this container's netns/iptables NAT lab.
-- Repo/commit: `p2p` @ `feat/p2p-cone-random`, task commit `46f7cfa test(p2p): cover cone-random punch in netns`; no push.
-- Files changed: `tests/e2e/run.sh` (`nat-cone-random` in the registry, `setup_nat_net`, a config-aware `start_p2p_pair` extracted from `start_derp_pair`, the scenario with its in-run relay control, and topology restore after the scenario), `tests/e2e/lib.sh` (router-namespace NAT helpers, `net_teardown` generalized to tracked namespaces/veths), `tests/e2e/README.md` (scenario row), and this plan.
+- Date/status: 2026-11-28, REVISED — environment-gated. The scenario has zero failures and reports `SKIPPED (3 skipped assertion(s))`; no direct path is claimed as passing in this lab. Opt-in, not a CI gate.
+- Repo/commit: `p2p` @ `feat/p2p-cone-random`, revision commit subject `test(p2p): gate cone-random direct assertion on the NAT lab` (SHA inlined by the required follow-up docs commit); earlier task commits `46f7cfa test(p2p): cover cone-random punch in netns` and `a423725 docs(p2p): record task 8 commit`; no push.
+- Files changed: `tests/e2e/run.sh` (skip-aware scenario/global summary, `wait_status_grep`, branch-activity assertions and the three environment-gated skips in `nat-cone-random`), `tests/e2e/lib.sh` (`skip` primitive and counter), `tests/e2e/README.md` (opt-in/skip semantics and the scenario row), and this plan.
 - Tests/commands and results:
+  - Controller ruling: the nested-netns `MASQUERADE --random-fully` mappings do not meet the random spray (eight runs, tcpdump showing disjoint port sets, both fallback branches running). Task 8 Step 4's expected green `direct established` is wrong for this container. The direct path was already proven by the earlier real-network pi/phone spike; the definitive field check is Task 9. Therefore the direct assertions are explicit skips, not passes and not failures.
   - Harness interface is `./run.sh --scenario nat-cone-random`, not the brief's positional form; the worktree sits under `p2p/.worktrees`, so `run.sh`'s derived `$GOST_DIR` does not exist. Binaries were prebuilt (`GOWORK=off` for p2p/helper, workspace build for gost) and the suite was run with `--skip-build` inside `unshare -n` with `lo` up (the host's 10.99.0.1:18081 is occupied by an unrelated process).
-  - RED: with both fallback configs set to `mode: off`, `unshare -n bash -c 'ip link set lo up; exec ./run.sh --scenario nat-cone-random --skip-build --keep'` → `scenario nat-cone-random: FAIL (3 assertion(s))`, 3 FAILED / 11 assertions; all four control assertions passed and the relay carried HTTP. This proves the new direct assertions fail when the fallback is disabled.
-  - GREEN attempts: with `spray`/`sockets` modes, the same command was run eight times with progressively larger bounded budgets (1000/150 → 2048/300/512), different spray windows, staggered host starts, a bounded `--random-fully` port pool, and `raw/NOTRACK` rules for unsolicited UDP. Every run reached both fallback branches (`direct punch: spray`, `direct punch: sockets`) and then failed with `no direct established by spray` plus `no direct peer with punch off` only for the control. Packet captures (`tcpdump -ni any udp -vv` inside both router namespaces, temporary harness debug only) showed ~2048 sprayed destination ports but **zero** overlap with the random router's 300/512 public mappings in the same run, while the same sets overlap normally across different runs. The spray/sockets code paths therefore execute but cannot meet in this lab.
-  - Final command/output: `unshare -n bash -c 'ip link set lo up; exec ./run.sh --scenario nat-cone-random --skip-build --keep'` → `scenario nat-cone-random: FAIL (3 assertion(s))`, `3 FAILED / 11 assertions`, exit 1; log dir `/tmp/p2p-e2e/runs/20261128-110801-3614970-8974`.
-  - Regression check: `./run.sh --scenario derp-relay --skip-build --keep` inside the same netns → `ALL PASS (10 assertions)`; `./run.sh --scenario stub --skip-build --keep` → 2 pre-existing token assertions failed (the tokenless client log has no `Unauthenticated ... invalid token` line), unrelated to the NAT helpers. `GOWORK=off go build ./...` → PASS.
-- Review findings and fixes: self-review only (no reviewer was dispatched). The first NAT lab used RFC1918 addresses for the routers' external segment, which `isPublicIPv4` correctly rejects, so the fallback never armed; moved that segment to the isolated 198.18.0.0/24 benchmark range. The generic `net_teardown` originally deleted only the fixed A/B names and broke when the array was empty in holder mode; it now iterates tracked names. Temporary tcpdump/iptables experiments were removed from the committed scenario. The final config retains bounded budgets and short backoff, which are harmless and keep the test decisive on a NAT where mappings and sprays can overlap.
-- Deferred items/limitations: BLOCKED on a passing GREEN in this environment. The failure is in the lab's NAT/port-allocation behavior, not an executed-and-passing product assertion: the control correctly stays on the relay, the fallback arms and both sides spray/open sockets, but Linux conntrack's port choices in nested netns keep the sprayed ports disjoint from the random mappings. The scenario is opt-in and not a CI gate; it needs verification on a host where MASQUERADE --random- mappings actually overlap a random spray, or a harness NAT model that removes that coupling. The full `internal/host` suite was not run (known flake).
+  - Earlier RED evidence (retained from the first implementation): with both modes `off`, the same command gave `scenario nat-cone-random: FAIL (3 assertion(s))` / `3 FAILED / 11 assertions`; all control assertions passed. With `spray`/`sockets`, eight runs reached both fallback branches but never established direct; packet captures showed zero overlap between sprayed ports and random mappings within a run. That evidence is why the gate exists; it is not a pass.
+  - Final gated command (from `tests/e2e`), run id `20261128-111746-3622363-19109`, log dir `/tmp/p2p-e2e/runs/20261128-111746-3622363-19109/logs`:
+
+    ```sh
+    set -o pipefail; unshare -n bash -c 'ip link set lo up; exec ./run.sh --scenario nat-cone-random --skip-build --keep' 2>&1 | tee /tmp/opencode/task8-gated-run-final.log; echo "run.sh exit=${PIPESTATUS[0]}"
+    ```
+
+    Exact output:
+
+    ```text
+    p2p e2e  run=20261128-111746-3622363-19109  work=/tmp/p2p-e2e
+    binaries: p2p=/tmp/p2p-e2e/bin/p2p gost=/tmp/p2p-e2e/bin/gost helper=/tmp/p2p-e2e/bin/helper derper=/tmp/p2p-e2e/derper-root/usr/local/bin/derper
+    namespaces A=10.99.0.2 B=10.99.0.3 (mode=ip), bridge p2p-e2e-br
+
+    == NAT cone <-> random: the spray/sockets fallback crosses a random NAT
+    NAT namespaces: A=10.99.1.2 via RA=198.18.0.4 (cone) B=10.99.2.2 via RB=198.18.0.5 (random-fully)
+      PASS derper nat-ctrl up (stun=on)
+      PASS derp pair up (nat-ctrl): A=eGTTURGyDQYFKRgKCO0uTUpvTvEl8xMV-PtCS6Wb0Q4 B=AaUlqUfPS619SX4OwDSFfsp0zGJftmq8wLNwdx9f51w
+      PASS control: the relay carries HTTP
+      PASS control: the peer is on the relay
+      PASS control: no direct peer with punch off
+      PASS control: no direct established with punch off
+      PASS derp pair up (nat): A=CbHZ2llHhsEEMljCH9erCZNSCsn3jGDnNmX7JTUyiSc B=QM5F036mVLD3Rkr1-9LYvwMYWOCwQeEOKJvzpZs7nRA
+      PASS the cone side ran the spray fallback
+      PASS the random side ran the sockets fallback
+      PASS the cone side's punch trace records the spray fallback
+      SKIP direct established by spray on the cone side (nested-netns MASQUERADE --random-fully mappings do not meet the random spray; direct path is verified on the real network — Task 9)
+      SKIP the random side established the matching direct path (nested-netns MASQUERADE --random-fully mappings do not meet the random spray; direct path is verified on the real network — Task 9)
+      SKIP status shows a live direct peer (nested-netns MASQUERADE --random-fully mappings do not meet the random spray; direct path is verified on the real network — Task 9)
+      PASS the fallback pair still carries HTTP
+      PASS the fallback pair still has its relay peer
+      PASS the fallback pair's HTTP rode the relay
+    namespaces A=10.99.0.2 B=10.99.0.3 (mode=ip), bridge p2p-e2e-br
+    scenario nat-cone-random: SKIPPED (3 skipped assertion(s))
+
+    NO FAILURES (13 passed, 3 skipped)
+    logs: /tmp/p2p-e2e/runs/20261128-111746-3622363-19109/logs
+    run.sh exit=0
+    ```
+  - Regression check, same netns, run id `20261128-111735-3621647-21721`:
+
+    ```sh
+    unshare -n bash -c 'ip link set lo up; exec ./run.sh --scenario derp-relay --skip-build --keep'
+    ```
+
+    Exact output:
+
+    ```text
+    p2p e2e  run=20261128-111735-3621647-21721  work=/tmp/p2p-e2e
+    binaries: p2p=/tmp/p2p-e2e/bin/p2p gost=/tmp/p2p-e2e/bin/gost helper=/tmp/p2p-e2e/bin/helper derper=/tmp/p2p-e2e/derper-root/usr/local/bin/derper
+    namespaces A=10.99.0.2 B=10.99.0.3 (mode=ip), bridge p2p-e2e-br
+
+    == derp relay-only: two hosts, real derper, no direct path
+      PASS derper relay up (stun=off)
+      PASS derp pair up (relay): A=dKzAi_u7Tcv3yBzr96d6wJI27lsEljcteOnh1ck1AkY B=4_KQ3mENgCKSGwHj-xVpaNHXDMusDR6s9d6aKYD6JgY
+      PASS relay tunnel carries HTTP
+      PASS relay bulk transfer is 1 MiB
+      PASS relay path is used
+      PASS no direct session in relay-only mode
+      PASS status carries a per-peer diagnostic
+      PASS the diagnostic is keyed by the peer
+      PASS the diagnostic names the transport
+      PASS tunnel record reclaimed after the stream ends (zero residue)
+    scenario derp-relay: PASS
+
+    ALL PASS (10 assertions)
+    logs: /tmp/p2p-e2e/runs/20261128-111735-3621647-21721/logs
+    ```
+  - `GOWORK=off go build ./...` from the worktree → PASS; `git diff --check` → clean. `bash -n tests/e2e/run.sh tests/e2e/lib.sh` → PASS.
+- Review findings and fixes: controller revised the blocked Task 8: keep the topology, the `punch.mode: off` control and both fallback branches, but replace the three direct-established assertions with explicit skips carrying the lab reason. Added a `skip` primitive that never increments `PASSED`, and made the scenario summary print `SKIPPED` (never `PASS`) when skips exist; the global summary prints `NO FAILURES (... passed, ... skipped)` instead of `ALL PASS`. Branch activity is now asserted from the wire: A's log (`direct punch: spray`) and Status trace (`fallback spray ports=`), B's log (`direct punch: sockets`), plus relay peer and HTTP over the relay. Earlier findings retained: RFC1918 external addresses were replaced with the isolated 198.18.0.0/24 benchmark range so `isPublicIPv4` can arm the fallback; `net_teardown` iterates tracked namespaces; temporary tcpdump/NOTRACK experiments were removed.
+- Deferred items/limitations: the direct path remains **field-only** here: Task 9 (pi hub + Pixel 9 cellular, `spray` vs `sockets`, with an `off` control) is the definitive verification. This scenario is opt-in and not a CI gate; its `SKIPPED` result must never be read as a direct-path pass. The nested-netns NAT keeps sprayed ports disjoint from `--random-fully` mappings, so a green direct assertion in this container is not expected. The full `internal/host` suite was not run (known flake).
 
 ---
 

@@ -14,6 +14,7 @@ fi
 
 PASSED=0
 FAILURES=0
+SKIPPED=0
 SCENARIO=""
 PIDS=()          # every process started (killed at global cleanup)
 SCENARIO_PIDS=() # processes started by the current scenario
@@ -24,6 +25,13 @@ ok()   { PASSED=$((PASSED + 1)); printf '  %sPASS%s %s\n' "$C_OK" "$C_RST" "$*";
 fail() {
 	FAILURES=$((FAILURES + 1))
 	printf '  %sFAIL%s %s\n' "$C_ERR" "$C_RST" "$*"
+}
+# skip <desc> <reason>: an assertion this environment cannot evaluate. It is
+# neither a pass nor a failure, and the runner reports skipped scenarios as
+# SKIPPED rather than PASS.
+skip() {
+	SKIPPED=$((SKIPPED + 1))
+	printf '  %sSKIP%s %s (%s)\n' "$C_DIM" "$C_RST" "$1" "$2"
 }
 # check <desc> <cmd...>: run cmd, PASS on exit 0.
 check() {
