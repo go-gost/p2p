@@ -4,3 +4,6 @@
 
 # superpowers scratch (per-plan workspaces/ledgers)
 .superpowers/
+
+# local git worktrees
+.worktrees/
